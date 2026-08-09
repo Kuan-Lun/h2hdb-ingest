@@ -15,7 +15,7 @@ from h2hdb import (
 )
 
 from .config import ResidentConfig
-from .service import IngestService
+from .staged_service import IngestSynchronizer
 
 SQLITE_RENEW_BUSY_TIMEOUT_SECONDS = 1.0
 SQLITE_RENEW_RETRY_SECONDS = 0.1
@@ -153,7 +153,7 @@ class ResidentIngestor:
     def __init__(
         self,
         *,
-        service: IngestService,
+        service: IngestSynchronizer,
         coordinator: DownloadCoordinator,
         database_admin: DatabaseAdmin,
         config: ResidentConfig,
@@ -170,13 +170,28 @@ class ResidentIngestor:
     def initialize(self) -> SchemaCompatibility:
         return self._database_admin.check_compatibility()
 
-    def process_available(self, *, periodic_scan: bool) -> bool:
+    def process_available(
+        self,
+        *,
+        periodic_scan: bool,
+        preflight: Callable[[], None] | None = None,
+    ) -> bool:
         turn = self._coordinator.claim_gallery_ingest(
             lease_seconds=self._config.lease_seconds,
             periodic_scan=periodic_scan,
         )
         if turn is None:
             return False
+        if preflight is not None:
+            try:
+                preflight()
+            except BaseException as error:
+                if not self._coordinator.complete_gallery_ingest(turn):
+                    error.add_note(
+                        "The ingest lease could not be released after preflight "
+                        "failed."
+                    )
+                raise
         with IngestLeaseHeartbeat(
             self._coordinator,
             turn,

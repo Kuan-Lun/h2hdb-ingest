@@ -17,6 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 DEFAULT_HASH_WORKERS = min(4, os.process_cpu_count() or 1)
 DEFAULT_CBZ_WORKERS = min(4, os.process_cpu_count() or 1)
 DEFAULT_STALE_TEMP_AGE_SECONDS = 60
+DEFAULT_SCAN_BATCH_GALLERIES = 128
+DEFAULT_SCAN_BATCH_FILES = 2_048
 _PAGES_SORT_PATTERN = re.compile(r"pages(?:\+([1-9]\d*))?")
 
 
@@ -51,6 +53,16 @@ class IngestPathsConfig(ConfigModel):
         ge=60,
     )
     hash_workers: int = Field(default=DEFAULT_HASH_WORKERS, ge=1, le=32)
+    scan_batch_galleries: int = Field(
+        default=DEFAULT_SCAN_BATCH_GALLERIES,
+        ge=1,
+        le=200,
+    )
+    scan_batch_files: int = Field(
+        default=DEFAULT_SCAN_BATCH_FILES,
+        ge=1,
+        le=2_048,
+    )
 
     @model_validator(mode="after")
     def validate_cbz_roots(self) -> IngestPathsConfig:

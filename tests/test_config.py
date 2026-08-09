@@ -5,6 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from h2hdb_ingest import CBZGrouping, IngestConfig, IngestPathsConfig, load_config
+from h2hdb_ingest.scope import catalog_scope_key
 
 
 def test_loader_resolves_nested_core_secret_and_path_environment_values(
@@ -111,6 +112,83 @@ def test_runtime_paths_reject_empty_download_mount(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="gallery volume is mounted"):
         config.ensure_paths()
+
+
+def test_scan_batch_limits_have_bounded_defaults(tmp_path: Path) -> None:
+    paths = IngestPathsConfig(download_path=tmp_path)
+
+    assert paths.scan_batch_galleries == 128
+    assert paths.scan_batch_files == 2_048
+
+
+@pytest.mark.parametrize("field", ["scan_batch_galleries", "scan_batch_files"])
+def test_scan_batch_limits_must_be_positive(tmp_path: Path, field: str) -> None:
+    with pytest.raises(ValidationError):
+        IngestPathsConfig.model_validate({"download_path": tmp_path, field: 0})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("scan_batch_galleries", 201), ("scan_batch_files", 2_049)],
+)
+def test_scan_batch_limits_reject_oversized_transactions(
+    tmp_path: Path,
+    field: str,
+    value: int,
+) -> None:
+    with pytest.raises(ValidationError):
+        IngestPathsConfig.model_validate({"download_path": tmp_path, field: value})
+
+
+def test_catalog_scope_ignores_throughput_tuning_but_tracks_semantics(
+    tmp_path: Path,
+) -> None:
+    base = IngestPathsConfig(
+        download_path=tmp_path / "source",
+        cbz_path=tmp_path / "current",
+        artifact_store_path=tmp_path / "artifacts",
+        hash_workers=1,
+        cbz_workers=1,
+        scan_batch_galleries=1,
+        scan_batch_files=1,
+    )
+    tuned = base.model_copy(
+        update={
+            "hash_workers": 8,
+            "cbz_workers": 8,
+            "scan_batch_galleries": 200,
+            "scan_batch_files": 2_048,
+        }
+    )
+
+    base_key = catalog_scope_key(base, parser_version="0.5.0")
+
+    assert catalog_scope_key(tuned, parser_version="0.5.0") == base_key
+    assert base_key.startswith("filesystem-v1:")
+    assert (
+        catalog_scope_key(
+            base.model_copy(update={"max_image_short_side": 1024}),
+            parser_version="0.5.0",
+        )
+        != base_key
+    )
+    assert catalog_scope_key(base, parser_version="0.6.0") != base_key
+
+
+def test_catalog_scope_ignores_cbz_policy_when_cbz_is_disabled(tmp_path: Path) -> None:
+    base = IngestPathsConfig(download_path=tmp_path / "source")
+    changed = base.model_copy(
+        update={
+            "max_image_short_side": 2_048,
+            "cbz_grouping": CBZGrouping.date_yyyy_mm_dd,
+            "cbz_sort": "gid",
+        }
+    )
+
+    assert catalog_scope_key(base, parser_version="0.5.0") == catalog_scope_key(
+        changed,
+        parser_version="0.5.0",
+    )
 
 
 @pytest.mark.parametrize(

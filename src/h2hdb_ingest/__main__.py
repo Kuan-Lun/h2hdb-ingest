@@ -4,22 +4,23 @@ from collections.abc import Sequence
 from h2hdb import H2HDB
 
 from .cbz import CBZReconciler
-from .config import load_config
-from .deduplication import DeduplicationPolicy
+from .config import IngestConfig, load_config
 from .resident import ResidentIngestor
 from .scanner import FilesystemScanner
-from .service import IngestService
+from .scope import catalog_scope_key
+from .staged_deduplication import StagedDeduplicationPlanner
+from .staged_service import StagedIngestService
+from .staging import CoreFileHashCache, FilesystemSourceStager
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(
-        description="Scan galleries and publish H2HDB revisions"
-    )
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--once", action="store_true")
-    args = parser.parse_args(argv)
-    config = load_config(args.config)
-    config.ensure_paths()
+def _build_runtime(config: IngestConfig) -> tuple[H2HDB, ResidentIngestor]:
+    """Construct the one production staged runtime used by both entry points."""
+
+    if config.paths.cbz_path is not None and config.paths.cbz_sort != "no":
+        raise ValueError(
+            "The staged ingest pipeline currently supports only cbz_sort='no'; "
+            "refusing to silently publish a differently ordered projection"
+        )
     database = H2HDB(config.core)
     cbz = None
     if config.paths.cbz_path is not None:
@@ -33,18 +34,29 @@ def main(argv: Sequence[str] | None = None) -> None:
             stale_temp_age_seconds=config.paths.stale_temp_age_seconds,
             event_logger=database.logger.info,
         )
-    service = IngestService(
-        scanner=FilesystemScanner(
-            config.paths.download_path,
-            hash_workers=config.paths.hash_workers,
-            event_logger=database.logger.info,
+    hash_cache = CoreFileHashCache(database)
+    scanner = FilesystemScanner(
+        config.paths.download_path,
+        hash_workers=config.paths.hash_workers,
+        hash_cache=hash_cache,
+        max_galleries=config.paths.scan_batch_galleries,
+        max_files=config.paths.scan_batch_files,
+        event_logger=database.logger.info,
+    )
+    service = StagedIngestService(
+        source_stager=FilesystemSourceStager(
+            scanner=scanner,
+            coordinator=database,
+            hash_cache=hash_cache,
         ),
-        deduplication=DeduplicationPolicy(),
-        cbz=cbz,
-        catalog_reader=database,
-        catalog_publisher=database,
+        planner=StagedDeduplicationPlanner(),
+        catalog=database,
         database_admin=database,
-        sort_mode=config.paths.cbz_sort,
+        catalog_reader=database,
+        source_root=config.paths.download_path,
+        scope_key=catalog_scope_key(config.paths),
+        cbz=cbz,
+        event_logger=database.logger.info,
     )
     resident = ResidentIngestor(
         service=service,
@@ -54,6 +66,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         database_type=config.core.database.sql_type,
         event_logger=database.logger.info,
     )
+    return database, resident
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Scan galleries and publish H2HDB revisions"
+    )
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args(argv)
+    config = load_config(args.config)
+    config.ensure_paths()
+    _database, resident = _build_runtime(config)
     resident.initialize()
     if args.once:
         if not resident.process_available(periodic_scan=True):

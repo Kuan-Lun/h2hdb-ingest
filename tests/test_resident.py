@@ -14,13 +14,9 @@ from h2hdb import (
     SchemaCompatibility,
 )
 
-from h2hdb_ingest import (
-    IngestService,
-    ResidentConfig,
-    ResidentIngestor,
-    SyncOutcome,
-)
+from h2hdb_ingest import ResidentConfig, ResidentIngestor, SyncOutcome
 from h2hdb_ingest.resident import IngestLeaseHeartbeat
+from h2hdb_ingest.staged_service import IngestSynchronizer
 
 
 def _outcome(*, new: int = 0, changed: int = 0, removed: int = 0) -> SyncOutcome:
@@ -122,7 +118,7 @@ def _resident(
     outcomes: list[SyncOutcome] | None = None,
 ) -> ResidentIngestor:
     return ResidentIngestor(
-        service=cast(IngestService, _Service(events, outcomes)),
+        service=cast(IngestSynchronizer, _Service(events, outcomes)),
         coordinator=cast(DownloadCoordinator, _Coordinator(events)),
         database_admin=cast(
             DatabaseAdmin,
@@ -158,6 +154,23 @@ def test_failed_maintenance_does_not_acknowledge_ingest_turn() -> None:
         resident.process_available(periodic_scan=False)
 
     assert events == ["claim", "synchronize", "maintenance"]
+
+
+def test_failed_preflight_releases_claim_before_synchronization() -> None:
+    events: list[str] = []
+    resident = _resident(events)
+
+    def fail_preflight() -> None:
+        events.append("preflight")
+        raise RuntimeError("not fresh")
+
+    with pytest.raises(RuntimeError, match="not fresh"):
+        resident.process_available(
+            periodic_scan=True,
+            preflight=fail_preflight,
+        )
+
+    assert events == ["claim", "preflight", "complete"]
 
 
 def test_same_lease_rescans_until_new_and_changed_work_converges(

@@ -4,7 +4,11 @@ from pathlib import Path
 
 
 def test_package_is_importable() -> None:
-    import_module("h2hdb_ingest")
+    package = import_module("h2hdb_ingest")
+
+    assert callable(package.StagedIngestService)
+    assert callable(package.LegacyIngestService)
+    assert not hasattr(package, "IngestService")
 
 
 def test_distribution_command_targets_python_module_main() -> None:

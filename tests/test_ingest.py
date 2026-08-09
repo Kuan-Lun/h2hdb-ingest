@@ -1,4 +1,5 @@
 import json
+from collections.abc import Iterable
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
@@ -24,7 +25,7 @@ from h2hdb_ingest import (
     CBZReconciler,
     DeduplicationPolicy,
     FilesystemScanner,
-    IngestService,
+    LegacyIngestService,
     SyncOutcome,
     gallery_name_to_cbz_file_name,
 )
@@ -74,7 +75,7 @@ def _service(
     max_image_short_side: int = 16,
     cbz_reconciler: CBZReconciler | None = None,
     sort_mode: str = "no",
-) -> IngestService:
+) -> LegacyIngestService:
     cbz = cbz_reconciler
     if cbz is None and cbz_path is not None:
         cbz = CBZReconciler(
@@ -82,7 +83,7 @@ def _service(
             cbz_path=cbz_path,
             max_image_short_side=max_image_short_side,
         )
-    return IngestService(
+    return LegacyIngestService(
         scanner=FilesystemScanner(galleries, hash_workers=2),
         deduplication=DeduplicationPolicy(),
         cbz=cbz,
@@ -99,7 +100,7 @@ def _claim_ingest(database: H2HDB) -> GalleryIngestTurn:
     return turn
 
 
-def _synchronize(database: H2HDB, service: IngestService) -> SyncOutcome:
+def _synchronize(database: H2HDB, service: LegacyIngestService) -> SyncOutcome:
     turn = _claim_ingest(database)
     outcome = service.synchronize_once(turn)
     assert database.complete_gallery_ingest(turn)
@@ -215,7 +216,7 @@ def test_publication_selection_contains_no_canonical_metadata(
     )
 
     (gallery,) = FilesystemScanner(galleries, hash_workers=1).scan()
-    selection = IngestService._to_publication_selection(gallery, None)
+    selection = LegacyIngestService._to_publication_selection(gallery, None)
 
     assert gallery.title == ""
     assert selection.source_gallery_name == "Friendly Empty Title [6]"
@@ -648,6 +649,24 @@ def test_cbz_webtoon_short_side_resize_preserves_long_strips_without_upscale(
     assert manifest["version"] == cbz_module.CBZ_MANIFEST_VERSION
     assert manifest["resizePolicy"] == "webtoon-short-side-no-upscale-v1"
     assert manifest["maxImageShortSide"] == 50
+    assert "files" not in manifest
+
+
+def test_cbz_rejects_a_source_file_changed_after_staging(tmp_path: Path) -> None:
+    galleries = tmp_path / "galleries"
+    folder = _write_gallery(galleries, 72, color=(255, 0, 0))
+    scanner = FilesystemScanner(galleries, hash_workers=1)
+    plan = DeduplicationPolicy().select(scanner.scan())
+    (folder / "001.png").write_bytes(b"changed-after-staging")
+    reconciler = CBZReconciler(
+        artifact_store_path=tmp_path / "artifacts",
+        cbz_path=tmp_path / "cbz",
+        max_image_short_side=50,
+        workers=1,
+    )
+
+    with pytest.raises(RuntimeError, match="changed before CBZ read"):
+        reconciler.prepare(plan)
 
 
 def test_cbz_normalized_member_names_are_unique_and_bytes_are_reproducible(
@@ -666,8 +685,13 @@ def test_cbz_normalized_member_names_are_unique_and_bytes_are_reproducible(
 
     first = reconciler.prepare(policy.select(scanner.scan()))
     reconciler.finalize_published(first)
-    (tmp_path / "artifacts" / ".h2hdb-cbz-state.json").unlink()
-    second = reconciler.prepare(policy.select(scanner.scan()))
+    (tmp_path / "artifacts" / cbz_module.STATE_DATABASE_FILE_NAME).unlink()
+    (tmp_path / "artifacts" / cbz_module.STATE_DATABASE_MARKER_FILE_NAME).unlink()
+    second = CBZReconciler(
+        artifact_store_path=tmp_path / "artifacts",
+        cbz_path=tmp_path / "cbz",
+        max_image_short_side=16,
+    ).prepare(policy.select(scanner.scan()))
 
     assert first[0].sha256 == second[0].sha256
     assert first[0].path == second[0].path
@@ -701,7 +725,7 @@ def test_cbz_grouping_changes_storage_location_but_not_friendly_name(
     (artifact,) = reconciler.prepare(plan)
     reconciler.protect_for_publish((artifact,))
     reconciler.finalize_published((artifact,))
-    selection = IngestService._to_publication_selection(gallery, artifact)
+    selection = LegacyIngestService._to_publication_selection(gallery, artifact)
 
     assert artifact.path.parent.relative_to(tmp_path / "artifacts").parts == (
         "2024",
@@ -832,11 +856,12 @@ class _RecordingCatalogPublisher:
 class _CrashAfterPublishCBZ(CBZReconciler):
     def finalize_published(
         self,
-        artifacts: tuple[CBZArtifact, ...],
+        artifacts: Iterable[CBZArtifact],
         *,
         revision: int | None = None,
+        protection_id: str = cbz_module.LEGACY_PROTECTION_ID,
     ) -> None:
-        del artifacts, revision
+        del artifacts, revision, protection_id
         raise RuntimeError("injected post-commit crash")
 
 
