@@ -67,6 +67,35 @@ uv run --no-sync python -m build
 
 If the environment is damaged, run `scripts/rebuild-env.sh`.
 
+## Formal Verification
+
+The executable vNext specifications live in `verification/`; they are design
+models, not evidence that the current runtime implements the model. Run them
+with the pinned Lean toolchain and checksum-pinned TLC release:
+
+```bash
+uv run --no-sync python scripts/verify-formal.py lean
+uv run --no-sync python scripts/fetch-formal-tools.py
+uv run --no-sync python scripts/verify-formal.py tla \
+  --tla-jar .formal-tools/tla2tools-1.7.4.jar
+```
+
+Use `--deep` only for the larger manual/nightly TLA+ profile; the default
+`Small` profile is the finite required check. TLC success exhausts reachable
+states only for the selected constants. Lean theorems are unbounded over their
+stated mathematical inputs, but rely on explicit assumptions such as exact
+delta detection, correct prior caches, collision-free canonical hash identity,
+and deterministic policy/artifact functions. Differential tests and crash/fault
+injection are still required for implementation conformance.
+
+A newly added gallery changes the corpus evidence and can change spam answers
+for hashes and galleries that already existed. Incremental processing must
+derive the exact global spam delta, invalidate every affected old or new file
+multiset, recompute selection/ownership/policy artifact inputs, and derive the
+exact CBZ rebuild, delete, and create sets. Never treat a new gallery as a
+local-only shard update unless the locality premise is established by the
+classifier model.
+
 ## Shared Finalization
 
 The repository keeps provider-neutral hooks in `scripts/hooks/`.
