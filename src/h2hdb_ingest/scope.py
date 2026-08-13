@@ -11,10 +11,10 @@ from pathlib import Path
 
 from .cbz import CBZ_MANIFEST_VERSION
 from .config import IngestPathsConfig
-from .scanner import SOURCE_MANIFEST_VERSION
+from .scanner import FILESYSTEM_OBSERVATION_VERSION
+from .source_manifest import CANONICAL_SOURCE_MANIFEST_VERSION
 
 _SCOPE_FORMAT_VERSION = 1
-_CANONICAL_SOURCE_MANIFEST_VERSION = 1
 _STAGED_DEDUPLICATION_POLICY_VERSION = 1
 
 
@@ -53,8 +53,8 @@ def catalog_scope_key(
         "parser_version": parser_version,
         "scope_format_version": _SCOPE_FORMAT_VERSION,
         "source": {
-            "canonical_manifest_version": _CANONICAL_SOURCE_MANIFEST_VERSION,
-            "filesystem_observation_version": SOURCE_MANIFEST_VERSION,
+            "canonical_manifest_version": CANONICAL_SOURCE_MANIFEST_VERSION,
+            "filesystem_observation_version": FILESYSTEM_OBSERVATION_VERSION,
             "root": _resolved(paths.download_path),
         },
     }

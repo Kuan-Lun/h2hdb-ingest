@@ -510,7 +510,14 @@ class FilesystemSourceStager:
             gallery_name=chunk.manifest.gallery_name,
             expected_file_count=completion.source_file_count,
             scan_observation_sha256=completion.scan_observation_sha256,
-            scan_observation_version=completion.source_manifest_version,
+            scan_observation_version=completion.scan_observation_version,
+            canonical_source_manifest_sha256=(
+                completion.canonical_source_manifest_sha256
+            ),
+            canonical_source_manifest_version=(
+                completion.canonical_source_manifest_version
+            ),
+            raw_content_sha256=completion.raw_content_sha256,
             metadata_sha256=completion.metadata_sha256,
             page_count=completion.pages,
             directory_entry_count=completion.directory_entry_count,

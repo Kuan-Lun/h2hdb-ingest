@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 __all__ = [
+    "FILESYSTEM_OBSERVATION_VERSION",
     "FileHashCache",
     "FilesystemDiscoverySession",
     "FilesystemScanner",
@@ -11,8 +12,9 @@ import json
 import logging
 import os
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import closing
 from dataclasses import dataclass
 from hashlib import sha256
 from itertools import islice
@@ -40,12 +42,16 @@ from .models import (
     ScannedGalleryCompletion,
     ScannedGalleryManifest,
 )
+from .source_manifest import (
+    CANONICAL_SOURCE_MANIFEST_VERSION,
+    CanonicalManifestAccumulator,
+)
 
 GALLERY_INFO_NAME = "galleryinfo.txt"
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 60.0
 DEFAULT_MAX_GALLERIES = 128
 DEFAULT_MAX_FILES = 2_048
-SOURCE_MANIFEST_VERSION = 2
+FILESYSTEM_OBSERVATION_VERSION = 2
 _DIGEST_MODULUS = 1 << 256
 logger = logging.getLogger(__name__)
 
@@ -452,7 +458,7 @@ class FilesystemScanner:
         max_files: int | None = None,
         scan_attempt: str | None = None,
         relative_folders: Iterable[str] | None = None,
-    ) -> Iterator[FilesystemScanBatch]:
+    ) -> Generator[FilesystemScanBatch]:
         """Yield bounded chunks suitable for durable staging writes.
 
         ``scan_attempt`` should be the durable build identifier when a caller has
@@ -481,40 +487,44 @@ class FilesystemScanner:
                 if relative_folders is None
                 else self._gallery_info_paths(relative_folders)
             )
-            chunks = self._iter_gallery_chunks(
-                executor,
-                gallery_info_paths=gallery_info_paths,
-                scan_attempt=attempt,
-                max_files=file_limit,
-                progress=progress,
-            )
-            for chunk in chunks:
-                gallery_attempt = chunk.manifest.gallery_attempt
-                new_gallery = gallery_attempt not in batch_attempts
-                exceeds_gallery_limit = (
-                    new_gallery and len(batch_attempts) >= gallery_limit
+            with closing(
+                self._iter_gallery_chunks(
+                    executor,
+                    gallery_info_paths=gallery_info_paths,
+                    scan_attempt=attempt,
+                    max_files=file_limit,
+                    progress=progress,
                 )
-                exceeds_file_limit = batch_file_count + len(chunk.files) > file_limit
-                if batch_chunks and (exceeds_gallery_limit or exceeds_file_limit):
-                    yield FilesystemScanBatch(tuple(batch_chunks))
-                    batch_chunks.clear()
-                    batch_attempts.clear()
-                    batch_file_count = 0
-                batch_chunks.append(chunk)
-                batch_attempts.add(gallery_attempt)
-                batch_file_count += len(chunk.files)
+            ) as chunks:
+                for chunk in chunks:
+                    gallery_attempt = chunk.manifest.gallery_attempt
+                    new_gallery = gallery_attempt not in batch_attempts
+                    exceeds_gallery_limit = (
+                        new_gallery and len(batch_attempts) >= gallery_limit
+                    )
+                    exceeds_file_limit = (
+                        batch_file_count + len(chunk.files) > file_limit
+                    )
+                    if batch_chunks and (exceeds_gallery_limit or exceeds_file_limit):
+                        yield FilesystemScanBatch(tuple(batch_chunks))
+                        batch_chunks.clear()
+                        batch_attempts.clear()
+                        batch_file_count = 0
+                    batch_chunks.append(chunk)
+                    batch_attempts.add(gallery_attempt)
+                    batch_file_count += len(chunk.files)
 
-                if (
-                    len(batch_attempts) >= gallery_limit
-                    or batch_file_count >= file_limit
-                ):
-                    yield FilesystemScanBatch(tuple(batch_chunks))
-                    batch_chunks.clear()
-                    batch_attempts.clear()
-                    batch_file_count = 0
+                    if (
+                        len(batch_attempts) >= gallery_limit
+                        or batch_file_count >= file_limit
+                    ):
+                        yield FilesystemScanBatch(tuple(batch_chunks))
+                        batch_chunks.clear()
+                        batch_attempts.clear()
+                        batch_file_count = 0
 
-            if batch_chunks:
-                yield FilesystemScanBatch(tuple(batch_chunks))
+                if batch_chunks:
+                    yield FilesystemScanBatch(tuple(batch_chunks))
 
         self._event_logger(
             "Filesystem scan completed: "
@@ -563,7 +573,7 @@ class FilesystemScanner:
         scan_attempt: str,
         max_files: int,
         progress: _ScanProgress,
-    ) -> Iterator[ScannedGalleryChunk]:
+    ) -> Generator[ScannedGalleryChunk]:
         for gallery_info_path in gallery_info_paths:
             folder = gallery_info_path.parent
             try:
@@ -588,74 +598,86 @@ class FilesystemScanner:
                 relative_folder=relative_folder,
             )
             digest = _ManifestDigestAccumulator()
-            initial_observation = _DirectoryObservationAccumulator()
-            metadata_sha256: str | None = None
-            metadata_seen = False
-            had_chunk = False
-            candidate_chunks = self._iter_candidate_chunks(
-                folder,
-                max_files,
-                progress,
-                initial_observation,
-            )
-            for chunk_index, (candidates, is_last) in enumerate(candidate_chunks):
-                had_chunk = True
-                scanned_files = self._scan_candidate_chunk(
-                    executor,
-                    candidates,
+            with CanonicalManifestAccumulator() as canonical_digest:
+                initial_observation = _DirectoryObservationAccumulator()
+                metadata_sha256: str | None = None
+                metadata_seen = False
+                had_chunk = False
+                candidate_chunks = self._iter_candidate_chunks(
+                    folder,
+                    max_files,
                     progress,
+                    initial_observation,
                 )
-                for candidate, source_file in zip(
-                    candidates, scanned_files, strict=True
-                ):
-                    digest.add(source_file)
-                    if candidate.path == gallery_info_path:
-                        if candidate.key.signature != metadata_after_parse:
-                            raise GalleryScanError(
-                                "Gallery metadata changed between parsing and hashing: "
-                                f"{gallery_info_path}"
-                            )
-                        metadata_seen = True
-                        metadata_sha256 = source_file.sha256
+                for chunk_index, (candidates, is_last) in enumerate(candidate_chunks):
+                    had_chunk = True
+                    scanned_files = self._scan_candidate_chunk(
+                        executor,
+                        candidates,
+                        progress,
+                    )
+                    for candidate, source_file in zip(
+                        candidates, scanned_files, strict=True
+                    ):
+                        digest.add(source_file)
+                        canonical_digest.add(source_file)
+                        if candidate.path == gallery_info_path:
+                            if candidate.key.signature != metadata_after_parse:
+                                raise GalleryScanError(
+                                    "Gallery metadata changed between parsing and "
+                                    f"hashing: {gallery_info_path}"
+                                )
+                            metadata_seen = True
+                            metadata_sha256 = source_file.sha256
 
-                if is_last:
-                    if not metadata_seen or metadata_sha256 is None:
-                        raise GalleryScanError(
-                            f"Gallery metadata disappeared during scan: {folder}"
-                        )
-                    final_observation = self._observe_directory(folder)
-                    if final_observation != initial_observation.snapshot():
-                        raise GalleryScanError(
-                            f"Gallery directory changed during scan: {folder}"
-                        )
-                    observation = final_observation
-                    yield ScannedGalleryChunk(
-                        manifest=manifest,
-                        chunk_index=chunk_index,
-                        files=scanned_files,
-                        completion=ScannedGalleryCompletion(
-                            source_manifest_version=SOURCE_MANIFEST_VERSION,
-                            metadata_sha256=metadata_sha256,
-                            scan_observation_sha256=digest.source_digest(
-                                metadata_sha256
+                    if is_last:
+                        if not metadata_seen or metadata_sha256 is None:
+                            raise GalleryScanError(
+                                f"Gallery metadata disappeared during scan: {folder}"
+                            )
+                        final_observation = self._observe_directory(folder)
+                        if final_observation != initial_observation.snapshot():
+                            raise GalleryScanError(
+                                f"Gallery directory changed during scan: {folder}"
+                            )
+                        observation = final_observation
+                        canonical = canonical_digest.finish(metadata_sha256)
+                        yield ScannedGalleryChunk(
+                            manifest=manifest,
+                            chunk_index=chunk_index,
+                            files=scanned_files,
+                            completion=ScannedGalleryCompletion(
+                                scan_observation_version=(
+                                    FILESYSTEM_OBSERVATION_VERSION
+                                ),
+                                metadata_sha256=metadata_sha256,
+                                scan_observation_sha256=digest.source_digest(
+                                    metadata_sha256
+                                ),
+                                canonical_source_manifest_sha256=(
+                                    canonical.canonical_source_manifest_sha256
+                                ),
+                                canonical_source_manifest_version=(
+                                    CANONICAL_SOURCE_MANIFEST_VERSION
+                                ),
+                                raw_content_sha256=canonical.raw_content_sha256,
+                                source_file_count=digest.source_file_count,
+                                pages=max(0, digest.source_file_count - 1),
+                                directory_entry_count=observation.entry_count,
+                                directory_observation_sha256=observation.digest,
                             ),
-                            source_file_count=digest.source_file_count,
-                            pages=max(0, digest.source_file_count - 1),
-                            directory_entry_count=observation.entry_count,
-                            directory_observation_sha256=observation.digest,
-                        ),
+                        )
+                        progress.galleries_completed += 1
+                    else:
+                        yield ScannedGalleryChunk(
+                            manifest=manifest,
+                            chunk_index=chunk_index,
+                            files=scanned_files,
+                        )
+                if not had_chunk:
+                    raise GalleryScanError(
+                        f"Gallery metadata disappeared during scan: {folder}"
                     )
-                    progress.galleries_completed += 1
-                else:
-                    yield ScannedGalleryChunk(
-                        manifest=manifest,
-                        chunk_index=chunk_index,
-                        files=scanned_files,
-                    )
-            if not had_chunk:
-                raise GalleryScanError(
-                    f"Gallery metadata disappeared during scan: {folder}"
-                )
 
     def _gallery_info_paths(self, relative_folders: Iterable[str]) -> Iterator[Path]:
         for relative_folder in relative_folders:
@@ -943,25 +965,10 @@ class FilesystemScanner:
             raise GalleryScanError(
                 f"Gallery metadata disappeared during scan: {manifest.folder}"
             ) from error
-        source_payload = {
-            "version": 1,
-            "metadata": metadata_digest,
-            "files": [
-                {"name": file.name, "size": file.size_bytes, "sha256": file.sha256}
-                for file in files
-            ],
-        }
-        content_hashes = sorted(
-            bytes.fromhex(file.sha256)
-            for file in files
-            if file.name != GALLERY_INFO_NAME
-        )
-        source_digest = sha256(
-            json.dumps(source_payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-        content_digest = (
-            sha256(b"".join(content_hashes)).hexdigest() if content_hashes else None
-        )
+        if completion.metadata_sha256 != metadata_digest:
+            raise GalleryScanError(
+                f"Gallery completion metadata does not match files: {manifest.folder}"
+            )
         return ScannedGallery(
             folder=manifest.folder,
             gallery_name=manifest.gallery_name,
@@ -976,6 +983,6 @@ class FilesystemScanner:
             tags=manifest.tags,
             files=files,
             metadata_sha256=metadata_digest,
-            source_digest=source_digest,
-            content_digest=content_digest,
+            source_digest=completion.canonical_source_manifest_sha256,
+            content_digest=completion.raw_content_sha256,
         )

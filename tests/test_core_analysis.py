@@ -192,7 +192,10 @@ def test_core_adapter_runs_bounded_deduplication_with_durable_restart(
     adapter = CoreStagedDeduplicationAdapter(database, build, turn)
     planner = StagedDeduplicationPlanner(page_size=1, write_batch_size=2)
     summary = planner.run(adapter, build_id=build.build_id)
-    assert summary.gallery_source_manifests == len(legacy_galleries)
+    # Canonical manifests are now sealed with each gallery completion.  The
+    # planner observes the durable SOURCE_MANIFESTS checkpoint and does not
+    # reread every staged source-file row to derive the same values again.
+    assert summary.gallery_source_manifests == 0
     assert summary.gallery_content_digests == len(legacy_galleries)
     assert summary.gallery_analyses == len(legacy_galleries)
 

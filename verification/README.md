@@ -29,9 +29,59 @@ selection, owner, and policy version. From the resulting old/new artifact maps
 it derives the exact CBZ rebuild, delete, and create sets; old CBZs are rebuilt
 or removed when the new corpus changes their outcome.
 
+Content-owner and GID-winner worksets are likewise formed from every changed
+candidate's old and new group keys. A group whose final member moves or is
+deleted therefore remains in the workset and emits an explicit tombstone even
+though the new candidate state no longer contains a row from which to discover
+that key. The Lean completeness and locality theorems derive this property from
+candidate inequality and group membership; they do not assume equality of the
+incremental and full winner maps.
+
+Spam evidence counts exact file occurrences, including duplicate hashes inside
+one gallery, rather than counting only gallery membership. Incremental cache
+inheritance also pins the exact policy and source baseline revision/generation.
+The baseline and target source contexts must have the same registered channel
+and source scope; a policy, channel, or scope change requires a depth-zero full
+recomputation.
+
 Hash shards are an execution partition only. The shard theorem applies when
 the classifier input for a hash is completely contained in that hash's exact
 evidence shard; it is not permission to ignore global evidence changes.
+
+The vNext winner reducers have no active-head or incumbent input. Their final
+tie-break is the required stable, unique full gallery-locator key, so candidate
+insertion order cannot change a content owner or GID winner. A policy-version
+change cannot inherit an older analysis generation: it starts a depth-zero full
+recomputation. Because policy version and the exact ordered CBZ member plan are
+both part of `ArtifactInput`, either difference invalidates the selected
+artifact and therefore appears in the exact rebuild set.
+
+The Python model in `tests/reference/vnext_incremental.py` is an independent
+oracle: it imports no production reducer or persistence code. A focused
+differential test compares its compatible vNext formulas with the current
+deduplication implementation, while the remaining tests exercise vNext-only
+semantics such as stable nested-locator gallery keys, old-group tombstones,
+source-baseline isolation, policy compaction, and the exact disjoint
+create/rebuild/delete/unchanged artifact-operation partition.
+
+`tests/test_vnext_incremental_state_machine.py` uses Hypothesis to generate
+small old/new snapshots and longer state-machine sequences containing
+additions, deletions, modifications, empty and metadata-only galleries,
+duplicate file hashes, and nested galleries with equal leaf names. Every valid
+transition compares the incremental oracle with a clean full recomputation at
+each evidence, spam, content, owner, winner, artifact-input, artifact, and
+operation layer. Generated policy/channel/scope/base mismatches must fail
+closed instead of inheriting derived state.
+
+The deterministic `pr` profile is the default. CI/nightly jobs select the
+larger profile with `H2HDB_HYPOTHESIS_PROFILE=nightly`; neither profile uses a
+wall-clock assertion or deadline.
+
+```bash
+uv run --no-sync pytest tests/test_vnext_incremental_state_machine.py
+H2HDB_HYPOTHESIS_PROFILE=nightly \
+  uv run --no-sync pytest tests/test_vnext_incremental_state_machine.py
+```
 
 ## Commands
 

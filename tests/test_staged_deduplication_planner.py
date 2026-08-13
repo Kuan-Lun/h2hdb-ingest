@@ -6,18 +6,18 @@ from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 
-import pytest
-
-from h2hdb_ingest.deduplication import DeduplicationCandidate, DeduplicationPolicy
+from h2hdb_ingest.deduplication import (
+    SPAM_FILE_MINIMUM_OCCURRENCES,
+    DeduplicationCandidate,
+    DeduplicationPolicy,
+)
 from h2hdb_ingest.models import ScannedFile, ScannedGallery
 from h2hdb_ingest.staged_deduplication import (
-    AnalysisScanCompletion,
     ContentCandidateCursor,
     ContentCandidatePage,
     ContentCandidateRow,
     ContentOwnershipDecision,
     FileHashAggregate,
-    FileHashAggregateCursor,
     FileHashAggregatePage,
     GalleryAnalysisCursor,
     GalleryAnalysisDecision,
@@ -82,6 +82,8 @@ class _MemoryAdapter:
         self.page_calls: Counter[str] = Counter()
         self.write_batch_sizes: list[int] = []
         self.batch_ids: list[str] = []
+        self._spam_after = ""
+        self._spam_generation = 1
 
     @staticmethod
     def _check_build(build_id: str) -> None:
@@ -99,6 +101,8 @@ class _MemoryAdapter:
                 galleries_by_hash[digest].add(gallery.name)
         aggregates = []
         for digest, occurrence_count in occurrences.items():
+            if occurrence_count < SPAM_FILE_MINIMUM_OCCURRENCES:
+                continue
             gallery_names = galleries_by_hash[digest]
             artists = {
                 artist
@@ -115,9 +119,10 @@ class _MemoryAdapter:
                     occurrence_count,
                     len(artists),
                     maximum,
+                    SPAM_FILE_MINIMUM_OCCURRENCES,
                 )
             )
-        return tuple(sorted(aggregates, key=lambda item: item.cursor))
+        return tuple(sorted(aggregates, key=lambda item: item.file_sha256))
 
     def _gallery_source_files(self) -> tuple[GallerySourceFileRow, ...]:
         rows: list[GallerySourceFileRow] = []
@@ -181,42 +186,50 @@ class _MemoryAdapter:
             (manifest.gallery_name, manifest) for manifest in manifests
         )
 
-    def page_file_hash_aggregates(
+    def get_file_spam_page(
         self,
         build_id: str,
         *,
-        after: FileHashAggregateCursor | None,
+        minimum_occurrences: int,
         limit: int,
     ) -> FileHashAggregatePage:
         self._check_build(build_id)
+        assert minimum_occurrences == SPAM_FILE_MINIMUM_OCCURRENCES
         self.page_calls["spam"] += 1
         values = tuple(
             item
             for item in self._file_hash_aggregates()
-            if after is None or item.cursor > after
+            if item.file_sha256 > self._spam_after
         )[:limit]
-        completion = (
-            AnalysisScanCompletion(
-                after_value="" if after is None else after.file_sha256,
-                token_sha256=_digest(
-                    "file-spam-complete:" + ("" if after is None else after.file_sha256)
-                ),
-            )
-            if not values
-            else None
+        next_cursor = values[-1].file_sha256 if values else self._spam_after
+        return FileHashAggregatePage(
+            items=values,
+            minimum_occurrences=minimum_occurrences,
+            checkpoint_generation=self._spam_generation,
+            start_cursor_sha256=self._spam_after,
+            next_cursor_sha256=next_cursor,
+            input_sha256=_digest(
+                json.dumps(
+                    [item.file_sha256 for item in values],
+                    separators=(",", ":"),
+                )
+            ),
+            page_limit=limit,
         )
-        return FileHashAggregatePage(values, completion)
 
-    def stage_excluded_file_hashes(
+    def apply_file_spam_page(
         self,
         build_id: str,
+        page: FileHashAggregatePage,
         hashes: Sequence[str],
-        *,
-        batch_id: str,
     ) -> None:
         self._check_build(build_id)
-        self._record_batch(hashes, batch_id)
+        assert page.checkpoint_generation == self._spam_generation
+        assert page.start_cursor_sha256 == self._spam_after
+        assert set(hashes) <= {item.file_sha256 for item in page.items}
         self.excluded_hashes.update(hashes)
+        self._spam_after = page.next_cursor_sha256
+        self._spam_generation += 1
 
     def _gallery_file_hashes(self) -> tuple[GalleryFileHashRow, ...]:
         rows: list[GalleryFileHashRow] = []
@@ -227,8 +240,8 @@ class _MemoryAdapter:
                         gallery_name=gallery.name,
                         gallery_key=_gallery_key(gallery.name),
                         file_key="",
-                        file_name=None,
                         file_sha256="",
+                        metadata_file=False,
                         excluded_as_spam=False,
                     )
                 )
@@ -237,12 +250,12 @@ class _MemoryAdapter:
                 GalleryFileHashRow(
                     gallery_name=gallery.name,
                     gallery_key=_gallery_key(gallery.name),
-                    file_key=f"{position:08d}:{file_name}",
-                    file_name=file_name,
+                    file_key=_digest(file_name),
                     file_sha256=digest,
+                    metadata_file=file_name == "galleryinfo.txt",
                     excluded_as_spam=digest in self.excluded_hashes,
                 )
-                for position, (file_name, digest) in enumerate(gallery.files)
+                for file_name, digest in gallery.files
             )
         return tuple(sorted(rows, key=lambda item: item.cursor))
 
@@ -432,12 +445,8 @@ class _MemoryAdapter:
         self,
         build_id: str,
         phase: StagedDeduplicationPhase,
-        *,
-        scan_completion: AnalysisScanCompletion | None = None,
     ) -> None:
         self._check_build(build_id)
-        if phase is StagedDeduplicationPhase.file_spam:
-            assert scan_completion is not None
         self.completed_phases.append(phase)
 
     def is_deduplication_phase_complete(
@@ -751,34 +760,20 @@ def test_completed_phases_resume_without_replaying_pages_or_writes() -> None:
     assert resumed == type(resumed)(0, 0, 0, 0, 0, 0)
 
 
-def test_file_spam_phase_rejects_a_stream_without_terminal_proof() -> None:
+def test_file_spam_applies_each_server_page_before_requesting_the_next() -> None:
     galleries, _spam, duplicate_digest = _fixtures()
 
-    class MissingCompletionAdapter(_MemoryAdapter):
-        def page_file_hash_aggregates(
-            self,
-            build_id: str,
-            *,
-            after: FileHashAggregateCursor | None,
-            limit: int,
-        ) -> FileHashAggregatePage:
-            page = super().page_file_hash_aggregates(
-                build_id,
-                after=after,
-                limit=limit,
-            )
-            return FileHashAggregatePage(page.items)
-
-    adapter = MissingCompletionAdapter(
+    adapter = _MemoryAdapter(
         galleries,
         content_incumbents={duplicate_digest: "dup_a"},
         gid_incumbents={500: "gid_a"},
     )
+    StagedDeduplicationPlanner(page_size=1, write_batch_size=2).run(
+        adapter,
+        build_id="build-for-test",
+    )
 
-    with pytest.raises(ValueError, match="without a completion token"):
-        StagedDeduplicationPlanner(page_size=1, write_batch_size=2).run(
-            adapter,
-            build_id="build-for-test",
-        )
-
-    assert StagedDeduplicationPhase.file_spam not in adapter.completed_phases
+    # One generation advance per non-empty page plus the empty terminal page
+    # proves the planner never accumulates decisions across page boundaries.
+    assert adapter._spam_generation == adapter.page_calls["spam"] + 1
+    assert StagedDeduplicationPhase.file_spam in adapter.completed_phases

@@ -171,7 +171,10 @@ def _excluded_spam_hashes(
         artist_sets = [
             {value for name, value in gallery.tags if name == ARTIST_TAG_NAME}
             for gallery in galleries
-            if any(source_file.sha256 == digest for source_file in gallery.files)
+            if any(
+                source_file.name != "galleryinfo.txt" and source_file.sha256 == digest
+                for source_file in gallery.files
+            )
         ]
         if is_cross_artist_spam(artist_sets):
             excluded.add(digest)

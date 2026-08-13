@@ -6,14 +6,12 @@ from collections.abc import Sequence
 
 from h2hdb import (
     CatalogAnalysisPhase,
-    CatalogAnalysisScanCompletion,
     CatalogBuild,
     CatalogBuildAnalyzer,
     CatalogContentCandidateCursor,
     CatalogContentDigest,
     CatalogContentOwner,
     CatalogDeduplicationCandidate,
-    CatalogFileHashAggregateCursor,
     CatalogFinalAnalysisCursor,
     CatalogGalleryFileHashCursor,
     CatalogGidCandidateCursor,
@@ -23,16 +21,20 @@ from h2hdb import (
     CatalogSourceManifestCursor,
     GalleryIngestTurn,
 )
+from h2hdb import (
+    CatalogFileHashAggregate as CoreFileHashAggregate,
+)
+from h2hdb import (
+    CatalogFileHashAggregatePage as CoreFileHashAggregatePage,
+)
 
 from .deduplication import ALREADY_UPLOADED_TAG_VALUE, DeduplicationCandidate
 from .staged_deduplication import (
-    AnalysisScanCompletion,
     ContentCandidateCursor,
     ContentCandidatePage,
     ContentCandidateRow,
     ContentOwnershipDecision,
     FileHashAggregate,
-    FileHashAggregateCursor,
     FileHashAggregatePage,
     GalleryAnalysisCursor,
     GalleryAnalysisDecision,
@@ -161,56 +163,68 @@ class CoreStagedDeduplicationAdapter:
             ingest_turn=self._ingest_turn,
         )
 
-    def page_file_hash_aggregates(
+    def get_file_spam_page(
         self,
         build_id: str,
         *,
-        after: FileHashAggregateCursor | None,
+        minimum_occurrences: int,
         limit: int,
     ) -> FileHashAggregatePage:
         self._require_build(build_id)
-        core_after = (
-            CatalogFileHashAggregateCursor(after.file_sha256)
-            if after is not None
-            else None
-        )
-        page = self._analyzer.list_catalog_file_hash_aggregates(
-            build_id,
-            after=core_after,
+        page = self._analyzer.get_catalog_file_spam_page(
+            self._build,
+            minimum_occurrences=minimum_occurrences,
             limit=limit,
+            ingest_turn=self._ingest_turn,
         )
         return FileHashAggregatePage(
-            tuple(
+            items=tuple(
                 FileHashAggregate(
                     file_sha256=row.file_sha256,
                     occurrence_count=row.occurrence_count,
                     distinct_artist_count=row.distinct_artist_count,
                     maximum_gallery_artist_count=row.maximum_gallery_artist_count,
+                    minimum_occurrences=row.minimum_occurrences,
                 )
                 for row in page.items
             ),
-            (
-                None
-                if page.completion is None
-                else AnalysisScanCompletion(
-                    after_value=page.completion.after_value,
-                    token_sha256=page.completion.token_sha256,
-                )
-            ),
+            minimum_occurrences=page.minimum_occurrences,
+            checkpoint_generation=page.checkpoint_generation,
+            start_cursor_sha256=page.start_cursor_sha256,
+            next_cursor_sha256=page.next_cursor_sha256,
+            input_sha256=page.input_sha256,
+            page_limit=page.limit,
         )
 
-    def stage_excluded_file_hashes(
+    def apply_file_spam_page(
         self,
         build_id: str,
+        page: FileHashAggregatePage,
         hashes: Sequence[str],
-        *,
-        batch_id: str,
     ) -> None:
         self._require_build(build_id)
-        self._analyzer.stage_catalog_excluded_file_hashes(
+        core_page = CoreFileHashAggregatePage(
+            items=tuple(
+                CoreFileHashAggregate(
+                    file_sha256=item.file_sha256,
+                    occurrence_count=item.occurrence_count,
+                    distinct_artist_count=item.distinct_artist_count,
+                    maximum_gallery_artist_count=item.maximum_gallery_artist_count,
+                    minimum_occurrences=item.minimum_occurrences,
+                )
+                for item in page.items
+            ),
+            limit=page.page_limit,
+            minimum_occurrences=page.minimum_occurrences,
+            checkpoint_generation=page.checkpoint_generation,
+            start_cursor_sha256=page.start_cursor_sha256,
+            next_cursor_sha256=page.next_cursor_sha256,
+            input_sha256=page.input_sha256,
+        )
+        self._analyzer.apply_catalog_file_spam_page(
             self._build,
+            core_page,
             tuple(hashes),
-            batch_id=batch_id,
             ingest_turn=self._ingest_turn,
         )
 
@@ -242,8 +256,8 @@ class CoreStagedDeduplicationAdapter:
                     gallery_name=row.gallery_name,
                     gallery_key=row.gallery_key,
                     file_key=row.file_key,
-                    file_name=row.file_name,
                     file_sha256=row.file_sha256,
+                    metadata_file=row.metadata_file,
                     excluded_as_spam=row.excluded_as_spam,
                 )
                 for row in page.items
@@ -434,24 +448,12 @@ class CoreStagedDeduplicationAdapter:
         self,
         build_id: str,
         phase: StagedDeduplicationPhase,
-        *,
-        scan_completion: AnalysisScanCompletion | None = None,
     ) -> None:
         self._require_build(build_id)
         self._analyzer.complete_catalog_analysis_phase(
             self._build,
             _core_phase(phase),
             ingest_turn=self._ingest_turn,
-            scan_completion=(
-                None
-                if scan_completion is None
-                else CatalogAnalysisScanCompletion(
-                    build_id=build_id,
-                    phase=_core_phase(phase),
-                    after_value=scan_completion.after_value,
-                    token_sha256=scan_completion.token_sha256,
-                )
-            ),
         )
 
     @staticmethod

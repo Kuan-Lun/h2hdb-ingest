@@ -1,4 +1,5 @@
 from collections.abc import Iterable, Sequence
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from h2hdb_ingest.models import (
     FileStatSignature,
 )
 from h2hdb_ingest.scanner import FilesystemScanner, GalleryScanError
+from h2hdb_ingest.source_manifest import CanonicalManifestAccumulator
 
 
 def _write_gallery(root: Path, gid: int, *, source_files: int) -> Path:
@@ -86,13 +88,79 @@ def test_batch_iterator_enforces_both_limits_and_chunks_one_large_gallery(
         assert completion is not None
         assert completion.scan_observation_sha256
         assert completion.metadata_sha256
-        assert completion.source_manifest_version == 2
+        assert completion.scan_observation_version == 2
+        assert completion.canonical_source_manifest_sha256
+        assert completion.canonical_source_manifest_version == 1
+        assert completion.raw_content_sha256
         assert completion.source_file_count == 5
         assert completion.pages == 4
         assert all(
             file.relative_locator for chunk in gallery_chunks for file in chunk.files
         )
         assert all(file.signature for chunk in gallery_chunks for file in chunk.files)
+
+
+def test_completion_digests_match_legacy_scan_across_chunk_sizes_and_names(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "galleries"
+    folder = _write_gallery(root, 1, source_files=0)
+    (folder / "SS.bin").write_bytes(b"latin")
+    (folder / "ß.bin").write_bytes(b"unicode-casefold")
+    (folder / "漫 畫.bin ").write_bytes(b"trailing-space")
+
+    completions = []
+    for max_files in (1, 2, 99):
+        scanner = FilesystemScanner(root, hash_workers=2, max_files=max_files)
+        chunks = tuple(
+            chunk
+            for batch in scanner.iter_batches(scan_attempt=f"chunk-{max_files}")
+            for chunk in batch.chunks
+        )
+        completion = next(
+            chunk.completion for chunk in chunks if chunk.completion is not None
+        )
+        completions.append(completion)
+
+        files = tuple(source_file for chunk in chunks for source_file in chunk.files)
+        content_hashes = sorted(
+            bytes.fromhex(source_file.sha256)
+            for source_file in files
+            if source_file.name != "galleryinfo.txt"
+        )
+        assert (
+            completion.raw_content_sha256
+            == sha256(b"".join(content_hashes)).hexdigest()
+        )
+
+        (legacy,) = scanner.scan()
+        assert legacy.source_digest == completion.canonical_source_manifest_sha256
+        assert legacy.content_digest == completion.raw_content_sha256
+
+    assert len({completion.scan_observation_sha256 for completion in completions}) == 1
+    assert (
+        len({completion.canonical_source_manifest_sha256 for completion in completions})
+        == 1
+    )
+    assert len({completion.raw_content_sha256 for completion in completions}) == 1
+
+
+def test_metadata_only_completion_has_no_raw_content_digest(tmp_path: Path) -> None:
+    root = tmp_path / "galleries"
+    _write_gallery(root, 1, source_files=0)
+    scanner = FilesystemScanner(root, hash_workers=1, max_files=1)
+
+    completion = next(
+        chunk.completion
+        for batch in scanner.iter_batches(scan_attempt="metadata-only")
+        for chunk in batch.chunks
+        if chunk.completion is not None
+    )
+
+    assert completion.raw_content_sha256 is None
+    (legacy,) = scanner.scan()
+    assert legacy.content_digest is None
+    assert legacy.source_digest == completion.canonical_source_manifest_sha256
 
 
 def test_discovery_is_bounded_and_scan_can_target_pending_relative_folders(
@@ -185,6 +253,36 @@ def test_scan_yields_full_file_batch_before_hashing_the_next_chunk(
 
     assert first.file_count == 2
     assert len(hashed) == 2
+
+
+def test_abandoned_scan_iterator_closes_manifest_spill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "galleries"
+    _write_gallery(root, 1, source_files=2)
+    spill_root = tmp_path / "manifest-spill"
+    spill_root.mkdir()
+
+    def tiny_manifest_accumulator() -> CanonicalManifestAccumulator:
+        return CanonicalManifestAccumulator(
+            memory_limit_bytes=1,
+            temporary_directory=spill_root,
+        )
+
+    monkeypatch.setattr(
+        scanner_module,
+        "CanonicalManifestAccumulator",
+        tiny_manifest_accumulator,
+    )
+    scanner = FilesystemScanner(root, hash_workers=1, max_files=1)
+    iterator = scanner.iter_batches(scan_attempt="abandoned")
+
+    next(iterator)
+    assert tuple(spill_root.iterdir())
+    iterator.close()
+
+    assert not tuple(spill_root.iterdir())
 
 
 def test_metadata_change_after_parse_rejects_the_gallery(
@@ -292,9 +390,24 @@ def test_bulk_cache_hit_uses_complete_locator_and_does_not_hash_bytes(
 
 def test_cached_gallery_is_not_sealed_if_a_file_changes_after_lookup(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "galleries"
     folder = _write_gallery(root, 1, source_files=1)
+    spill_root = tmp_path / "manifest-spill"
+    spill_root.mkdir()
+
+    def tiny_manifest_accumulator() -> CanonicalManifestAccumulator:
+        return CanonicalManifestAccumulator(
+            memory_limit_bytes=1,
+            temporary_directory=spill_root,
+        )
+
+    monkeypatch.setattr(
+        scanner_module,
+        "CanonicalManifestAccumulator",
+        tiny_manifest_accumulator,
+    )
     cache = _RecordingCache()
     scanner = FilesystemScanner(root, hash_workers=1, hash_cache=cache)
     tuple(scanner.iter_batches(scan_attempt="first"))
@@ -313,6 +426,8 @@ def test_cached_gallery_is_not_sealed_if_a_file_changes_after_lookup(
 
     with pytest.raises(GalleryScanError, match="directory changed during scan"):
         tuple(scanner.iter_batches(scan_attempt="second"))
+
+    assert not tuple(spill_root.iterdir())
 
 
 def test_compatibility_memory_cache_is_lru_bounded() -> None:

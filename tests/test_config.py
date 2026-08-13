@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+import h2hdb_ingest.scope as ingest_scope
 from h2hdb_ingest import CBZGrouping, IngestConfig, IngestPathsConfig, load_config
 from h2hdb_ingest.scope import catalog_scope_key
 
@@ -189,6 +190,18 @@ def test_catalog_scope_ignores_cbz_policy_when_cbz_is_disabled(tmp_path: Path) -
         changed,
         parser_version="0.5.0",
     )
+
+
+def test_catalog_scope_pins_the_ingest_deduplication_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = IngestPathsConfig(download_path=tmp_path / "source")
+    current = catalog_scope_key(paths, parser_version="0.5.0")
+
+    monkeypatch.setattr(ingest_scope, "_STAGED_DEDUPLICATION_POLICY_VERSION", 2)
+
+    assert catalog_scope_key(paths, parser_version="0.5.0") != current
 
 
 @pytest.mark.parametrize(

@@ -154,17 +154,22 @@ class ScannedGalleryManifest:
 class ScannedGalleryCompletion:
     """Final observation needed to durably seal and later revalidate a gallery."""
 
-    source_manifest_version: int
+    scan_observation_version: int
     metadata_sha256: str
     scan_observation_sha256: str
+    canonical_source_manifest_sha256: str
+    canonical_source_manifest_version: int
+    raw_content_sha256: str | None
     source_file_count: int
     pages: int
     directory_entry_count: int
     directory_observation_sha256: str
 
     def __post_init__(self) -> None:
-        if self.source_manifest_version <= 0:
-            raise ValueError("source_manifest_version must be positive")
+        if self.scan_observation_version <= 0:
+            raise ValueError("scan_observation_version must be positive")
+        if self.canonical_source_manifest_version <= 0:
+            raise ValueError("canonical_source_manifest_version must be positive")
         if (
             min(
                 self.source_file_count,
@@ -177,6 +182,10 @@ class ScannedGalleryCompletion:
         for label, value in (
             ("metadata_sha256", self.metadata_sha256),
             ("scan_observation_sha256", self.scan_observation_sha256),
+            (
+                "canonical_source_manifest_sha256",
+                self.canonical_source_manifest_sha256,
+            ),
             ("directory_observation_sha256", self.directory_observation_sha256),
         ):
             if len(value) != 64:
@@ -185,6 +194,15 @@ class ScannedGalleryCompletion:
                 bytes.fromhex(value)
             except ValueError as error:
                 raise ValueError(f"{label} must be hexadecimal") from error
+        if self.raw_content_sha256 is not None:
+            if len(self.raw_content_sha256) != 64:
+                raise ValueError(
+                    "raw_content_sha256 must be a SHA-256 hexadecimal digest"
+                )
+            try:
+                bytes.fromhex(self.raw_content_sha256)
+            except ValueError as error:
+                raise ValueError("raw_content_sha256 must be hexadecimal") from error
 
 
 @dataclass(frozen=True, slots=True)

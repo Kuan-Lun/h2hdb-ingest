@@ -7,14 +7,16 @@ defines the producer-facing, storage-neutral adapter contract needed by the
 deduplication policy:
 
 * keyset pages of database-computed file-hash aggregates;
-* keyset pages of source files annotated with the persisted spam decision;
+* keyset pages of source-file hashes annotated with metadata and spam flags;
 * keyset pages of content and GID candidates, including active incumbents; and
 * idempotent, bounded writes for each derived decision plus a durable phase
   completion marker.
 
 An adapter is expected to implement the page queries with database grouping
-and joins.  In particular, ``page_file_hash_aggregates`` must omit the exact
-leaf name ``galleryinfo.txt`` and return one row per hash.  Its three aggregate
+and joins.  In particular, ``get_file_spam_page`` must omit the exact
+leaf name ``galleryinfo.txt`` and hashes occurring fewer than the requested
+``minimum_occurrences``, then return one row per remaining hash.  The planner
+supplies that bound from the ingest-owned spam policy.  Its three aggregate
 counts preserve the legacy spam rule without transporting every artist string
 to the ingest process.  ``page_gallery_file_hashes`` must retain one row per
   file occurrence and order by ``(gallery_key, file_sha256, file_key)``; this
@@ -35,12 +37,10 @@ and ``selected`` is true only for the final GID winner.
 """
 
 __all__ = [
-    "AnalysisScanCompletion",
     "ContentCandidateCursor",
     "ContentCandidatePage",
     "ContentCandidateRow",
     "ContentOwnershipDecision",
-    "FileHashAggregateCursor",
     "FileHashAggregatePage",
     "FileHashAggregate",
     "GalleryContentDigest",
@@ -114,22 +114,6 @@ def _validate_gallery_key(value: str) -> None:
 
 
 @dataclass(frozen=True, slots=True)
-class AnalysisScanCompletion:
-    """Storage-neutral proof that an analysis input reached its terminal page."""
-
-    after_value: str
-    token_sha256: str
-
-    def __post_init__(self) -> None:
-        _validate_sha256(self.token_sha256, label="Analysis completion token")
-
-
-@dataclass(frozen=True, order=True, slots=True)
-class FileHashAggregateCursor:
-    file_sha256: str
-
-
-@dataclass(frozen=True, slots=True)
 class FileHashAggregate:
     """Database aggregate needed to classify one repeated file hash."""
 
@@ -137,11 +121,16 @@ class FileHashAggregate:
     occurrence_count: int
     distinct_artist_count: int
     maximum_gallery_artist_count: int
+    minimum_occurrences: int
 
     def __post_init__(self) -> None:
         _validate_sha256(self.file_sha256, label="File SHA-256")
         if self.occurrence_count <= 0:
             raise ValueError("occurrence_count must be positive")
+        if self.minimum_occurrences <= 0:
+            raise ValueError("minimum_occurrences must be positive")
+        if self.occurrence_count < self.minimum_occurrences:
+            raise ValueError("File hash does not satisfy its stream occurrence bound")
         if (
             min(
                 self.distinct_artist_count,
@@ -155,20 +144,40 @@ class FileHashAggregate:
                 "maximum gallery artist count cannot exceed distinct artists"
             )
 
-    @property
-    def cursor(self) -> FileHashAggregateCursor:
-        return FileHashAggregateCursor(self.file_sha256)
-
 
 @dataclass(frozen=True, slots=True)
 class FileHashAggregatePage:
     items: tuple[FileHashAggregate, ...]
-    completion: AnalysisScanCompletion | None = None
+    minimum_occurrences: int
+    checkpoint_generation: int
+    start_cursor_sha256: str
+    next_cursor_sha256: str
+    input_sha256: str
+    page_limit: int
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "items", tuple(self.items))
-        if self.items and self.completion is not None:
-            raise ValueError("Only an empty terminal page can carry scan completion")
+        if self.minimum_occurrences <= 0:
+            raise ValueError("File-spam minimum occurrences must be positive")
+        if any(
+            item.minimum_occurrences != self.minimum_occurrences for item in self.items
+        ):
+            raise ValueError("File-spam page rows belong to a different policy")
+        if self.checkpoint_generation <= 0 or self.page_limit <= 0:
+            raise ValueError(
+                "File-spam checkpoint generation and limit must be positive"
+            )
+        for label, value in (
+            ("File-spam start cursor", self.start_cursor_sha256),
+            ("File-spam next cursor", self.next_cursor_sha256),
+        ):
+            if value:
+                _validate_sha256(value, label=label)
+        _validate_sha256(self.input_sha256, label="File-spam input")
+
+    @property
+    def terminal(self) -> bool:
+        return not self.items
 
 
 @dataclass(frozen=True, order=True, slots=True)
@@ -188,24 +197,25 @@ class GalleryFileHashRow:
     gallery_name: str
     gallery_key: str
     file_key: str
-    file_name: str | None
     file_sha256: str
+    metadata_file: bool
     excluded_as_spam: bool
 
     def __post_init__(self) -> None:
         _validate_gallery_name(self.gallery_name)
         _validate_gallery_key(self.gallery_key)
-        if self.file_name is None:
-            if self.file_sha256 or self.file_key or self.excluded_as_spam:
+        if self.empty_gallery_sentinel:
+            if self.metadata_file or self.excluded_as_spam:
                 raise ValueError(
                     "An empty-gallery sentinel must use empty digest and file key"
                 )
         else:
-            if not self.file_name:
-                raise ValueError("file_name must not be blank")
-            if not self.file_key:
-                raise ValueError("file_key must not be blank")
+            _validate_sha256(self.file_key, label="File key")
             _validate_sha256(self.file_sha256, label="File SHA-256")
+
+    @property
+    def empty_gallery_sentinel(self) -> bool:
+        return not self.file_key and not self.file_sha256
 
     @property
     def cursor(self) -> GalleryFileHashCursor:
@@ -500,20 +510,19 @@ class StagedDeduplicationAdapter(Protocol):
         batch_id: str,
     ) -> None: ...
 
-    def page_file_hash_aggregates(
+    def get_file_spam_page(
         self,
         build_id: str,
         *,
-        after: FileHashAggregateCursor | None,
+        minimum_occurrences: int,
         limit: int,
     ) -> FileHashAggregatePage: ...
 
-    def stage_excluded_file_hashes(
+    def apply_file_spam_page(
         self,
         build_id: str,
+        page: FileHashAggregatePage,
         hashes: Sequence[str],
-        *,
-        batch_id: str,
     ) -> None: ...
 
     def page_gallery_file_hashes(
@@ -584,8 +593,6 @@ class StagedDeduplicationAdapter(Protocol):
         self,
         build_id: str,
         phase: StagedDeduplicationPhase,
-        *,
-        scan_completion: AnalysisScanCompletion | None = None,
     ) -> None: ...
 
 
@@ -750,28 +757,14 @@ class StagedDeduplicationPlanner:
         adapter: StagedDeduplicationAdapter,
         build_id: str,
     ) -> int:
-        excluded: list[str] = []
         excluded_count = 0
-        after: FileHashAggregateCursor | None = None
-        completion: AnalysisScanCompletion | None = None
         while True:
-            page = adapter.page_file_hash_aggregates(
+            page = adapter.get_file_spam_page(
                 build_id,
-                after=after,
+                minimum_occurrences=SPAM_FILE_MINIMUM_OCCURRENCES,
                 limit=self._page_size,
             )
-            if not page.items:
-                completion = page.completion
-                break
-            if page.completion is not None:
-                raise ValueError(
-                    "A non-terminal file-hash page carried a completion token"
-                )
-            self._validate_page(
-                tuple(item.cursor for item in page.items),
-                after=after,
-                label="file-hash aggregate",
-            )
+            excluded: list[str] = []
             for aggregate in page.items:
                 spam = (
                     aggregate.occurrence_count >= SPAM_FILE_MINIMUM_OCCURRENCES
@@ -784,42 +777,14 @@ class StagedDeduplicationPlanner:
                     continue
                 excluded.append(aggregate.file_sha256)
                 excluded_count += 1
-                if len(excluded) == self._write_batch_size:
-                    self._stage_excluded_batch(
-                        adapter,
-                        build_id,
-                        excluded,
-                    )
-                    excluded.clear()
-            after = page.items[-1].cursor
-        if excluded:
-            self._stage_excluded_batch(
-                adapter,
-                build_id,
-                excluded,
-            )
-        if completion is None:
-            raise ValueError(
-                "The file-hash aggregate stream ended without a completion token"
-            )
+            adapter.apply_file_spam_page(build_id, page, tuple(excluded))
+            if page.terminal:
+                break
         adapter.complete_deduplication_phase(
             build_id,
             StagedDeduplicationPhase.file_spam,
-            scan_completion=completion,
         )
         return excluded_count
-
-    @staticmethod
-    def _stage_excluded_batch(
-        adapter: StagedDeduplicationAdapter,
-        build_id: str,
-        values: Sequence[str],
-    ) -> None:
-        adapter.stage_excluded_file_hashes(
-            build_id,
-            tuple(values),
-            batch_id=_batch_id("file-spam", values),
-        )
 
     def _derive_gallery_content_digests(
         self,
@@ -841,7 +806,7 @@ class StagedDeduplicationPlanner:
             for row in chain((first_row,), group):
                 if row.gallery_name != gallery_name:
                     raise ValueError("A gallery key resolved to multiple gallery names")
-                if row.file_name is not None:
+                if not row.empty_gallery_sentinel:
                     file_count += 1
                     if row.file_sha256 == current_file_sha256:
                         current_hash_occurrences += 1
@@ -851,8 +816,8 @@ class StagedDeduplicationPlanner:
                         current_file_sha256 = row.file_sha256
                         current_hash_occurrences = 1
                 if (
-                    row.file_name is None
-                    or row.file_name == "galleryinfo.txt"
+                    row.empty_gallery_sentinel
+                    or row.metadata_file
                     or row.excluded_as_spam
                 ):
                     continue

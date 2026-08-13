@@ -4,11 +4,34 @@ on:
   pull_request:
   push:
   workflow_dispatch:
+    inputs:
+      deep:
+        description: Run the larger Hypothesis state-machine profile
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "41 3 * * 1"
 
 permissions:
   contents: read
 
 jobs:
+  incremental-reference-properties:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14.6"
+
+      - name: Install exact generated-test runtime
+        run: python -m pip install pytest==9.1.1 hypothesis==6.165.3
+
+      - name: Compare incremental and full evaluators over generated traces
+        run: python -m pytest -q tests/test_vnext_incremental_state_machine.py
+
   incremental-equivalence:
     runs-on: ubuntu-latest
     steps:
@@ -46,3 +69,21 @@ jobs:
         run: >-
           python scripts/verify-formal.py tla
           --tla-jar .formal-tools/tla2tools-1.7.4.jar
+
+  incremental-reference-properties-deep:
+    if: github.event_name == 'schedule' || inputs.deep == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14.6"
+
+      - name: Install exact generated-test runtime
+        run: python -m pip install pytest==9.1.1 hypothesis==6.165.3
+
+      - name: Explore larger incremental state-machine traces
+        env:
+          H2HDB_HYPOTHESIS_PROFILE: nightly
+        run: python -m pytest -q tests/test_vnext_incremental_state_machine.py
