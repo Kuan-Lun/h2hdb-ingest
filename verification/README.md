@@ -57,12 +57,13 @@ both part of `ArtifactInput`, either difference invalidates the selected
 artifact and therefore appears in the exact rebuild set.
 
 The Python model in `tests/reference/vnext_incremental.py` is an independent
-oracle: it imports no production reducer or persistence code. A focused
-differential test compares its compatible vNext formulas with the current
-deduplication implementation, while the remaining tests exercise vNext-only
+cross-component oracle: it imports no production reducer or persistence code.
+Production analysis and deduplication are implemented and authorized by the
+`h2hdb` core package, not this consumer. The retained model exercises vNext
 semantics such as stable nested-locator gallery keys, old-group tombstones,
 source-baseline isolation, policy compaction, and the exact disjoint
-create/rebuild/delete/unchanged artifact-operation partition.
+create/rebuild/delete/unchanged artifact-operation partition. It must not be
+used as a second runtime implementation in ingest.
 
 `tests/test_vnext_incremental_state_machine.py` uses Hypothesis to generate
 small old/new snapshots and longer state-machine sequences containing

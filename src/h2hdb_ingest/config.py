@@ -6,20 +6,13 @@ __all__ = [
 ]
 
 import json
-import os
-import re
 from enum import StrEnum
 from pathlib import Path
 
 from h2hdb import CoreConfig, resolve_environment_placeholders
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-DEFAULT_HASH_WORKERS = min(4, os.process_cpu_count() or 1)
-DEFAULT_CBZ_WORKERS = min(4, os.process_cpu_count() or 1)
-DEFAULT_STALE_TEMP_AGE_SECONDS = 60
-DEFAULT_SCAN_BATCH_GALLERIES = 128
-DEFAULT_SCAN_BATCH_FILES = 2_048
-_PAGES_SORT_PATTERN = re.compile(r"pages(?:\+([1-9]\d*))?")
+DEFAULT_MAX_ROWS = 128
 
 
 class CBZGrouping(StrEnum):
@@ -46,23 +39,6 @@ class IngestPathsConfig(ConfigModel):
         ),
     )
     cbz_grouping: CBZGrouping = CBZGrouping.flat
-    cbz_sort: str = "no"
-    cbz_workers: int = Field(default=DEFAULT_CBZ_WORKERS, ge=1, le=32)
-    stale_temp_age_seconds: int = Field(
-        default=DEFAULT_STALE_TEMP_AGE_SECONDS,
-        ge=60,
-    )
-    hash_workers: int = Field(default=DEFAULT_HASH_WORKERS, ge=1, le=32)
-    scan_batch_galleries: int = Field(
-        default=DEFAULT_SCAN_BATCH_GALLERIES,
-        ge=1,
-        le=200,
-    )
-    scan_batch_files: int = Field(
-        default=DEFAULT_SCAN_BATCH_FILES,
-        ge=1,
-        le=2_048,
-    )
 
     @model_validator(mode="after")
     def validate_cbz_roots(self) -> IngestPathsConfig:
@@ -85,24 +61,13 @@ class IngestPathsConfig(ConfigModel):
             )
         return self
 
-    @field_validator("cbz_sort")
-    @classmethod
-    def validate_cbz_sort(cls, value: str) -> str:
-        if value in {"no", "upload_time", "download_time", "gid", "title"}:
-            return value
-        if _PAGES_SORT_PATTERN.fullmatch(value):
-            return value
-        raise ValueError(
-            "cbz_sort must be no, upload_time, download_time, gid, title, pages, "
-            "or pages+[num]"
-        )
-
 
 class ResidentConfig(ConfigModel):
     periodic_scan_seconds: float = Field(default=1800, gt=0)
     poll_seconds: float = Field(default=5, gt=0)
     lease_seconds: int = Field(default=300, ge=2)
     heartbeat_seconds: float = Field(default=60, gt=0)
+    max_rows: int = Field(default=DEFAULT_MAX_ROWS, ge=1, le=128)
 
     @model_validator(mode="after")
     def validate_heartbeat(self) -> ResidentConfig:

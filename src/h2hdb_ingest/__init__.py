@@ -1,30 +1,35 @@
-"""Filesystem ingest and CBZ reconciliation for H2HDB."""
+"""Filesystem ingest and managed CBZ storage for H2HDB vNext."""
+
+from __future__ import annotations
 
 __all__ = [
-    "CBZReconciler",
-    "CBZSourceChangedError",
+    "FILESYSTEM_OBSERVATION_VERSION",
+    "ArtifactProducerIdentity",
     "CBZGrouping",
-    "DeduplicationPolicy",
-    "FilesystemScanner",
-    "FilesystemSourceStager",
-    "GalleryScanError",
+    "CurrentProjectionAdapter",
+    "CurrentProjectionCheckpoint",
+    "CurrentProjectionItem",
+    "CurrentProjectionStatus",
+    "FilesystemEntryType",
+    "FilesystemGalleryObservation",
+    "FilesystemObservationError",
+    "FilesystemPage",
+    "FilesystemSource",
+    "IngestLeaseHeartbeat",
     "IngestConfig",
-    "IngestSynchronizer",
     "IngestPathsConfig",
-    "LegacyIngestService",
+    "IngestSessionController",
+    "ManagedFilesystemArtifactAdapter",
     "ResidentConfig",
     "ResidentIngestor",
-    "StagedDeduplicationPlanner",
-    "StagedIngestService",
-    "SyncOutcome",
-    "CoreFileHashCache",
-    "CatalogScopeMismatchError",
-    "catalog_scope_key",
-    "gallery_name_to_cbz_file_name",
+    "VNextFilesystemSourceAdapter",
+    "VNextIngestService",
+    "VNextIngestSynchronizationResult",
+    "build_ingest_policy",
     "load_config",
 ]
 
-from .cbz import CBZReconciler, CBZSourceChangedError
+from .artifact import ArtifactProducerIdentity, ManagedFilesystemArtifactAdapter
 from .config import (
     CBZGrouping,
     IngestConfig,
@@ -32,17 +37,22 @@ from .config import (
     ResidentConfig,
     load_config,
 )
-from .deduplication import DeduplicationPolicy
-from .models import SyncOutcome
-from .naming import gallery_name_to_cbz_file_name
-from .resident import ResidentIngestor
-from .scanner import FilesystemScanner, GalleryScanError
-from .scope import catalog_scope_key
-from .service import IngestService as LegacyIngestService
-from .staged_deduplication import StagedDeduplicationPlanner
-from .staged_service import IngestSynchronizer, StagedIngestService
-from .staging import (
-    CatalogScopeMismatchError,
-    CoreFileHashCache,
-    FilesystemSourceStager,
+from .core_source import VNextFilesystemSourceAdapter
+from .filesystem import (
+    FILESYSTEM_OBSERVATION_VERSION,
+    FilesystemEntryType,
+    FilesystemGalleryObservation,
+    FilesystemObservationError,
+    FilesystemPage,
+    FilesystemSource,
 )
+from .policy import build_ingest_policy
+from .projection import (
+    CurrentProjectionAdapter,
+    CurrentProjectionCheckpoint,
+    CurrentProjectionItem,
+    CurrentProjectionStatus,
+)
+from .resident import ResidentIngestor
+from .service import VNextIngestService, VNextIngestSynchronizationResult
+from .session import IngestLeaseHeartbeat, IngestSessionController

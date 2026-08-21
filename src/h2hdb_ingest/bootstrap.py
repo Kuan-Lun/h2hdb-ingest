@@ -1,4 +1,4 @@
-"""Fresh catalog bootstrap command."""
+"""Publish the first catalog revision for an already initialized vNext epoch."""
 
 from __future__ import annotations
 
@@ -6,19 +6,23 @@ import argparse
 from collections.abc import Sequence
 from pathlib import Path
 
-from .__main__ import _build_runtime
+from h2hdb import CatalogRevisionNotFoundError
+
 from .config import load_config
+from .runtime import build_runtime, configure_logging
+
+
+class _AlreadyPublished(RuntimeError):
+    pass
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description=(
-            "Perform the one-time filesystem-to-canonical reconciliation and "
-            "publish the initial catalog revision"
-        )
+        description="Publish the first nonempty H2HDB vNext catalog revision"
     )
     parser.add_argument("--config", type=Path, required=True)
     parsed = parser.parse_args(arguments)
+
     config = load_config(parsed.config)
     config.ensure_paths()
     if next(config.paths.download_path.rglob("galleryinfo.txt"), None) is None:
@@ -27,19 +31,21 @@ def main(arguments: Sequence[str] | None = None) -> int:
             "No galleryinfo.txt was found below download_path; refusing to "
             "publish an empty initial catalog.\n",
         )
-    database, resident = _build_runtime(config)
-    resident.initialize()
-
-    class _AlreadyPublished(RuntimeError):
-        pass
+    configure_logging(config)
+    runtime = build_runtime(config)
+    runtime.resident.initialize()
 
     def require_unpublished_catalog() -> None:
-        current = database.get_catalog_revision()
-        if current.revision != 0:
-            raise _AlreadyPublished(str(current.revision))
+        try:
+            current = runtime.catalog.get_catalog_revision()
+        except CatalogRevisionNotFoundError as error:
+            if error.revision == 0:
+                return
+            raise
+        raise _AlreadyPublished(str(current.revision))
 
     try:
-        processed = resident.process_available(
+        processed = runtime.resident.process_available(
             periodic_scan=True,
             preflight=require_unpublished_catalog,
         )
@@ -52,7 +58,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     if not processed:
         parser.exit(2, "No gallery ingest lease is currently available.\n")
 
-    published = database.get_catalog_revision()
+    published = runtime.catalog.get_catalog_revision()
     if published.revision <= 0 or published.publication_count <= 0:
         parser.exit(
             1,

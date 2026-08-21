@@ -1,317 +1,165 @@
-import sqlite3
-from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
-from time import sleep
+from __future__ import annotations
+
 from typing import cast
 
 import pytest
 from h2hdb import (
-    DatabaseAdmin,
-    DatabaseMaintenanceResult,
-    DownloadCoordinator,
-    GalleryIngestPhase,
-    GalleryIngestTurn,
-    SchemaCompatibility,
+    SchemaEpochReport,
+    VNextDatabaseAdminFacade,
+    VNextIngestCompletionReceipt,
+    VNextIngestFacade,
+    VNextIngestSession,
 )
 
-from h2hdb_ingest import ResidentConfig, ResidentIngestor, SyncOutcome
-from h2hdb_ingest.resident import IngestLeaseHeartbeat
-from h2hdb_ingest.staged_service import IngestSynchronizer
+import h2hdb_ingest.resident as resident_module
+from h2hdb_ingest import ResidentConfig
+from h2hdb_ingest.resident import ResidentIngestor
+from h2hdb_ingest.session import IngestSessionController
 
 
-def _outcome(*, new: int = 0, changed: int = 0, removed: int = 0) -> SyncOutcome:
-    return SyncOutcome(
-        revision=1,
-        scanned=1,
-        published=1,
-        new=new,
-        changed=changed,
-        removed=removed,
-        duplicate_losers=0,
-        cbz_created=0,
-        cbz_rebuilt=0,
+def _session() -> VNextIngestSession:
+    return VNextIngestSession(
+        gate_owner_token=b"g" * 16,
+        gate_generation=1,
+        gate_slot=0,
+        gate_lease_expires_at=10_000_000,
+        ingest_generation=2,
+        ingest_owner_token=b"i" * 16,
+        ingest_lease_expires_at=10_000_000,
+        download_generation=None,
+        handoff_owner_token=None,
+        handoff_kind=None,
+        consumed_at=None,
     )
 
 
-class _Service:
-    def __init__(
-        self,
-        events: list[str],
-        outcomes: list[SyncOutcome] | None = None,
-    ) -> None:
+class _Facade:
+    def __init__(self, events: list[object], *, available: bool = True) -> None:
         self._events = events
-        self._outcomes = iter(outcomes or [_outcome()])
+        self._available = available
 
-    def synchronize_once(self, turn: GalleryIngestTurn) -> SyncOutcome:
-        del turn
-        self._events.append("synchronize")
-        return next(self._outcomes)
+    def try_claim_ingest(
+        self,
+        periodic: bool,
+        lease_duration_microseconds: int,
+    ) -> VNextIngestSession | None:
+        self._events.append(("claim", periodic, lease_duration_microseconds))
+        return _session() if self._available else None
 
-
-class _Coordinator:
-    def __init__(self, events: list[str]) -> None:
-        self._events = events
-        self.turn = GalleryIngestTurn(
-            generation=1,
-            owner_token="owner",
-            lease_expires_at=10_000,
-            claimed_from_phase=GalleryIngestPhase.ingest_requested,
+    def complete_ingest(
+        self,
+        session: VNextIngestSession,
+    ) -> VNextIngestCompletionReceipt:
+        self._events.append(("complete", session.ingest_generation))
+        return VNextIngestCompletionReceipt(
+            session.ingest_generation,
+            session.ingest_owner_token,
+            10,
+            session.download_generation,
+            False,
         )
-        self.allow_expired_sqlite_lease = False
-
-    def claim_gallery_ingest(
-        self,
-        *,
-        lease_seconds: int,
-        periodic_scan: bool,
-    ) -> GalleryIngestTurn:
-        del lease_seconds, periodic_scan
-        self._events.append("claim")
-        return self.turn
-
-    def renew_gallery_ingest(
-        self,
-        turn: GalleryIngestTurn,
-        *,
-        lease_seconds: int,
-        sqlite_busy_timeout_ms: int | None = None,
-    ) -> int:
-        del turn, lease_seconds, sqlite_busy_timeout_ms
-        self._events.append("renew")
-        return 10_000
-
-    def complete_gallery_ingest(
-        self,
-        turn: GalleryIngestTurn,
-        *,
-        allow_expired_sqlite_lease: bool = False,
-    ) -> bool:
-        del turn
-        self.allow_expired_sqlite_lease = allow_expired_sqlite_lease
-        self._events.append(
-            "complete-expired" if allow_expired_sqlite_lease else "complete"
-        )
-        return True
 
 
 class _Admin:
-    def __init__(self, events: list[str], *, maintenance_fails: bool = False) -> None:
+    def __init__(self, events: list[object]) -> None:
         self._events = events
-        self._maintenance_fails = maintenance_fails
 
-    def check_compatibility(self) -> SchemaCompatibility:
+    def check(self) -> SchemaEpochReport:
         self._events.append("check")
-        return SchemaCompatibility(1, 1, 1)
+        return cast(SchemaEpochReport, object())
 
-    def run_scheduled_database_maintenance(self) -> DatabaseMaintenanceResult:
-        self._events.append("maintenance")
-        if self._maintenance_fails:
-            raise RuntimeError("injected maintenance failure")
-        return DatabaseMaintenanceResult(False, (), 0)
+
+class _Service:
+    def __init__(self, events: list[object]) -> None:
+        self._events = events
+
+    def synchronize_once(self, session: IngestSessionController) -> object:
+        self._events.append("synchronize")
+        return session.call(lambda _facade, receipt: receipt.ingest_generation)
+
+
+class _Heartbeat:
+    def __init__(
+        self,
+        controller: IngestSessionController,
+        *,
+        interval_seconds: float,
+    ) -> None:
+        del controller, interval_seconds
+
+    def __enter__(self) -> _Heartbeat:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        del args
+
+    def raise_if_failed(self) -> None:
+        return None
 
 
 def _resident(
-    events: list[str],
+    events: list[object],
     *,
-    maintenance_fails: bool = False,
-    database_type: str = "mariadb",
-    outcomes: list[SyncOutcome] | None = None,
+    available: bool = True,
 ) -> ResidentIngestor:
+    facade = _Facade(events, available=available)
     return ResidentIngestor(
-        service=cast(IngestSynchronizer, _Service(events, outcomes)),
-        coordinator=cast(DownloadCoordinator, _Coordinator(events)),
-        database_admin=cast(
-            DatabaseAdmin,
-            _Admin(events, maintenance_fails=maintenance_fails),
-        ),
+        service=_Service(events),
+        facade=cast(VNextIngestFacade, facade),
+        database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
         config=ResidentConfig(
             periodic_scan_seconds=60,
             poll_seconds=1,
             lease_seconds=10,
             heartbeat_seconds=5,
         ),
-        database_type=database_type,
+        database_type="sqlite",
+        event_logger=lambda message: events.append(("log", message)),
     )
 
 
-def test_startup_checks_compatibility_and_maintenance_precedes_completion() -> None:
-    events: list[str] = []
+def test_startup_only_checks_existing_epoch_and_processes_one_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
     resident = _resident(events)
 
-    compatibility = resident.initialize()
-    processed = resident.process_available(periodic_scan=True)
+    resident.initialize()
+    assert resident.process_available(periodic_scan=True)
 
-    assert compatibility == SchemaCompatibility(1, 1, 1)
-    assert processed
-    assert events == ["check", "claim", "synchronize", "maintenance", "complete"]
-
-
-def test_failed_maintenance_does_not_acknowledge_ingest_turn() -> None:
-    events: list[str] = []
-    resident = _resident(events, maintenance_fails=True)
-
-    with pytest.raises(RuntimeError, match="injected maintenance failure"):
-        resident.process_available(periodic_scan=False)
-
-    assert events == ["claim", "synchronize", "maintenance"]
+    assert events[:4] == [
+        "check",
+        ("claim", True, 10_000_000),
+        "synchronize",
+        ("log", "vNext ingest synchronization completed: 2"),
+    ]
+    assert events[4] == ("complete", 2)
+    assert events[5] == (
+        "log",
+        "vNext ingest session completed: generation=2 replayed=False",
+    )
 
 
-def test_failed_preflight_releases_claim_before_synchronization() -> None:
-    events: list[str] = []
+def test_ordinary_claim_contention_is_not_an_error() -> None:
+    events: list[object] = []
+    resident = _resident(events, available=False)
+
+    assert not resident.process_available(periodic_scan=False)
+    assert events == [("claim", False, 10_000_000)]
+
+
+def test_failed_preflight_completes_claim_without_running_service() -> None:
+    events: list[object] = []
     resident = _resident(events)
-
-    def fail_preflight() -> None:
-        events.append("preflight")
-        raise RuntimeError("not fresh")
 
     with pytest.raises(RuntimeError, match="not fresh"):
         resident.process_available(
             periodic_scan=True,
-            preflight=fail_preflight,
+            preflight=lambda: (_ for _ in ()).throw(RuntimeError("not fresh")),
         )
 
-    assert events == ["claim", "preflight", "complete"]
-
-
-def test_same_lease_rescans_until_new_and_changed_work_converges(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[str] = []
-
-    class _Heartbeat:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            del args, kwargs
-
-        def __enter__(self) -> _Heartbeat:
-            events.append("heartbeat-enter")
-            return self
-
-        def __exit__(self, *args: object) -> None:
-            del args
-            events.append("heartbeat-exit")
-
-        def raise_if_failed(self) -> None:
-            events.append("heartbeat-check")
-
-    monkeypatch.setattr("h2hdb_ingest.resident.IngestLeaseHeartbeat", _Heartbeat)
-    resident = _resident(
-        events,
-        outcomes=[
-            _outcome(new=1),
-            _outcome(changed=1),
-            _outcome(removed=1),
-        ],
-    )
-
-    assert resident.process_available(periodic_scan=False)
-
     assert events == [
-        "claim",
-        "heartbeat-enter",
-        "synchronize",
-        "heartbeat-check",
-        "synchronize",
-        "heartbeat-check",
-        "synchronize",
-        "heartbeat-check",
-        "maintenance",
-        "heartbeat-check",
-        "heartbeat-exit",
-        "complete",
+        ("claim", True, 10_000_000),
+        ("complete", 2),
     ]
-
-
-def test_sqlite_stops_heartbeat_and_renews_before_exclusive_maintenance() -> None:
-    events: list[str] = []
-    resident = _resident(events, database_type="sqlite")
-
-    assert resident.process_available(periodic_scan=True)
-
-    assert events == [
-        "claim",
-        "synchronize",
-        "renew",
-        "maintenance",
-        "complete-expired",
-    ]
-
-
-def test_sqlite_heartbeat_retries_transient_busy_until_renewed() -> None:
-    events: list[str] = []
-
-    class _BusyCoordinator(_Coordinator):
-        def __init__(self) -> None:
-            super().__init__(events)
-            self.attempts = 0
-            self.busy_timeouts: list[int | None] = []
-
-        def renew_gallery_ingest(
-            self,
-            turn: GalleryIngestTurn,
-            *,
-            lease_seconds: int,
-            sqlite_busy_timeout_ms: int | None = None,
-        ) -> int:
-            del turn, lease_seconds
-            self.attempts += 1
-            self.busy_timeouts.append(sqlite_busy_timeout_ms)
-            if self.attempts <= 3:
-                raise sqlite3.OperationalError("database is locked")
-            return 10_000
-
-    coordinator = _BusyCoordinator()
-    heartbeat = IngestLeaseHeartbeat(
-        cast(DownloadCoordinator, coordinator),
-        coordinator.turn,
-        lease_seconds=10,
-        interval_seconds=2,
-        database_type="sqlite",
-    )
-
-    assert heartbeat.renew_now() == 10_000
-    assert coordinator.attempts == 4
-    assert all(
-        timeout is not None and timeout > 0 for timeout in coordinator.busy_timeouts
-    )
-
-
-def test_heartbeat_serializes_manual_and_background_renewals() -> None:
-    events: list[str] = []
-
-    class _ConcurrentCoordinator(_Coordinator):
-        def __init__(self) -> None:
-            super().__init__(events)
-            self._active_lock = Lock()
-            self.active = 0
-            self.maximum_active = 0
-
-        def renew_gallery_ingest(
-            self,
-            turn: GalleryIngestTurn,
-            *,
-            lease_seconds: int,
-            sqlite_busy_timeout_ms: int | None = None,
-        ) -> int:
-            del turn, lease_seconds, sqlite_busy_timeout_ms
-            with self._active_lock:
-                self.active += 1
-                self.maximum_active = max(self.maximum_active, self.active)
-            sleep(0.02)
-            with self._active_lock:
-                self.active -= 1
-            return 10_000
-
-    coordinator = _ConcurrentCoordinator()
-    heartbeat = IngestLeaseHeartbeat(
-        cast(DownloadCoordinator, coordinator),
-        coordinator.turn,
-        lease_seconds=10,
-        interval_seconds=2,
-        database_type="sqlite",
-    )
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(lambda _index: heartbeat.renew_now(), range(2)))
-
-    assert results == [10_000, 10_000]
-    assert coordinator.maximum_active == 1

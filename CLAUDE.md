@@ -8,19 +8,26 @@ This file provides repository guidance to Claude Code and other coding agents.
 
 ## Project
 
-`h2hdb-ingest` is the filesystem-facing ingest service for H2HDB. It owns
-gallery discovery, `galleryinfo.txt` parsing orchestration, hashing,
-deduplication policy, CBZ creation and reconciliation, and the resident ingest
-loop with its ingest-lease heartbeat.
+`h2hdb-ingest` is the filesystem-facing service for H2HDB vNext. It owns
+keyset-paged discovery, `galleryinfo.txt` parsing, exact source observations,
+artifact rendering/storage, crash-safe Komga current-view reconciliation, and
+the resident loop with its ingest-lease heartbeat.
 
 Keep the modern src layout at `src/h2hdb_ingest`; consumers still import
 `h2hdb_ingest`. Do not flatten it to match older repositories.
 
 The `h2hdb` core package exclusively owns database connectors, transactions,
-schema migrations, durable queues, token fencing, catalog repositories, and
-catalog publication. Use only core public interfaces. Never import connector or
-repository internals, create schema, or publish catalog data before final CBZ
-reconciliation succeeds.
+schema-epoch administration, durable queues, token fencing, source checkpoints,
+analysis/deduplication policy, artifact selection, and catalog publication. Use
+only public vNext facades, protocols, and domain receipts. Never import core
+internals, recreate the removed `H2HDB` compatibility API, create schema, or
+supply registry surrogate IDs. Startup calls
+`VNextDatabaseAdminFacade.check()` only and never initializes or migrates.
+
+Keep the session controller lock around bounded database issue/commit calls
+only. Filesystem scans, hashing, rendering, artifact storage, projection
+spooling, and other local I/O belong in the prepare step outside that lock so
+the heartbeat can renew the exact session receipt.
 
 Prepare content-addressed CBZ artifacts without overwriting currently published
 files. Durably protect selected artifacts before the catalog revision
@@ -38,10 +45,10 @@ file in the Komga root.
 
 Every CBZ-enabled publisher must use the same shared `artifact_store_path` as
 its coordination domain. Acquire the artifact-store publication flock before
-the core database gate and hold it from immediately before catalog publication
-through projection finalization; never acquire these locks in the reverse
-order. The OS releases the flock if a process exits, and the durable pending
-projection journal is the source of truth for crash recovery.
+the bounded core publication calls and hold it through projection and core
+finalization; never acquire these locks in the reverse order. The OS releases
+the flock if a process exits, and the durable pending projection journal is the
+source of truth for crash recovery.
 Persist the current projection's artifact identity and regular-file stat
 signature. Skip a projection copy only when both still match; any external
 mutation must be reverified with an atomic copy.
@@ -85,13 +92,9 @@ delta detection, correct prior caches, collision-free canonical hash identity,
 and deterministic policy/artifact functions. Differential tests and crash/fault
 injection are still required for implementation conformance.
 
-A newly added gallery changes the corpus evidence and can change spam answers
-for hashes and galleries that already existed. Incremental processing must
-derive the exact global spam delta, invalidate every affected old or new file
-multiset, recompute selection/ownership/policy artifact inputs, and derive the
-exact CBZ rebuild, delete, and create sets. Never treat a new gallery as a
-local-only shard update unless the locality premise is established by the
-classifier model.
+The retained incremental oracle and Lean model describe global analysis
+semantics, but production analysis is implemented and authorized by `h2hdb`.
+They must never become a second runtime deduplication implementation here.
 
 ## Shared Finalization
 

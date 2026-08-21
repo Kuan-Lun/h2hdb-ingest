@@ -1,173 +1,225 @@
+from __future__ import annotations
+
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from h2hdb import CatalogRevisionNotFoundError
 
 import h2hdb_ingest.__main__ as cli
+import h2hdb_ingest.bootstrap as bootstrap
 from h2hdb_ingest import IngestConfig, IngestPathsConfig
-from h2hdb_ingest.config import CBZGrouping
 
 
-def test_once_uses_the_coordinated_resident_path(
+class _Resident:
+    def __init__(self, events: list[object], *, available: bool = True) -> None:
+        self._events = events
+        self._available = available
+
+    def initialize(self) -> None:
+        self._events.append("initialize")
+
+    def process_available(
+        self,
+        *,
+        periodic_scan: bool,
+        preflight: Any = None,
+    ) -> bool:
+        self._events.append(("process", periodic_scan))
+        if preflight is not None:
+            preflight()
+        return self._available
+
+    def run_forever(self) -> None:
+        self._events.append("run-forever")
+
+
+def _cli_config(events: list[object]) -> SimpleNamespace:
+    return SimpleNamespace(ensure_paths=lambda: events.append("ensure-paths"))
+
+
+def test_once_checks_epoch_then_uses_one_periodic_session(
     tmp_path: Path,
-    monkeypatch: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[object] = []
-    cbz_arguments: dict[str, object] = {}
-    scanner_arguments: dict[str, object] = {}
-    service_arguments: dict[str, object] = {}
-    config = SimpleNamespace(
-        core=SimpleNamespace(database=SimpleNamespace(sql_type="sqlite")),
-        paths=SimpleNamespace(
-            download_path=tmp_path,
-            cbz_path=tmp_path / "cbz",
-            artifact_store_path=tmp_path / "artifacts",
-            hash_workers=1,
-            scan_batch_galleries=17,
-            scan_batch_files=101,
-            max_image_short_side=16,
-            cbz_workers=2,
-            stale_temp_age_seconds=3600,
-            cbz_grouping=CBZGrouping.flat,
-            cbz_sort="no",
-        ),
-        resident=object(),
-        ensure_paths=lambda: events.append("ensure-paths"),
-    )
-
-    def log_event(message: str) -> None:
-        del message
-
-    database = SimpleNamespace(logger=SimpleNamespace(info=log_event))
-    cache = object()
-    scanner = object()
-    stager = object()
-    planner = object()
-    staged_service = object()
-    cbz_reconciler = object()
-
-    class FakeResident:
-        def __init__(self, **kwargs: object) -> None:
-            assert kwargs["service"] is staged_service
-            assert kwargs["coordinator"] is database
-            assert kwargs["database_type"] == "sqlite"
-            assert kwargs["event_logger"] == database.logger.info
-
-        def initialize(self) -> None:
-            events.append("initialize")
-
-        def process_available(self, *, periodic_scan: bool) -> bool:
-            events.append(("process", periodic_scan))
-            return True
-
-    def fake_cbz_reconciler(**kwargs: object) -> object:
-        cbz_arguments.update(kwargs)
-        events.append("cbz")
-        return cbz_reconciler
-
-    def fake_filesystem_scanner(*args: object, **kwargs: object) -> object:
-        scanner_arguments["args"] = args
-        scanner_arguments.update(kwargs)
-        return scanner
-
-    def fake_source_stager(**kwargs: object) -> object:
-        assert kwargs == {
-            "scanner": scanner,
-            "coordinator": database,
-            "hash_cache": cache,
-        }
-        return stager
-
-    def fake_staged_service(**kwargs: object) -> object:
-        service_arguments.update(kwargs)
-        return staged_service
+    config = _cli_config(events)
+    resident = _Resident(events)
 
     monkeypatch.setattr(cli, "load_config", lambda path: config)
-    monkeypatch.setattr(cli, "H2HDB", lambda core: database)
-    monkeypatch.setattr(cli, "ResidentIngestor", FakeResident)
-    monkeypatch.setattr(cli, "CBZReconciler", fake_cbz_reconciler)
-    monkeypatch.setattr(cli, "CoreFileHashCache", lambda coordinator: cache)
-    monkeypatch.setattr(cli, "FilesystemScanner", fake_filesystem_scanner)
-    monkeypatch.setattr(cli, "FilesystemSourceStager", fake_source_stager)
-    monkeypatch.setattr(cli, "StagedDeduplicationPlanner", lambda: planner)
-    monkeypatch.setattr(cli, "StagedIngestService", fake_staged_service)
-    monkeypatch.setattr(cli, "catalog_scope_key", lambda paths: "scope-key")
+    monkeypatch.setattr(
+        cli,
+        "configure_logging",
+        lambda value: events.append(("logging", value)),
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_runtime",
+        lambda value: SimpleNamespace(
+            resident=resident if value is config else None,
+        ),
+    )
 
     cli.main(["--config", str(tmp_path / "ingest.json"), "--once"])
 
-    assert events[0] == "ensure-paths"
-    assert events[1] == "cbz"
-    assert cbz_arguments["cbz_path"] == tmp_path / "cbz"
-    assert cbz_arguments["artifact_store_path"] == tmp_path / "artifacts"
-    assert cbz_arguments["max_image_short_side"] == 16
-    assert cbz_arguments["workers"] == 2
-    assert cbz_arguments["stale_temp_age_seconds"] == 3600
-    assert cbz_arguments["event_logger"] == database.logger.info
-    assert scanner_arguments["args"] == (tmp_path,)
-    assert scanner_arguments["hash_workers"] == 1
-    assert scanner_arguments["hash_cache"] is cache
-    assert scanner_arguments["max_galleries"] == 17
-    assert scanner_arguments["max_files"] == 101
-    assert scanner_arguments["event_logger"] == database.logger.info
-    assert service_arguments == {
-        "source_stager": stager,
-        "planner": planner,
-        "catalog": database,
-        "database_admin": database,
-        "catalog_reader": database,
-        "source_root": tmp_path,
-        "scope_key": "scope-key",
-        "cbz": cbz_reconciler,
-        "event_logger": database.logger.info,
-    }
-    assert events[2:] == ["initialize", ("process", True)]
+    assert events == [
+        "ensure-paths",
+        ("logging", config),
+        "initialize",
+        ("process", True),
+    ]
 
 
-def test_cli_rejects_legacy_cbz_sort_modes_before_opening_database(
+def test_resident_mode_runs_forever_after_epoch_check(
     tmp_path: Path,
-    monkeypatch: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = SimpleNamespace(
-        paths=SimpleNamespace(cbz_path=tmp_path / "cbz", cbz_sort="gid"),
-        ensure_paths=lambda: None,
+    events: list[object] = []
+    config = _cli_config(events)
+    resident = _Resident(events)
+    monkeypatch.setattr(cli, "load_config", lambda path: config)
+    monkeypatch.setattr(cli, "configure_logging", lambda value: None)
+    monkeypatch.setattr(
+        cli,
+        "build_runtime",
+        lambda value: SimpleNamespace(resident=resident),
     )
+
+    cli.main(["--config", str(tmp_path / "ingest.json")])
+
+    assert events == ["ensure-paths", "initialize", "run-forever"]
+
+
+def test_once_reports_ordinary_claim_contention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    config = _cli_config(events)
+    resident = _Resident(events, available=False)
+    monkeypatch.setattr(cli, "load_config", lambda path: config)
+    monkeypatch.setattr(cli, "configure_logging", lambda value: None)
+    monkeypatch.setattr(
+        cli,
+        "build_runtime",
+        lambda value: SimpleNamespace(resident=resident),
+    )
+
+    with pytest.raises(RuntimeError, match="No gallery ingest lease"):
+        cli.main(["--config", str(tmp_path / "ingest.json"), "--once"])
+
+
+def test_cli_rejects_empty_download_mount_before_opening_facades(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    download_path = tmp_path / "download"
+    download_path.mkdir()
+    config = IngestConfig(paths=IngestPathsConfig(download_path=download_path))
     opened = False
 
-    def open_database(core: object) -> object:
+    def open_runtime(value: object) -> object:
         nonlocal opened
-        del core
+        del value
         opened = True
         return object()
 
     monkeypatch.setattr(cli, "load_config", lambda path: config)
-    monkeypatch.setattr(cli, "H2HDB", open_database)
+    monkeypatch.setattr(cli, "build_runtime", open_runtime)
 
-    with pytest.raises(ValueError, match="supports only cbz_sort='no'"):
+    with pytest.raises(ValueError, match="gallery volume is mounted"):
         cli.main(["--config", str(tmp_path / "ingest.json"), "--once"])
 
     assert not opened
 
 
-def test_cli_rejects_empty_download_mount_before_opening_database(
-    tmp_path: Path,
-    monkeypatch: Any,
-) -> None:
-    download_path = tmp_path / "download"
-    download_path.mkdir()
-    config = IngestConfig(paths=IngestPathsConfig(download_path=download_path))
-    database_opened = False
+class _Catalog:
+    def __init__(self, revisions: list[object]) -> None:
+        self._revisions = revisions
 
-    def open_database(core: object) -> object:
-        nonlocal database_opened
-        del core
-        database_opened = True
+    def get_catalog_revision(self) -> object:
+        value = self._revisions.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+def _bootstrap_config(tmp_path: Path) -> IngestConfig:
+    download = tmp_path / "download"
+    gallery = download / "gallery"
+    gallery.mkdir(parents=True)
+    (gallery / "galleryinfo.txt").write_text("metadata", encoding="utf-8")
+    return IngestConfig(paths=IngestPathsConfig(download_path=download))
+
+
+def test_bootstrap_requires_no_current_revision_then_publishes_nonempty_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    events: list[object] = []
+    config = _bootstrap_config(tmp_path)
+    catalog = _Catalog(
+        [
+            CatalogRevisionNotFoundError(0),
+            SimpleNamespace(revision=1, publication_count=7),
+        ]
+    )
+    runtime = SimpleNamespace(resident=_Resident(events), catalog=catalog)
+    monkeypatch.setattr(bootstrap, "load_config", lambda path: config)
+    monkeypatch.setattr(bootstrap, "configure_logging", lambda value: None)
+    monkeypatch.setattr(bootstrap, "build_runtime", lambda value: runtime)
+
+    assert bootstrap.main(["--config", str(tmp_path / "ingest.json")]) == 0
+
+    assert events == ["initialize", ("process", True)]
+    assert "revision=1 publications=7" in capsys.readouterr().out
+
+
+def test_bootstrap_refuses_an_existing_catalog_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    events: list[object] = []
+    config = _bootstrap_config(tmp_path)
+    runtime = SimpleNamespace(
+        resident=_Resident(events),
+        catalog=_Catalog([SimpleNamespace(revision=9, publication_count=3)]),
+    )
+    monkeypatch.setattr(bootstrap, "load_config", lambda path: config)
+    monkeypatch.setattr(bootstrap, "configure_logging", lambda value: None)
+    monkeypatch.setattr(bootstrap, "build_runtime", lambda value: runtime)
+
+    with pytest.raises(SystemExit) as stopped:
+        bootstrap.main(["--config", str(tmp_path / "ingest.json")])
+
+    assert stopped.value.code == 2
+    assert "current_revision=9" in capsys.readouterr().err
+
+
+def test_bootstrap_rejects_a_source_without_gallery_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    download = tmp_path / "download"
+    download.mkdir()
+    (download / "mounted-volume-marker").touch()
+    config = IngestConfig(paths=IngestPathsConfig(download_path=download))
+    opened = False
+
+    def open_runtime(value: object) -> object:
+        nonlocal opened
+        del value
+        opened = True
         return object()
 
-    monkeypatch.setattr(cli, "load_config", lambda path: config)
-    monkeypatch.setattr(cli, "H2HDB", open_database)
+    monkeypatch.setattr(bootstrap, "load_config", lambda path: config)
+    monkeypatch.setattr(bootstrap, "build_runtime", open_runtime)
 
-    with pytest.raises(ValueError, match="gallery volume is mounted"):
-        cli.main(["--config", str(tmp_path / "ingest.json"), "--once"])
+    with pytest.raises(SystemExit) as stopped:
+        bootstrap.main(["--config", str(tmp_path / "ingest.json")])
 
-    assert not database_opened
+    assert stopped.value.code == 2
+    assert not opened

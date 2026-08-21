@@ -11,10 +11,9 @@ environment. The supported Python version is defined by `requires-python` in
 
 This repository owns:
 
-- filesystem scanning and gallery discovery;
-- `galleryinfo.txt` parsing orchestration;
-- source hashing and deduplication policy;
-- CBZ creation, rebuilding, and final reconciliation;
+- deterministic, keyset-paged filesystem discovery and `galleryinfo.txt` parsing;
+- exact source-byte observations and consumer-side artifact rendering/storage;
+- crash-safe Komga current-view reconciliation;
 - the resident ingest loop and ingest-lease heartbeat orchestration.
 
 Keep the src layout (`src/h2hdb_ingest`); the public import package is
@@ -22,16 +21,20 @@ Keep the src layout (`src/h2hdb_ingest`); the public import package is
 an older project.
 
 The `h2hdb` core package exclusively owns connectors, transactions, database
-schema and migrations, durable queues, token-fenced coordination, catalog
-repositories, and catalog publication. Depend only on core public interfaces;
-do not import connector or repository internals and do not add schema here.
-Catalog publication must follow successful final CBZ reconciliation.
-Prepare new CBZ files without overwriting currently published artifacts. Before
-entering the revision transaction, durably protect every selected artifact from
-pruning. After commit, promote those files to published state. Retain immutable
-published and commit-ambiguous protected artifacts for historical revisions;
-prune only abandoned staging artifacts. Consumer startup performs a
-compatibility check and must never migrate core schema.
+schema/epoch administration, durable queues, token-fenced coordination, source
+checkpoints, analysis and deduplication policy, catalog repositories, artifact
+selection, and publication. Depend only on the public vNext facade, protocols,
+and domain receipts; never import core repository or connector internals and
+never recreate the removed `H2HDB` compatibility surface. Consumer startup
+calls `VNextDatabaseAdminFacade.check()` and must never initialize or migrate
+the core schema.
+
+Every core operation follows an issue/prepare/commit split. Hold the session
+controller lock only for a bounded database issue or commit call. Filesystem
+scans, hashing, image/ZIP work, artifact storage, projection spooling, and other
+local I/O run outside that lock so the heartbeat can renew the exact session
+receipt. Never supply registry surrogate IDs; construct immutable natural
+`VNextIngestPolicy` facts and let the core resolve or allocate authority.
 
 CBZ operation uses two distinct, non-nested roots. `artifact_store_path` owns
 content-addressed immutable artifacts and reconciliation state for OPDS;
@@ -42,10 +45,10 @@ file in the Komga root.
 
 Every CBZ-enabled publisher must use the same shared `artifact_store_path` as
 its coordination domain. Acquire the artifact-store publication flock before
-the core database gate and hold it from immediately before catalog publication
-through projection finalization; never acquire these locks in the reverse
-order. The OS releases the flock if a process exits, and the durable pending
-projection journal is the source of truth for crash recovery.
+the bounded core publication calls and hold it through projection and core
+finalization; never acquire these locks in the reverse order. The OS releases
+the flock if a process exits, and the durable pending projection journal is the
+source of truth for crash recovery.
 Persist the current projection's artifact identity and regular-file stat
 signature. Skip a projection copy only when both still match; any external
 mutation must be reverified with an atomic copy.
@@ -88,13 +91,9 @@ delta detection, correct prior caches, collision-free canonical hash identity,
 and deterministic policy/artifact functions. Differential tests and crash/fault
 injection are still required for implementation conformance.
 
-A newly added gallery changes the corpus evidence and can change spam answers
-for hashes and galleries that already existed. Incremental processing must
-derive the exact global spam delta, invalidate every affected old or new file
-multiset, recompute selection/ownership/policy artifact inputs, and derive the
-exact CBZ rebuild, delete, and create sets. Never treat a new gallery as a
-local-only shard update unless the locality premise is established by the
-classifier model.
+The retained incremental oracle and Lean model describe global analysis
+semantics, but production analysis is implemented and authorized by `h2hdb`.
+They must never become a second runtime deduplication implementation here.
 
 ## Shared Finalization
 
