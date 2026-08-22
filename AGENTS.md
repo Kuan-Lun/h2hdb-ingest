@@ -70,6 +70,11 @@ uv run --no-sync python -m build
 
 If the environment is damaged, run `scripts/rebuild-env.sh`.
 
+## Branch Discipline
+
+Do not create or switch to a development branch. All development work must be
+performed directly on the repository's primary branch (`main`).
+
 ## Formal Verification
 
 The executable vNext specifications live in `verification/`; they are design
