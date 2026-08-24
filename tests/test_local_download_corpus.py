@@ -8,16 +8,45 @@ import pytest
 from h2hdb_ingest.filesystem import FilesystemSource
 
 _DOWNLOAD_PATH_ENVIRONMENT = "H2HDB_INGEST_TEST_DOWNLOAD_PATH"
+_DEFAULT_DOWNLOAD_PATH = (
+    Path(__file__).resolve().parents[1] / ".local-test-data" / "hath-download"
+)
 
 
 def _local_download_path() -> Path:
     configured = os.environ.get(_DOWNLOAD_PATH_ENVIRONMENT)
     if configured is None:
-        pytest.skip(f"set {_DOWNLOAD_PATH_ENVIRONMENT} to run the private corpus test")
-    path = Path(configured)
+        path = _DEFAULT_DOWNLOAD_PATH
+        if not path.exists():
+            pytest.skip(
+                f"place a private H@H corpus at {path} or set "
+                f"{_DOWNLOAD_PATH_ENVIRONMENT}"
+            )
+    else:
+        path = Path(configured)
     if not path.is_dir():
-        pytest.fail(f"{_DOWNLOAD_PATH_ENVIRONMENT} is not a directory: {path}")
+        pytest.fail(f"private H@H corpus path is not a directory: {path}")
     return path
+
+
+def test_default_private_corpus_uses_the_ignored_repository_local_root() -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    ignored = (repository_root / ".gitignore").read_text(encoding="utf-8").splitlines()
+
+    assert _DEFAULT_DOWNLOAD_PATH == (
+        repository_root / ".local-test-data" / "hath-download"
+    )
+    assert "/.local-test-data/" in ignored
+    assert "/download-1" not in ignored
+
+
+def test_private_corpus_path_allows_an_environment_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_DOWNLOAD_PATH_ENVIRONMENT, str(tmp_path))
+
+    assert _local_download_path() == tmp_path
 
 
 def test_opt_in_local_download_corpus_is_bounded_and_replayable() -> None:

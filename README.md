@@ -147,6 +147,11 @@ uv run --no-sync pytest
 uv run --no-sync python -m build
 ```
 
+The opt-in private-corpus regression test automatically uses
+`.local-test-data/hath-download`. This repository-local directory is ignored by
+Git and must contain a complete Hentai@Home download tree. Set
+`H2HDB_INGEST_TEST_DOWNLOAD_PATH` only when testing a corpus stored elsewhere.
+
 The independent Python oracle and Lean model under `verification/` specify
 cross-component analysis semantics; core owns the production implementation.
 The TLA+ model covers crash-safe current-projection behavior. Run the required

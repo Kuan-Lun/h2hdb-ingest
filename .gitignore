@@ -14,5 +14,5 @@ htmlcov/
 uv.lock
 /.formal-tools/
 
-# Local H@H download corpus; never commit downloaded gallery content.
-/download-1
+# Repository-local private corpora; never commit downloaded gallery content.
+/.local-test-data/
