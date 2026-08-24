@@ -13,3 +13,6 @@ dist/
 htmlcov/
 uv.lock
 /.formal-tools/
+
+# Local H@H download corpus; never commit downloaded gallery content.
+/download-1
