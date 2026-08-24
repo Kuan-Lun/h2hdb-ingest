@@ -10,7 +10,12 @@ from threading import Event
 from time import monotonic
 from typing import Protocol
 
-from h2hdb import SchemaEpochReport, VNextDatabaseAdminFacade, VNextIngestFacade
+from h2hdb import (
+    SchemaEpochReport,
+    VNextDatabaseAdminFacade,
+    VNextIngestFacade,
+    VNextSourceManifestMismatchError,
+)
 
 from .config import ResidentConfig
 from .session import IngestLeaseHeartbeat, IngestSessionController
@@ -75,13 +80,28 @@ class ResidentIngestor:
                         f"failed: {completion_error!r}"
                     )
                 raise
-        with IngestLeaseHeartbeat(
-            session,
-            interval_seconds=self._config.heartbeat_seconds,
-        ) as heartbeat:
-            outcome = self._service.synchronize_once(session)
-            heartbeat.raise_if_failed()
-            self._event_logger(f"vNext ingest synchronization completed: {outcome!r}")
+        try:
+            with IngestLeaseHeartbeat(
+                session,
+                interval_seconds=self._config.heartbeat_seconds,
+            ) as heartbeat:
+                outcome = self._service.synchronize_once(session)
+                heartbeat.raise_if_failed()
+                self._event_logger(
+                    f"vNext ingest synchronization completed: {outcome!r}"
+                )
+        except VNextSourceManifestMismatchError as error:
+            # The core has already atomically abandoned the exact mismatched
+            # working build.  Complete this generation after the heartbeat is
+            # stopped so the resident can immediately claim a stable retry.
+            try:
+                session.complete()
+            except BaseException as completion_error:
+                error.add_note(
+                    "The ingest session could not be completed after its source "
+                    f"manifest mismatched: {completion_error!r}"
+                )
+            raise
         completion = session.complete()
         self._event_logger(
             "vNext ingest session completed: "

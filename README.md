@@ -147,6 +147,15 @@ uv run --no-sync pytest
 uv run --no-sync python -m build
 ```
 
+The source-to-analysis-to-publication resident E2E runs against SQLite by
+default. Enable its pinned MariaDB 10.11.11 testcontainer with Docker available:
+
+```bash
+H2HDB_TEST_MARIADB=1 uv run --no-sync pytest tests/test_runtime_e2e.py
+```
+
+The PyPI validation workflow always enables the MariaDB case.
+
 The opt-in private-corpus regression test automatically uses
 `.local-test-data/hath-download`. This repository-local directory is ignored by
 Git and must contain a complete Hentai@Home download tree. Set

@@ -4,8 +4,11 @@ import os
 from pathlib import Path
 
 import pytest
+from h2hdb import CoreConfig
 
+from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
 from h2hdb_ingest.filesystem import FilesystemSource
+from h2hdb_ingest.runtime import build_runtime
 
 _DOWNLOAD_PATH_ENVIRONMENT = "H2HDB_INGEST_TEST_DOWNLOAD_PATH"
 _DEFAULT_DOWNLOAD_PATH = (
@@ -140,3 +143,45 @@ def test_opt_in_local_download_corpus_is_bounded_and_replayable() -> None:
     assert directory_entry_count >= file_count
     assert tag_count > 0
     assert bytes_read > 0
+
+
+def test_private_corpus_completes_mariadb_resident_cycle_and_restart_replay(
+    mariadb_config: CoreConfig,
+) -> None:
+    """Run the private corpus through the real MariaDB resident vertical slice."""
+
+    config = IngestConfig(
+        core=mariadb_config,
+        paths=IngestPathsConfig(download_path=_local_download_path()),
+        resident=ResidentConfig(
+            lease_seconds=1_800,
+            heartbeat_seconds=30,
+            max_rows=128,
+        ),
+    )
+    runtime = build_runtime(config)
+    initialized = runtime.database_admin.initialize()
+    checked = runtime.resident.initialize()
+
+    assert initialized.epoch == checked.epoch
+    assert runtime.resident.process_available(periodic_scan=True)
+    first_revision = runtime.catalog.get_catalog_revision()
+    first_page = runtime.catalog.list_publications(
+        revision=first_revision,
+        limit=128,
+    )
+    assert first_revision.revision == 1
+    assert first_revision.publication_count > 0
+    assert first_page.total == first_revision.publication_count
+    assert len(first_page.publications) == first_revision.publication_count
+
+    restarted = build_runtime(config)
+    restarted.resident.initialize()
+    assert restarted.resident.process_available(periodic_scan=True)
+    replayed_revision = restarted.catalog.get_catalog_revision()
+    replayed_page = restarted.catalog.list_publications(
+        revision=replayed_revision,
+        limit=128,
+    )
+    assert replayed_revision == first_revision
+    assert replayed_page == first_page

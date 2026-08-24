@@ -3,8 +3,10 @@ from __future__ import annotations
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
+from typing import cast
 from zipfile import ZipFile
 
+import pytest
 from h2hdb import CoreConfig, DatabaseConfig
 from PIL import Image
 
@@ -12,7 +14,28 @@ from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
 from h2hdb_ingest.runtime import build_runtime
 
 
-def _gallery(root: Path, gid: int, artist: str) -> None:
+@pytest.fixture(params=("sqlite", "mariadb"))
+def runtime_core_config(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> CoreConfig:
+    if request.param == "sqlite":
+        return CoreConfig(
+            database=DatabaseConfig(
+                sql_type="sqlite",
+                database=str(tmp_path / "catalog.sqlite3"),
+            )
+        )
+    return cast(CoreConfig, request.getfixturevalue("mariadb_config"))
+
+
+def _gallery(
+    root: Path,
+    gid: int,
+    artist: str,
+    *,
+    page_bytes: bytes = b"first page",
+) -> None:
     folder = root / str(gid)
     folder.mkdir(parents=True)
     (folder / "galleryinfo.txt").write_text(
@@ -30,21 +53,17 @@ def _gallery(root: Path, gid: int, artist: str) -> None:
         ),
         encoding="utf-8",
     )
-    (folder / "001.jpg").write_bytes(b"first page")
+    (folder / "001.jpg").write_bytes(page_bytes)
 
 
-def test_fresh_sqlite_epoch_runs_source_analysis_and_publication(
+def test_fresh_epoch_runs_source_analysis_and_publication(
     tmp_path: Path,
+    runtime_core_config: CoreConfig,
 ) -> None:
     source = tmp_path / "download"
     _gallery(source, 1001, "first")
     config = IngestConfig(
-        core=CoreConfig(
-            database=DatabaseConfig(
-                sql_type="sqlite",
-                database=str(tmp_path / "catalog.sqlite3"),
-            )
-        ),
+        core=runtime_core_config,
         paths=IngestPathsConfig(download_path=source),
         resident=ResidentConfig(
             lease_seconds=30,
@@ -63,16 +82,84 @@ def test_fresh_sqlite_epoch_runs_source_analysis_and_publication(
     assert revision.revision == 1
     assert revision.publication_count == 1
 
+    # A periodic scan after process restart must replay the exact SEALED source
+    # snapshot without attempting to reopen its discovery checkpoint.
+    restarted = build_runtime(config)
+    restarted.resident.initialize()
+    assert restarted.resident.process_available(periodic_scan=True)
+    replayed_revision = restarted.catalog.get_catalog_revision()
+    assert replayed_revision == revision
+
     # The same content in three galleries with three distinct artists reaches
     # the registered spam threshold.  This public result covers both derived
     # source projections: per-observation hash occurrences and artist tags.
     _gallery(source, 1002, "second")
     _gallery(source, 1003, "third")
 
-    assert runtime.resident.process_available(periodic_scan=True)
-    excluded_revision = runtime.catalog.get_catalog_revision()
+    assert restarted.resident.process_available(periodic_scan=True)
+    excluded_revision = restarted.catalog.get_catalog_revision()
     assert excluded_revision.revision == 2
     assert excluded_revision.publication_count == 0
+
+    # Replay the incremental build after its own publication has advanced the
+    # channel head.  Its analysis must retain the baseline that was persisted
+    # when the run began instead of deriving a new baseline from revision 2.
+    restarted_incremental = build_runtime(config)
+    restarted_incremental.resident.initialize()
+    assert restarted_incremental.resident.process_available(periodic_scan=True)
+    assert restarted_incremental.catalog.get_catalog_revision() == excluded_revision
+
+
+def test_same_locator_content_a_b_a_creates_three_revisions_then_replays(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+) -> None:
+    source = tmp_path / "download"
+    _gallery(source, 1001, "artist", page_bytes=b"content-A")
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(download_path=source),
+        resident=ResidentConfig(
+            lease_seconds=30,
+            heartbeat_seconds=5,
+        ),
+    )
+    runtime = build_runtime(config)
+    runtime.database_admin.initialize()
+
+    def current_content() -> str:
+        page = runtime.catalog.list_publications()
+        assert page.total == len(page.publications) == 1
+        content_sha256 = page.publications[0].content_sha256
+        assert content_sha256 is not None
+        return content_sha256
+
+    assert runtime.resident.process_available(periodic_scan=True)
+    first_revision = runtime.catalog.get_catalog_revision()
+    first_content = current_content()
+    assert first_revision.revision == 1
+
+    (source / "1001" / "001.jpg").write_bytes(b"content-B")
+    assert runtime.resident.process_available(periodic_scan=True)
+    second_revision = runtime.catalog.get_catalog_revision()
+    second_content = current_content()
+    assert second_revision.revision == 2
+    assert second_content != first_content
+
+    (source / "1001" / "001.jpg").write_bytes(b"content-A")
+    assert runtime.resident.process_available(periodic_scan=True)
+    third_revision = runtime.catalog.get_catalog_revision()
+    third_content = current_content()
+    assert third_revision.revision == 3
+    assert third_content == first_content
+
+    restarted = build_runtime(config)
+    restarted.resident.initialize()
+    assert restarted.resident.process_available(periodic_scan=True)
+    assert restarted.catalog.get_catalog_revision() == third_revision
+    replayed = restarted.catalog.list_publications()
+    assert replayed.total == len(replayed.publications) == 1
+    assert replayed.publications[0].content_sha256 == first_content
 
 
 def test_fresh_artifact_runtime_publishes_immutable_and_current_cbz(

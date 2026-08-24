@@ -84,6 +84,8 @@ jobs:
           scripts/bootstrap-catalog.py
 
       - name: Test
+        env:
+          H2HDB_TEST_MARIADB: "1"
         run: python -m pytest
 
       - name: Build distributions

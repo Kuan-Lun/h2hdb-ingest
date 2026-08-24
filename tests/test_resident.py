@@ -9,6 +9,7 @@ from h2hdb import (
     VNextIngestCompletionReceipt,
     VNextIngestFacade,
     VNextIngestSession,
+    VNextSourceManifestMismatchError,
 )
 
 import h2hdb_ingest.resident as resident_module
@@ -78,6 +79,16 @@ class _Service:
         return session.call(lambda _facade, receipt: receipt.ingest_generation)
 
 
+class _ManifestMismatchService:
+    def __init__(self, events: list[object]) -> None:
+        self._events = events
+
+    def synchronize_once(self, session: IngestSessionController) -> object:
+        del session
+        self._events.append("synchronize")
+        raise VNextSourceManifestMismatchError("source changed")
+
+
 class _Heartbeat:
     def __init__(
         self,
@@ -101,10 +112,11 @@ def _resident(
     events: list[object],
     *,
     available: bool = True,
+    service: _Service | _ManifestMismatchService | None = None,
 ) -> ResidentIngestor:
     facade = _Facade(events, available=available)
     return ResidentIngestor(
-        service=_Service(events),
+        service=service or _Service(events),
         facade=cast(VNextIngestFacade, facade),
         database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
         config=ResidentConfig(
@@ -161,5 +173,34 @@ def test_failed_preflight_completes_claim_without_running_service() -> None:
 
     assert events == [
         ("claim", True, 10_000_000),
+        ("complete", 2),
+    ]
+
+
+def test_source_manifest_mismatch_completes_claim_after_heartbeat_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+
+    class _OrderedHeartbeat(_Heartbeat):
+        def __enter__(self) -> _OrderedHeartbeat:
+            events.append("heartbeat-start")
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+            events.append("heartbeat-stop")
+
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _OrderedHeartbeat)
+    resident = _resident(events, service=_ManifestMismatchService(events))
+
+    with pytest.raises(VNextSourceManifestMismatchError, match="source changed"):
+        resident.process_available(periodic_scan=True)
+
+    assert events == [
+        ("claim", True, 10_000_000),
+        "heartbeat-start",
+        "synchronize",
+        "heartbeat-stop",
         ("complete", 2),
     ]

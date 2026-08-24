@@ -68,6 +68,14 @@ uv run --no-sync pytest
 uv run --no-sync python -m build
 ```
 
+The real MariaDB resident-lifecycle E2E pins MariaDB 10.11.11 through
+testcontainers. It is opt-in for ordinary local runs and mandatory in the PyPI
+validation workflow. Run it locally with Docker available:
+
+```bash
+H2HDB_TEST_MARIADB=1 uv run --no-sync pytest tests/test_runtime_e2e.py
+```
+
 If the environment is damaged, run `scripts/rebuild-env.sh`.
 
 ## Branch Discipline
