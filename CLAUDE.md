@@ -31,13 +31,16 @@ the heartbeat can renew the exact session receipt.
 
 Prepare content-addressed CBZ artifacts without overwriting currently published
 files. Durably protect selected artifacts before the catalog revision
-transaction, then promote them to published state after commit. Retain immutable
-published and commit-ambiguous protected artifacts for historical revisions;
-prune only abandoned staging artifacts. Startup performs only the core schema
+transaction, then promote them to published state after commit. Retain every
+current, pending, or commit-ambiguous protected artifact; after a new current
+projection reconciles, prune released old artifact bytes and their exact
+ingest-owned artifact row through the artifact database's durable digest queue.
+Permanently retain the terminal `RELEASED` token tombstone so a delayed protect
+cannot resurrect reclaimed bytes. Startup performs only the core schema
 compatibility check and must not run migrations.
 
 CBZ operation uses two distinct, non-nested roots. `artifact_store_path` owns
-content-addressed immutable artifacts and reconciliation state for OPDS;
+content-addressed artifacts and reconciliation state for OPDS;
 `cbz_path` owns only the current friendly-file projection for Komga. Update the
 Komga projection only after catalog publication succeeds, and remove only paths
 recorded as managed in artifact-store state. Never replace or delete an unknown
@@ -52,6 +55,19 @@ source of truth for crash recovery.
 Persist the current projection's artifact identity and regular-file stat
 signature. Skip a projection copy only when both still match; any external
 mutation must be reverified with an atomic copy.
+Artifact pruning runs in bounded state pages under the publication lock, never
+follows symlinks, never touches unknown paths, and fails closed on external byte
+changes. Artifact and current-view quarantine namespaces are private mode-0700
+adapter capabilities under their respective roots. Only the lock-holding
+adapter may create or mutate their entries; any unexpected owner, mode, inode,
+or entry change fails closed without acknowledging cleanup. The public ingest
+current-projection maintenance action advances at
+most one eight-item page in each durable cleanup queue. The resident invokes it
+before every claim and once after session completion. Retry local or core
+`PROGRESSED` immediately without resetting the periodic deadline; local
+`BLOCKED`, core `BLOCKED`/`CONTENDED`, `DONE`, and transient failures continue
+on the ordinary idle/pre-claim poll cadence. After session completion, also
+attempt the public core current-only maintenance drain once.
 
 ## Development
 

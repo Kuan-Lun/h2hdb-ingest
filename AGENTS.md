@@ -37,7 +37,7 @@ receipt. Never supply registry surrogate IDs; construct immutable natural
 `VNextIngestPolicy` facts and let the core resolve or allocate authority.
 
 CBZ operation uses two distinct, non-nested roots. `artifact_store_path` owns
-content-addressed immutable artifacts and reconciliation state for OPDS;
+content-addressed artifacts and reconciliation state for OPDS;
 `cbz_path` owns only the current friendly-file projection for Komga. Update the
 Komga projection only after catalog publication succeeds, and remove only paths
 recorded as managed in artifact-store state. Never replace or delete an unknown
@@ -52,6 +52,23 @@ source of truth for crash recovery.
 Persist the current projection's artifact identity and regular-file stat
 signature. Skip a projection copy only when both still match; any external
 mutation must be reverified with an atomic copy.
+After a new revision reconciles, forward a bounded page from the durable
+projection outbox into the artifact database's durable released-digest queue
+under the same publication lock. Each cleanup attempt scans only that queue and
+deletes artifact bytes/state referenced by neither current nor pending
+projection. Retain every protected artifact and every terminal `RELEASED` token
+tombstone, and reject symlinks or externally changed bytes.
+Artifact and current-view quarantine namespaces are private mode-0700 adapter
+capabilities under their respective roots. Only the lock-holding adapter may
+create or mutate their entries; any unexpected owner, mode, inode, or entry
+change fails closed without acknowledging cleanup. The public ingest
+current-projection maintenance action advances at most one eight-item page in
+each durable cleanup queue. The resident invokes it before every claim and once
+after session completion. Retry local or core `PROGRESSED` immediately without
+resetting the periodic deadline; local `BLOCKED`, core `BLOCKED`/`CONTENDED`,
+`DONE`, and transient failures continue on the ordinary idle/pre-claim poll
+cadence. After session completion, also attempt the public core current-only
+maintenance drain once.
 
 ## Environment and Commands
 

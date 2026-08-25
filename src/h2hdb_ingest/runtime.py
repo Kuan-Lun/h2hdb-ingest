@@ -21,6 +21,10 @@ from h2hdb import (
 
 from .artifact import ManagedFilesystemArtifactAdapter
 from .config import IngestConfig
+from .maintenance import (
+    CurrentProjectionMaintenanceAdapter,
+    CurrentProjectionMaintenanceOutcome,
+)
 from .policy import build_ingest_policy
 from .projection import CurrentProjectionAdapter
 from .resident import ResidentIngestor
@@ -55,9 +59,12 @@ def build_runtime(
     artifact_adapters: dict[bytes, ManagedFilesystemArtifactAdapter] = {}
     finalization_adapters: dict[bytes, ManagedFilesystemArtifactAdapter] = {}
     current_projection: VNextCurrentProjectionAdapter
+    current_projection_maintenance: CurrentProjectionMaintenanceAdapter
     publication_guard: Callable[[], AbstractContextManager[None]]
     if config.paths.artifact_store_path is None:
-        current_projection = _DisabledCurrentProjectionAdapter()
+        disabled_projection = _DisabledCurrentProjectionAdapter()
+        current_projection = disabled_projection
+        current_projection_maintenance = disabled_projection
         publication_guard = _disabled_publication_guard
     else:
         cbz_path = config.paths.cbz_path
@@ -73,8 +80,10 @@ def build_runtime(
             artifact_store_path=config.paths.artifact_store_path,
             cbz_path=cbz_path,
             grouping=config.paths.cbz_grouping,
+            artifact_adapter=artifact,
         )
         current_projection = projection
+        current_projection_maintenance = projection
         publication_guard = projection.publication_guard
 
     service = VNextIngestService(
@@ -90,6 +99,7 @@ def build_runtime(
         service=service,
         facade=facade,
         database_admin=database_admin,
+        current_projection_maintenance=current_projection_maintenance,
         config=config.resident,
         database_type=config.core.database.sql_type,
         event_logger=event_logger or logger.info,
@@ -144,6 +154,9 @@ class _DisabledCurrentProjectionAdapter:
     def reconcile(self, revision: int) -> None:
         del revision
         raise RuntimeError("artifact-disabled projection cannot be reconciled")
+
+    def maintain_cleanup(self) -> CurrentProjectionMaintenanceOutcome:
+        return CurrentProjectionMaintenanceOutcome.DONE
 
 
 def _disabled_publication_guard() -> nullcontext[None]:

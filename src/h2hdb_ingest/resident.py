@@ -6,21 +6,33 @@ __all__ = ["IngestSynchronizer", "ResidentIngestor"]
 
 import logging
 from collections.abc import Callable
+from enum import StrEnum
 from threading import Event
 from time import monotonic
 from typing import Protocol
 
 from h2hdb import (
     SchemaEpochReport,
+    VNextCurrentOnlyMaintenanceOutcome,
     VNextDatabaseAdminFacade,
     VNextIngestFacade,
     VNextSourceManifestMismatchError,
 )
 
 from .config import ResidentConfig
+from .maintenance import (
+    CurrentProjectionMaintenanceAdapter,
+    CurrentProjectionMaintenanceOutcome,
+)
 from .session import IngestLeaseHeartbeat, IngestSessionController
 
 logger = logging.getLogger(__name__)
+
+
+class _ResidentCycleOutcome(StrEnum):
+    INGESTED = "INGESTED"
+    MAINTENANCE_PROGRESSED = "MAINTENANCE_PROGRESSED"
+    IDLE = "IDLE"
 
 
 class IngestSynchronizer(Protocol):
@@ -36,6 +48,7 @@ class ResidentIngestor:
         service: IngestSynchronizer,
         facade: VNextIngestFacade,
         database_admin: VNextDatabaseAdminFacade,
+        current_projection_maintenance: CurrentProjectionMaintenanceAdapter,
         config: ResidentConfig,
         database_type: str,
         event_logger: Callable[[str], None] | None = None,
@@ -43,6 +56,15 @@ class ResidentIngestor:
         self._service = service
         self._facade = facade
         self._database_admin = database_admin
+        if not isinstance(
+            current_projection_maintenance,
+            CurrentProjectionMaintenanceAdapter,
+        ):
+            raise TypeError(
+                "current_projection_maintenance must implement the bounded "
+                "maintenance protocol"
+            )
+        self._current_projection_maintenance = current_projection_maintenance
         self._config = config
         self._database_type = database_type.casefold()
         self._event_logger = event_logger or logger.info
@@ -50,7 +72,10 @@ class ResidentIngestor:
     def initialize(self) -> SchemaEpochReport:
         """Validate an existing READY epoch without creating or migrating it."""
 
-        return self._database_admin.check()
+        report = self._database_admin.check()
+        self._try_current_projection_maintenance()
+        self._try_current_only_maintenance()
+        return report
 
     def process_available(
         self,
@@ -58,10 +83,32 @@ class ResidentIngestor:
         periodic_scan: bool,
         preflight: Callable[[], None] | None = None,
     ) -> bool:
+        """Process one ingest or maintenance progress unit if available."""
+
+        return (
+            self._process_cycle(periodic_scan=periodic_scan, preflight=preflight)
+            is not _ResidentCycleOutcome.IDLE
+        )
+
+    def _process_cycle(
+        self,
+        *,
+        periodic_scan: bool,
+        preflight: Callable[[], None] | None = None,
+    ) -> _ResidentCycleOutcome:
         lease_duration = self._config.lease_seconds * 1_000_000
+        # A previous bounded sweep may have lost its response, contended on the
+        # EXCLUSIVE gate, or remained blocked by a live predecessor.  Retrying
+        # once before every claim also provides progress while ingest is idle.
+        projection_maintenance = self._try_current_projection_maintenance()
+        if projection_maintenance is CurrentProjectionMaintenanceOutcome.PROGRESSED:
+            return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
+        database_maintenance = self._try_current_only_maintenance(lease_duration)
+        if database_maintenance is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED:
+            return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
         claimed = self._facade.try_claim_ingest(periodic_scan, lease_duration)
         if claimed is None:
-            return False
+            return _ResidentCycleOutcome.IDLE
         session = IngestSessionController(
             self._facade,
             claimed,
@@ -74,6 +121,8 @@ class ResidentIngestor:
             except BaseException as error:
                 try:
                     session.complete()
+                    self._try_current_projection_maintenance()
+                    self._try_current_only_maintenance(lease_duration)
                 except BaseException as completion_error:
                     error.add_note(
                         "The ingest session could not be completed after preflight "
@@ -96,6 +145,8 @@ class ResidentIngestor:
             # stopped so the resident can immediately claim a stable retry.
             try:
                 session.complete()
+                self._try_current_projection_maintenance()
+                self._try_current_only_maintenance(lease_duration)
             except BaseException as completion_error:
                 error.add_note(
                     "The ingest session could not be completed after its source "
@@ -103,20 +154,60 @@ class ResidentIngestor:
                 )
             raise
         completion = session.complete()
+        self._try_current_projection_maintenance()
+        self._try_current_only_maintenance(lease_duration)
         self._event_logger(
             "vNext ingest session completed: "
             f"generation={completion.ingest_generation} "
             f"replayed={completion.replayed}"
         )
-        return True
+        return _ResidentCycleOutcome.INGESTED
+
+    def _try_current_projection_maintenance(
+        self,
+    ) -> CurrentProjectionMaintenanceOutcome | None:
+        """Make one bounded ingest-owned CBZ cleanup attempt."""
+
+        try:
+            outcome = self._current_projection_maintenance.maintain_cleanup()
+            if not isinstance(outcome, CurrentProjectionMaintenanceOutcome):
+                raise TypeError(
+                    "current-projection maintenance returned an invalid outcome"
+                )
+            return outcome
+        except Exception:
+            logger.exception("current-projection maintenance attempt failed")
+            return None
+
+    def _try_current_only_maintenance(
+        self,
+        lease_duration_microseconds: int | None = None,
+    ) -> VNextCurrentOnlyMaintenanceOutcome | None:
+        """Make one bounded current-only sweep attempt without blocking ingest."""
+
+        duration = lease_duration_microseconds
+        if duration is None:
+            duration = self._config.lease_seconds * 1_000_000
+        try:
+            return self._facade.drain_current_only_maintenance(duration)
+        except Exception:
+            # The ingest receipt is already durable when this is called after
+            # completion.  Maintenance is response-loss safe and the resident
+            # retries on the next poll, so a transient failure must not make a
+            # completed ingest appear to have rolled back.
+            logger.exception("current-only maintenance attempt failed")
+            return None
 
     def run_forever(self, *, stop: Event | None = None) -> None:
         stop_event = stop or Event()
         next_periodic = monotonic()
         while not stop_event.is_set():
             periodic = monotonic() >= next_periodic
-            if self.process_available(periodic_scan=periodic):
+            outcome = self._process_cycle(periodic_scan=periodic)
+            if outcome is _ResidentCycleOutcome.INGESTED:
                 next_periodic = monotonic() + self._config.periodic_scan_seconds
+                continue
+            if outcome is _ResidentCycleOutcome.MAINTENANCE_PROGRESSED:
                 continue
             remaining = max(0.0, next_periodic - monotonic())
             stop_event.wait(

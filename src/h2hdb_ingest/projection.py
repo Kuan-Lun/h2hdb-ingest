@@ -12,11 +12,11 @@ __all__ = [
 import fcntl
 import os
 import re
+import secrets
 import sqlite3
 import stat
-import tempfile
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -30,13 +30,27 @@ from h2hdb import (
     VNextCurrentProjectionItem as CurrentProjectionItem,
 )
 
+from .artifact import (
+    _QUARANTINE_PAYLOAD_NAME,
+    ManagedFilesystemArtifactAdapter,
+    _lstat_at,
+    _open_directory_chain,
+    _open_private_quarantine,
+    _PrivateQuarantine,
+    _rename_noreplace,
+    _require_directory_chain_identity,
+    _verify_regular_at,
+)
 from .config import CBZGrouping
+from .maintenance import CurrentProjectionMaintenanceOutcome
 
 _COPY_BUFFER_BYTES = 4 * 1024 * 1024
 _DATABASE_NAME = ".h2hdb-vnext-current-projection.sqlite3"
 _LOCK_NAME = ".h2hdb-vnext-publication.lock"
+_CURRENT_QUARANTINE_NAME = ".h2hdb-vnext-current-quarantine"
 _ARTIFACT_LEAF = re.compile(r"[0-9a-f]{64}\.cbz")
 _MAX_PAGE_ITEMS = 128
+_MAX_CLEANUP_ARTIFACTS_PER_ATTEMPT = 8
 _MAX_FILE_NAME_BYTES = 255
 
 
@@ -49,6 +63,7 @@ class CurrentProjectionAdapter:
         artifact_store_path: Path,
         cbz_path: Path,
         grouping: CBZGrouping,
+        artifact_adapter: ManagedFilesystemArtifactAdapter,
     ) -> None:
         artifact_root = artifact_store_path.resolve(strict=False)
         current_root = cbz_path.resolve(strict=False)
@@ -60,9 +75,16 @@ class CurrentProjectionAdapter:
             raise ValueError("artifact and current-view roots must not be nested")
         if not isinstance(grouping, CBZGrouping):
             raise TypeError("grouping must be CBZGrouping")
+        if not isinstance(artifact_adapter, ManagedFilesystemArtifactAdapter):
+            raise TypeError("artifact_adapter must be ManagedFilesystemArtifactAdapter")
+        if artifact_adapter._root != artifact_root:
+            raise ValueError(
+                "artifact_adapter and current projection must share one artifact root"
+            )
         self._artifact_root = artifact_root
         self._current_root = current_root
         self._grouping = grouping
+        self._artifact_adapter = artifact_adapter
         self._database_path = artifact_root / _DATABASE_NAME
         self._lock_path = artifact_root / _LOCK_NAME
         self._process_lock = RLock()
@@ -142,6 +164,7 @@ class CurrentProjectionAdapter:
                     raise RuntimeError(
                         "installed projection belongs to another publication receipt"
                     )
+                self._prune_artifacts(connection)
                 return CurrentProjectionCheckpoint(
                     target,
                     receipt,
@@ -242,6 +265,75 @@ class CurrentProjectionAdapter:
                 connection.rollback()
                 raise
 
+    def maintain_cleanup(self) -> CurrentProjectionMaintenanceOutcome:
+        """Run one publication-serialized, bounded cleanup action."""
+
+        with self.publication_guard():
+            with self._connection() as connection:
+                return self._prune_artifacts(connection)
+
+    def _prune_artifacts(
+        self,
+        connection: sqlite3.Connection,
+    ) -> CurrentProjectionMaintenanceOutcome:
+        """Forward one outbox page and attempt one fixed artifact page."""
+
+        rows = connection.execute(
+            "SELECT artifact_sha256 FROM artifact_cleanup_candidates "
+            "ORDER BY artifact_sha256 LIMIT ?",
+            (_MAX_CLEANUP_ARTIFACTS_PER_ATTEMPT,),
+        ).fetchall()
+        candidates = tuple(bytes(row[0]) for row in rows)
+        if any(len(digest) != 32 for digest in candidates):
+            raise RuntimeError("artifact cleanup candidate state is corrupt")
+        if candidates:
+            # The projection database is a durable outbox.  A crash after the
+            # idempotent artifact-state enqueue but before this acknowledgement
+            # simply forwards the same digests again on replay.
+            self._artifact_adapter._enqueue_cleanup_candidates(candidates)
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.executemany(
+                    "DELETE FROM artifact_cleanup_candidates "
+                    "WHERE artifact_sha256 = ?",
+                    ((digest,) for digest in candidates),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+        acknowledged = self._artifact_adapter._prune_cleanup_candidates(
+            is_retained=lambda digest: self._projection_retains(connection, digest),
+            limit=_MAX_CLEANUP_ARTIFACTS_PER_ATTEMPT,
+        )
+        projection_pending = connection.execute(
+            "SELECT EXISTS (SELECT 1 FROM artifact_cleanup_candidates)"
+        ).fetchone()
+        if projection_pending is None or projection_pending[0] not in {0, 1}:
+            raise RuntimeError("projection cleanup queue state is corrupt")
+        remaining = (
+            bool(projection_pending[0])
+            or self._artifact_adapter._has_cleanup_candidates()
+        )
+        if not remaining:
+            return CurrentProjectionMaintenanceOutcome.DONE
+        if candidates or acknowledged:
+            return CurrentProjectionMaintenanceOutcome.PROGRESSED
+        return CurrentProjectionMaintenanceOutcome.BLOCKED
+
+    @staticmethod
+    def _projection_retains(connection: sqlite3.Connection, digest: bytes) -> bool:
+        row = connection.execute(
+            "SELECT (EXISTS (SELECT 1 FROM current_projection "
+            "WHERE artifact_sha256 = ?) OR EXISTS ("
+            "SELECT 1 FROM pending_projection WHERE artifact_sha256 = ?))",
+            (digest, digest),
+        ).fetchone()
+        if row is None or row[0] not in {0, 1}:
+            raise RuntimeError("current projection retention state is corrupt")
+        return bool(row[0])
+
     def seal(self, revision: int) -> None:
         target = _revision(revision)
         self._require_guard()
@@ -296,6 +388,15 @@ class CurrentProjectionAdapter:
             self._remove_stale(connection)
             connection.execute("BEGIN IMMEDIATE")
             try:
+                connection.execute(
+                    "INSERT OR IGNORE INTO artifact_cleanup_candidates "
+                    "(artifact_sha256) "
+                    "SELECT DISTINCT current.artifact_sha256 "
+                    "FROM current_projection AS current "
+                    "WHERE NOT EXISTS ("
+                    "SELECT 1 FROM pending_projection AS pending "
+                    "WHERE pending.artifact_sha256 = current.artifact_sha256)"
+                )
                 connection.execute("DELETE FROM current_projection")
                 connection.execute(
                     "INSERT INTO current_projection "
@@ -319,11 +420,13 @@ class CurrentProjectionAdapter:
             except BaseException:
                 connection.rollback()
                 raise
+            self._prune_artifacts(connection)
 
     def _preflight(self, connection: sqlite3.Connection, *, applying: bool) -> None:
         rows = connection.execute(
             "SELECT p.path_name, p.artifact_locator, p.artifact_sha256, "
-            "p.size_bytes, p.authorized, c.path_name "
+            "p.size_bytes, p.authorized, c.path_name, c.artifact_sha256, "
+            "c.device, c.inode, c.size_bytes, c.modified_ns, c.changed_ns "
             "FROM pending_projection AS p LEFT JOIN current_projection AS c "
             "ON c.path_name = p.path_name ORDER BY p.publication_key"
         )
@@ -338,19 +441,30 @@ class CurrentProjectionAdapter:
                     label="immutable artifact",
                 )
                 target = self._current_path(path_name)
-                if not target.exists() and not target.is_symlink():
+                signature = self._safe_current_signature(path_name)
+                if signature is None:
                     continue
                 managed = row[5] is not None
                 authorized = bool(row[4]) and applying
                 if managed:
-                    if target.is_dir() and not target.is_symlink():
-                        raise RuntimeError(
-                            f"managed projection path became a directory: {target}"
+                    expected_signature = _signature_from_row(row[7:])
+                    if signature == expected_signature:
+                        continue
+                    if authorized:
+                        self._verify_current_file(
+                            path_name,
+                            expected_sha256=bytes(row[2]),
+                            expected_size=int(row[3]),
+                            label="recoverable projected artifact",
                         )
-                    continue
+                        continue
+                    raise RuntimeError(
+                        "refusing to replace externally changed managed path: "
+                        f"{target}"
+                    )
                 if authorized:
-                    _verify_regular_file(
-                        target,
+                    self._verify_current_file(
+                        path_name,
                         expected_sha256=bytes(row[2]),
                         expected_size=int(row[3]),
                         label="recoverable projected artifact",
@@ -367,18 +481,23 @@ class CurrentProjectionAdapter:
         )
         while page := stale.fetchmany(_MAX_PAGE_ITEMS):
             for row in page:
-                target = self._current_path(str(row[0]))
-                if not target.exists() and not target.is_symlink():
+                path_name = str(row[0])
+                target = self._current_path(path_name)
+                signature = self._safe_current_signature(path_name)
+                if signature is None:
                     continue
-                if _lstat_signature(target) != _signature_from_row(row[1:]):
+                if signature != _signature_from_row(row[1:]):
                     raise RuntimeError(
                         f"refusing to delete externally changed managed path: {target}"
                     )
 
     def _materialize(self, connection: sqlite3.Connection) -> None:
         rows = connection.execute(
-            "SELECT path_name, artifact_locator, artifact_sha256, size_bytes "
-            "FROM pending_projection ORDER BY publication_key"
+            "SELECT p.path_name, p.artifact_locator, p.artifact_sha256, "
+            "p.size_bytes, c.path_name, c.artifact_sha256, c.device, c.inode, "
+            "c.size_bytes, c.modified_ns, c.changed_ns "
+            "FROM pending_projection AS p LEFT JOIN current_projection AS c "
+            "ON c.path_name = p.path_name ORDER BY p.publication_key"
         )
         while page := rows.fetchmany(_MAX_PAGE_ITEMS):
             for row in page:
@@ -386,36 +505,40 @@ class CurrentProjectionAdapter:
                 digest = bytes(row[2])
                 size_bytes = int(row[3])
                 source = self._artifact_path(str(row[1]), digest)
-                target = self._current_path(path_name)
-                current = connection.execute(
-                    "SELECT artifact_sha256, device, inode, size_bytes, "
-                    "modified_ns, changed_ns FROM current_projection "
-                    "WHERE path_name = ?",
-                    (path_name,),
-                ).fetchone()
-                if current is None and (target.exists() or target.is_symlink()):
-                    _verify_regular_file(
-                        target,
+                managed = row[4] is not None
+                existing_signature = self._safe_current_signature(path_name)
+                if not managed and existing_signature is not None:
+                    signature = self._verify_current_file(
+                        path_name,
                         expected_sha256=digest,
                         expected_size=size_bytes,
                         label="recoverable projected artifact",
                     )
-                    signature = _lstat_signature(target)
-                elif (
-                    current is not None
-                    and bytes(current[0]) == digest
-                    and target.exists()
-                    and not target.is_symlink()
-                    and _lstat_signature(target) == _signature_from_row(current[1:])
-                ):
-                    signature = _signature_from_row(current[1:])
+                elif managed:
+                    current_digest = bytes(row[5])
+                    current_signature = _signature_from_row(row[6:])
+                    if (
+                        existing_signature == current_signature
+                        and current_digest == digest
+                    ):
+                        signature = current_signature
+                    else:
+                        signature = self._atomic_copy(
+                            source,
+                            path_name,
+                            expected_sha256=digest,
+                            expected_size=size_bytes,
+                            replace_managed_digest=current_digest,
+                            replace_managed_signature=current_signature,
+                        )
                 else:
                     signature = self._atomic_copy(
                         source,
-                        target,
+                        path_name,
                         expected_sha256=digest,
                         expected_size=size_bytes,
-                        replace_managed=current is not None,
+                        replace_managed_digest=None,
+                        replace_managed_signature=None,
                     )
                 connection.execute("BEGIN IMMEDIATE")
                 try:
@@ -432,72 +555,475 @@ class CurrentProjectionAdapter:
 
     def _remove_stale(self, connection: sqlite3.Connection) -> None:
         rows = connection.execute(
-            "SELECT c.path_name, c.device, c.inode, c.size_bytes, c.modified_ns, "
-            "c.changed_ns FROM current_projection AS c "
+            "SELECT c.path_name, c.artifact_sha256, c.device, c.inode, "
+            "c.size_bytes, c.modified_ns, c.changed_ns "
+            "FROM current_projection AS c "
             "LEFT JOIN pending_projection AS p ON p.path_name = c.path_name "
             "WHERE p.path_name IS NULL ORDER BY c.path_name"
         )
         while page := rows.fetchmany(_MAX_PAGE_ITEMS):
             for row in page:
-                target = self._current_path(str(row[0]))
-                if not target.exists() and not target.is_symlink():
-                    continue
-                if _lstat_signature(target) != _signature_from_row(row[1:]):
+                self._safe_unlink_current(
+                    str(row[0]),
+                    expected_sha256=bytes(row[1]),
+                    expected_signature=_signature_from_row(row[2:]),
+                )
+
+    def _safe_current_signature(
+        self,
+        path_name: str,
+    ) -> tuple[bytes, bytes, int, int, int] | None:
+        """Read a managed leaf signature through no-follow directory fds."""
+
+        components = self._current_components(path_name)
+        target = self._current_root.joinpath(*components)
+        with _open_directory_chain(
+            self._current_root,
+            components[:-1],
+            label=f"current projection parent is unsafe: {target.parent}",
+            create_mode=0o755,
+        ) as parent_descriptor:
+            value = _lstat_at(parent_descriptor, components[-1])
+            if value is None:
+                return None
+            if not stat.S_ISREG(value.st_mode):
+                raise RuntimeError(f"projection target is not a regular file: {target}")
+            return _signature_from_stat(value)
+
+    def _verify_current_file(
+        self,
+        path_name: str,
+        *,
+        expected_sha256: bytes,
+        expected_size: int,
+        label: str,
+    ) -> tuple[bytes, bytes, int, int, int]:
+        components = self._current_components(path_name)
+        target = self._current_root.joinpath(*components)
+        with _open_directory_chain(
+            self._current_root,
+            components[:-1],
+            label=f"current projection parent is unsafe: {target.parent}",
+        ) as parent_descriptor:
+            try:
+                value = _verify_regular_at(
+                    parent_descriptor,
+                    components[-1],
+                    expected_sha256=expected_sha256,
+                    expected_size=expected_size,
+                )
+            except RuntimeError as error:
+                raise RuntimeError(f"{label} failed verification: {target}") from error
+            return _signature_from_stat(value)
+
+    def _safe_unlink_current(
+        self,
+        path_name: str,
+        *,
+        expected_sha256: bytes,
+        expected_signature: tuple[bytes, bytes, int, int, int],
+    ) -> None:
+        """Quarantine, verify, and unlink one stale managed leaf safely."""
+
+        components = self._current_components(path_name)
+        target = self._current_root.joinpath(*components)
+        with _open_directory_chain(
+            self._current_root,
+            components[:-1],
+            label=f"current projection parent is unsafe: {target.parent}",
+        ) as parent_descriptor:
+            with _open_private_quarantine(
+                self._current_root,
+                namespace_name=_CURRENT_QUARANTINE_NAME,
+                object_name=_quarantine_object_name(
+                    "stale",
+                    path_name,
+                    expected_sha256,
+                ),
+                label=f"stale projection quarantine is unsafe: {target}",
+            ) as quarantine:
+                leaf = components[-1]
+                leaf_value = _lstat_at(parent_descriptor, leaf)
+                payload_value = _lstat_at(
+                    quarantine.object_descriptor,
+                    _QUARANTINE_PAYLOAD_NAME,
+                )
+                if payload_value is not None:
+                    if leaf_value is not None:
+                        raise RuntimeError(
+                            f"refusing competing stale cleanup state: {target}"
+                        )
+                else:
+                    if leaf_value is None:
+                        quarantine.remove_empty()
+                        return
+                    if (
+                        not stat.S_ISREG(leaf_value.st_mode)
+                        or _signature_from_stat(leaf_value) != expected_signature
+                    ):
+                        raise RuntimeError(
+                            "refusing to delete externally changed managed path: "
+                            f"{target}"
+                        )
+                    try:
+                        _rename_noreplace(
+                            leaf,
+                            _QUARANTINE_PAYLOAD_NAME,
+                            source_descriptor=parent_descriptor,
+                            destination_descriptor=quarantine.object_descriptor,
+                        )
+                    except FileExistsError as error:
+                        raise RuntimeError(
+                            "stale projection quarantine destination changed: "
+                            f"{target}"
+                        ) from error
+                    os.fsync(parent_descriptor)
+                    os.fsync(quarantine.object_descriptor)
+                quarantine.validate({_QUARANTINE_PAYLOAD_NAME})
+                _require_directory_chain_identity(
+                    self._current_root,
+                    components[:-1],
+                    parent_descriptor,
+                    label=f"current projection parent changed: {target.parent}",
+                )
+                verified = self._verify_quarantined_current(
+                    quarantine,
+                    target=target,
+                    expected_sha256=expected_sha256,
+                    expected_signature=expected_signature,
+                    operation="stale projection",
+                )
+                if _lstat_at(parent_descriptor, leaf) is not None:
                     raise RuntimeError(
-                        f"refusing to delete externally changed managed path: {target}"
+                        f"refusing competing stale cleanup state: {target}"
                     )
-                target.unlink()
-                _fsync_directory(target.parent)
+                quarantine.validate({_QUARANTINE_PAYLOAD_NAME})
+                verified_again = self._verify_quarantined_current(
+                    quarantine,
+                    target=target,
+                    expected_sha256=expected_sha256,
+                    expected_signature=expected_signature,
+                    operation="stale projection",
+                )
+                if (verified.st_dev, verified.st_ino) != (
+                    verified_again.st_dev,
+                    verified_again.st_ino,
+                ):
+                    raise RuntimeError(
+                        f"stale projection quarantine changed identity: {target}"
+                    )
+                # The publication lock and private 0700 object directory exclude
+                # every authorized writer after this second verification.
+                os.unlink(
+                    _QUARANTINE_PAYLOAD_NAME,
+                    dir_fd=quarantine.object_descriptor,
+                )
+                os.fsync(quarantine.object_descriptor)
+                quarantine.remove_empty()
+
+    @staticmethod
+    def _verify_quarantined_current(
+        quarantine: _PrivateQuarantine,
+        *,
+        target: Path,
+        expected_sha256: bytes,
+        expected_signature: tuple[bytes, bytes, int, int, int],
+        operation: str,
+    ) -> os.stat_result:
+        try:
+            verified = _verify_regular_at(
+                quarantine.object_descriptor,
+                _QUARANTINE_PAYLOAD_NAME,
+                expected_sha256=expected_sha256,
+                expected_size=expected_signature[2],
+            )
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"{operation} quarantine failed verification: {target}"
+            ) from error
+        if (
+            verified.st_dev.to_bytes(8, "big") != expected_signature[0]
+            or verified.st_ino.to_bytes(8, "big") != expected_signature[1]
+        ):
+            raise RuntimeError(f"{operation} quarantine changed identity: {target}")
+        return verified
 
     def _atomic_copy(
         self,
         source: Path,
-        target: Path,
+        path_name: str,
         *,
         expected_sha256: bytes,
         expected_size: int,
-        replace_managed: bool,
+        replace_managed_digest: bytes | None,
+        replace_managed_signature: tuple[bytes, bytes, int, int, int] | None,
     ) -> tuple[bytes, bytes, int, int, int]:
-        self._ensure_current_parent(target.parent)
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=".h2hdb-current-",
-            suffix=".tmp",
-            dir=target.parent,
+        if (replace_managed_digest is None) != (replace_managed_signature is None):
+            raise RuntimeError("managed replacement evidence is incomplete")
+        components = self._current_components(path_name)
+        target = self._current_root.joinpath(*components)
+        with _open_directory_chain(
+            self._current_root,
+            components[:-1],
+            label=f"current projection parent is unsafe: {target.parent}",
+            create_mode=0o755,
+        ) as parent_descriptor:
+            leaf = components[-1]
+            temporary = f".h2hdb-current-{secrets.token_hex(16)}.tmp"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(
+                temporary,
+                flags,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+            digest = sha256()
+            size_bytes = 0
+            temporary_inode: tuple[int, int] | None = None
+            try:
+                os.fchmod(descriptor, 0o644)
+                source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                with (
+                    os.fdopen(
+                        os.open(source, source_flags),
+                        "rb",
+                        closefd=True,
+                    ) as reader,
+                    os.fdopen(descriptor, "wb", closefd=False) as writer,
+                ):
+                    while part := reader.read(_COPY_BUFFER_BYTES):
+                        digest.update(part)
+                        size_bytes += len(part)
+                        writer.write(part)
+                    writer.flush()
+                    os.fsync(writer.fileno())
+                temporary_value = os.fstat(descriptor)
+                temporary_inode = (temporary_value.st_dev, temporary_value.st_ino)
+            finally:
+                os.close(descriptor)
+            try:
+                if digest.digest() != expected_sha256 or size_bytes != expected_size:
+                    raise RuntimeError(
+                        "immutable artifact changed during projection copy"
+                    )
+                with ExitStack() as quarantine_stack:
+                    quarantine = (
+                        quarantine_stack.enter_context(
+                            _open_private_quarantine(
+                                self._current_root,
+                                namespace_name=_CURRENT_QUARANTINE_NAME,
+                                object_name=_quarantine_object_name(
+                                    "replace",
+                                    path_name,
+                                    replace_managed_digest,
+                                ),
+                                label=(
+                                    "managed replacement quarantine is unsafe: "
+                                    f"{target}"
+                                ),
+                            )
+                        )
+                        if replace_managed_digest is not None
+                        else None
+                    )
+                    quarantine_owned = False
+                    if quarantine is not None:
+                        assert replace_managed_digest is not None
+                        assert replace_managed_signature is not None
+                        quarantine_owned = self._prepare_managed_replacement(
+                            parent_descriptor,
+                            leaf=leaf,
+                            quarantine=quarantine,
+                            target=target,
+                            old_sha256=replace_managed_digest,
+                            old_signature=replace_managed_signature,
+                            new_sha256=expected_sha256,
+                            new_size=expected_size,
+                        )
+                        _require_directory_chain_identity(
+                            self._current_root,
+                            components[:-1],
+                            parent_descriptor,
+                            label=(
+                                "current projection parent changed: " f"{target.parent}"
+                            ),
+                        )
+                    if _lstat_at(parent_descriptor, leaf) is None:
+                        try:
+                            os.link(
+                                temporary,
+                                leaf,
+                                src_dir_fd=parent_descriptor,
+                                dst_dir_fd=parent_descriptor,
+                                follow_symlinks=False,
+                            )
+                        except FileExistsError as error:
+                            raise RuntimeError(
+                                "refusing to replace competing current-view path: "
+                                f"{target}"
+                            ) from error
+                    current_temporary = _lstat_at(parent_descriptor, temporary)
+                    if (
+                        temporary_inode is None
+                        or current_temporary is None
+                        or (
+                            current_temporary.st_dev,
+                            current_temporary.st_ino,
+                        )
+                        != temporary_inode
+                    ):
+                        raise RuntimeError(
+                            f"projection temporary changed before install: {target}"
+                        )
+                    os.unlink(temporary, dir_fd=parent_descriptor)
+                    temporary_inode = None
+                    os.fsync(parent_descriptor)
+                    installed = _verify_regular_at(
+                        parent_descriptor,
+                        leaf,
+                        expected_sha256=expected_sha256,
+                        expected_size=expected_size,
+                    )
+                    if quarantine is not None:
+                        if quarantine_owned:
+                            assert replace_managed_digest is not None
+                            assert replace_managed_signature is not None
+                            verified_old = self._verify_quarantined_current(
+                                quarantine,
+                                target=target,
+                                expected_sha256=replace_managed_digest,
+                                expected_signature=replace_managed_signature,
+                                operation="managed replacement",
+                            )
+                            quarantine.validate({_QUARANTINE_PAYLOAD_NAME})
+                            verified_old_again = self._verify_quarantined_current(
+                                quarantine,
+                                target=target,
+                                expected_sha256=replace_managed_digest,
+                                expected_signature=replace_managed_signature,
+                                operation="managed replacement",
+                            )
+                            if (verified_old.st_dev, verified_old.st_ino) != (
+                                verified_old_again.st_dev,
+                                verified_old_again.st_ino,
+                            ):
+                                raise RuntimeError(
+                                    "managed replacement quarantine changed "
+                                    f"identity: {target}"
+                                )
+                            _require_directory_chain_identity(
+                                self._current_root,
+                                components[:-1],
+                                parent_descriptor,
+                                label=(
+                                    "current projection parent changed: "
+                                    f"{target.parent}"
+                                ),
+                            )
+                            # The publication lock and private 0700 object
+                            # directory exclude every authorized writer after
+                            # the second verification above.
+                            os.unlink(
+                                _QUARANTINE_PAYLOAD_NAME,
+                                dir_fd=quarantine.object_descriptor,
+                            )
+                            os.fsync(quarantine.object_descriptor)
+                        quarantine.remove_empty()
+                    os.fsync(parent_descriptor)
+                    return _signature_from_stat(installed)
+            finally:
+                if temporary_inode is not None:
+                    current_temporary = _lstat_at(parent_descriptor, temporary)
+                    if (
+                        current_temporary is not None
+                        and (
+                            current_temporary.st_dev,
+                            current_temporary.st_ino,
+                        )
+                        == temporary_inode
+                    ):
+                        os.unlink(temporary, dir_fd=parent_descriptor)
+                        os.fsync(parent_descriptor)
+
+    @staticmethod
+    def _prepare_managed_replacement(
+        parent_descriptor: int,
+        *,
+        leaf: str,
+        quarantine: _PrivateQuarantine,
+        target: Path,
+        old_sha256: bytes,
+        old_signature: tuple[bytes, bytes, int, int, int],
+        new_sha256: bytes,
+        new_size: int,
+    ) -> bool:
+        leaf_value = _lstat_at(parent_descriptor, leaf)
+        payload_value = _lstat_at(
+            quarantine.object_descriptor,
+            _QUARANTINE_PAYLOAD_NAME,
         )
-        temporary = Path(temporary_name)
-        digest = sha256()
-        size_bytes = 0
-        try:
-            os.fchmod(descriptor, 0o644)
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            with (
-                os.fdopen(os.open(source, flags), "rb", closefd=True) as reader,
-                os.fdopen(descriptor, "wb", closefd=True) as writer,
-            ):
-                while part := reader.read(_COPY_BUFFER_BYTES):
-                    digest.update(part)
-                    size_bytes += len(part)
-                    writer.write(part)
-                writer.flush()
-                os.fsync(writer.fileno())
-            if digest.digest() != expected_sha256 or size_bytes != expected_size:
-                raise RuntimeError("immutable artifact changed during projection copy")
-            if replace_managed:
-                os.replace(temporary, target)
-            else:
+        if payload_value is not None:
+            if leaf_value is not None:
                 try:
-                    os.link(temporary, target, follow_symlinks=False)
+                    _verify_regular_at(
+                        parent_descriptor,
+                        leaf,
+                        expected_sha256=new_sha256,
+                        expected_size=new_size,
+                    )
+                except RuntimeError as error:
+                    raise RuntimeError(
+                        f"refusing competing managed replacement: {target}"
+                    ) from error
+        else:
+            if leaf_value is None:
+                return False
+            if _signature_from_stat(leaf_value) == old_signature:
+                try:
+                    _rename_noreplace(
+                        leaf,
+                        _QUARANTINE_PAYLOAD_NAME,
+                        source_descriptor=parent_descriptor,
+                        destination_descriptor=quarantine.object_descriptor,
+                    )
                 except FileExistsError as error:
                     raise RuntimeError(
-                        f"refusing to replace unknown current-view path: {target}"
+                        "managed replacement quarantine destination changed: "
+                        f"{target}"
                     ) from error
-                # Removing the temporary hard link changes the inode ctime, so
-                # do it before capturing the durable target signature.
-                temporary.unlink()
-            _fsync_directory(target.parent)
-            return _lstat_signature(target)
-        finally:
-            temporary.unlink(missing_ok=True)
+                os.fsync(parent_descriptor)
+                os.fsync(quarantine.object_descriptor)
+                leaf_value = None
+            else:
+                try:
+                    _verify_regular_at(
+                        parent_descriptor,
+                        leaf,
+                        expected_sha256=new_sha256,
+                        expected_size=new_size,
+                    )
+                except RuntimeError as error:
+                    raise RuntimeError(
+                        "refusing to replace externally changed managed path: "
+                        f"{target}"
+                    ) from error
+                return False
+        quarantine.validate({_QUARANTINE_PAYLOAD_NAME})
+        CurrentProjectionAdapter._verify_quarantined_current(
+            quarantine,
+            target=target,
+            expected_sha256=old_sha256,
+            expected_signature=old_signature,
+            operation="managed replacement",
+        )
+        if leaf_value is not None:
+            _verify_regular_at(
+                parent_descriptor,
+                leaf,
+                expected_sha256=new_sha256,
+                expected_size=new_size,
+            )
+        return True
 
     def _friendly_path(self, item: CurrentProjectionItem) -> str:
         leaf = _friendly_leaf(item.gid, item.source_gallery_name)
@@ -517,6 +1043,10 @@ class CurrentProjectionAdapter:
         return self._artifact_root.joinpath(*components)
 
     def _current_path(self, path_name: str) -> Path:
+        return self._current_root.joinpath(*self._current_components(path_name))
+
+    @staticmethod
+    def _current_components(path_name: str) -> tuple[str, ...]:
         pure = PurePosixPath(path_name)
         if (
             pure.is_absolute()
@@ -524,15 +1054,7 @@ class CurrentProjectionAdapter:
             or any(part in {"", ".", ".."} for part in pure.parts)
         ):
             raise RuntimeError("projection state contains an unsafe path")
-        return self._current_root.joinpath(*pure.parts)
-
-    def _ensure_current_parent(self, directory: Path) -> None:
-        directory.mkdir(mode=0o755, parents=True, exist_ok=True)
-        current = directory
-        while current != self._current_root:
-            _require_directory(current, label="current projection parent")
-            current = current.parent
-        _require_directory(self._current_root, label="current projection root")
+        return pure.parts
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -575,6 +1097,8 @@ class CurrentProjectionAdapter:
                     modified_ns INTEGER NOT NULL,
                     changed_ns INTEGER NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS current_projection_artifact_sha256_idx
+                    ON current_projection(artifact_sha256);
                 CREATE TABLE IF NOT EXISTS pending_projection (
                     publication_key BLOB PRIMARY KEY,
                     path_name TEXT NOT NULL UNIQUE,
@@ -590,6 +1114,12 @@ class CurrentProjectionAdapter:
                     inode BLOB NULL,
                     modified_ns INTEGER NULL,
                     changed_ns INTEGER NULL
+                );
+                CREATE INDEX IF NOT EXISTS pending_projection_artifact_sha256_idx
+                    ON pending_projection(artifact_sha256);
+                CREATE TABLE IF NOT EXISTS artifact_cleanup_candidates (
+                    artifact_sha256 BLOB PRIMARY KEY
+                        CHECK (length(artifact_sha256) = 32)
                 );
                 """)
             if connection.execute(
@@ -722,10 +1252,7 @@ def _verify_regular_file(
         raise RuntimeError(f"{label} has an unexpected digest: {path}")
 
 
-def _lstat_signature(path: Path) -> tuple[bytes, bytes, int, int, int]:
-    value = path.lstat()
-    if not stat.S_ISREG(value.st_mode):
-        raise RuntimeError(f"projection target is not a regular file: {path}")
+def _signature_from_stat(value: os.stat_result) -> tuple[bytes, bytes, int, int, int]:
     return (
         value.st_dev.to_bytes(8, "big"),
         value.st_ino.to_bytes(8, "big"),
@@ -733,6 +1260,18 @@ def _lstat_signature(path: Path) -> tuple[bytes, bytes, int, int, int]:
         value.st_mtime_ns,
         value.st_ctime_ns,
     )
+
+
+def _quarantine_object_name(kind: str, path_name: str, digest: bytes) -> str:
+    if not re.fullmatch(r"[a-z]+", kind) or type(digest) is not bytes:
+        raise RuntimeError("invalid current projection quarantine identity")
+    identity = sha256()
+    identity.update(kind.encode("ascii"))
+    identity.update(b"\0")
+    identity.update(path_name.encode("utf-8"))
+    identity.update(b"\0")
+    identity.update(digest)
+    return f"{kind}-{identity.hexdigest()}"
 
 
 def _signature_from_row(row: Sequence[object]) -> tuple[bytes, bytes, int, int, int]:
@@ -754,11 +1293,3 @@ def _signature_from_row(row: Sequence[object]) -> tuple[bytes, bytes, int, int, 
         modified_ns,
         changed_ns,
     )
-
-
-def _fsync_directory(directory: Path) -> None:
-    descriptor = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)

@@ -24,6 +24,12 @@ One ingest turn performs these steps:
    SQLite, reconcile the current Komga view, and only then finalize publication
    in core.
 6. Complete the ingest session.
+7. Advance one bounded page in each ingest-owned CBZ cleanup queue.
+8. After the SHARED session gate is released, make one response-loss-safe core
+   current-only maintenance attempt. A typed local or core `PROGRESSED` outcome
+   is retried immediately without resetting the periodic deadline; `BLOCKED`,
+   `CONTENDED`, `DONE`, and transient failures use the ordinary idle poll
+   cadence.
 
 Database operations and local work are split explicitly. The controller lock
 is held only for a bounded core issue or commit call. Directory walks, hashing,
@@ -41,16 +47,34 @@ between pages fails closed.
 
 CBZ-enabled deployments use two different, non-nested roots:
 
-- `artifact_store_path` contains immutable, content-addressed artifacts and
-  ingest-owned coordination journals. Published artifacts remain available to
-  historical catalog revisions.
+- `artifact_store_path` contains content-addressed artifacts and ingest-owned
+  coordination journals. It retains current and bounded pending/protected
+  artifacts; released old artifacts are reclaimed after a new current
+  projection reconciles.
 - `cbz_path` contains only the friendly current projection for Komga.
 
 The artifact adapter verifies the expected SHA-256 while materializing each
 archive and never mutates an existing content-addressed artifact. Protection
-and release tokens are monotone and crash-safe.
+and release transitions are crash-safe. When neither the current nor pending
+projection references a released artifact, bounded cleanup verifies its exact
+digest and regular-file type, unlinks it, and removes its artifact row. Cleanup
+is driven by a durable released-digest queue; the terminal `RELEASED` token
+tombstone remains permanently so a delayed protect cannot resurrect reclaimed
+bytes. Symlinks, unknown paths, and externally changed bytes fail closed.
+Cleanup first captures a managed leaf with an atomic no-replace rename into a
+private mode-0700 quarantine namespace under the same filesystem root. Only the
+publication-lock-holding adapter may mutate that namespace. Unexpected owner,
+mode, inode, or directory entries preserve the quarantined bytes and fail
+closed without acknowledging the durable candidate.
+`CurrentProjectionMaintenanceAdapter.maintain_cleanup()` is the public bounded
+resident action: one call advances at most eight projection-outbox candidates
+and eight artifact-queue candidates. It reports `PROGRESSED` only when durable
+work committed and more remains, `BLOCKED` when protected bytes leave work but
+no progress, and `DONE` when both queues are empty. The resident calls it before
+every ingest claim and once after session completion, so a backlog larger than
+one page drains without a restart or another publication.
 
-The current projection is built from a complete pinned core publication. It is
+The current projection is built from the complete current core publication. It is
 spooled before any friendly path changes, uses atomic copies, and records both
 artifact identity and a durable regular-file stat signature. Unknown paths are
 never overwritten or removed. A managed path that became a symlink, directory,

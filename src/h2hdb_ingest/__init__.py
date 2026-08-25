@@ -9,6 +9,8 @@ __all__ = [
     "CurrentProjectionAdapter",
     "CurrentProjectionCheckpoint",
     "CurrentProjectionItem",
+    "CurrentProjectionMaintenanceAdapter",
+    "CurrentProjectionMaintenanceOutcome",
     "CurrentProjectionStatus",
     "FilesystemEntryType",
     "FilesystemGalleryObservation",
@@ -45,6 +47,10 @@ from .filesystem import (
     FilesystemObservationError,
     FilesystemPage,
     FilesystemSource,
+)
+from .maintenance import (
+    CurrentProjectionMaintenanceAdapter,
+    CurrentProjectionMaintenanceOutcome,
 )
 from .policy import build_ingest_policy
 from .projection import (
