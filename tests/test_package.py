@@ -24,7 +24,7 @@ def test_distribution_commands_target_vnext_entry_points() -> None:
     )["project"]
 
     assert project["name"] == "h2hdb-ingest"
-    assert project["version"] == "0.4.9"
+    assert project["version"] == "0.4.10"
     assert project["scripts"] == {
         "h2hdb-ingest": "h2hdb_ingest.__main__:main",
         "h2hdb-ingest-bootstrap": "h2hdb_ingest.bootstrap:main",
