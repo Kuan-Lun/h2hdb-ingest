@@ -174,13 +174,18 @@ def synchronize_analysis(
                     prepared,
                 )
             )
+            # outside_session invokes its callback before this loop advances.
             prepared_step = session.outside_session(
-                lambda facade: facade.prepare_analysis_step(prepared, issued)
+                lambda facade: facade.prepare_analysis_step(
+                    prepared,
+                    issued,  # noqa: B023
+                )
             )
+            # call invokes its callback before prepared_step can be reassigned.
             result = session.call(
                 lambda facade, receipt: facade.commit_analysis_step(
                     receipt,
-                    prepared_step,
+                    prepared_step,  # noqa: B023
                 )
             )
             _require_analysis_result(result)
@@ -217,19 +222,21 @@ def synchronize_publication(
         issued = session.call(
             lambda facade, receipt: facade.issue_publication_step(receipt, policy)
         )
+        # outside_session invokes its callback before this loop advances.
         prepared = session.outside_session(
             lambda facade: facade.prepare_publication_step(
-                issued,
+                issued,  # noqa: B023
                 artifact_adapters=artifact_adapters,
                 finalization_adapters=finalization_adapters,
                 current_projection=current_projection,
             )
         )
         with prepared:
+            # call invokes its callback before prepared can be reassigned.
             result = session.call(
                 lambda facade, receipt: facade.commit_publication_step(
                     receipt,
-                    prepared,
+                    prepared,  # noqa: B023
                 )
             )
         _require_publication_result(result)
@@ -258,13 +265,18 @@ def synchronize_source(
                     prepared,
                 )
             )
+            # outside_session invokes its callback before this loop advances.
             prepared_step = session.outside_session(
-                lambda facade: facade.prepare_source_step(prepared, issued)
+                lambda facade: facade.prepare_source_step(
+                    prepared,
+                    issued,  # noqa: B023
+                )
             )
+            # call invokes its callback before prepared_step can be reassigned.
             result = session.call(
                 lambda facade, receipt: facade.commit_source_step(
                     receipt,
-                    prepared_step,
+                    prepared_step,  # noqa: B023
                 )
             )
             _require_source_result(result)

@@ -79,28 +79,29 @@ larger profile with `H2HDB_HYPOTHESIS_PROFILE=nightly`; neither profile uses a
 wall-clock assertion or deadline.
 
 ```bash
-uv run --no-sync pytest tests/test_vnext_incremental_state_machine.py
+.venv/bin/pytest tests/test_vnext_incremental_state_machine.py
 H2HDB_HYPOTHESIS_PROFILE=nightly \
-  uv run --no-sync pytest tests/test_vnext_incremental_state_machine.py
+  .venv/bin/pytest tests/test_vnext_incremental_state_machine.py
 ```
 
 ## Commands
 
 ```bash
-uv run --no-sync python scripts/verify-formal.py lean
-uv run --no-sync python scripts/fetch-formal-tools.py
-uv run --no-sync python scripts/verify-formal.py tla \
+.venv/bin/python scripts/verify-formal.py lean
+.venv/bin/python scripts/fetch-formal-tools.py
+.venv/bin/python scripts/verify-formal.py tla \
   --tla-jar .formal-tools/tla2tools-1.7.4.jar
 ```
 
 Tool versions and checksums are pinned in `tools.lock.toml`. The `Small` TLA+
 configuration is the required finite profile; `Deep` is manual/nightly. A TLC
 success covers every reachable state for the chosen finite constants, not
-arbitrary corpus size.
+arbitrary corpus size. The default `auto` runtime uses host Java when available,
+then falls back to the digest-pinned, network-off Docker runtime.
 
 Run the larger profile explicitly:
 
 ```bash
-uv run --no-sync python scripts/verify-formal.py tla \
+.venv/bin/python scripts/verify-formal.py tla \
   --tla-jar .formal-tools/tla2tools-1.7.4.jar --deep
 ```

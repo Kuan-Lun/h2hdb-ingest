@@ -161,21 +161,25 @@ operator-managed ACL.
 This repository uses a `src` layout and a repository-local virtual environment:
 
 ```bash
-uv venv --python 3.14
-uv pip install -e "../h2h-galleryinfo-parser.clone" \
-  -e "../h2hdb.clone" -e ".[dev]"
-uv run --no-sync ruff check .
-uv run --no-sync black --check .
-uv run --no-sync mypy src tests scripts/bootstrap-catalog.py
-uv run --no-sync pytest
-uv run --no-sync python -m build
+./scripts/rebuild-env.sh
+./scripts/check-fast.sh
+./scripts/check-full.sh
+```
+
+Dependencies resolve from the configured package index. An integration task
+may override a dependency explicitly without relying on sibling checkouts:
+
+```bash
+./scripts/rebuild-env.sh \
+  --source h2hdb=/tmp/h2hdb.whl \
+  --source h2h-galleryinfo-parser='git+https://github.com/Kuan-Lun/h2h-galleryinfo-parser.git@ref'
 ```
 
 The source-to-analysis-to-publication resident E2E runs against SQLite by
 default. Enable its pinned MariaDB 10.11.11 testcontainer with Docker available:
 
 ```bash
-H2HDB_TEST_MARIADB=1 uv run --no-sync pytest tests/test_runtime_e2e.py
+H2HDB_TEST_MARIADB=1 .venv/bin/pytest tests/test_runtime_e2e.py
 ```
 
 The PyPI validation workflow always enables the MariaDB case.
@@ -191,8 +195,16 @@ The TLA+ model covers crash-safe current-projection behavior. Run the required
 formal checks with:
 
 ```bash
-uv run --no-sync python scripts/verify-formal.py lean
-uv run --no-sync python scripts/fetch-formal-tools.py
-uv run --no-sync python scripts/verify-formal.py tla \
+.venv/bin/python scripts/verify-formal.py lean
+.venv/bin/python scripts/fetch-formal-tools.py
+.venv/bin/python scripts/verify-formal.py tla \
   --tla-jar .formal-tools/tla2tools-1.7.4.jar
 ```
+
+TLC uses host Java when available. If no working JRE is present, the default
+`auto` mode falls back to the digest-pinned, network-off Docker runtime in
+`tools.lock.toml`.
+
+## License
+
+GNU General Public License v3.0 only. See [LICENSE](LICENSE).

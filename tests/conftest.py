@@ -41,8 +41,7 @@ def mariadb_container() -> Iterator[Any]:
         started = container.start()
     except Exception as error:
         pytest.fail(
-            f"MariaDB tests were enabled but the testcontainer is unavailable: "
-            f"{error}",
+            f"MariaDB tests were enabled but the testcontainer is unavailable: {error}",
             pytrace=False,
         )
     try:

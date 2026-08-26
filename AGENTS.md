@@ -1,145 +1,224 @@
-# Agent Instructions
+# AGENTS.md
 
-## Project
+## 政策來源
 
-`h2hdb-ingest` is the filesystem-facing ingest service for H2HDB. Python must
-be run through `uv run --no-sync`, using the repository-local virtual
-environment. The supported Python version is defined by `requires-python` in
-`pyproject.toml`.
+- 本檔是此 repository 的唯一代理開發政策來源。
+- 其他代理入口只能要求完整閱讀本檔，不得複製另一份政策。
+- 可執行規則以 repository 內的 scripts 與設定檔為準。
 
-## Ownership Boundary
+## 溝通
 
-This repository owns:
+- 最終回覆一律使用繁體中文。
+- 程式碼、識別字、命令、檔名與 commit message 可使用英文。
+- 不得為了承載回覆而新增 Markdown 文件。
+- 移除 compatibility path、改變公開行為或採用例外時，必須在對話及
+  最終回覆中明確說明。
 
-- deterministic, keyset-paged filesystem discovery and `galleryinfo.txt` parsing;
-- exact source-byte observations and consumer-side artifact rendering/storage;
-- crash-safe Komga current-view reconciliation;
-- the resident ingest loop and ingest-lease heartbeat orchestration.
+## 設計與修改原則
 
-Keep the src layout (`src/h2hdb_ingest`); the public import package is
-`h2hdb_ingest`. Do not move the package to the repository root merely to match
-an older project.
+- 不預設存在最小修改或向後相容要求。
+- 在任務範圍內選擇架構、可讀性與可測試性最好的完整結果。
+- 綜合考慮 SOLID、KISS、YAGNI、內聚性與低耦合。
+- 必要的局部重構可直接納入任務。
+- 若會實質擴大任務範圍、改變原要求未涵蓋的公開行為，或引入資料遷移，
+  必須先取得使用者同意。
+- 任務直接涉及的 legacy compatibility code 應移除，不保留 shim；不全面
+  清理與任務無關的 legacy code。
+- generated output 不得直接修改；必須修改 generator 或 source 後重新產生。
 
-The `h2hdb` core package exclusively owns connectors, transactions, database
-schema/epoch administration, durable queues, token-fenced coordination, source
-checkpoints, analysis and deduplication policy, catalog repositories, artifact
-selection, and publication. Depend only on the public vNext facade, protocols,
-and domain receipts; never import core repository or connector internals and
-never recreate the removed `H2HDB` compatibility surface. Consumer startup
-calls `VNextDatabaseAdminFacade.check()` and must never initialize or migrate
-the core schema.
+## 工作樹與 Git
 
-Every core operation follows an issue/prepare/commit split. Hold the session
-controller lock only for a bounded database issue or commit call. Filesystem
-scans, hashing, image/ZIP work, artifact storage, projection spooling, and other
-local I/O run outside that lock so the heartbeat can renew the exact session
-receipt. Never supply registry surrogate IDs; construct immutable natural
-`VNextIngestPolicy` facts and let the core resolve or allocate authority.
+- 唯讀分析不建立 branch。
+- 凡會修改 tracked files 的任務，使用
+  `scripts/detect-primary-branch.sh` 判定 primary，並建立專用 task branch。
+- 不得 stash、reset、clean、覆寫或混入既有使用者修改。
+- 工作樹不乾淨時，從 committed primary 建立獨立 worktree。
+- task branch 可包含多個邏輯 Conventional Commits。避免巨大 commit；小而
+  內聚的任務仍可只有一個 commit。
+- 任務完成後執行 `scripts/git-flow-merge.sh`。該腳本負責完整 gate、
+  `--no-ff` merge、安全移除 task worktree，以及以 `git branch -d`
+  刪除已合併的本機 branch。
+- primary 在任務期間可以推進；整合只要求 primary 與 task branch 有共同
+  ancestor，不要求 task branch 仍直接基於目前 primary tip。
+- merge conflict 或 gate failure 時必須 abort merge 並保留 task branch。
+- merge 後收到的任何 follow-up 都建立新的 task branch。
+- 本機 task branch、commit、`--no-ff` merge 與 `branch -d` 已獲預先
+  授權。
+- fetch、pull、push、remote branch、tag、release、publish、deploy 與任何
+  force 操作仍須逐次明確授權。
+- 不得使用 `--no-verify`。
 
-CBZ operation uses two distinct, non-nested roots. `artifact_store_path` owns
-content-addressed artifacts and reconciliation state for OPDS;
-`cbz_path` owns only the current friendly-file projection for Komga. Update the
-Komga projection only after catalog publication succeeds, and remove only paths
-recorded as managed in artifact-store state. Never replace or delete an unknown
-file in the Komga root.
+## 提交格式
 
-Every CBZ-enabled publisher must use the same shared `artifact_store_path` as
-its coordination domain. Acquire the artifact-store publication flock before
-the bounded core publication calls and hold it through projection and core
-finalization; never acquire these locks in the reverse order. The OS releases
-the flock if a process exits, and the durable pending projection journal is the
-source of truth for crash recovery.
-Persist the current projection's artifact identity and regular-file stat
-signature. Skip a projection copy only when both still match; any external
-mutation must be reverified with an atomic copy.
-After a new revision reconciles, forward a bounded page from the durable
-projection outbox into the artifact database's durable released-digest queue
-under the same publication lock. Each cleanup attempt scans only that queue and
-deletes artifact bytes/state referenced by neither current nor pending
-projection. Retain every protected artifact and every terminal `RELEASED` token
-tombstone, and reject symlinks or externally changed bytes.
-Artifact and current-view quarantine namespaces are private mode-0700 adapter
-capabilities under their respective roots. Only the lock-holding adapter may
-create or mutate their entries; any unexpected owner, mode, inode, or entry
-change fails closed without acknowledging cleanup. The public ingest
-current-projection maintenance action advances at most one eight-item page in
-each durable cleanup queue. The resident invokes it before every claim and once
-after session completion. Retry local or core `PROGRESSED` immediately without
-resetting the periodic deadline; local `BLOCKED`, core `BLOCKED`/`CONTENDED`,
-`DONE`, and transient failures continue on the ordinary idle/pre-claim poll
-cadence. After session completion, also attempt the public core current-only
-maintenance drain once.
+- 所有非 merge commit 必須符合 Conventional Commits。
+- Breaking change 使用 `type!:` 或 `BREAKING CHANGE:` footer。
+- project version 更新使用獨立 commit：
+  `chore(release): bump version to X.Y.Z`。
 
-## Environment and Commands
+## 版本政策
 
-This is a standalone repository, not a uv workspace. `uv.lock` is ignored and
-must not become a build, test, or runtime input.
+- `pyproject.toml` 的 `[project].version` 是唯一 project version source。
+- project version 固定使用 `X.Y.Z`。
+- 1.0 前，`Y` 是 compatibility lane，`Z` 是同一 lane 內的相容 release
+  counter。相容修正或功能遞增 `Z`；breaking change 遞增 `Y` 並將
+  `Z` 歸零。
+- 1.0 後使用標準 Semantic Versioning。
+- 整個 task branch 只在整合前更新一次 project version。
+- shipped runtime 或 deployment surface 有變更時，至少需要相容升版。
+- Breaking API、CLI、config、schema、protocol、資料格式或 Python/platform
+  support 變更必須提高 compatibility lane 或 major。
+- tests、一般文件、IDE、hooks、CI 與 dev-only tooling 單獨變更時不升版。
+- 未分類路徑必須明確判定 impact，不得靜默當作 `none`。
+- `Version-Impact: none` 必須附具體理由，並在最終回覆揭露。
+- project version 變更必須觸發完整 direct dependency audit。
+- `scripts/check-version.py` 以 staged merge candidate 判定 release surface，
+  並強制 task-level `X.Y.Z` 只升版一次；pre-merge gate 不得略過。
+- 升版後執行 `scripts/audit-dependencies.py --review-note "<相容性結論>"`，
+  並將 `.release/dependency-audit.json` 納入 task branch。receipt 必須符合
+  candidate version 與完整 dependency manifest。
 
-```bash
-uv venv --python 3.14
-uv pip install -e ".[dev]"
-uv run --no-sync ruff check .
-uv run --no-sync black --check .
-uv run --no-sync mypy src tests
-uv run --no-sync pytest
-uv run --no-sync python -m build
-```
+## 依賴與環境
 
-The real MariaDB resident-lifecycle E2E pins MariaDB 10.11.11 through
-testcontainers. It is opt-in for ordinary local runs and mandatory in the PyPI
-validation workflow. Run it locally with Docker available:
+- repository 必須能從單一乾淨 checkout 重建，不得依賴固定 sibling clone
+  路徑。
+- 明確跨 repository 任務可使用傳入的 wheel、Git URL/ref 或 repository
+  path；sibling discovery 只能是選擇性的效能優化。
+- Python registry dependencies 原則上使用 `>=` lower bound；合理 upper
+  bound 與 `!=` 可以保留，但必須有相容性依據。
+- 精確版本只允許經驗證且有文件理由的特殊契約。
+- dependency audit 必須涵蓋 build、runtime、optional 與 development direct
+  dependencies，並搜尋現有 upper bound 之外的候選版本。
+- 有新版時必須檢查 release notes、驗證相容性並嘗試修正問題。
+- `uv.lock` 不得成為環境重建或驗證的輸入；`scripts/rebuild-env.sh` 可
+  使用 `uv venv` 與 `uv pip`，但不得使用會依賴 project lockfile 的
+  同步流程。
+- Node tooling 使用 `npm install --package-lock=false`，不得產生或提交
+  `package-lock.json`。
+- 不得依賴 system-wide lint、format、type-check 或 Markdown 工具。
+- `requires-python` 使用 `>=3.14`；只有經驗證的壞版本可使用 `!=`。
 
-```bash
-H2HDB_TEST_MARIADB=1 uv run --no-sync pytest tests/test_runtime_e2e.py
-```
+## 品質工具
 
-If the environment is damaged, run `scripts/rebuild-env.sh`.
+- `pyproject.toml` 是 Ruff 與 mypy 的唯一規則來源。
+- 使用 Ruff lint 與 Ruff formatter，不使用 Black。
+- Ruff 使用適合專案的嚴格規則集，不從 `ALL` 出發；每個停用規則必須
+  記錄理由。
+- mypy 使用標準 `strict = true`。不得保留 `mypy.ini`。
+- module 例外使用精確 TOML overrides。
+- `type: ignore` 必須指定 error code 並附理由。
+- `noqa` 必須指定 rule code 並附理由。
+- Markdown 使用 repository-local `markdownlint-cli2`。
+- VS Code 使用相同設定與 repository-local environment；CLI gate 是最終
+  權威，IDE diagnostics 為即時輔助。
 
-## Branch Discipline
+## 檢查分層
 
-Do not create or switch to a development branch. All development work must be
-performed directly on the repository's primary branch (`main`).
+- `scripts/format.sh`：明確執行會修改檔案的 formatter 或 fixer。
+- `scripts/check-fast.sh`：離線、唯讀的 Ruff、format check、mypy 與
+  markdownlint；每次非 merge commit 執行。
+- `scripts/check-full.sh`：fast gate、完整測試、build、wheel smoke 及本
+  repository 的特殊檢查；整合候選只跑一次。
+- dependency audit 可連網，但 hooks 只驗證本機 receipt，不在 commit
+  過程連網。
+- GitHub Actions 只呼叫相同 scripts，並保留 trusted publishing、平台特有
+  或本機無法可靠重現的檢查。
+- 不使用 Claude、Codex 或其他 provider-specific Stop hooks 重複檢查。
 
-## Formal Verification
+## 測試與例外
 
-The executable vNext specifications live in `verification/`; they are design
-models, not evidence that the current runtime implements the model. Run them
-with the pinned Lean toolchain and checksum-pinned TLC release:
+- runtime 行為變更必須新增或更新測試；bug fix 必須有 regression test。
+- 新功能涵蓋正常、邊界與錯誤路徑。
+- 數值測試固定隨機種子；容許誤差需有依據。
+- flaky test 視為失敗，不得以重跑掩蓋。
+- 不設定跨 repository 的統一 coverage 百分比。
+- live account、network、production 或 destructive probe 不得進入 hooks、
+  一般 pytest 或自動 merge gate。
+- `skip` 或 `xfail` 必須有理由；`xfail` 原則上使用 `strict=True`。
+- 不得為通過檢查而全域放寬工具設定。
 
-```bash
-uv run --no-sync python scripts/verify-formal.py lean
-uv run --no-sync python scripts/fetch-formal-tools.py
-uv run --no-sync python scripts/verify-formal.py tla \
-  --tla-jar .formal-tools/tla2tools-1.7.4.jar
-```
+## 完成回報
 
-Use `--deep` only for the larger manual/nightly TLA+ profile; the default
-`Small` profile is the finite required check. TLC success exhausts reachable
-states only for the selected constants. Lean theorems are unbounded over their
-stated mathematical inputs, but rely on explicit assumptions such as exact
-delta detection, correct prior caches, collision-free canonical hash identity,
-and deterministic policy/artifact functions. Differential tests and crash/fault
-injection are still required for implementation conformance.
+最終回覆必須包含：
 
-The retained incremental oracle and Lean model describe global analysis
-semantics, but production analysis is implemented and authorized by `h2hdb`.
-They must never become a second runtime deduplication implementation here.
+- 實作及公開行為變化。
+- 移除的 compatibility path。
+- project version 與 dependency audit 結果。
+- commits 與完整檢查結果。
+- primary branch 與 merge commit。
+- branch/worktree 是否已清除。
+- 是否仍未 push、publish 或 deploy。
 
-## Shared Finalization
+## Repository-specific policy
 
-The repository keeps provider-neutral hooks in `scripts/hooks/`.
+`h2hdb-ingest` 是 H2HDB 的 filesystem-facing ingest service，發佈名稱為
+`h2hdb-ingest`，公開 import package 為 `h2hdb_ingest`。維持
+`src/h2hdb_ingest/` layout。
 
-- After changing Python, run `bash scripts/hooks/finalize-python.sh`.
-- After changing Markdown, run `bash scripts/hooks/finalize-markdown.sh`.
+### Ownership boundary
 
-Do not create agent-specific copies of these implementations.
+本 repository 擁有：
 
-## Design and Compatibility
+- deterministic、keyset-paged filesystem discovery 與
+  `galleryinfo.txt` parsing；
+- exact source-byte observations；
+- consumer-side artifact rendering 與 storage；
+- crash-safe Komga current-view reconciliation；
+- resident ingest loop 與 ingest-lease heartbeat orchestration。
 
-The project is pre-1.0. Prefer clear responsibility boundaries and the cleanest
-end state over compatibility shims or deprecated aliases. Follow SOLID
-principles and keep network waits or filesystem work outside core database
-transactions and the database gate.
+`h2hdb` core 獨占 connectors、transactions、schema/epoch administration、
+durable queues、token-fenced coordination、source checkpoints、
+analysis/deduplication policy、catalog repositories、artifact selection 與
+publication。只能依賴公開 vNext facade、protocol 與 domain receipt；不得
+import core repository、connector internals，或重建已移除的 `H2HDB`
+compatibility surface。startup 只能呼叫 `VNextDatabaseAdminFacade.check()`，
+不得初始化或 migrate core schema。
 
-`CLAUDE.md` documents the same repository rules. Keep both files synchronized
-when changing workflow, ownership, testing, or tooling conventions.
+每個 core operation 維持 issue/prepare/commit 分離。session controller lock
+只包住有界的 database issue 或 commit call；filesystem scan、hash、image/ZIP
+work、artifact storage、projection spooling 與其他 local I/O 必須在 lock
+之外，讓 heartbeat 能更新精確 session receipt。不得提供 registry surrogate
+ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 authority。
+
+### Artifact and projection safety
+
+- `artifact_store_path` 與 `cbz_path` 必須是不同且不互相巢狀的 root。
+  前者擁有 content-addressed artifact 與 OPDS reconciliation state；後者只
+  擁有 Komga current friendly-file projection。
+- catalog publication 成功後才能更新 Komga projection。只能移除
+  artifact-store state 記錄為 managed 的 path，不得覆寫或刪除未知檔案。
+- 所有 CBZ-enabled publisher 必須以同一 `artifact_store_path` 作為
+  coordination domain。先取得 artifact-store publication flock，再執行
+  bounded core publication，並持有到 projection 與 core finalization 完成；
+  不得反向取得 lock。
+- durable pending projection journal 是 crash recovery 的 source of truth。
+  projection copy 只有在 artifact identity 與 regular-file stat signature
+  都相符時才能略過；外部變更必須以 atomic copy 重新驗證。
+- released-digest cleanup 使用 durable bounded queue。不得刪除 current 或
+  pending projection 仍引用的 bytes/state；永久保留 terminal `RELEASED`
+  token tombstone，且不得 follow symlink。
+- artifact 與 current-view quarantine 是 root 下 mode-0700 的 private adapter
+  capability。owner、mode、inode 或 entry 出現非預期變更時必須 fail closed，
+  不得 acknowledge cleanup。
+- current-projection maintenance 每次最多推進各 durable cleanup queue 的
+  one eight-item page。resident 在每次 claim 前與 session 完成後各執行一次。
+  `PROGRESSED` 立即重試；`BLOCKED`、`CONTENDED`、`DONE` 與 transient
+  failure 回到正常 poll cadence。
+
+### Verification
+
+- 一般 tests 必須離線且使用 temporary roots/fakes；private corpus 永遠
+  opt-in，不得進入自動 merge gate。
+- MariaDB resident-lifecycle E2E 使用 testcontainers 的 MariaDB 10.11.11，
+  只有明確設定 `H2HDB_TEST_MARIADB=1` 時執行；release validation 必須跑，
+  一般 commit 與 merge gate 不得啟動 MariaDB 或其他 live service。唯一的
+  Docker 例外是 host Java 不可用時，以 lockfile digest-pinned、network-off
+  container 執行 TLC。
+- `scripts/check-full.sh` 執行完整離線 pytest、Lean verification、
+  checksum-pinned TLC Small profile、sdist/wheel build 與 installed-wheel
+  CLI/import smoke。
+- `verification/` 是 executable design model，不代表 runtime 自動符合。
+  Lean/TLA 變更仍需 differential test、crash/fault injection 與 implementation
+  conformance evidence。
+- retained incremental oracle 與 Lean model 只描述 global analysis semantics；
+  production analysis authority 仍屬 `h2hdb`，不得在本 repository 建立第二
+  份 runtime deduplication implementation。

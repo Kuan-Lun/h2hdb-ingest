@@ -19,6 +19,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
+from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from threading import RLock
 
@@ -206,7 +207,7 @@ class CurrentProjectionAdapter:
             raise TypeError("projection page contains a foreign item")
         if any(
             left.publication_key >= right.publication_key
-            for left, right in zip(page, page[1:])
+            for left, right in pairwise(page)
         ):
             raise ValueError("projection page keys must be strictly increasing")
         self._require_guard()
@@ -294,8 +295,7 @@ class CurrentProjectionAdapter:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 connection.executemany(
-                    "DELETE FROM artifact_cleanup_candidates "
-                    "WHERE artifact_sha256 = ?",
+                    "DELETE FROM artifact_cleanup_candidates WHERE artifact_sha256 = ?",
                     ((digest,) for digest in candidates),
                 )
                 connection.commit()
@@ -459,8 +459,7 @@ class CurrentProjectionAdapter:
                         )
                         continue
                     raise RuntimeError(
-                        "refusing to replace externally changed managed path: "
-                        f"{target}"
+                        f"refusing to replace externally changed managed path: {target}"
                     )
                 if authorized:
                     self._verify_current_file(
@@ -674,8 +673,7 @@ class CurrentProjectionAdapter:
                         )
                     except FileExistsError as error:
                         raise RuntimeError(
-                            "stale projection quarantine destination changed: "
-                            f"{target}"
+                            f"stale projection quarantine destination changed: {target}"
                         ) from error
                     os.fsync(parent_descriptor)
                     os.fsync(quarantine.object_descriptor)
@@ -845,7 +843,7 @@ class CurrentProjectionAdapter:
                             components[:-1],
                             parent_descriptor,
                             label=(
-                                "current projection parent changed: " f"{target.parent}"
+                                f"current projection parent changed: {target.parent}"
                             ),
                         )
                     if _lstat_at(parent_descriptor, leaf) is None:
@@ -988,8 +986,7 @@ class CurrentProjectionAdapter:
                     )
                 except FileExistsError as error:
                     raise RuntimeError(
-                        "managed replacement quarantine destination changed: "
-                        f"{target}"
+                        f"managed replacement quarantine destination changed: {target}"
                     ) from error
                 os.fsync(parent_descriptor)
                 os.fsync(quarantine.object_descriptor)
@@ -1004,8 +1001,7 @@ class CurrentProjectionAdapter:
                     )
                 except RuntimeError as error:
                     raise RuntimeError(
-                        "refusing to replace externally changed managed path: "
-                        f"{target}"
+                        f"refusing to replace externally changed managed path: {target}"
                     ) from error
                 return False
         quarantine.validate({_QUARANTINE_PAYLOAD_NAME})
