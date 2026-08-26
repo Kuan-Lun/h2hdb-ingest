@@ -87,9 +87,9 @@ H2HDB_HYPOTHESIS_PROFILE=nightly \
 ## Commands
 
 ```bash
-uv run --no-sync python scripts/verify-formal.py lean
-uv run --no-sync python scripts/fetch-formal-tools.py
-uv run --no-sync python scripts/verify-formal.py tla \
+.venv/bin/python scripts/verify-formal.py lean
+.venv/bin/python scripts/fetch-formal-tools.py
+.venv/bin/python scripts/verify-formal.py tla \
   --tla-jar .formal-tools/tla2tools-1.7.4.jar
 ```
 
@@ -102,6 +102,6 @@ then falls back to the digest-pinned, network-off Docker runtime.
 Run the larger profile explicitly:
 
 ```bash
-uv run --no-sync python scripts/verify-formal.py tla \
+.venv/bin/python scripts/verify-formal.py tla \
   --tla-jar .formal-tools/tla2tools-1.7.4.jar --deep
 ```
