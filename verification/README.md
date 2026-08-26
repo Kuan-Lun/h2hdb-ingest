@@ -96,7 +96,8 @@ uv run --no-sync python scripts/verify-formal.py tla \
 Tool versions and checksums are pinned in `tools.lock.toml`. The `Small` TLA+
 configuration is the required finite profile; `Deep` is manual/nightly. A TLC
 success covers every reachable state for the chosen finite constants, not
-arbitrary corpus size.
+arbitrary corpus size. The default `auto` runtime uses host Java when available,
+then falls back to the digest-pinned, network-off Docker runtime.
 
 Run the larger profile explicitly:
 
