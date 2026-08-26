@@ -317,7 +317,7 @@ def test_stale_cleanup_rejects_current_root_symlink_without_touching_target(
     current_root.rename(outside_root)
     current_root.symlink_to(outside_root, target_is_directory=True)
     outside_target = outside_root / "1 - first.cbz"
-    with pytest.raises(RuntimeError, match="current projection.*safe directory"):
+    with pytest.raises(RuntimeError, match=r"current projection.*safe directory"):
         with adapter.publication_guard():
             pass
 

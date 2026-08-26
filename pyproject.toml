@@ -9,7 +9,7 @@ description = "Filesystem ingest and CBZ reconciliation for H2HDB"
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
 license = { file = "LICENSE" }
-requires-python = ">=3.14,<3.15"
+requires-python = ">=3.14"
 dependencies = [
     "h2h-galleryinfo-parser>=0.5.3,<0.6",
     "h2hdb>=0.23.0.11,<0.24",
@@ -31,10 +31,10 @@ h2hdb-ingest-bootstrap = "h2hdb_ingest.bootstrap:main"
 [project.optional-dependencies]
 dev = [
     "build>=1.5.0",
-    "black>=26.5.1",
+    "hatchling>=1.32.0,<2.0.0",
     "hypothesis>=6.165.10,<7.0.0",
     "mypy>=2.3.1",
-    "pymarkdownlnt>=0.9.39",
+    "packaging>=26.0",
     "pytest>=9.1.1",
     "ruff>=0.16.4",
     "testcontainers>=4.15.0",
@@ -51,13 +51,25 @@ packages = ["src/h2hdb_ingest"]
 [tool.hatch.build.targets.sdist]
 exclude = ["/.hypothesis"]
 
-[tool.black]
-target-version = ["py314"]
-
 [tool.ruff]
 line-length = 88
 target-version = "py314"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP"]
-extend-ignore = ["E203", "E226", "E501"]
+select = ["B", "C4", "E", "F", "I", "PIE", "RUF", "UP"]
+# Ruff format can intentionally retain long URLs, strings, and docstrings.
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.14"
+mypy_path = "src"
+files = ["src", "tests"]
+strict = true
+warn_unused_configs = true
+warn_unreachable = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.h2h.version]
+release-paths = ["LICENSE", "src/**"]

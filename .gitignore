@@ -11,6 +11,8 @@ __pycache__/
 build/
 dist/
 htmlcov/
+node_modules/
+package-lock.json
 uv.lock
 /.formal-tools/
 

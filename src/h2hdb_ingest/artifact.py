@@ -321,7 +321,7 @@ class ManagedFilesystemArtifactAdapter:
 
         with self._exclusive_state() as connection:
             state = connection.execute(
-                "SELECT after_sha256 FROM artifact_cleanup_state " "WHERE singleton = 1"
+                "SELECT after_sha256 FROM artifact_cleanup_state WHERE singleton = 1"
             ).fetchone()
             if state is None or len(state) != 1:
                 raise RuntimeError("artifact cleanup cursor state is corrupt")
@@ -365,8 +365,7 @@ class ManagedFilesystemArtifactAdapter:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 connection.executemany(
-                    "DELETE FROM artifact_cleanup_candidates "
-                    "WHERE artifact_sha256 = ?",
+                    "DELETE FROM artifact_cleanup_candidates WHERE artifact_sha256 = ?",
                     ((digest,) for digest in acknowledged),
                 )
                 affected = connection.execute(
@@ -737,8 +736,7 @@ class ManagedFilesystemArtifactAdapter:
                     ) from error
                 if _lstat_at(parent_descriptor, leaf) is not None:
                     raise RuntimeError(
-                        "artifact cleanup found competing filesystem state: "
-                        f"{target}"
+                        f"artifact cleanup found competing filesystem state: {target}"
                     )
                 quarantine.validate({_QUARANTINE_PAYLOAD_NAME})
                 try:
