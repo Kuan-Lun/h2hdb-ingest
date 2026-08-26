@@ -79,9 +79,9 @@ larger profile with `H2HDB_HYPOTHESIS_PROFILE=nightly`; neither profile uses a
 wall-clock assertion or deadline.
 
 ```bash
-uv run --no-sync pytest tests/test_vnext_incremental_state_machine.py
+.venv/bin/pytest tests/test_vnext_incremental_state_machine.py
 H2HDB_HYPOTHESIS_PROFILE=nightly \
-  uv run --no-sync pytest tests/test_vnext_incremental_state_machine.py
+  .venv/bin/pytest tests/test_vnext_incremental_state_machine.py
 ```
 
 ## Commands
