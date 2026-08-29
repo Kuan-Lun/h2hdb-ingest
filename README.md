@@ -31,6 +31,15 @@ One ingest turn performs these steps:
    `CONTENDED`, `DONE`, and transient failures use the ordinary idle poll
    cadence.
 
+Core gallery-staging capacity exhaustion is bounded backpressure rather than a
+fatal resident error. After the rejected request commits no rows, the resident
+stops the heartbeat, completes the exact ingest session, and runs both bounded
+maintenance actions. Any `PROGRESSED` result is retried immediately; otherwise
+the resident uses the ordinary idle poll cadence so it cannot busy-loop. If
+exact session completion fails, the original capacity exception is preserved
+with the completion failure attached as a note. Source-manifest mismatch
+remains fail-closed.
+
 Database operations and local work are split explicitly. The controller lock
 is held only for a bounded core issue or commit call. Directory walks, hashing,
 parsing, image conversion, ZIP creation, projection spooling, and filesystem

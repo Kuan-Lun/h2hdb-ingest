@@ -12,11 +12,19 @@ from h2hdb import (
     CatalogRevisionNotFoundError,
     CoreConfig,
     DatabaseConfig,
+    GalleryStagingCapacityError,
     VNextCurrentOnlyMaintenanceOutcome,
 )
 from PIL import Image
 
-from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
+from h2hdb_ingest import (
+    CurrentProjectionMaintenanceOutcome,
+    IngestConfig,
+    IngestPathsConfig,
+    IngestSessionController,
+    ResidentConfig,
+    ResidentIngestor,
+)
 from h2hdb_ingest.runtime import build_runtime
 
 
@@ -60,6 +68,55 @@ def _gallery(
         encoding="utf-8",
     )
     (folder / "001.jpg").write_bytes(page_bytes)
+
+
+class _CapacityThenSuccessService:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def synchronize_once(self, session: IngestSessionController) -> object:
+        del session
+        self.calls += 1
+        if self.calls == 1:
+            raise GalleryStagingCapacityError(1_500_000)
+        return "recovered"
+
+
+class _DoneProjectionMaintenance:
+    def maintain_cleanup(self) -> CurrentProjectionMaintenanceOutcome:
+        return CurrentProjectionMaintenanceOutcome.DONE
+
+
+def test_capacity_backpressure_releases_real_core_session_for_retry(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+) -> None:
+    source = tmp_path / "download"
+    source.mkdir()
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(download_path=source),
+        resident=ResidentConfig(
+            lease_seconds=30,
+            heartbeat_seconds=5,
+        ),
+    )
+    runtime = build_runtime(config)
+    runtime.database_admin.initialize()
+    service = _CapacityThenSuccessService()
+    resident = ResidentIngestor(
+        service=service,
+        facade=runtime.facade,
+        database_admin=runtime.database_admin,
+        current_projection_maintenance=_DoneProjectionMaintenance(),
+        config=config.resident,
+        database_type=config.core.database.sql_type,
+    )
+
+    assert not resident.process_available(periodic_scan=True)
+    assert resident.process_available(periodic_scan=True)
+    assert service.calls == 2
+    assert runtime.database_admin.check().state == "READY"
 
 
 def test_fresh_epoch_runs_source_analysis_and_publication(

@@ -12,6 +12,7 @@ from time import monotonic
 from typing import Protocol
 
 from h2hdb import (
+    GalleryStagingCapacityError,
     SchemaEpochReport,
     VNextCurrentOnlyMaintenanceOutcome,
     VNextDatabaseAdminFacade,
@@ -139,18 +140,40 @@ class ResidentIngestor:
                 self._event_logger(
                     f"vNext ingest synchronization completed: {outcome!r}"
                 )
+        except GalleryStagingCapacityError as error:
+            # Capacity is bounded backpressure, not a failed resident process.
+            # The rejected request committed no rows, while completing the
+            # exact session releases its SHARED gate and makes stale terminal
+            # staging eligible for bounded EXCLUSIVE maintenance.
+            try:
+                session.complete()
+            except BaseException as completion_error:
+                error.add_note(
+                    "The ingest session could not be completed after gallery "
+                    f"staging capacity was exhausted: {completion_error!r}"
+                )
+                raise error from completion_error
+            projection_maintenance = self._try_current_projection_maintenance()
+            database_maintenance = self._try_current_only_maintenance(lease_duration)
+            if (
+                projection_maintenance is CurrentProjectionMaintenanceOutcome.PROGRESSED
+                or database_maintenance is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED
+            ):
+                return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
+            return _ResidentCycleOutcome.IDLE
         except VNextSourceManifestMismatchError as error:
-            # The core has already atomically abandoned the exact mismatched
-            # working build.  Complete this generation after the heartbeat is
-            # stopped so the resident can immediately claim a stable retry.
+            # The mismatch has already abandoned the exact build.  Completing
+            # after heartbeat shutdown makes it immediately eligible for
+            # bounded maintenance instead of waiting for lease expiry, but the
+            # source-authority failure remains fatal to this resident turn.
             try:
                 session.complete()
                 self._try_current_projection_maintenance()
                 self._try_current_only_maintenance(lease_duration)
             except BaseException as completion_error:
                 error.add_note(
-                    "The ingest session could not be completed after its source "
-                    f"manifest mismatched: {completion_error!r}"
+                    "The ingest session could not be completed after source "
+                    f"synchronization failed: {completion_error!r}"
                 )
             raise
         completion = session.complete()

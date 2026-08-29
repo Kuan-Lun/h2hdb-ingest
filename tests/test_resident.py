@@ -5,6 +5,7 @@ from typing import cast
 
 import pytest
 from h2hdb import (
+    GalleryStagingCapacityError,
     SchemaEpochReport,
     VNextCurrentOnlyMaintenanceOutcome,
     VNextDatabaseAdminFacade,
@@ -17,7 +18,7 @@ from h2hdb import (
 import h2hdb_ingest.resident as resident_module
 from h2hdb_ingest import ResidentConfig
 from h2hdb_ingest.maintenance import CurrentProjectionMaintenanceOutcome
-from h2hdb_ingest.resident import ResidentIngestor
+from h2hdb_ingest.resident import IngestSynchronizer, ResidentIngestor
 from h2hdb_ingest.session import IngestSessionController
 
 
@@ -126,6 +127,16 @@ class _ManifestMismatchService:
         raise VNextSourceManifestMismatchError("source changed")
 
 
+class _StagingCapacityService:
+    def __init__(self, events: list[object]) -> None:
+        self._events = events
+
+    def synchronize_once(self, session: IngestSessionController) -> object:
+        del session
+        self._events.append("synchronize")
+        raise GalleryStagingCapacityError(1_500_000)
+
+
 class _Heartbeat:
     def __init__(
         self,
@@ -153,7 +164,7 @@ def _resident(
         VNextCurrentOnlyMaintenanceOutcome.DONE,
     ),
     projection_maintenance: _ProjectionMaintenance | None = None,
-    service: _Service | _ManifestMismatchService | None = None,
+    service: IngestSynchronizer | None = None,
 ) -> ResidentIngestor:
     facade = _Facade(
         events,
@@ -307,6 +318,132 @@ def test_source_manifest_mismatch_completes_claim_after_heartbeat_stops(
     ]
 
 
+def test_staging_capacity_without_cleanup_progress_completes_claim_and_idles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+
+    class _OrderedHeartbeat(_Heartbeat):
+        def __enter__(self) -> _OrderedHeartbeat:
+            events.append("heartbeat-start")
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+            events.append("heartbeat-stop")
+
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _OrderedHeartbeat)
+    resident = _resident(events, service=_StagingCapacityService(events))
+
+    assert not resident.process_available(periodic_scan=True)
+
+    assert events == [
+        ("current-only", 10_000_000),
+        ("claim", True, 10_000_000),
+        "heartbeat-start",
+        "synchronize",
+        "heartbeat-stop",
+        ("complete", 2),
+        ("current-only", 10_000_000),
+    ]
+
+
+def test_staging_capacity_reports_core_cleanup_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    resident = _resident(
+        events,
+        service=_StagingCapacityService(events),
+        maintenance_results=(
+            VNextCurrentOnlyMaintenanceOutcome.DONE,
+            VNextCurrentOnlyMaintenanceOutcome.PROGRESSED,
+        ),
+    )
+
+    assert resident.process_available(periodic_scan=True)
+    assert events == [
+        ("current-only", 10_000_000),
+        ("claim", True, 10_000_000),
+        "synchronize",
+        ("complete", 2),
+        ("current-only", 10_000_000),
+    ]
+
+
+def test_staging_capacity_reports_projection_cleanup_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    projection_maintenance = _ProjectionMaintenance(
+        (
+            CurrentProjectionMaintenanceOutcome.DONE,
+            CurrentProjectionMaintenanceOutcome.PROGRESSED,
+        )
+    )
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    resident = _resident(
+        events,
+        service=_StagingCapacityService(events),
+        projection_maintenance=projection_maintenance,
+    )
+
+    assert resident.process_available(periodic_scan=True)
+    assert projection_maintenance.calls == 2
+    assert events == [
+        ("current-only", 10_000_000),
+        ("claim", True, 10_000_000),
+        "synchronize",
+        ("complete", 2),
+        ("current-only", 10_000_000),
+    ]
+
+
+def test_staging_capacity_preserves_completion_failure_as_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+
+    class _CompletionFailureFacade(_Facade):
+        def complete_ingest(
+            self,
+            session: VNextIngestSession,
+        ) -> VNextIngestCompletionReceipt:
+            del session
+            raise RuntimeError("completion failed")
+
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    facade = _CompletionFailureFacade(events)
+    resident = ResidentIngestor(
+        service=_StagingCapacityService(events),
+        facade=cast(VNextIngestFacade, facade),
+        database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
+        current_projection_maintenance=_ProjectionMaintenance(),
+        config=ResidentConfig(
+            periodic_scan_seconds=60,
+            poll_seconds=1,
+            lease_seconds=10,
+            heartbeat_seconds=5,
+        ),
+        database_type="sqlite",
+        event_logger=lambda message: events.append(("log", message)),
+    )
+
+    with pytest.raises(GalleryStagingCapacityError) as caught:
+        resident.process_available(periodic_scan=True)
+
+    assert caught.value.__notes__ == [
+        "The ingest session could not be completed after gallery staging "
+        "capacity was exhausted: RuntimeError('completion failed')"
+    ]
+    assert events == [
+        ("current-only", 10_000_000),
+        ("claim", True, 10_000_000),
+        "synchronize",
+    ]
+
+
 def test_startup_contention_is_retried_once_on_the_next_idle_poll() -> None:
     events: list[object] = []
     resident = _resident(
@@ -404,6 +541,39 @@ def test_run_forever_retries_progress_immediately_without_resetting_periodic(
         ("current-only", 10_000_000),
         ("current-only", 10_000_000),
         ("claim", True, 10_000_000),
+        ("wait", 1.0),
+    ]
+
+
+def test_run_forever_waits_instead_of_exiting_on_staging_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    resident = _resident(events, service=_StagingCapacityService(events))
+
+    class _Stop:
+        def __init__(self) -> None:
+            self.waited = False
+
+        def is_set(self) -> bool:
+            return self.waited
+
+        def wait(self, timeout: float) -> bool:
+            events.append(("wait", timeout))
+            self.waited = True
+            return True
+
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    monkeypatch.setattr(resident_module, "monotonic", lambda: 100.0)
+    stop = _Stop()
+    resident.run_forever(stop=cast(Event, stop))
+
+    assert events == [
+        ("current-only", 10_000_000),
+        ("claim", True, 10_000_000),
+        "synchronize",
+        ("complete", 2),
+        ("current-only", 10_000_000),
         ("wait", 1.0),
     ]
 
