@@ -86,16 +86,7 @@ class IngestConfig(ConfigModel):
             )
         library_path = self.paths.library_path
         if library_path is not None:
-            library_path.mkdir(mode=0o755, parents=True, exist_ok=True)
-            current_path = library_path / "current"
-            _ensure_directory(current_path, 0o755)
-            state_path = library_path / ".h2hdb-state"
-            _ensure_directory(state_path, 0o700)
-            for name in ("staging", "quarantine", "journal", "locks"):
-                private_path = state_path / name
-                _ensure_directory(private_path, 0o700)
-            coordination_path = state_path / "coordination"
-            _ensure_directory(coordination_path, 0o755)
+            _require_existing_library_root(library_path)
 
 
 def load_config(path: str | Path) -> IngestConfig:
@@ -109,23 +100,29 @@ def load_config(path: str | Path) -> IngestConfig:
     return IngestConfig.model_validate(resolve_environment_placeholders(raw))
 
 
-def _ensure_directory(path: Path, mode: int) -> None:
-    path.mkdir(mode=mode, exist_ok=True)
-    value = path.lstat()
+def _require_existing_library_root(path: Path) -> None:
+    try:
+        value = path.lstat()
+    except FileNotFoundError as error:
+        raise ValueError(
+            f"library_path must be a pre-existing bind mount directory: {path}"
+        ) from error
     if stat.S_ISLNK(value.st_mode) or not stat.S_ISDIR(value.st_mode):
-        raise ValueError(f"managed library path is not a safe directory: {path}")
+        raise ValueError(f"library_path is not a safe directory: {path}")
+    if value.st_uid != os.geteuid() or stat.S_IMODE(value.st_mode) & 0o022:
+        raise ValueError(
+            f"library_path must be owned by the ingest UID without group/world write: "
+            f"{path}"
+        )
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
-        raise ValueError(
-            f"managed library path is not safely openable: {path}"
-        ) from error
+        raise ValueError(f"library_path is not safely openable: {path}") from error
     try:
         opened = os.fstat(descriptor)
         visible = path.lstat()
         if (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino):
-            raise ValueError(f"managed library path changed identity: {path}")
-        os.fchmod(descriptor, mode)
+            raise ValueError(f"library_path changed identity: {path}")
     finally:
         os.close(descriptor)

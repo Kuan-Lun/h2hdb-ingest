@@ -263,6 +263,7 @@ def test_fresh_artifact_runtime_publishes_one_current_cbz(
     _gallery(source, 2001, "artist")
     Image.new("RGB", (8, 12), "red").save(source / "2001" / "001.jpg")
     library_root = tmp_path / "library"
+    library_root.mkdir(mode=0o755)
     current_root = library_root / "current"
     config = IngestConfig(
         core=CoreConfig(
@@ -341,6 +342,7 @@ def test_many_replacements_keep_one_stable_current_file_per_gid(
 ) -> None:
     source = tmp_path / "download"
     library_root = tmp_path / "library"
+    library_root.mkdir(mode=0o755)
     current_root = library_root / "current"
     gallery_count = 10
     for offset in range(gallery_count):

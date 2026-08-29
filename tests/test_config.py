@@ -66,13 +66,14 @@ def test_source_and_library_roots_must_be_distinct_and_non_nested(
         )
 
 
-def test_runtime_paths_create_one_public_library_and_private_state(
+def test_runtime_paths_require_one_preexisting_library_mount(
     tmp_path: Path,
 ) -> None:
     download_path = tmp_path / "download"
     download_path.mkdir()
     (download_path / "gallery").mkdir()
     library_path = tmp_path / "library"
+    library_path.mkdir(mode=0o755)
     config = IngestConfig(
         paths=IngestPathsConfig(
             download_path=download_path,
@@ -82,21 +83,22 @@ def test_runtime_paths_create_one_public_library_and_private_state(
 
     config.ensure_paths()
 
-    assert (library_path / "current").is_dir()
-    assert stat.S_IMODE((library_path / "current").stat().st_mode) == 0o755
-    state_path = library_path / ".h2hdb-state"
-    assert state_path.is_dir()
-    assert stat.S_IMODE(state_path.stat().st_mode) == 0o700
-    assert {entry.name for entry in state_path.iterdir()} == {
-        "coordination",
-        "journal",
-        "locks",
-        "quarantine",
-        "staging",
-    }
-    for name in ("journal", "locks", "quarantine", "staging"):
-        assert stat.S_IMODE((state_path / name).stat().st_mode) == 0o700
-    assert stat.S_IMODE((state_path / "coordination").stat().st_mode) == 0o755
+    assert list(library_path.iterdir()) == []
+
+
+def test_runtime_paths_reject_missing_library_mount(tmp_path: Path) -> None:
+    download_path = tmp_path / "download"
+    download_path.mkdir()
+    (download_path / "gallery").mkdir()
+    config = IngestConfig(
+        paths=IngestPathsConfig(
+            download_path=download_path,
+            library_path=tmp_path / "missing-library",
+        )
+    )
+
+    with pytest.raises(ValueError, match="pre-existing bind mount"):
+        config.ensure_paths()
 
 
 def test_runtime_paths_reject_empty_download_mount(tmp_path: Path) -> None:
@@ -115,10 +117,9 @@ def test_runtime_paths_reject_managed_directory_symlink_without_chmod_target(
     download_path.mkdir()
     (download_path / "gallery").mkdir()
     library_path = tmp_path / "library"
-    library_path.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir(mode=0o700)
-    (library_path / "current").symlink_to(outside, target_is_directory=True)
+    library_path.symlink_to(outside, target_is_directory=True)
     config = IngestConfig(
         paths=IngestPathsConfig(
             download_path=download_path,

@@ -77,13 +77,26 @@ Core owns the stable GID storage key. The registered
 changes therefore retain the same Komga identity. Ingest never derives a
 second locator or grouping layout.
 
-`protect()` writes, hashes, size-checks, and fsyncs a private staging file. A
-reader-invisible core publication is then spooled to the activation journal.
-Each `reconcile_page()` advances at most 128 installs or removals. It creates
-the durable `ACTIVATING` marker while holding `publication.lock` exclusively,
-uses same-filesystem `os.replace` for changed paths, and records exact regular
-file stat identities. Core advances the reader-visible head only after durable
-`READY`; `complete()` then removes and fsyncs the marker before unlocking.
+`protect()` resumes only an exact private staging prefix, then hashes,
+size-checks, and fsyncs the complete file. A reader-invisible core publication
+is then spooled to the activation journal. Each `reconcile_page()` advances at
+most 128 installs or removals. It creates the durable `ACTIVATING` marker while
+holding `publication.lock` exclusively, uses atomic no-replace capture and a
+same-filesystem no-replace rename for changed paths, and records exact
+regular-file identities. Stage authority becomes terminal in the same SQLite
+transaction that records current authority. Core advances the reader-visible
+head only after durable `READY`; `complete()` then removes and fsyncs the
+marker before unlocking.
+
+If publishing a staging leaf or activation marker loses its response after the
+rename, replay verifies the exact leaf, re-fsyncs its owning directory, and
+verifies the same identity again before advancing the SQLite journal.
+Conservative power-loss recovery may expose both rename names. Replay collapses
+them only when the journal facts and digest identify one exact shared two-link
+inode; it syncs both directories, removes the source duplicate, syncs again,
+fsyncs the survivor inode, and revalidates its post-unlink identity before
+retiring journal authority. Byte-identical names on different inodes are
+preserved and fail closed.
 
 OPDS holds a shared flock while resolving the current head and opening the
 file. Lock contention, a present/invalid marker, an unknown target, an
@@ -92,6 +105,18 @@ and OPDS therefore read the same persistent CBZ; staging/quarantine bytes may
 exist only during a pending or interrupted activation. SIGINT/SIGTERM stops at
 the next bounded durable step and does not claim new work. A forced container
 kill leaves the marker and journal so restart continues before readers resume.
+
+The `library_path` parent and `.h2hdb-state` are ingest-owned, single-writer
+namespaces. No other process, including one running under the same UID, may
+mutate them; Komga and OPDS mounts remain read-only. Races on public `current`
+entries still fail closed and preserve unknown bytes.
+
+A terminal release tombstones its protection token before cleanup, so delayed
+or response-lost `protect()` calls cannot recreate bytes. A durable `WRITING`
+row authorizes cleanup of its deterministic partial private temp after the
+adapter captures that temp's stable digest and file identity. If replay sees an
+authorized stage, temp, quarantine, or marker already absent, it re-fsyncs the
+owning directory and confirms absence before retiring the journal authority.
 
 ## Installation and commands
 
@@ -146,7 +171,11 @@ SQLite example with artifacts enabled is:
 
 `library_path` points at the parent containing `current` and `.h2hdb-state`.
 Setting it to `null` disables artifact output. `download_path` and
-`library_path` must be distinct and non-nested.
+`library_path` must be distinct and non-nested. When enabled, it must already
+exist as a real bind-mount root owned by the ingest UID without group/world
+write access; for example, pre-create the host bind source with mode `0755`
+before starting Compose. Ingest never creates the mount root because it cannot
+durably fsync the host parent from inside the container.
 
 `max_rows` is constrained to 1–128. Core also fixes publication and activation
 pages at 128 rows. These limits bound each database or adapter step, not the
@@ -156,9 +185,11 @@ Core environment placeholders are resolved before validation. A complete
 string such as `"${H2HDB_RW_DB_PASSWORD}"` is substituted recursively; missing
 variables and unknown configuration fields fail startup.
 
-The download root must already be a nonempty directory. When artifacts are
-enabled, ingest creates `current`, the private state directories, coordination
-directory, journal, and permanent lock. Mount only `current` into Komga. Mount
+The download root must already be a nonempty directory. Under the pre-existing
+library mount, ingest durably creates `current`, the private state directories,
+coordination directory, journal, and permanent lock. Each managed directory is
+fsynced before its parent entry and then revalidated. Mount only `current` into
+Komga. Mount
 `current` and `.h2hdb-state/coordination` separately and read-only into OPDS;
 never expose staging, quarantine, or the journal to readers.
 

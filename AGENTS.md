@@ -184,12 +184,30 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
 - CBZ-enabled deployment 只有一個 `library_path` parent。`current/` 是 Komga
   與 OPDS 共用的唯一 persistent CBZ tree；`.h2hdb-state/` 擁有 private
   staging、quarantine、journal、locks 與 reader-visible coordination。
+- `library_path` 是 deployment 預先建立、由 ingest UID 擁有且不可 group/world
+  write 的真實 bind-mount root；runtime 不得建立 mount root 或依賴容器內不可見
+  的 host parent fsync。root 下每個 managed directory 與 persistent control file
+  建立或 replay 時必須 child fsync、parent fsync，再重驗 exact identity、owner
+  與 mode；涵蓋 lock files 與 SQLite database 的首次 parent entry。
+- `library_path` parent 與 `.h2hdb-state/` 是 ingest-owned single-writer
+  namespace；其他程序即使使用相同 UID 也不得 mutate。Komga 與 OPDS 只能
+  read-only mount 所需路徑；public `current/` 的 unknown entry race 仍須
+  preserve bytes 並 fail closed。
 - filesystem path 只能使用 core `ArtifactStorageKey` 的固定
   `gid-sha256-12-v1` codec；不得重建 content-addressed locator、日期 grouping、
   friendly title path 或第二份 persistent CBZ tree。
-- artifact 必須先在同 filesystem 的 mode-0700 staging 完整寫入、驗證
-  SHA-256/size 並 fsync。activation 只能用 descriptor-relative、逐層
-  `O_NOFOLLOW` 的 `os.replace` 安裝到 current；不得 byte-copy persistent CBZ。
+- artifact 必須先在同 filesystem 的 mode-0700 staging 以 exact-prefix
+  resumable temp 完整寫入、驗證 SHA-256/size 並 fsync。activation 先以 atomic
+  no-replace capture 舊 current，再以 descriptor-relative、逐層
+  `O_NOFOLLOW` 的 atomic no-replace rename 把 stage 移入 current；不得
+  hard-link 或 byte-copy persistent CBZ。rename 成功與 response-loss replay
+  都必須 fsync current parent 及 staging directory。temp publish 到 stage 或
+  marker 的 response-loss replay 也必須重新 fsync owning directory，才能推進
+  journal state。若保守的 power-loss recovery 同時顯示 rename 兩個名稱，只能
+  在 journal facts、digest、size 與 durable dev/inode/mtime authority 完全相符，
+  且兩名確為同一個 nlink=2 inode 時，fsync 兩側後移除 source duplicate、再次
+  捕獲 post-unlink exact signature、fsync survivor inode 與兩側 directory，再
+  重驗 survivor；不同 inode 即使 bytes 相同也必須 preserve 並 fail closed。
 - core reader head 在 library durable `READY` 前不得 advance。activation 從
   reader-invisible DB commit 起持有 `coordination/publication.lock` exclusive
   flock，建立並 fsync `ACTIVATING`；core finalization 成功後才可 durable unlink
@@ -198,10 +216,19 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
 - `reconcile_page` 每次最多處理 128 個 install/removal 並回寫 opaque cursor。
   SIGINT/SIGTERM 在 bounded step 間停止且不得再 claim；SIGKILL 後由 exact
   receipt、journal、marker、digest 與 stat identity 繼續，不得要求 rollback。
-- 只能 replace/delete journal 記錄為 managed 且 exact signature 相符的 path。
-  unknown path、中間 symlink、owner/mode/inode/entry 變更一律 fail closed。
-- terminal `RELEASED` protection token tombstone 永久保留；private cleanup
-  每次最多推進 one eight-item page，不得刪除 current bytes。
+- 只能 capture/install/delete journal 記錄為 managed 且 exact authority 相符的
+  path。unknown path、中間 symlink、owner/mode/inode/entry 變更一律 fail
+  closed。唯一 partial-content 例外是 durable `WRITING` token 所綁定的
+  deterministic private temp；terminal release 必須先 durable tombstone，再
+  捕獲其實際 digest/stat identity 後 descriptor-relative delete。
+- terminal `RELEASED` protection token tombstone 永久保留並 fence delayed
+  `protect`；tombstone 或 cleanup response loss 必須由保留的 staging authority
+  重播。若 replay 已看不到 authorized leaf，必須先 fsync owning directory 並
+  再確認 absent，才能清除 journal authority。private cleanup 每次最多推進 one
+  eight-item page，不得刪除 current bytes。
+- stage token 轉為 `INSTALLED` 並清除 inode authority，必須和
+  `current_entries` authority 及 pending activation completion 在同一個 SQLite
+  transaction 發生；不得留下兩個 transaction 間的 crash gap。
 - resident 在每次 claim 前與 session 完成後各執行一次 library maintenance。
   `PROGRESSED` 立即重試；`BLOCKED`、`CONTENDED`、`DONE` 與 transient
   failure 回到正常 poll cadence。
