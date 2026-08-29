@@ -5,13 +5,6 @@ from __future__ import annotations
 __all__ = [
     "FILESYSTEM_OBSERVATION_VERSION",
     "ArtifactProducerIdentity",
-    "CBZGrouping",
-    "CurrentProjectionAdapter",
-    "CurrentProjectionCheckpoint",
-    "CurrentProjectionItem",
-    "CurrentProjectionMaintenanceAdapter",
-    "CurrentProjectionMaintenanceOutcome",
-    "CurrentProjectionStatus",
     "FilesystemEntryType",
     "FilesystemGalleryObservation",
     "FilesystemObservationError",
@@ -21,7 +14,9 @@ __all__ = [
     "IngestLeaseHeartbeat",
     "IngestPathsConfig",
     "IngestSessionController",
-    "ManagedFilesystemArtifactAdapter",
+    "LibraryMaintenanceAdapter",
+    "LibraryMaintenanceOutcome",
+    "ManagedFilesystemLibraryAdapter",
     "ResidentConfig",
     "ResidentIngestor",
     "VNextFilesystemSourceAdapter",
@@ -31,9 +26,8 @@ __all__ = [
     "load_config",
 ]
 
-from .artifact import ArtifactProducerIdentity, ManagedFilesystemArtifactAdapter
+from .artifact import ArtifactProducerIdentity
 from .config import (
-    CBZGrouping,
     IngestConfig,
     IngestPathsConfig,
     ResidentConfig,
@@ -48,17 +42,12 @@ from .filesystem import (
     FilesystemPage,
     FilesystemSource,
 )
+from .library import ManagedFilesystemLibraryAdapter
 from .maintenance import (
-    CurrentProjectionMaintenanceAdapter,
-    CurrentProjectionMaintenanceOutcome,
+    LibraryMaintenanceAdapter,
+    LibraryMaintenanceOutcome,
 )
 from .policy import build_ingest_policy
-from .projection import (
-    CurrentProjectionAdapter,
-    CurrentProjectionCheckpoint,
-    CurrentProjectionItem,
-    CurrentProjectionStatus,
-)
 from .resident import ResidentIngestor
 from .service import VNextIngestService, VNextIngestSynchronizationResult
 from .session import IngestLeaseHeartbeat, IngestSessionController

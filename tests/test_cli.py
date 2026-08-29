@@ -25,14 +25,16 @@ class _Resident:
         *,
         periodic_scan: bool,
         preflight: Any = None,
+        should_stop: Any = None,
     ) -> bool:
+        del should_stop
         self._events.append(("process", periodic_scan))
         if preflight is not None:
             preflight()
         return self._available
 
-    def run_forever(self) -> None:
-        self._events.append("run-forever")
+    def run_forever(self, *, stop: object) -> None:
+        self._events.append(("run-forever", stop))
 
 
 def _cli_config(events: list[object]) -> SimpleNamespace:
@@ -88,7 +90,10 @@ def test_resident_mode_runs_forever_after_epoch_check(
 
     cli.main(["--config", str(tmp_path / "ingest.json")])
 
-    assert events == ["ensure-paths", "initialize", "run-forever"]
+    assert events[:2] == ["ensure-paths", "initialize"]
+    resident_event = events[2]
+    assert isinstance(resident_event, tuple)
+    assert resident_event[0] == "run-forever"
 
 
 def test_once_reports_ordinary_claim_contention(

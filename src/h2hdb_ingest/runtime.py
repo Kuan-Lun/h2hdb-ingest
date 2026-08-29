@@ -10,23 +10,22 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 
 from h2hdb import (
-    CurrentProjectionCheckpoint,
-    CurrentProjectionStatus,
+    LibraryActivationCheckpoint,
+    LibraryActivationStatus,
     VNextCatalogFacade,
-    VNextCurrentProjectionAdapter,
-    VNextCurrentProjectionItem,
     VNextDatabaseAdminFacade,
     VNextIngestFacade,
+    VNextLibraryActivationAdapter,
+    VNextLibraryActivationItem,
 )
 
-from .artifact import ManagedFilesystemArtifactAdapter
 from .config import IngestConfig
+from .library import ManagedFilesystemLibraryAdapter
 from .maintenance import (
-    CurrentProjectionMaintenanceAdapter,
-    CurrentProjectionMaintenanceOutcome,
+    LibraryMaintenanceAdapter,
+    LibraryMaintenanceOutcome,
 )
 from .policy import build_ingest_policy
-from .projection import CurrentProjectionAdapter
 from .resident import ResidentIngestor
 from .service import VNextIngestService
 
@@ -56,35 +55,26 @@ def build_runtime(
     database_admin = VNextDatabaseAdminFacade(config.core)
     catalog = VNextCatalogFacade(config.core)
 
-    artifact_adapters: dict[bytes, ManagedFilesystemArtifactAdapter] = {}
-    finalization_adapters: dict[bytes, ManagedFilesystemArtifactAdapter] = {}
-    current_projection: VNextCurrentProjectionAdapter
-    current_projection_maintenance: CurrentProjectionMaintenanceAdapter
+    artifact_adapters: dict[bytes, ManagedFilesystemLibraryAdapter] = {}
+    finalization_adapters: dict[bytes, ManagedFilesystemLibraryAdapter] = {}
+    library_activation: VNextLibraryActivationAdapter
+    library_maintenance: LibraryMaintenanceAdapter
     publication_guard: Callable[[], AbstractContextManager[None]]
-    if config.paths.artifact_store_path is None:
-        disabled_projection = _DisabledCurrentProjectionAdapter()
-        current_projection = disabled_projection
-        current_projection_maintenance = disabled_projection
+    if config.paths.library_path is None:
+        disabled_library = _DisabledLibraryActivationAdapter()
+        library_activation = disabled_library
+        library_maintenance = disabled_library
         publication_guard = _disabled_publication_guard
     else:
-        cbz_path = config.paths.cbz_path
-        if cbz_path is None:  # protected by IngestPathsConfig validation
-            raise RuntimeError("artifact output lacks its current projection root")
-        artifact = ManagedFilesystemArtifactAdapter(
-            config.paths.artifact_store_path,
+        library = ManagedFilesystemLibraryAdapter(
+            config.paths.library_path,
             max_image_short_side=config.paths.max_image_short_side,
         )
-        artifact_adapters[artifact.adapter_id] = artifact
-        finalization_adapters[artifact.adapter_id] = artifact
-        projection = CurrentProjectionAdapter(
-            artifact_store_path=config.paths.artifact_store_path,
-            cbz_path=cbz_path,
-            grouping=config.paths.cbz_grouping,
-            artifact_adapter=artifact,
-        )
-        current_projection = projection
-        current_projection_maintenance = projection
-        publication_guard = projection.publication_guard
+        artifact_adapters[library.adapter_id] = library
+        finalization_adapters[library.adapter_id] = library
+        library_activation = library
+        library_maintenance = library
+        publication_guard = library.publication_guard
 
     service = VNextIngestService(
         source_root=config.paths.download_path,
@@ -92,14 +82,14 @@ def build_runtime(
         max_rows=config.resident.max_rows,
         artifact_adapters=artifact_adapters,
         finalization_adapters=finalization_adapters,
-        current_projection=current_projection,
+        library_activation=library_activation,
         publication_guard=publication_guard,
     )
     resident = ResidentIngestor(
         service=service,
         facade=facade,
         database_admin=database_admin,
-        current_projection_maintenance=current_projection_maintenance,
+        library_maintenance=library_maintenance,
         config=config.resident,
         database_type=config.core.database.sql_type,
         event_logger=event_logger or logger.info,
@@ -124,39 +114,49 @@ def configure_logging(config: IngestConfig) -> None:
     )
 
 
-class _DisabledCurrentProjectionAdapter:
-    """A terminal no-op projection for policies that produce no artifacts."""
+class _DisabledLibraryActivationAdapter:
+    """A terminal no-op activation for policies that produce no artifacts."""
 
     def begin(
         self,
         revision: int,
         receipt_id: bytes,
-    ) -> CurrentProjectionCheckpoint:
-        return CurrentProjectionCheckpoint(
+    ) -> LibraryActivationCheckpoint:
+        return LibraryActivationCheckpoint(
             revision,
             receipt_id,
-            CurrentProjectionStatus.COMPLETE,
+            LibraryActivationStatus.COMPLETE,
             None,
         )
 
-    def append_page(
+    def activate_page(
         self,
         revision: int,
-        items: Sequence[VNextCurrentProjectionItem],
+        items: Sequence[VNextLibraryActivationItem],
     ) -> None:
         del revision, items
-        raise RuntimeError("artifact-disabled projection cannot accept pages")
+        raise RuntimeError("artifact-disabled library cannot accept pages")
 
     def seal(self, revision: int) -> None:
         del revision
-        raise RuntimeError("artifact-disabled projection cannot be sealed")
+        raise RuntimeError("artifact-disabled library cannot be sealed")
 
-    def reconcile(self, revision: int) -> None:
-        del revision
-        raise RuntimeError("artifact-disabled projection cannot be reconciled")
+    def reconcile_page(
+        self,
+        revision: int,
+        receipt_id: bytes,
+        *,
+        limit: int,
+    ) -> LibraryActivationCheckpoint:
+        del revision, receipt_id, limit
+        raise RuntimeError("artifact-disabled library cannot be reconciled")
 
-    def maintain_cleanup(self) -> CurrentProjectionMaintenanceOutcome:
-        return CurrentProjectionMaintenanceOutcome.DONE
+    def complete(self, revision: int, receipt_id: bytes) -> None:
+        del revision, receipt_id
+        raise RuntimeError("artifact-disabled library cannot be completed")
+
+    def maintain_cleanup(self) -> LibraryMaintenanceOutcome:
+        return LibraryMaintenanceOutcome.DONE
 
 
 def _disabled_publication_guard() -> nullcontext[None]:

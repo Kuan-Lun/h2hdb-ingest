@@ -1,8 +1,8 @@
 # h2hdb-ingest
 
 `h2hdb-ingest` is the filesystem-facing application for the H2HDB vNext
-schema epoch. It observes downloaded galleries, renders and stores immutable
-CBZ artifacts, maintains the current Komga projection, and drives the public
+schema epoch. It observes downloaded galleries, renders and activates canonical
+CBZ artifacts in one shared library, and drives the public
 core ingest facade under a renewable lease.
 
 The boundary is intentionally strict. The `h2hdb` package owns schema and
@@ -20,12 +20,14 @@ One ingest turn performs these steps:
 3. Freeze one filesystem discovery snapshot in a temporary SQLite keyset index.
 4. Drive source, analysis, artifact, publication, and finalization state
    machines through bounded public facade calls.
-5. If CBZ output is enabled, spool the pinned publication projection to local
-   SQLite, reconcile the current Komga view, and only then finalize publication
-   in core.
-6. Complete the ingest session.
-7. Advance one bounded page in each ingest-owned CBZ cleanup queue.
-8. After the SHARED session gate is released, make one response-loss-safe core
+5. If CBZ output is enabled, stage complete verified CBZs privately, spool the
+   pinned stable storage keys, and activate bounded pages under a durable
+   maintenance marker.
+6. Finalize the reader-visible core head only after the library reaches
+   `READY`, then clear the marker.
+7. Complete the ingest session.
+8. Advance one bounded page in the ingest-owned private cleanup queue.
+9. After the SHARED session gate is released, make one response-loss-safe core
    current-only maintenance attempt. A typed local or core `PROGRESSED` outcome
    is retried immediately without resetting the periodic deadline; `BLOCKED`,
    `CONTENDED`, `DONE`, and transient failures use the ordinary idle poll
@@ -42,7 +44,7 @@ remains fail-closed.
 
 Database operations and local work are split explicitly. The controller lock
 is held only for a bounded core issue or commit call. Directory walks, hashing,
-parsing, image conversion, ZIP creation, projection spooling, and filesystem
+parsing, image conversion, ZIP creation, activation spooling, and filesystem
 reconciliation run outside that lock, so lease renewal is never blocked by
 corpus-sized I/O.
 
@@ -52,48 +54,44 @@ indexed lookup instead of rescanning the corpus. Gallery file, directory, and
 tag observations are also bounded and audited. A source mutation observed
 between pages fails closed.
 
-## Artifact and Komga roots
+## Single CBZ library
 
-CBZ-enabled deployments use two different, non-nested roots:
+CBZ-enabled deployments configure one `library_path` parent:
 
-- `artifact_store_path` contains content-addressed artifacts and ingest-owned
-  coordination journals. It retains current and bounded pending/protected
-  artifacts; released old artifacts are reclaimed after a new current
-  projection reconciles.
-- `cbz_path` contains only the friendly current projection for Komga.
+```text
+library/
+├── current/                         # Komga and OPDS read-only mount
+└── .h2hdb-state/
+    ├── staging/                     # mode 0700, complete candidates
+    ├── quarantine/                  # mode 0700, stale-removal recovery
+    ├── journal/                     # mode 0700, SQLite activation journal
+    ├── locks/                       # mode 0700, adapter state lock
+    └── coordination/                # separately mounted read-only by OPDS
+        ├── publication.lock
+        └── ACTIVATING               # exists only during an unfinished cutover
+```
 
-The artifact adapter verifies the expected SHA-256 while materializing each
-archive and never mutates an existing content-addressed artifact. Protection
-and release transitions are crash-safe. When neither the current nor pending
-projection references a released artifact, bounded cleanup verifies its exact
-digest and regular-file type, unlinks it, and removes its artifact row. Cleanup
-is driven by a durable released-digest queue; the terminal `RELEASED` token
-tombstone remains permanently so a delayed protect cannot resurrect reclaimed
-bytes. Symlinks, unknown paths, and externally changed bytes fail closed.
-Cleanup first captures a managed leaf with an atomic no-replace rename into a
-private mode-0700 quarantine namespace under the same filesystem root. Only the
-publication-lock-holding adapter may mutate that namespace. Unexpected owner,
-mode, inode, or directory entries preserve the quarantined bytes and fail
-closed without acknowledging the durable candidate.
-`CurrentProjectionMaintenanceAdapter.maintain_cleanup()` is the public bounded
-resident action: one call advances at most eight projection-outbox candidates
-and eight artifact-queue candidates. It reports `PROGRESSED` only when durable
-work committed and more remains, `BLOCKED` when protected bytes leave work but
-no progress, and `DONE` when both queues are empty. The resident calls it before
-every ingest claim and once after session completion, so a backlog larger than
-one page drains without a restart or another publication.
+Core owns the stable GID storage key. The registered
+`gid-sha256-12-v1` codec resolves to
+`hash-v1/<2 hex>/<1 hex>/h2h-<gid>.cbz`; content, title, date, and revision
+changes therefore retain the same Komga identity. Ingest never derives a
+second locator or grouping layout.
 
-The current projection is built from the complete current core publication. It is
-spooled before any friendly path changes, uses atomic copies, and records both
-artifact identity and a durable regular-file stat signature. Unknown paths are
-never overwritten or removed. A managed path that became a symlink, directory,
-or externally changed file fails closed, including a change between stale-path
-preflight and deletion.
+`protect()` writes, hashes, size-checks, and fsyncs a private staging file. A
+reader-invisible core publication is then spooled to the activation journal.
+Each `reconcile_page()` advances at most 128 installs or removals. It creates
+the durable `ACTIVATING` marker while holding `publication.lock` exclusively,
+uses same-filesystem `os.replace` for changed paths, and records exact regular
+file stat identities. Core advances the reader-visible head only after durable
+`READY`; `complete()` then removes and fsyncs the marker before unlocking.
 
-Every publisher for one catalog must share the same `artifact_store_path`.
-Ingest holds its artifact-store publication flock across the bounded core
-publication calls, local projection, and core finalization. Never acquire the
-database gate and publication flock in the opposite order.
+OPDS holds a shared flock while resolving the current head and opening the
+file. Lock contention, a present/invalid marker, an unknown target, an
+intermediate symlink, or externally changed managed bytes fails closed. Komga
+and OPDS therefore read the same persistent CBZ; staging/quarantine bytes may
+exist only during a pending or interrupted activation. SIGINT/SIGTERM stops at
+the next bounded durable step and does not claim new work. A forced container
+kill leaves the marker and journal so restart continues before readers resume.
 
 ## Installation and commands
 
@@ -133,10 +131,8 @@ SQLite example with artifacts enabled is:
   },
   "paths": {
     "download_path": "/download",
-    "artifact_store_path": "/opds-artifacts",
-    "cbz_path": "/komga-library",
-    "max_image_short_side": 768,
-    "cbz_grouping": "flat"
+    "library_path": "/hentai/library",
+    "max_image_short_side": 768
   },
   "resident": {
     "periodic_scan_seconds": 1800,
@@ -148,11 +144,11 @@ SQLite example with artifacts enabled is:
 }
 ```
 
-`cbz_path` and `artifact_store_path` must either both be configured or both be
-`null`; setting both to `null` disables artifact output. Grouping accepts
-`flat`, `date-yyyy`, `date-yyyy-mm`, or `date-yyyy-mm-dd`.
+`library_path` points at the parent containing `current` and `.h2hdb-state`.
+Setting it to `null` disables artifact output. `download_path` and
+`library_path` must be distinct and non-nested.
 
-`max_rows` is constrained to 1–128. Core also fixes publication and projection
+`max_rows` is constrained to 1–128. Core also fixes publication and activation
 pages at 128 rows. These limits bound each database or adapter step, not the
 total corpus size.
 
@@ -161,9 +157,10 @@ string such as `"${H2HDB_RW_DB_PASSWORD}"` is substituted recursively; missing
 variables and unknown configuration fields fail startup.
 
 The download root must already be a nonempty directory. When artifacts are
-enabled, ingest creates the two output roots if needed. Containers that share
-the artifact or current-view mounts should use compatible numeric UID/GID or an
-operator-managed ACL.
+enabled, ingest creates `current`, the private state directories, coordination
+directory, journal, and permanent lock. Mount only `current` into Komga. Mount
+`current` and `.h2hdb-state/coordination` separately and read-only into OPDS;
+never expose staging, quarantine, or the journal to readers.
 
 ## Development
 
@@ -200,7 +197,7 @@ Git and must contain a complete Hentai@Home download tree. Set
 
 The independent Python oracle and Lean model under `verification/` specify
 cross-component analysis semantics; core owns the production implementation.
-The TLA+ model covers crash-safe current-projection behavior. Run the required
+The TLA+ model covers crash-safe single-library activation behavior. Run the required
 formal checks with:
 
 ```bash

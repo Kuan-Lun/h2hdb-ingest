@@ -175,32 +175,34 @@ compatibility surface。startup 只能呼叫 `VNextDatabaseAdminFacade.check()`�
 
 每個 core operation 維持 issue/prepare/commit 分離。session controller lock
 只包住有界的 database issue 或 commit call；filesystem scan、hash、image/ZIP
-work、artifact storage、projection spooling 與其他 local I/O 必須在 lock
+work、artifact staging、activation spooling 與其他 local I/O 必須在 lock
 之外，讓 heartbeat 能更新精確 session receipt。不得提供 registry surrogate
 ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 authority。
 
-### Artifact and projection safety
+### Single-library activation safety
 
-- `artifact_store_path` 與 `cbz_path` 必須是不同且不互相巢狀的 root。
-  前者擁有 content-addressed artifact 與 OPDS reconciliation state；後者只
-  擁有 Komga current friendly-file projection。
-- catalog publication 成功後才能更新 Komga projection。只能移除
-  artifact-store state 記錄為 managed 的 path，不得覆寫或刪除未知檔案。
-- 所有 CBZ-enabled publisher 必須以同一 `artifact_store_path` 作為
-  coordination domain。先取得 artifact-store publication flock，再執行
-  bounded core publication，並持有到 projection 與 core finalization 完成；
-  不得反向取得 lock。
-- durable pending projection journal 是 crash recovery 的 source of truth。
-  projection copy 只有在 artifact identity 與 regular-file stat signature
-  都相符時才能略過；外部變更必須以 atomic copy 重新驗證。
-- released-digest cleanup 使用 durable bounded queue。不得刪除 current 或
-  pending projection 仍引用的 bytes/state；永久保留 terminal `RELEASED`
-  token tombstone，且不得 follow symlink。
-- artifact 與 current-view quarantine 是 root 下 mode-0700 的 private adapter
-  capability。owner、mode、inode 或 entry 出現非預期變更時必須 fail closed，
-  不得 acknowledge cleanup。
-- current-projection maintenance 每次最多推進各 durable cleanup queue 的
-  one eight-item page。resident 在每次 claim 前與 session 完成後各執行一次。
+- CBZ-enabled deployment 只有一個 `library_path` parent。`current/` 是 Komga
+  與 OPDS 共用的唯一 persistent CBZ tree；`.h2hdb-state/` 擁有 private
+  staging、quarantine、journal、locks 與 reader-visible coordination。
+- filesystem path 只能使用 core `ArtifactStorageKey` 的固定
+  `gid-sha256-12-v1` codec；不得重建 content-addressed locator、日期 grouping、
+  friendly title path 或第二份 persistent CBZ tree。
+- artifact 必須先在同 filesystem 的 mode-0700 staging 完整寫入、驗證
+  SHA-256/size 並 fsync。activation 只能用 descriptor-relative、逐層
+  `O_NOFOLLOW` 的 `os.replace` 安裝到 current；不得 byte-copy persistent CBZ。
+- core reader head 在 library durable `READY` 前不得 advance。activation 從
+  reader-invisible DB commit 起持有 `coordination/publication.lock` exclusive
+  flock，建立並 fsync `ACTIVATING`；core finalization 成功後才可 durable unlink
+  marker 並 unlock。OPDS 只取得 nonblocking shared flock，marker/lock異常時
+  fail closed。
+- `reconcile_page` 每次最多處理 128 個 install/removal 並回寫 opaque cursor。
+  SIGINT/SIGTERM 在 bounded step 間停止且不得再 claim；SIGKILL 後由 exact
+  receipt、journal、marker、digest 與 stat identity 繼續，不得要求 rollback。
+- 只能 replace/delete journal 記錄為 managed 且 exact signature 相符的 path。
+  unknown path、中間 symlink、owner/mode/inode/entry 變更一律 fail closed。
+- terminal `RELEASED` protection token tombstone 永久保留；private cleanup
+  每次最多推進 one eight-item page，不得刪除 current bytes。
+- resident 在每次 claim 前與 session 完成後各執行一次 library maintenance。
   `PROGRESSED` 立即重試；`BLOCKED`、`CONTENDED`、`DONE` 與 transient
   failure 回到正常 poll cadence。
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from threading import Event
 from typing import cast
 
@@ -17,7 +18,7 @@ from h2hdb import (
 
 import h2hdb_ingest.resident as resident_module
 from h2hdb_ingest import ResidentConfig
-from h2hdb_ingest.maintenance import CurrentProjectionMaintenanceOutcome
+from h2hdb_ingest.maintenance import LibraryMaintenanceOutcome
 from h2hdb_ingest.resident import IngestSynchronizer, ResidentIngestor
 from h2hdb_ingest.session import IngestSessionController
 
@@ -93,26 +94,32 @@ class _Admin:
         return cast(SchemaEpochReport, object())
 
 
-class _ProjectionMaintenance:
+class _LibraryMaintenance:
     def __init__(
         self,
-        results: tuple[CurrentProjectionMaintenanceOutcome, ...] = (
-            CurrentProjectionMaintenanceOutcome.DONE,
+        results: tuple[LibraryMaintenanceOutcome, ...] = (
+            LibraryMaintenanceOutcome.DONE,
         ),
     ) -> None:
         self._results = iter(results)
         self.calls = 0
 
-    def maintain_cleanup(self) -> CurrentProjectionMaintenanceOutcome:
+    def maintain_cleanup(self) -> LibraryMaintenanceOutcome:
         self.calls += 1
-        return next(self._results, CurrentProjectionMaintenanceOutcome.DONE)
+        return next(self._results, LibraryMaintenanceOutcome.DONE)
 
 
 class _Service:
     def __init__(self, events: list[object]) -> None:
         self._events = events
 
-    def synchronize_once(self, session: IngestSessionController) -> object:
+    def synchronize_once(
+        self,
+        session: IngestSessionController,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> object:
+        del should_stop
         self._events.append("synchronize")
         return session.call(lambda _facade, receipt: receipt.ingest_generation)
 
@@ -121,8 +128,13 @@ class _ManifestMismatchService:
     def __init__(self, events: list[object]) -> None:
         self._events = events
 
-    def synchronize_once(self, session: IngestSessionController) -> object:
-        del session
+    def synchronize_once(
+        self,
+        session: IngestSessionController,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> object:
+        del session, should_stop
         self._events.append("synchronize")
         raise VNextSourceManifestMismatchError("source changed")
 
@@ -131,8 +143,13 @@ class _StagingCapacityService:
     def __init__(self, events: list[object]) -> None:
         self._events = events
 
-    def synchronize_once(self, session: IngestSessionController) -> object:
-        del session
+    def synchronize_once(
+        self,
+        session: IngestSessionController,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> object:
+        del session, should_stop
         self._events.append("synchronize")
         raise GalleryStagingCapacityError(1_500_000)
 
@@ -163,7 +180,7 @@ def _resident(
     maintenance_results: tuple[VNextCurrentOnlyMaintenanceOutcome, ...] = (
         VNextCurrentOnlyMaintenanceOutcome.DONE,
     ),
-    projection_maintenance: _ProjectionMaintenance | None = None,
+    library_maintenance: _LibraryMaintenance | None = None,
     service: IngestSynchronizer | None = None,
 ) -> ResidentIngestor:
     facade = _Facade(
@@ -175,9 +192,7 @@ def _resident(
         service=service or _Service(events),
         facade=cast(VNextIngestFacade, facade),
         database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
-        current_projection_maintenance=(
-            projection_maintenance or _ProjectionMaintenance()
-        ),
+        library_maintenance=(library_maintenance or _LibraryMaintenance()),
         config=ResidentConfig(
             periodic_scan_seconds=60,
             poll_seconds=1,
@@ -226,6 +241,20 @@ def test_ordinary_claim_contention_is_not_an_error() -> None:
     ]
 
 
+def test_requested_stop_skips_maintenance_and_does_not_claim_new_work() -> None:
+    events: list[object] = []
+    library_maintenance = _LibraryMaintenance()
+    resident = _resident(events, library_maintenance=library_maintenance)
+
+    assert not resident.process_available(
+        periodic_scan=True,
+        should_stop=lambda: True,
+    )
+
+    assert library_maintenance.calls == 0
+    assert events == []
+
+
 def test_maintenance_progress_skips_ingest_claim() -> None:
     events: list[object] = []
     resident = _resident(
@@ -237,29 +266,25 @@ def test_maintenance_progress_skips_ingest_claim() -> None:
     assert events == [("current-only", 10_000_000)]
 
 
-def test_projection_maintenance_progress_skips_database_and_ingest() -> None:
+def test_library_maintenance_progress_skips_database_and_ingest() -> None:
     events: list[object] = []
-    projection_maintenance = _ProjectionMaintenance(
-        (CurrentProjectionMaintenanceOutcome.PROGRESSED,)
-    )
+    library_maintenance = _LibraryMaintenance((LibraryMaintenanceOutcome.PROGRESSED,))
     resident = _resident(
         events,
-        projection_maintenance=projection_maintenance,
+        library_maintenance=library_maintenance,
     )
 
     assert resident.process_available(periodic_scan=True)
     assert events == []
 
 
-def test_blocked_projection_maintenance_uses_ordinary_claim_poll() -> None:
+def test_blocked_library_maintenance_uses_ordinary_claim_poll() -> None:
     events: list[object] = []
-    projection_maintenance = _ProjectionMaintenance(
-        (CurrentProjectionMaintenanceOutcome.BLOCKED,)
-    )
+    library_maintenance = _LibraryMaintenance((LibraryMaintenanceOutcome.BLOCKED,))
     resident = _resident(
         events,
         available=False,
-        projection_maintenance=projection_maintenance,
+        library_maintenance=library_maintenance,
     )
 
     assert not resident.process_available(periodic_scan=False)
@@ -372,25 +397,25 @@ def test_staging_capacity_reports_core_cleanup_progress(
     ]
 
 
-def test_staging_capacity_reports_projection_cleanup_progress(
+def test_staging_capacity_reports_library_cleanup_progress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[object] = []
-    projection_maintenance = _ProjectionMaintenance(
+    library_maintenance = _LibraryMaintenance(
         (
-            CurrentProjectionMaintenanceOutcome.DONE,
-            CurrentProjectionMaintenanceOutcome.PROGRESSED,
+            LibraryMaintenanceOutcome.DONE,
+            LibraryMaintenanceOutcome.PROGRESSED,
         )
     )
     monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
     resident = _resident(
         events,
         service=_StagingCapacityService(events),
-        projection_maintenance=projection_maintenance,
+        library_maintenance=library_maintenance,
     )
 
     assert resident.process_available(periodic_scan=True)
-    assert projection_maintenance.calls == 2
+    assert library_maintenance.calls == 2
     assert events == [
         ("current-only", 10_000_000),
         ("claim", True, 10_000_000),
@@ -419,7 +444,7 @@ def test_staging_capacity_preserves_completion_failure_as_note(
         service=_StagingCapacityService(events),
         facade=cast(VNextIngestFacade, facade),
         database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
-        current_projection_maintenance=_ProjectionMaintenance(),
+        library_maintenance=_LibraryMaintenance(),
         config=ResidentConfig(
             periodic_scan_seconds=60,
             poll_seconds=1,
@@ -489,7 +514,7 @@ def test_maintenance_failure_does_not_undo_completed_ingest(
         service=_Service(events),
         facade=cast(VNextIngestFacade, _FailAfterCompletionFacade()),
         database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
-        current_projection_maintenance=_ProjectionMaintenance(),
+        library_maintenance=_LibraryMaintenance(),
         config=ResidentConfig(
             periodic_scan_seconds=60,
             poll_seconds=1,
@@ -578,20 +603,20 @@ def test_run_forever_waits_instead_of_exiting_on_staging_capacity(
     ]
 
 
-def test_run_forever_immediately_drains_projection_progress_then_waits(
+def test_run_forever_immediately_drains_library_progress_then_waits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[object] = []
-    projection_maintenance = _ProjectionMaintenance(
+    library_maintenance = _LibraryMaintenance(
         (
-            CurrentProjectionMaintenanceOutcome.PROGRESSED,
-            CurrentProjectionMaintenanceOutcome.DONE,
+            LibraryMaintenanceOutcome.PROGRESSED,
+            LibraryMaintenanceOutcome.DONE,
         )
     )
     resident = _resident(
         events,
         available=False,
-        projection_maintenance=projection_maintenance,
+        library_maintenance=library_maintenance,
     )
 
     class _Stop:
@@ -610,7 +635,7 @@ def test_run_forever_immediately_drains_projection_progress_then_waits(
     stop = _Stop()
     resident.run_forever(stop=cast(Event, stop))
 
-    assert projection_maintenance.calls == 2
+    assert library_maintenance.calls == 2
     assert events == [
         ("current-only", 10_000_000),
         ("claim", True, 10_000_000),

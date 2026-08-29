@@ -33,5 +33,5 @@ def build_ingest_policy(config: IngestConfig) -> VNextIngestPolicy:
         max_image_short_side=config.paths.max_image_short_side,
         zip=VNextArtifactZipPolicy(),
         operational_max_batch_rows=config.resident.max_rows,
-        artifacts_required=config.paths.artifact_store_path is not None,
+        artifacts_required=config.paths.library_path is not None,
     )

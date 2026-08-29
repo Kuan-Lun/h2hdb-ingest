@@ -9,17 +9,17 @@ import pytest
 from h2hdb import (
     ArtifactReleaseAdapter,
     ArtifactStorageAdapter,
-    CurrentProjectionCheckpoint,
-    CurrentProjectionStatus,
+    LibraryActivationCheckpoint,
+    LibraryActivationStatus,
     VNextAnalysisAdvanceResult,
-    VNextCurrentProjectionAdapter,
-    VNextCurrentProjectionItem,
     VNextIngestAdvanceResult,
     VNextIngestFacade,
     VNextIngestPhase,
     VNextIngestSession,
     VNextIngestSourceAdapter,
     VNextIngestSourceReceipt,
+    VNextLibraryActivationAdapter,
+    VNextLibraryActivationItem,
     VNextResolvedIngestPolicy,
 )
 
@@ -27,6 +27,7 @@ import h2hdb_ingest.service as service_module
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, build_ingest_policy
 from h2hdb_ingest.service import (
     VNextIngestService,
+    _IngestStopRequested,
     synchronize_analysis,
     synchronize_publication,
     synchronize_source,
@@ -407,7 +408,7 @@ def test_source_orchestration_rejects_terminal_result_without_sealed_receipt() -
         raise AssertionError("missing source receipt was accepted")
 
 
-class _Projection:
+class _LibraryActivation:
     def __init__(self) -> None:
         self.guarded = False
 
@@ -424,26 +425,36 @@ class _Projection:
         self,
         revision: int,
         receipt_id: bytes,
-    ) -> CurrentProjectionCheckpoint:
-        return CurrentProjectionCheckpoint(
+    ) -> LibraryActivationCheckpoint:
+        return LibraryActivationCheckpoint(
             revision,
             receipt_id,
-            CurrentProjectionStatus.COMPLETE,
+            LibraryActivationStatus.COMPLETE,
             None,
         )
 
-    def append_page(
+    def activate_page(
         self,
         revision: int,
-        items: Sequence[VNextCurrentProjectionItem],
+        items: Sequence[VNextLibraryActivationItem],
     ) -> None:
         del revision, items
 
     def seal(self, revision: int) -> None:
         del revision
 
-    def reconcile(self, revision: int) -> None:
-        del revision
+    def reconcile_page(
+        self,
+        revision: int,
+        receipt_id: bytes,
+        *,
+        limit: int,
+    ) -> LibraryActivationCheckpoint:
+        del limit
+        return self.begin(revision, receipt_id)
+
+    def complete(self, revision: int, receipt_id: bytes) -> None:
+        del revision, receipt_id
 
 
 class _PreparedPublication:
@@ -481,7 +492,7 @@ class _PublicationFacade:
         *,
         artifact_adapters: Mapping[bytes, ArtifactStorageAdapter],
         finalization_adapters: Mapping[bytes, ArtifactReleaseAdapter],
-        current_projection: VNextCurrentProjectionAdapter,
+        library_activation: VNextLibraryActivationAdapter,
     ) -> _PreparedPublication:
         self._events.append(
             (
@@ -489,7 +500,7 @@ class _PublicationFacade:
                 issued[1],
                 artifact_adapters,
                 finalization_adapters,
-                current_projection,
+                library_activation,
             )
         )
         return _PreparedPublication(self._events, issued[1])
@@ -523,7 +534,7 @@ def test_publication_orchestration_closes_each_prepared_step() -> None:
         lease_duration_microseconds=10_000_000,
         database_type="sqlite",
     )
-    projection = _Projection()
+    activation = _LibraryActivation()
     storage = cast(ArtifactStorageAdapter, object())
     release = cast(ArtifactReleaseAdapter, object())
     policy = cast(VNextResolvedIngestPolicy, object())
@@ -533,7 +544,7 @@ def test_publication_orchestration_closes_each_prepared_step() -> None:
         policy,
         artifact_adapters={b"store": storage},
         finalization_adapters={b"store": release},
-        current_projection=projection,
+        library_activation=activation,
     )
 
     assert result.phase is VNextIngestPhase.FINALIZATION
@@ -552,12 +563,41 @@ def test_publication_orchestration_closes_each_prepared_step() -> None:
     ]
 
 
+def test_publication_stop_is_observed_after_one_committed_bounded_step() -> None:
+    events: list[object] = []
+    facade = _PublicationFacade(events)
+    controller = IngestSessionController(
+        cast(VNextIngestFacade, facade),
+        _session(),
+        lease_duration_microseconds=10_000_000,
+        database_type="sqlite",
+    )
+
+    with pytest.raises(_IngestStopRequested):
+        synchronize_publication(
+            controller,
+            cast(VNextResolvedIngestPolicy, object()),
+            artifact_adapters={},
+            finalization_adapters={},
+            library_activation=_LibraryActivation(),
+            should_stop=lambda: facade._step == 1,
+        )
+
+    assert [event[0] for event in events if isinstance(event, tuple)] == [
+        "publication-issue",
+        "publication-prepare",
+        "publication-enter",
+        "publication-commit",
+        "publication-close",
+    ]
+
+
 def test_complete_service_holds_one_outer_guard_through_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[object] = []
-    projection = _Projection()
+    activation = _LibraryActivation()
     config = IngestConfig(paths=IngestPathsConfig(download_path=tmp_path))
     policy = build_ingest_policy(config)
     resolved = cast(VNextResolvedIngestPolicy, object())
@@ -604,8 +644,9 @@ def test_complete_service_holds_one_outer_guard_through_publication(
         session: object,
         selected: object,
         adapter: object,
+        **kwargs: object,
     ) -> VNextIngestSourceReceipt:
-        del session, adapter
+        del session, adapter, kwargs
         assert selected is resolved
         events.append("source")
         return source_receipt
@@ -615,8 +656,9 @@ def test_complete_service_holds_one_outer_guard_through_publication(
         selected: object,
         receipt: object,
         max_rows: int,
+        **kwargs: object,
     ) -> VNextAnalysisAdvanceResult:
-        del session
+        del session, kwargs
         assert selected is resolved and receipt is source_receipt and max_rows == 128
         events.append("analysis")
         return analysis
@@ -627,7 +669,7 @@ def test_complete_service_holds_one_outer_guard_through_publication(
         **kwargs: object,
     ) -> VNextIngestAdvanceResult:
         del session, kwargs
-        assert selected is resolved and projection.guarded
+        assert selected is resolved and activation.guarded
         events.append("publication")
         return publication
 
@@ -660,8 +702,8 @@ def test_complete_service_holds_one_outer_guard_through_publication(
         max_rows=128,
         artifact_adapters={},
         finalization_adapters={},
-        current_projection=projection,
-        publication_guard=projection.publication_guard,
+        library_activation=activation,
+        publication_guard=activation.publication_guard,
     )
 
     outcome = service.synchronize_once(controller)

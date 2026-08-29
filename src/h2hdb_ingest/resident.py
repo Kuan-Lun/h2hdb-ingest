@@ -22,9 +22,10 @@ from h2hdb import (
 
 from .config import ResidentConfig
 from .maintenance import (
-    CurrentProjectionMaintenanceAdapter,
-    CurrentProjectionMaintenanceOutcome,
+    LibraryMaintenanceAdapter,
+    LibraryMaintenanceOutcome,
 )
+from .service import _IngestStopRequested
 from .session import IngestLeaseHeartbeat, IngestSessionController
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,12 @@ class _ResidentCycleOutcome(StrEnum):
 class IngestSynchronizer(Protocol):
     """Cross-phase service invoked under one renewable public session."""
 
-    def synchronize_once(self, session: IngestSessionController) -> object: ...
+    def synchronize_once(
+        self,
+        session: IngestSessionController,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> object: ...
 
 
 class ResidentIngestor:
@@ -49,7 +55,7 @@ class ResidentIngestor:
         service: IngestSynchronizer,
         facade: VNextIngestFacade,
         database_admin: VNextDatabaseAdminFacade,
-        current_projection_maintenance: CurrentProjectionMaintenanceAdapter,
+        library_maintenance: LibraryMaintenanceAdapter,
         config: ResidentConfig,
         database_type: str,
         event_logger: Callable[[str], None] | None = None,
@@ -58,14 +64,13 @@ class ResidentIngestor:
         self._facade = facade
         self._database_admin = database_admin
         if not isinstance(
-            current_projection_maintenance,
-            CurrentProjectionMaintenanceAdapter,
+            library_maintenance,
+            LibraryMaintenanceAdapter,
         ):
             raise TypeError(
-                "current_projection_maintenance must implement the bounded "
-                "maintenance protocol"
+                "library_maintenance must implement the bounded maintenance protocol"
             )
-        self._current_projection_maintenance = current_projection_maintenance
+        self._library_maintenance = library_maintenance
         self._config = config
         self._database_type = database_type.casefold()
         self._event_logger = event_logger or logger.info
@@ -74,7 +79,7 @@ class ResidentIngestor:
         """Validate an existing READY epoch without creating or migrating it."""
 
         report = self._database_admin.check()
-        self._try_current_projection_maintenance()
+        self._try_library_maintenance()
         self._try_current_only_maintenance()
         return report
 
@@ -83,11 +88,16 @@ class ResidentIngestor:
         *,
         periodic_scan: bool,
         preflight: Callable[[], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> bool:
         """Process one ingest or maintenance progress unit if available."""
 
         return (
-            self._process_cycle(periodic_scan=periodic_scan, preflight=preflight)
+            self._process_cycle(
+                periodic_scan=periodic_scan,
+                preflight=preflight,
+                should_stop=should_stop,
+            )
             is not _ResidentCycleOutcome.IDLE
         )
 
@@ -96,15 +106,22 @@ class ResidentIngestor:
         *,
         periodic_scan: bool,
         preflight: Callable[[], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> _ResidentCycleOutcome:
+        if should_stop is not None and should_stop():
+            return _ResidentCycleOutcome.IDLE
         lease_duration = self._config.lease_seconds * 1_000_000
         # A previous bounded sweep may have lost its response, contended on the
         # EXCLUSIVE gate, or remained blocked by a live predecessor.  Retrying
         # once before every claim also provides progress while ingest is idle.
-        projection_maintenance = self._try_current_projection_maintenance()
-        if projection_maintenance is CurrentProjectionMaintenanceOutcome.PROGRESSED:
+        library_maintenance = self._try_library_maintenance()
+        if should_stop is not None and should_stop():
+            return _ResidentCycleOutcome.IDLE
+        if library_maintenance is LibraryMaintenanceOutcome.PROGRESSED:
             return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
         database_maintenance = self._try_current_only_maintenance(lease_duration)
+        if should_stop is not None and should_stop():
+            return _ResidentCycleOutcome.IDLE
         if database_maintenance is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED:
             return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
         claimed = self._facade.try_claim_ingest(periodic_scan, lease_duration)
@@ -122,7 +139,7 @@ class ResidentIngestor:
             except BaseException as error:
                 try:
                     session.complete()
-                    self._try_current_projection_maintenance()
+                    self._try_library_maintenance()
                     self._try_current_only_maintenance(lease_duration)
                 except BaseException as completion_error:
                     error.add_note(
@@ -135,11 +152,22 @@ class ResidentIngestor:
                 session,
                 interval_seconds=self._config.heartbeat_seconds,
             ) as heartbeat:
-                outcome = self._service.synchronize_once(session)
+                if should_stop is None:
+                    outcome = self._service.synchronize_once(session)
+                else:
+                    outcome = self._service.synchronize_once(
+                        session,
+                        should_stop=should_stop,
+                    )
                 heartbeat.raise_if_failed()
                 self._event_logger(
                     f"vNext ingest synchronization completed: {outcome!r}"
                 )
+        except _IngestStopRequested:
+            self._event_logger(
+                "vNext ingest stopped at a durable bounded-step boundary"
+            )
+            return _ResidentCycleOutcome.IDLE
         except GalleryStagingCapacityError as error:
             # Capacity is bounded backpressure, not a failed resident process.
             # The rejected request committed no rows, while completing the
@@ -153,10 +181,10 @@ class ResidentIngestor:
                     f"staging capacity was exhausted: {completion_error!r}"
                 )
                 raise error from completion_error
-            projection_maintenance = self._try_current_projection_maintenance()
+            library_maintenance = self._try_library_maintenance()
             database_maintenance = self._try_current_only_maintenance(lease_duration)
             if (
-                projection_maintenance is CurrentProjectionMaintenanceOutcome.PROGRESSED
+                library_maintenance is LibraryMaintenanceOutcome.PROGRESSED
                 or database_maintenance is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED
             ):
                 return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
@@ -168,7 +196,7 @@ class ResidentIngestor:
             # source-authority failure remains fatal to this resident turn.
             try:
                 session.complete()
-                self._try_current_projection_maintenance()
+                self._try_library_maintenance()
                 self._try_current_only_maintenance(lease_duration)
             except BaseException as completion_error:
                 error.add_note(
@@ -177,7 +205,7 @@ class ResidentIngestor:
                 )
             raise
         completion = session.complete()
-        self._try_current_projection_maintenance()
+        self._try_library_maintenance()
         self._try_current_only_maintenance(lease_duration)
         self._event_logger(
             "vNext ingest session completed: "
@@ -186,20 +214,18 @@ class ResidentIngestor:
         )
         return _ResidentCycleOutcome.INGESTED
 
-    def _try_current_projection_maintenance(
+    def _try_library_maintenance(
         self,
-    ) -> CurrentProjectionMaintenanceOutcome | None:
+    ) -> LibraryMaintenanceOutcome | None:
         """Make one bounded ingest-owned CBZ cleanup attempt."""
 
         try:
-            outcome = self._current_projection_maintenance.maintain_cleanup()
-            if not isinstance(outcome, CurrentProjectionMaintenanceOutcome):
-                raise TypeError(
-                    "current-projection maintenance returned an invalid outcome"
-                )
+            outcome = self._library_maintenance.maintain_cleanup()
+            if not isinstance(outcome, LibraryMaintenanceOutcome):
+                raise TypeError("library maintenance returned an invalid outcome")
             return outcome
         except Exception:
-            logger.exception("current-projection maintenance attempt failed")
+            logger.exception("library maintenance attempt failed")
             return None
 
     def _try_current_only_maintenance(
@@ -226,7 +252,10 @@ class ResidentIngestor:
         next_periodic = monotonic()
         while not stop_event.is_set():
             periodic = monotonic() >= next_periodic
-            outcome = self._process_cycle(periodic_scan=periodic)
+            outcome = self._process_cycle(
+                periodic_scan=periodic,
+                should_stop=stop_event.is_set,
+            )
             if outcome is _ResidentCycleOutcome.INGESTED:
                 next_periodic = monotonic() + self._config.periodic_scan_seconds
                 continue

@@ -11,8 +11,7 @@ def test_policy_is_derived_only_from_natural_consumer_facts(tmp_path: Path) -> N
     config = IngestConfig(
         paths=IngestPathsConfig(
             download_path=tmp_path / "download",
-            cbz_path=tmp_path / "cbz",
-            artifact_store_path=tmp_path / "artifacts",
+            library_path=tmp_path / "library",
             max_image_short_side=1024,
         ),
         resident=ResidentConfig(max_rows=64),

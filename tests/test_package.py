@@ -9,8 +9,7 @@ def test_package_exports_only_vnext_consumer_boundaries() -> None:
     package = import_module("h2hdb_ingest")
 
     assert callable(package.VNextFilesystemSourceAdapter)
-    assert callable(package.ManagedFilesystemArtifactAdapter)
-    assert callable(package.CurrentProjectionAdapter)
+    assert callable(package.ManagedFilesystemLibraryAdapter)
     assert callable(package.ResidentIngestor)
     assert callable(package.VNextIngestService)
     assert not hasattr(package, "H2HDB")

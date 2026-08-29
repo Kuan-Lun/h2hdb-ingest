@@ -6,7 +6,8 @@ __all__ = [
 ]
 
 import json
-from enum import StrEnum
+import os
+import stat
 from pathlib import Path
 
 from h2hdb import CoreConfig, resolve_environment_placeholders
@@ -15,21 +16,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 DEFAULT_MAX_ROWS = 128
 
 
-class CBZGrouping(StrEnum):
-    flat = "flat"
-    date_yyyy = "date-yyyy"
-    date_yyyy_mm = "date-yyyy-mm"
-    date_yyyy_mm_dd = "date-yyyy-mm-dd"
-
-
 class ConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 class IngestPathsConfig(ConfigModel):
     download_path: Path
-    cbz_path: Path | None = None
-    artifact_store_path: Path | None = None
+    library_path: Path | None = None
     max_image_short_side: int = Field(
         default=768,
         ge=1,
@@ -38,26 +31,20 @@ class IngestPathsConfig(ConfigModel):
             "and images are never enlarged"
         ),
     )
-    cbz_grouping: CBZGrouping = CBZGrouping.flat
 
     @model_validator(mode="after")
-    def validate_cbz_roots(self) -> IngestPathsConfig:
-        if (self.cbz_path is None) != (self.artifact_store_path is None):
-            raise ValueError(
-                "cbz_path and artifact_store_path must either both be set or "
-                "both be null"
-            )
-        if self.cbz_path is None or self.artifact_store_path is None:
+    def validate_library_root(self) -> IngestPathsConfig:
+        if self.library_path is None:
             return self
-        cbz_root = self.cbz_path.resolve(strict=False)
-        artifact_root = self.artifact_store_path.resolve(strict=False)
-        if cbz_root == artifact_root:
-            raise ValueError("cbz_path and artifact_store_path must be different")
-        if cbz_root.is_relative_to(artifact_root) or artifact_root.is_relative_to(
-            cbz_root
+        source_root = self.download_path.resolve(strict=False)
+        library_root = self.library_path.resolve(strict=False)
+        if source_root == library_root:
+            raise ValueError("download_path and library_path must be different")
+        if source_root.is_relative_to(library_root) or library_root.is_relative_to(
+            source_root
         ):
             raise ValueError(
-                "cbz_path and artifact_store_path must not contain one another"
+                "download_path and library_path must not contain one another"
             )
         return self
 
@@ -97,10 +84,18 @@ class IngestConfig(ConfigModel):
                 f"download_path is empty: {self.paths.download_path}; "
                 "check that the gallery volume is mounted"
             )
-        if self.paths.cbz_path is not None:
-            assert self.paths.artifact_store_path is not None
-            self.paths.cbz_path.mkdir(parents=True, exist_ok=True)
-            self.paths.artifact_store_path.mkdir(parents=True, exist_ok=True)
+        library_path = self.paths.library_path
+        if library_path is not None:
+            library_path.mkdir(mode=0o755, parents=True, exist_ok=True)
+            current_path = library_path / "current"
+            _ensure_directory(current_path, 0o755)
+            state_path = library_path / ".h2hdb-state"
+            _ensure_directory(state_path, 0o700)
+            for name in ("staging", "quarantine", "journal", "locks"):
+                private_path = state_path / name
+                _ensure_directory(private_path, 0o700)
+            coordination_path = state_path / "coordination"
+            _ensure_directory(coordination_path, 0o755)
 
 
 def load_config(path: str | Path) -> IngestConfig:
@@ -112,3 +107,25 @@ def load_config(path: str | Path) -> IngestConfig:
             f"Unable to load ingest config from {config_path}: {error}"
         ) from error
     return IngestConfig.model_validate(resolve_environment_placeholders(raw))
+
+
+def _ensure_directory(path: Path, mode: int) -> None:
+    path.mkdir(mode=mode, exist_ok=True)
+    value = path.lstat()
+    if stat.S_ISLNK(value.st_mode) or not stat.S_ISDIR(value.st_mode):
+        raise ValueError(f"managed library path is not a safe directory: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(
+            f"managed library path is not safely openable: {path}"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        visible = path.lstat()
+        if (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino):
+            raise ValueError(f"managed library path changed identity: {path}")
+        os.fchmod(descriptor, mode)
+    finally:
+        os.close(descriptor)

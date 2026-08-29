@@ -6,9 +6,10 @@ This directory contains executable specifications owned by filesystem ingest.
   produces the same gallery content, spam decisions, and CBZ create/rebuild/
   delete sets as clean full recomputation. A snapshot uses `Option`, so a
   deleted gallery is distinct from an existing empty gallery.
-- `tla/CbzProjection.tla` model-checks crash recovery between core publication
-  and local projection finalization, complete pending journals, unknown-path
-  protection, and artifact garbage-collection safety.
+- `tla/CbzLibraryActivation.tla` model-checks crash recovery between
+  reader-invisible
+  core publication, bounded local library activation, and reader-head
+  finalization, including maintenance-marker and unknown-path safety.
 
 The Lean proof assumes collision-free canonical hash identities, deterministic
 policy/artifact functions, an exact evidence delta, exact shard membership, and

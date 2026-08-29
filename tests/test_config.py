@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -49,55 +50,53 @@ def test_artifacts_can_be_disabled_without_creating_output_directories(
 
     config.ensure_paths()
 
-    assert config.paths.cbz_path is None
-    assert config.paths.artifact_store_path is None
+    assert config.paths.library_path is None
 
 
-@pytest.mark.parametrize(
-    ("cbz_path", "artifact_store_path"),
-    [
-        ("komga", None),
-        (None, "artifacts"),
-        ("same", "same"),
-        ("root", "root/artifacts"),
-        ("root/komga", "root"),
-    ],
-)
-def test_artifact_roots_must_be_distinct_non_nested_pairs(
+@pytest.mark.parametrize("library_relative", [".", "nested", "../download"])
+def test_source_and_library_roots_must_be_distinct_and_non_nested(
     tmp_path: Path,
-    cbz_path: str | None,
-    artifact_store_path: str | None,
+    library_relative: str,
 ) -> None:
+    download_path = tmp_path / "download"
     with pytest.raises(ValidationError):
         IngestPathsConfig(
-            download_path=tmp_path,
-            cbz_path=tmp_path / cbz_path if cbz_path is not None else None,
-            artifact_store_path=(
-                tmp_path / artifact_store_path
-                if artifact_store_path is not None
-                else None
-            ),
+            download_path=download_path,
+            library_path=download_path / library_relative,
         )
 
 
-def test_runtime_paths_create_both_output_roots(tmp_path: Path) -> None:
+def test_runtime_paths_create_one_public_library_and_private_state(
+    tmp_path: Path,
+) -> None:
     download_path = tmp_path / "download"
     download_path.mkdir()
     (download_path / "gallery").mkdir()
-    cbz_path = tmp_path / "komga"
-    artifact_store_path = tmp_path / "artifacts"
+    library_path = tmp_path / "library"
     config = IngestConfig(
         paths=IngestPathsConfig(
             download_path=download_path,
-            cbz_path=cbz_path,
-            artifact_store_path=artifact_store_path,
+            library_path=library_path,
         )
     )
 
     config.ensure_paths()
 
-    assert cbz_path.is_dir()
-    assert artifact_store_path.is_dir()
+    assert (library_path / "current").is_dir()
+    assert stat.S_IMODE((library_path / "current").stat().st_mode) == 0o755
+    state_path = library_path / ".h2hdb-state"
+    assert state_path.is_dir()
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o700
+    assert {entry.name for entry in state_path.iterdir()} == {
+        "coordination",
+        "journal",
+        "locks",
+        "quarantine",
+        "staging",
+    }
+    for name in ("journal", "locks", "quarantine", "staging"):
+        assert stat.S_IMODE((state_path / name).stat().st_mode) == 0o700
+    assert stat.S_IMODE((state_path / "coordination").stat().st_mode) == 0o755
 
 
 def test_runtime_paths_reject_empty_download_mount(tmp_path: Path) -> None:
@@ -107,6 +106,30 @@ def test_runtime_paths_reject_empty_download_mount(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="gallery volume is mounted"):
         config.ensure_paths()
+
+
+def test_runtime_paths_reject_managed_directory_symlink_without_chmod_target(
+    tmp_path: Path,
+) -> None:
+    download_path = tmp_path / "download"
+    download_path.mkdir()
+    (download_path / "gallery").mkdir()
+    library_path = tmp_path / "library"
+    library_path.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    (library_path / "current").symlink_to(outside, target_is_directory=True)
+    config = IngestConfig(
+        paths=IngestPathsConfig(
+            download_path=download_path,
+            library_path=library_path,
+        )
+    )
+
+    with pytest.raises(ValueError, match="not a safe directory"):
+        config.ensure_paths()
+
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o700
 
 
 def test_bounded_runtime_defaults() -> None:

@@ -19,12 +19,12 @@ from h2hdb import (
     ArtifactReleaseAdapter,
     ArtifactStorageAdapter,
     VNextAnalysisAdvanceResult,
-    VNextCurrentProjectionAdapter,
     VNextIngestAdvanceResult,
     VNextIngestPhase,
     VNextIngestPolicy,
     VNextIngestSourceAdapter,
     VNextIngestSourceReceipt,
+    VNextLibraryActivationAdapter,
     VNextResolvedIngestPolicy,
 )
 
@@ -33,6 +33,14 @@ from .filesystem import FilesystemSource
 from .session import IngestSessionController
 
 _ANALYSIS_SNAPSHOT_STAGE = b"snapshot_manifest"
+
+
+class _IngestStopRequested(Exception):
+    """Normal resident termination observed between bounded durable steps."""
+
+
+def _never_stop() -> bool:
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,7 +83,7 @@ class VNextIngestService:
         max_rows: int,
         artifact_adapters: Mapping[bytes, ArtifactStorageAdapter],
         finalization_adapters: Mapping[bytes, ArtifactReleaseAdapter],
-        current_projection: VNextCurrentProjectionAdapter,
+        library_activation: VNextLibraryActivationAdapter,
         publication_guard: Callable[[], AbstractContextManager[None]],
     ) -> None:
         if not isinstance(source_root, Path):
@@ -87,9 +95,9 @@ class VNextIngestService:
             raise TypeError("max_rows must be int")
         if not 1 <= max_rows <= 128:
             raise ValueError("max_rows must be from 1 through 128")
-        if not isinstance(current_projection, VNextCurrentProjectionAdapter):
+        if not isinstance(library_activation, VNextLibraryActivationAdapter):
             raise TypeError(
-                "current_projection must implement VNextCurrentProjectionAdapter"
+                "library_activation must implement VNextLibraryActivationAdapter"
             )
         if not callable(publication_guard):
             raise TypeError("publication_guard must be callable")
@@ -98,17 +106,21 @@ class VNextIngestService:
         self._max_rows = max_rows
         self._artifact_adapters = dict(artifact_adapters)
         self._finalization_adapters = dict(finalization_adapters)
-        self._current_projection = current_projection
+        self._library_activation = library_activation
         self._publication_guard = publication_guard
 
     def synchronize_once(
         self,
         session: IngestSessionController,
+        *,
+        should_stop: Callable[[], bool] | None = None,
     ) -> VNextIngestSynchronizationResult:
         """Synchronize one exact filesystem snapshot through finalization."""
 
         if not isinstance(session, IngestSessionController):
             raise TypeError("session must be IngestSessionController")
+        stop_requested = should_stop or _never_stop
+        _raise_if_stopping(stop_requested)
         resolved = session.call(
             lambda facade, receipt: facade.ensure_policy(receipt, self._policy)
         )
@@ -117,12 +129,14 @@ class VNextIngestService:
                 session,
                 resolved,
                 VNextFilesystemSourceAdapter(source),
+                should_stop=stop_requested,
             )
         analysis = synchronize_analysis(
             session,
             resolved,
             source_receipt,
             self._max_rows,
+            should_stop=stop_requested,
         )
         with self._publication_guard():
             publication = synchronize_publication(
@@ -130,7 +144,8 @@ class VNextIngestService:
                 resolved,
                 artifact_adapters=self._artifact_adapters,
                 finalization_adapters=self._finalization_adapters,
-                current_projection=self._current_projection,
+                library_activation=self._library_activation,
+                should_stop=stop_requested,
             )
         return VNextIngestSynchronizationResult(
             source_receipt,
@@ -144,6 +159,8 @@ def synchronize_analysis(
     policy: VNextResolvedIngestPolicy,
     source_receipt: VNextIngestSourceReceipt,
     max_rows: int,
+    *,
+    should_stop: Callable[[], bool] = _never_stop,
 ) -> VNextAnalysisAdvanceResult:
     """Drive bounded core analysis while leaving preparation outside the lock."""
 
@@ -168,6 +185,7 @@ def synchronize_analysis(
     )
     with prepared:
         while True:
+            _raise_if_stopping(should_stop)
             issued = session.call(
                 lambda facade, receipt: facade.issue_analysis_step(
                     receipt,
@@ -189,6 +207,7 @@ def synchronize_analysis(
                 )
             )
             _require_analysis_result(result)
+            _raise_if_stopping(should_stop)
             if not result.terminal:
                 continue
             if (
@@ -208,17 +227,19 @@ def synchronize_publication(
     *,
     artifact_adapters: Mapping[bytes, ArtifactStorageAdapter],
     finalization_adapters: Mapping[bytes, ArtifactReleaseAdapter],
-    current_projection: VNextCurrentProjectionAdapter,
+    library_activation: VNextLibraryActivationAdapter,
+    should_stop: Callable[[], bool] = _never_stop,
 ) -> VNextIngestAdvanceResult:
     """Drive publication and finalization inside the caller's outer guard."""
 
     if not isinstance(session, IngestSessionController):
         raise TypeError("session must be IngestSessionController")
-    if not isinstance(current_projection, VNextCurrentProjectionAdapter):
+    if not isinstance(library_activation, VNextLibraryActivationAdapter):
         raise TypeError(
-            "current_projection must implement VNextCurrentProjectionAdapter"
+            "library_activation must implement VNextLibraryActivationAdapter"
         )
     while True:
+        _raise_if_stopping(should_stop)
         issued = session.call(
             lambda facade, receipt: facade.issue_publication_step(receipt, policy)
         )
@@ -228,7 +249,7 @@ def synchronize_publication(
                 issued,  # noqa: B023
                 artifact_adapters=artifact_adapters,
                 finalization_adapters=finalization_adapters,
-                current_projection=current_projection,
+                library_activation=library_activation,
             )
         )
         with prepared:
@@ -240,6 +261,7 @@ def synchronize_publication(
                 )
             )
         _require_publication_result(result)
+        _raise_if_stopping(should_stop)
         if result.terminal:
             if result.phase is not VNextIngestPhase.FINALIZATION:
                 raise RuntimeError("terminal publication advancement is not finalized")
@@ -250,6 +272,8 @@ def synchronize_source(
     session: IngestSessionController,
     policy: VNextResolvedIngestPolicy,
     adapter: VNextIngestSourceAdapter,
+    *,
+    should_stop: Callable[[], bool] = _never_stop,
 ) -> VNextIngestSourceReceipt:
     """Drive source ingestion while keeping all local I/O outside the lease lock."""
 
@@ -258,6 +282,7 @@ def synchronize_source(
     prepared = session.outside_session(lambda facade: facade.prepare_source(adapter))
     with prepared:
         while True:
+            _raise_if_stopping(should_stop)
             issued = session.call(
                 lambda facade, receipt: facade.issue_source_step(
                     receipt,
@@ -280,6 +305,7 @@ def synchronize_source(
                 )
             )
             _require_source_result(result)
+            _raise_if_stopping(should_stop)
             if not result.terminal:
                 continue
             source_receipt = result.source_receipt
@@ -313,3 +339,8 @@ def _require_publication_result(result: VNextIngestAdvanceResult) -> None:
         VNextIngestPhase.FINALIZATION,
     }:
         raise RuntimeError("publication advancement returned another ingest phase")
+
+
+def _raise_if_stopping(should_stop: Callable[[], bool]) -> None:
+    if should_stop():
+        raise _IngestStopRequested

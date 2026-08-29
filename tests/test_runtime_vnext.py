@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from h2hdb import (
-    CurrentProjectionStatus,
+    LibraryActivationStatus,
     VNextCatalogFacade,
     VNextDatabaseAdminFacade,
     VNextIngestFacade,
@@ -11,7 +11,7 @@ from h2hdb import (
 
 from h2hdb_ingest import IngestConfig, IngestPathsConfig
 from h2hdb_ingest.artifact import ARTIFACT_ADAPTER_ID
-from h2hdb_ingest.projection import CurrentProjectionAdapter
+from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
 from h2hdb_ingest.runtime import build_runtime
 from h2hdb_ingest.service import VNextIngestService
 
@@ -36,7 +36,7 @@ def test_runtime_composes_only_public_vnext_core_facades(tmp_path: Path) -> None
     assert runtime.resident._database_admin is runtime.database_admin
 
 
-def test_artifact_disabled_runtime_uses_a_terminal_noop_projection(
+def test_artifact_disabled_runtime_uses_a_terminal_noop_library(
     tmp_path: Path,
 ) -> None:
     config = IngestConfig(paths=IngestPathsConfig(download_path=_source_root(tmp_path)))
@@ -46,23 +46,21 @@ def test_artifact_disabled_runtime_uses_a_terminal_noop_projection(
     assert isinstance(service, VNextIngestService)
     assert service._artifact_adapters == {}
     assert service._finalization_adapters == {}
-    checkpoint = service._current_projection.begin(3, b"r" * 16)
+    checkpoint = service._library_activation.begin(3, b"r" * 16)
     assert checkpoint.revision == 3
     assert checkpoint.receipt_id == b"r" * 16
-    assert checkpoint.status is CurrentProjectionStatus.COMPLETE
+    assert checkpoint.status is LibraryActivationStatus.COMPLETE
 
 
 def test_cbz_runtime_shares_one_adapter_for_protection_and_release(
     tmp_path: Path,
 ) -> None:
     source = _source_root(tmp_path)
-    artifact_root = tmp_path / "artifacts"
-    current_root = tmp_path / "komga"
+    library_root = tmp_path / "library"
     config = IngestConfig(
         paths=IngestPathsConfig(
             download_path=source,
-            artifact_store_path=artifact_root,
-            cbz_path=current_root,
+            library_path=library_root,
         )
     )
 
@@ -71,5 +69,5 @@ def test_cbz_runtime_shares_one_adapter_for_protection_and_release(
     assert isinstance(service, VNextIngestService)
     storage = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
     assert id(service._finalization_adapters[ARTIFACT_ADAPTER_ID]) == id(storage)
-    assert isinstance(service._current_projection, CurrentProjectionAdapter)
-    assert service._publication_guard == service._current_projection.publication_guard
+    assert isinstance(service._library_activation, ManagedFilesystemLibraryAdapter)
+    assert service._publication_guard == service._library_activation.publication_guard
