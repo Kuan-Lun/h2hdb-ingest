@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-08-28T18:41:24+00:00",
-  "manifest_sha256": "26c87759b0a743c8872442e0bdaf16f0819cde0604857489190ae3af8d4c3c88",
+  "checked_at": "2026-08-29T06:30:19+00:00",
+  "manifest_sha256": "4046873ed4a69ecc90d0ffe492b3982972fc2f020a9339fffe590ae6ad9a8f4a",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.5.0",
+  "project_version": "0.6.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,9 +30,9 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.24.0,<0.25",
+      "declared": "h2hdb>=0.25.0,<0.26",
       "group": "runtime",
-      "latest": "0.23.1",
+      "latest": "0.24.0",
       "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
@@ -130,7 +130,7 @@
     }
   ],
   "review": {
-    "note": "2026-08-29 full direct build, runtime, development, and Node registry review completed. h2hdb 0.24.0 is the local breaking exact-tree multi-repository candidate; PyPI latest is 0.23.1, so latest_satisfies=false is intentional and does not claim that 0.24.0 is published. All other latest releases satisfy their declared ranges and publish Python 3.14-compatible files. Official notes show Pydantic 2.13.5 contains validator-plugin reuse, GC traversal, and smart-union bug fixes compatible with the existing BaseModel and validator usage; build 1.6.0 adds CLI features and robustness fixes, while its removed BuildBackendException exc_info and deprecated build.util helper are unused because this repository only invokes python -m build; Ruff 0.16.5 adds preview-only selectors and ASYNC210, DTZ007, and SIM401 fixes outside the enabled non-preview rule set. Remaining candidates are unchanged from the prior reviewed audit; check-fast validates the resolved local tooling separately.",
+    "note": "2026-08-29 full direct build, runtime, development, and Node registry review completed. h2hdb 0.25.0 is the local breaking exact-tree multi-repository candidate; PyPI latest is 0.24.0, so latest_satisfies=false is intentional and does not claim that 0.25.0 is published. All other latest releases satisfy their declared ranges and publish Python 3.14-compatible files. Official notes show Pydantic 2.13.5 contains validator-plugin reuse, GC traversal, and smart-union bug fixes compatible with the existing BaseModel and validator usage; build 1.6.0 adds CLI features and robustness fixes, while its removed BuildBackendException exc_info and deprecated build.util helper are unused because this repository only invokes python -m build; Ruff 0.16.5 adds preview-only selectors and ASYNC210, DTZ007, and SIM401 fixes outside the enabled non-preview rule set. Remaining candidates are unchanged from the prior reviewed audit; exact-tree cross-repository gates validate the local h2hdb candidate separately.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
