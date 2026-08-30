@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-08-30T08:56:28+00:00",
+  "checked_at": "2026-08-30T11:26:26+00:00",
   "manifest_sha256": "c3bad7823f102a30396fc809e6d00050f24f27ef5b0c384370ab29115960af7f",
   "node": [
     {
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.9.0",
+  "project_version": "0.9.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -130,7 +130,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all direct build, runtime, optional development, and Node dependencies for h2hdb-ingest 0.9.0. This breaking release changes filesystem provisioning and metadata-validation behavior only: external roots are require-only, existing managed entries are validation-only, and exclusive creates retain mode initialization. Dependency APIs and bounds are unchanged; current registry candidates remain compatible with Python 3.14 and the tested h2hdb 0.26 cohort, with no bound exception required.",
+    "note": "Reviewed all direct build, runtime, optional development, and Node dependencies for h2hdb-ingest 0.9.1. This compatible fix delegates service access policy to Compose mounts and removes runtime exact UID/GID/mode enforcement without changing dependency APIs or bounds. Current registry candidates remain compatible with Python 3.14 and the tested h2hdb 0.26 cohort; no bound exception is required.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
