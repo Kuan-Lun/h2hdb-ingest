@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-08-30T06:52:31+00:00",
+  "checked_at": "2026-08-30T08:05:28+00:00",
   "manifest_sha256": "c3bad7823f102a30396fc809e6d00050f24f27ef5b0c384370ab29115960af7f",
   "node": [
     {
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.8.0",
+  "project_version": "0.8.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -130,7 +130,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed every direct build, runtime, optional, development, and Node dependency for h2hdb-ingest 0.8.0 against current registry metadata. All candidates are identical to the 0.7.1 receipt whose upstream release notes and Python 3.14 compatibility were reviewed on 2026-08-30. The breaking filesystem layout changes no dependency API, the manifest is unchanged, h2hdb 0.26.0 remains the tested cohort, and no dependency bound exception is required.",
+    "note": "Reviewed all direct build, runtime, optional development, and Node dependencies for h2hdb-ingest 0.8.1. This patch changes only fail-closed filesystem metadata diagnostics and pre-mutation ownership validation; dependency APIs and bounds are unchanged. Current registry candidates remain compatible with Python 3.14 and the tested h2hdb 0.26 cohort, with no bound exception required.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
