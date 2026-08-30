@@ -185,3 +185,6 @@ def test_publish_workflow_passes_the_pre_push_revision_to_the_checker() -> None:
         "format('refs/heads/{0}', github.event.repository.default_branch)" in workflow
     )
     assert "github.ref_name == github.event.repository.default_branch" not in workflow
+    assert "workflow_dispatch:" not in workflow
+    assert "check-publish-recovery.py" not in workflow
+    assert not (_PROJECT_ROOT / "scripts" / "check-publish-recovery.py").exists()
