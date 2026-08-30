@@ -109,10 +109,24 @@ def _require_existing_library_root(path: Path) -> None:
         ) from error
     if stat.S_ISLNK(value.st_mode) or not stat.S_ISDIR(value.st_mode):
         raise ValueError(f"library_path is not a safe directory: {path}")
-    if value.st_uid != os.geteuid() or stat.S_IMODE(value.st_mode) & 0o022:
+    expected_uid = os.geteuid()
+    permissions = stat.S_IMODE(value.st_mode)
+    violations: list[str] = []
+    if value.st_uid != expected_uid:
+        violations.append(
+            f"owner UID mismatch (actual_uid={value.st_uid}, "
+            f"expected_uid={expected_uid})"
+        )
+    forbidden_write_bits = permissions & 0o022
+    if forbidden_write_bits:
+        violations.append(
+            "group/world write is enabled "
+            f"(actual_mode={permissions:#05o}, "
+            f"forbidden_bits={forbidden_write_bits:#05o})"
+        )
+    if violations:
         raise ValueError(
-            f"library_path must be owned by the ingest UID without group/world write: "
-            f"{path}"
+            f"library_path has unsafe host metadata: {path}; " + "; ".join(violations)
         )
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:

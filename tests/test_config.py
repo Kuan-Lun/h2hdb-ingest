@@ -86,6 +86,91 @@ def test_runtime_paths_require_one_preexisting_library_mount(
     assert list(library_path.iterdir()) == []
 
 
+def test_runtime_paths_report_library_owner_uid_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    download_path = tmp_path / "download"
+    download_path.mkdir()
+    (download_path / "gallery").mkdir()
+    library_path = tmp_path / "library"
+    library_path.mkdir(mode=0o755)
+    actual_uid = library_path.stat().st_uid
+    expected_uid = actual_uid + 1
+    monkeypatch.setattr("h2hdb_ingest.config.os.geteuid", lambda: expected_uid)
+    config = IngestConfig(
+        paths=IngestPathsConfig(
+            download_path=download_path,
+            library_path=library_path,
+        )
+    )
+
+    with pytest.raises(ValueError) as caught:
+        config.ensure_paths()
+
+    message = str(caught.value)
+    assert "owner UID mismatch" in message
+    assert f"actual_uid={actual_uid}" in message
+    assert f"expected_uid={expected_uid}" in message
+    assert "group/world write is enabled" not in message
+
+
+def test_runtime_paths_report_unsafe_library_mode(
+    tmp_path: Path,
+) -> None:
+    download_path = tmp_path / "download"
+    download_path.mkdir()
+    (download_path / "gallery").mkdir()
+    library_path = tmp_path / "library"
+    library_path.mkdir(mode=0o755)
+    library_path.chmod(0o775)
+    config = IngestConfig(
+        paths=IngestPathsConfig(
+            download_path=download_path,
+            library_path=library_path,
+        )
+    )
+
+    with pytest.raises(ValueError) as caught:
+        config.ensure_paths()
+
+    message = str(caught.value)
+    assert "owner UID mismatch" not in message
+    assert "group/world write is enabled" in message
+    assert "actual_mode=0o775" in message
+    assert "forbidden_bits=0o020" in message
+
+
+def test_runtime_paths_report_all_unsafe_library_mode_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    download_path = tmp_path / "download"
+    download_path.mkdir()
+    (download_path / "gallery").mkdir()
+    library_path = tmp_path / "library"
+    library_path.mkdir(mode=0o755)
+    library_path.chmod(0o777)
+    actual_uid = library_path.stat().st_uid
+    expected_uid = actual_uid + 1
+    monkeypatch.setattr("h2hdb_ingest.config.os.geteuid", lambda: expected_uid)
+    config = IngestConfig(
+        paths=IngestPathsConfig(
+            download_path=download_path,
+            library_path=library_path,
+        )
+    )
+
+    with pytest.raises(ValueError) as caught:
+        config.ensure_paths()
+
+    message = str(caught.value)
+    assert "owner UID mismatch" in message
+    assert "group/world write is enabled" in message
+    assert "actual_mode=0o777" in message
+    assert "forbidden_bits=0o022" in message
+
+
 def test_runtime_paths_reject_missing_library_mount(tmp_path: Path) -> None:
     download_path = tmp_path / "download"
     download_path.mkdir()

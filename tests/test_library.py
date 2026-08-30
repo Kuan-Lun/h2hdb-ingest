@@ -146,6 +146,29 @@ def test_layout_durably_accepts_preexisting_reader_mount_roots(
     assert stat.S_IMODE((root / ".h2hdb-state").stat().st_mode) == 0o700
 
 
+def test_layout_rejects_foreign_owned_preexisting_child_before_chmod(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir(mode=0o755)
+    current = root / "current"
+    current.mkdir(mode=0o777)
+    current.chmod(0o777)
+    actual_uid = current.stat().st_uid
+    expected_uid = actual_uid + 1
+    monkeypatch.setattr("h2hdb_ingest.library.os.geteuid", lambda: expected_uid)
+
+    with pytest.raises(RuntimeError) as caught:
+        library_module._ensure_managed_directory(current, 0o755)
+
+    message = str(caught.value)
+    assert "managed directory owner UID mismatch" in message
+    assert f"actual_uid={actual_uid}" in message
+    assert f"expected_uid={expected_uid}" in message
+    assert stat.S_IMODE(current.stat().st_mode) == 0o777
+
+
 @pytest.mark.parametrize("legacy_kind", ("directory", "file", "symlink"))
 def test_layout_rejects_legacy_coordination_before_creating_new_sibling(
     tmp_path: Path,

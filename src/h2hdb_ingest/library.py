@@ -2457,12 +2457,23 @@ def _require_directory(path: Path, *, label: str, private: bool) -> None:
     if not stat.S_ISDIR(value.st_mode) or stat.S_ISLNK(value.st_mode):
         raise RuntimeError(f"{label} is not a safe directory: {path}")
     permissions = stat.S_IMODE(value.st_mode)
-    if value.st_uid != os.geteuid():
-        raise RuntimeError(f"{label} must be owned by the ingest UID: {path}")
+    expected_uid = os.geteuid()
+    if value.st_uid != expected_uid:
+        raise RuntimeError(
+            f"{label} owner UID mismatch: {path}; "
+            f"actual_uid={value.st_uid}; expected_uid={expected_uid}; "
+            f"actual_mode={permissions:#05o}"
+        )
     if private and permissions & 0o077:
-        raise RuntimeError(f"{label} must not grant group/world access: {path}")
+        raise RuntimeError(
+            f"{label} grants group/world access: {path}; "
+            f"actual_mode={permissions:#05o}; forbidden_bits={permissions & 0o077:#05o}"
+        )
     if not private and permissions & 0o022:
-        raise RuntimeError(f"{label} must not grant group/world write: {path}")
+        raise RuntimeError(
+            f"{label} grants group/world write: {path}; "
+            f"actual_mode={permissions:#05o}; forbidden_bits={permissions & 0o022:#05o}"
+        )
 
 
 def _ensure_managed_directory(path: Path, mode: int) -> None:
@@ -2490,6 +2501,13 @@ def _ensure_managed_directory(path: Path, mode: int) -> None:
                 or (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino)
             ):
                 raise RuntimeError(f"managed directory identity is unsafe: {path}")
+            expected_uid = os.geteuid()
+            if opened.st_uid != expected_uid:
+                raise RuntimeError(
+                    f"managed directory owner UID mismatch: {path}; "
+                    f"actual_uid={opened.st_uid}; expected_uid={expected_uid}; "
+                    f"actual_mode={stat.S_IMODE(opened.st_mode):#05o}"
+                )
             os.fchmod(child_descriptor, mode)
             os.fsync(child_descriptor)
             os.fsync(parent_descriptor)

@@ -176,11 +176,15 @@ Setting it to `null` disables artifact output. `download_path` and
 exist as a real bind-mount root owned by the ingest UID without group/world
 write access. For Synology Compose, pre-create the root plus empty `current`
 and `.h2hdb-coordination` reader bind sources, all owned by the ingest UID;
-their modes must be `0755`. Do not pre-create `.h2hdb-state`: ingest owns and
-durably creates that private tree. Ingest idempotently creates the two public
-children for non-Compose use, and always fsyncs and revalidates their exact
-identity, owner, and mode. It never creates the mount root because it cannot
-durably fsync the host parent from inside the container. The former
+use mode `0700` for the root and `0755` for both children. Creating these paths
+in a NAS file manager is not sufficient when its default owner or POSIX mode
+differs from the Compose `MEDIA_UID` contract. Startup errors report the actual
+and expected numeric UID and the unsafe mode bits so the host metadata can be
+corrected directly. Do not pre-create `.h2hdb-state`: ingest owns and durably
+creates that private tree. Ingest idempotently creates the two public children
+for non-Compose use, and always fsyncs and revalidates their exact identity,
+owner, and mode. It never creates the mount root because it cannot durably
+fsync the host parent from inside the container. The former
 `.h2hdb-state/coordination` layout is unsupported and is neither read nor
 migrated; any such entry makes startup fail closed before the new coordination
 sibling is created.
