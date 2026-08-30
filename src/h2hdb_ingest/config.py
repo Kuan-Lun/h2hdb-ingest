@@ -6,12 +6,15 @@ __all__ = [
 ]
 
 import json
-import os
-import stat
 from pathlib import Path
 
 from h2hdb import CoreConfig, resolve_environment_placeholders
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from ._library_layout import (
+    LibraryLayoutValidationError,
+    validate_precreated_library_layout,
+)
 
 DEFAULT_MAX_ROWS = 128
 
@@ -86,7 +89,10 @@ class IngestConfig(ConfigModel):
             )
         library_path = self.paths.library_path
         if library_path is not None:
-            _require_existing_library_root(library_path)
+            try:
+                validate_precreated_library_layout(library_path, durable=False)
+            except LibraryLayoutValidationError as error:
+                raise ValueError(str(error)) from error
 
 
 def load_config(path: str | Path) -> IngestConfig:
@@ -98,45 +104,3 @@ def load_config(path: str | Path) -> IngestConfig:
             f"Unable to load ingest config from {config_path}: {error}"
         ) from error
     return IngestConfig.model_validate(resolve_environment_placeholders(raw))
-
-
-def _require_existing_library_root(path: Path) -> None:
-    try:
-        value = path.lstat()
-    except FileNotFoundError as error:
-        raise ValueError(
-            f"library_path must be a pre-existing bind mount directory: {path}"
-        ) from error
-    if stat.S_ISLNK(value.st_mode) or not stat.S_ISDIR(value.st_mode):
-        raise ValueError(f"library_path is not a safe directory: {path}")
-    expected_uid = os.geteuid()
-    permissions = stat.S_IMODE(value.st_mode)
-    violations: list[str] = []
-    if value.st_uid != expected_uid:
-        violations.append(
-            f"owner UID mismatch (actual_uid={value.st_uid}, "
-            f"expected_uid={expected_uid})"
-        )
-    forbidden_write_bits = permissions & 0o022
-    if forbidden_write_bits:
-        violations.append(
-            "group/world write is enabled "
-            f"(actual_mode={permissions:#05o}, "
-            f"forbidden_bits={forbidden_write_bits:#05o})"
-        )
-    if violations:
-        raise ValueError(
-            f"library_path has unsafe host metadata: {path}; " + "; ".join(violations)
-        )
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise ValueError(f"library_path is not safely openable: {path}") from error
-    try:
-        opened = os.fstat(descriptor)
-        visible = path.lstat()
-        if (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino):
-            raise ValueError(f"library_path changed identity: {path}")
-    finally:
-        os.close(descriptor)

@@ -10,6 +10,14 @@ from pydantic import ValidationError
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig, load_config
 
 
+def _provision_library_root(root: Path) -> None:
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    for path in (root / "current", root / ".h2hdb-coordination"):
+        path.mkdir(mode=0o755)
+        path.chmod(0o755)
+
+
 def test_loader_resolves_nested_core_secret_and_path_environment_values(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -66,14 +74,14 @@ def test_source_and_library_roots_must_be_distinct_and_non_nested(
         )
 
 
-def test_runtime_paths_require_one_preexisting_library_mount(
+def test_runtime_paths_require_three_preexisting_library_mount_roots(
     tmp_path: Path,
 ) -> None:
     download_path = tmp_path / "download"
     download_path.mkdir()
     (download_path / "gallery").mkdir()
     library_path = tmp_path / "library"
-    library_path.mkdir(mode=0o755)
+    _provision_library_root(library_path)
     config = IngestConfig(
         paths=IngestPathsConfig(
             download_path=download_path,
@@ -83,7 +91,10 @@ def test_runtime_paths_require_one_preexisting_library_mount(
 
     config.ensure_paths()
 
-    assert list(library_path.iterdir()) == []
+    assert {path.name for path in library_path.iterdir()} == {
+        ".h2hdb-coordination",
+        "current",
+    }
 
 
 def test_runtime_paths_report_library_owner_uid_mismatch(
@@ -94,10 +105,14 @@ def test_runtime_paths_report_library_owner_uid_mismatch(
     download_path.mkdir()
     (download_path / "gallery").mkdir()
     library_path = tmp_path / "library"
-    library_path.mkdir(mode=0o755)
+    library_path.mkdir(mode=0o700)
+    library_path.chmod(0o700)
     actual_uid = library_path.stat().st_uid
     expected_uid = actual_uid + 1
-    monkeypatch.setattr("h2hdb_ingest.config.os.geteuid", lambda: expected_uid)
+    monkeypatch.setattr(
+        "h2hdb_ingest._library_layout.os.geteuid",
+        lambda: expected_uid,
+    )
     config = IngestConfig(
         paths=IngestPathsConfig(
             download_path=download_path,
@@ -112,7 +127,7 @@ def test_runtime_paths_report_library_owner_uid_mismatch(
     assert "owner UID mismatch" in message
     assert f"actual_uid={actual_uid}" in message
     assert f"expected_uid={expected_uid}" in message
-    assert "group/world write is enabled" not in message
+    assert "mode mismatch" not in message
 
 
 def test_runtime_paths_report_unsafe_library_mode(
@@ -122,7 +137,7 @@ def test_runtime_paths_report_unsafe_library_mode(
     download_path.mkdir()
     (download_path / "gallery").mkdir()
     library_path = tmp_path / "library"
-    library_path.mkdir(mode=0o755)
+    library_path.mkdir(mode=0o700)
     library_path.chmod(0o775)
     config = IngestConfig(
         paths=IngestPathsConfig(
@@ -136,9 +151,9 @@ def test_runtime_paths_report_unsafe_library_mode(
 
     message = str(caught.value)
     assert "owner UID mismatch" not in message
-    assert "group/world write is enabled" in message
+    assert "mode mismatch" in message
     assert "actual_mode=0o775" in message
-    assert "forbidden_bits=0o020" in message
+    assert "expected_mode=0o700" in message
 
 
 def test_runtime_paths_report_all_unsafe_library_mode_metadata(
@@ -149,11 +164,14 @@ def test_runtime_paths_report_all_unsafe_library_mode_metadata(
     download_path.mkdir()
     (download_path / "gallery").mkdir()
     library_path = tmp_path / "library"
-    library_path.mkdir(mode=0o755)
+    library_path.mkdir(mode=0o700)
     library_path.chmod(0o777)
     actual_uid = library_path.stat().st_uid
     expected_uid = actual_uid + 1
-    monkeypatch.setattr("h2hdb_ingest.config.os.geteuid", lambda: expected_uid)
+    monkeypatch.setattr(
+        "h2hdb_ingest._library_layout.os.geteuid",
+        lambda: expected_uid,
+    )
     config = IngestConfig(
         paths=IngestPathsConfig(
             download_path=download_path,
@@ -166,9 +184,63 @@ def test_runtime_paths_report_all_unsafe_library_mode_metadata(
 
     message = str(caught.value)
     assert "owner UID mismatch" in message
-    assert "group/world write is enabled" in message
+    assert "mode mismatch" in message
     assert "actual_mode=0o777" in message
-    assert "forbidden_bits=0o022" in message
+    assert "expected_mode=0o700" in message
+
+
+def test_runtime_paths_report_library_owner_gid_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    download_path = tmp_path / "download"
+    download_path.mkdir()
+    (download_path / "gallery").mkdir()
+    library_path = tmp_path / "library"
+    library_path.mkdir(mode=0o700)
+    library_path.chmod(0o700)
+    actual_gid = library_path.stat().st_gid
+    expected_gid = actual_gid + 1
+    monkeypatch.setattr("h2hdb_ingest._library_layout.os.getegid", lambda: expected_gid)
+    config = IngestConfig(
+        paths=IngestPathsConfig(
+            download_path=download_path,
+            library_path=library_path,
+        )
+    )
+
+    with pytest.raises(ValueError) as caught:
+        config.ensure_paths()
+
+    message = str(caught.value)
+    assert "owner GID mismatch" in message
+    assert f"actual_gid={actual_gid}" in message
+    assert f"expected_gid={expected_gid}" in message
+
+
+@pytest.mark.parametrize("missing_leaf", ("current", ".h2hdb-coordination"))
+def test_runtime_paths_reject_missing_precreated_reader_root_without_mutation(
+    tmp_path: Path,
+    missing_leaf: str,
+) -> None:
+    download_path = tmp_path / "download"
+    download_path.mkdir()
+    (download_path / "gallery").mkdir()
+    library_path = tmp_path / "library"
+    _provision_library_root(library_path)
+    (library_path / missing_leaf).rmdir()
+    config = IngestConfig(
+        paths=IngestPathsConfig(
+            download_path=download_path,
+            library_path=library_path,
+        )
+    )
+
+    with pytest.raises(ValueError, match="pre-existing real directory"):
+        config.ensure_paths()
+
+    assert not (library_path / missing_leaf).exists()
+    assert not (library_path / ".h2hdb-state").exists()
 
 
 def test_runtime_paths_reject_missing_library_mount(tmp_path: Path) -> None:
@@ -182,7 +254,7 @@ def test_runtime_paths_reject_missing_library_mount(tmp_path: Path) -> None:
         )
     )
 
-    with pytest.raises(ValueError, match="pre-existing bind mount"):
+    with pytest.raises(ValueError, match="pre-existing real directory"):
         config.ensure_paths()
 
 
@@ -212,7 +284,7 @@ def test_runtime_paths_reject_managed_directory_symlink_without_chmod_target(
         )
     )
 
-    with pytest.raises(ValueError, match="not a safe directory"):
+    with pytest.raises(ValueError, match="not a real directory"):
         config.ensure_paths()
 
     assert stat.S_IMODE(outside.stat().st_mode) == 0o700

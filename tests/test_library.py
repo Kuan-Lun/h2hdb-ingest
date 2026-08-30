@@ -45,8 +45,17 @@ def _item(gid: int, payload: bytes) -> VNextLibraryActivationItem:
 
 
 def _adapter(root: Path) -> ManagedFilesystemLibraryAdapter:
-    root.mkdir(mode=0o755, exist_ok=True)
+    if not root.exists():
+        _provision_library_root(root)
     return ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)
+
+
+def _provision_library_root(root: Path) -> None:
+    root.mkdir(mode=0o700, exist_ok=True)
+    root.chmod(0o700)
+    for path in (root / "current", root / ".h2hdb-coordination"):
+        path.mkdir(mode=0o755, exist_ok=True)
+        path.chmod(0o755)
 
 
 class _PartialThenError(BytesIO):
@@ -102,7 +111,7 @@ def test_layout_requires_a_preexisting_real_library_root(tmp_path: Path) -> None
     root = tmp_path / "missing-library"
     adapter = ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)
 
-    with pytest.raises(RuntimeError, match="pre-existing bind mount"):
+    with pytest.raises(RuntimeError, match="pre-existing real directory"):
         with adapter.publication_guard():
             pass
 
@@ -114,11 +123,9 @@ def test_layout_durably_accepts_preexisting_reader_mount_roots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "library"
-    root.mkdir(mode=0o755)
+    _provision_library_root(root)
     current = root / "current"
     coordination = root / ".h2hdb-coordination"
-    current.mkdir(mode=0o755)
-    coordination.mkdir(mode=0o755)
     expected_identities = {
         (current.stat().st_dev, current.stat().st_ino),
         (coordination.stat().st_dev, coordination.stat().st_ino),
@@ -146,12 +153,109 @@ def test_layout_durably_accepts_preexisting_reader_mount_roots(
     assert stat.S_IMODE((root / ".h2hdb-state").stat().st_mode) == 0o700
 
 
+def test_layout_replay_never_chmods_existing_managed_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    adapter._ensure_layout()
+
+    def reject_fchmod(descriptor: int, mode: int) -> None:
+        del descriptor, mode
+        raise AssertionError("existing managed entries must not be chmodded")
+
+    monkeypatch.setattr("h2hdb_ingest.library.os.fchmod", reject_fchmod)
+    ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)._ensure_layout()
+
+
+def test_layout_rejects_precreated_reader_mode_without_mutation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    _provision_library_root(root)
+    current = root / "current"
+    current.chmod(0o777)
+
+    adapter = ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)
+    with pytest.raises(RuntimeError) as caught:
+        adapter._ensure_layout()
+
+    message = str(caught.value)
+    assert "current library has unsafe host metadata" in message
+    assert "actual_mode=0o777" in message
+    assert "expected_mode=0o755" in message
+    assert stat.S_IMODE(current.stat().st_mode) == 0o777
+    assert not (root / ".h2hdb-state").exists()
+
+
+def test_layout_rejects_private_directory_mode_drift_without_repair(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    adapter._ensure_layout()
+    state = root / ".h2hdb-state"
+    state.chmod(0o755)
+
+    with pytest.raises(RuntimeError, match="library state has unsafe host metadata"):
+        ManagedFilesystemLibraryAdapter(
+            root,
+            max_image_short_side=768,
+        )._ensure_layout()
+
+    assert stat.S_IMODE(state.stat().st_mode) == 0o755
+
+
+def test_layout_rejects_existing_lock_mode_drift_without_repair(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    adapter._ensure_layout()
+    state_lock = root / ".h2hdb-state" / "locks" / "state.lock"
+    state_lock.chmod(0o644)
+
+    with pytest.raises(RuntimeError, match="changed durable identity or mode"):
+        ManagedFilesystemLibraryAdapter(
+            root,
+            max_image_short_side=768,
+        )._ensure_layout()
+
+    assert stat.S_IMODE(state_lock.stat().st_mode) == 0o644
+
+
+def test_layout_rejects_database_mode_before_sqlite_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    adapter._ensure_layout()
+    database = root / ".h2hdb-state" / "journal" / "library-activation.sqlite3"
+    database.chmod(0o644)
+
+    def reject_connect(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("unsafe database metadata must fail before SQLite open")
+
+    monkeypatch.setattr("h2hdb_ingest.library.sqlite3.connect", reject_connect)
+    with pytest.raises(RuntimeError, match="changed durable identity or mode"):
+        ManagedFilesystemLibraryAdapter(
+            root,
+            max_image_short_side=768,
+        )._ensure_layout()
+
+    assert stat.S_IMODE(database.stat().st_mode) == 0o644
+
+
 def test_layout_rejects_foreign_owned_preexisting_child_before_chmod(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "library"
-    root.mkdir(mode=0o755)
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
     current = root / "current"
     current.mkdir(mode=0o777)
     current.chmod(0o777)
@@ -160,10 +264,14 @@ def test_layout_rejects_foreign_owned_preexisting_child_before_chmod(
     monkeypatch.setattr("h2hdb_ingest.library.os.geteuid", lambda: expected_uid)
 
     with pytest.raises(RuntimeError) as caught:
-        library_module._ensure_managed_directory(current, 0o755)
+        library_module._ensure_managed_directory(
+            current,
+            0o755,
+            label="current library",
+        )
 
     message = str(caught.value)
-    assert "managed directory owner UID mismatch" in message
+    assert "current library owner UID mismatch" in message
     assert f"actual_uid={actual_uid}" in message
     assert f"expected_uid={expected_uid}" in message
     assert stat.S_IMODE(current.stat().st_mode) == 0o777
@@ -175,9 +283,10 @@ def test_layout_rejects_legacy_coordination_before_creating_new_sibling(
     legacy_kind: str,
 ) -> None:
     root = tmp_path / "library"
-    root.mkdir(mode=0o755)
+    _provision_library_root(root)
     state = root / ".h2hdb-state"
     state.mkdir(mode=0o700)
+    state.chmod(0o700)
     legacy = state / "coordination"
     if legacy_kind == "directory":
         legacy.mkdir(mode=0o755)
@@ -193,7 +302,7 @@ def test_layout_rejects_legacy_coordination_before_creating_new_sibling(
         adapter._ensure_layout()
 
     assert legacy.exists() or legacy.is_symlink()
-    assert not (root / ".h2hdb-coordination").exists()
+    assert (root / ".h2hdb-coordination").is_dir()
 
 
 def test_layout_mkdir_response_loss_replays_child_before_parent_fsync(
@@ -201,7 +310,7 @@ def test_layout_mkdir_response_loss_replays_child_before_parent_fsync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "library"
-    root.mkdir(mode=0o755)
+    _provision_library_root(root)
     adapter = ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)
     original_mkdir = os.mkdir
     interrupted = False
@@ -214,7 +323,7 @@ def test_layout_mkdir_response_loss_replays_child_before_parent_fsync(
     ) -> None:
         nonlocal interrupted
         original_mkdir(path, mode, dir_fd=dir_fd)
-        if str(path) == "current" and not interrupted:
+        if str(path) == ".h2hdb-state" and not interrupted:
             interrupted = True
             raise RuntimeError("fault: layout-mkdir-return-lost")
 
@@ -223,7 +332,7 @@ def test_layout_mkdir_response_loss_replays_child_before_parent_fsync(
         with pytest.raises(RuntimeError, match="layout-mkdir-return-lost"):
             adapter._ensure_layout()
 
-    assert (root / "current").is_dir()
+    assert (root / ".h2hdb-state").is_dir()
     fsynced: list[tuple[int, int]] = []
     original_fsync = os.fsync
 
@@ -279,7 +388,7 @@ def test_layout_child_swap_after_parent_fsync_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "library"
-    root.mkdir(mode=0o755)
+    _provision_library_root(root)
     adapter = ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)
     root_identity = (root.stat().st_dev, root.stat().st_ino)
     current = root / "current"
@@ -297,7 +406,7 @@ def test_layout_child_swap_after_parent_fsync_fails_closed(
             swapped = True
 
     monkeypatch.setattr("h2hdb_ingest.library.os.fsync", swap_after_parent_fsync)
-    with pytest.raises(RuntimeError, match="changed durable identity"):
+    with pytest.raises(RuntimeError, match="changed identity"):
         adapter._ensure_layout()
 
     assert swapped
@@ -328,6 +437,27 @@ def test_activation_moves_staging_into_one_canonical_current_file(
     assert not list((state / "quarantine").glob("*.cbz"))
     assert not (tmp_path / "library" / ".h2hdb-coordination" / "ACTIVATING").exists()
     assert list((tmp_path / "library").rglob("*.cbz")) == [target]
+
+
+def test_existing_shard_mode_drift_fails_without_repair(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    payload = b"canonical-cbz"
+    item = _item(7654321, payload)
+    _protect(adapter, item, payload, 1)
+    _activate(adapter, 1, b"r" * 16, (item,))
+    shard = adapter.current_path / item.storage_key.segments[0]
+    shard.chmod(0o777)
+
+    with pytest.raises(RuntimeError, match="library shard mode mismatch"):
+        with library_module._open_directory_chain(
+            adapter.current_path,
+            item.storage_key.segments[:-1],
+            create=True,
+        ):
+            pass
+
+    assert stat.S_IMODE(shard.stat().st_mode) == 0o777
 
 
 def test_replacement_keeps_open_reader_inode_and_removes_old_persistent_name(

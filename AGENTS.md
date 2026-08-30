@@ -185,18 +185,21 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
   與 OPDS 共用的唯一 persistent CBZ tree；`.h2hdb-coordination/` 是
   reader-visible publication fencing namespace；`.h2hdb-state/` 只擁有
   private staging、quarantine、journal 與 locks。
-- `library_path` 是 deployment 預先建立、由 ingest UID 擁有且不可 group/world
-  write 的真實 bind-mount root；runtime 不得建立 mount root 或依賴容器內不可見
-  的 host parent fsync。root 下每個 managed directory 與 persistent control file
-  建立或 replay 時必須 child fsync、parent fsync，再重驗 exact identity、owner
-  與 mode；涵蓋 lock files 與 SQLite database 的首次 parent entry。
-- Synology deployment 在建立 consumer containers 前預建立空的 `current/`
-  與 `.h2hdb-coordination/` reader bind sources，兩者均由 ingest UID
-  擁有且 mode 為 0755。Runtime 必須 idempotently durable revalidate 這兩個
-  mount roots，但 `.h2hdb-state/` 及其 private descendants 仍只由 ingest 建立。
+- `library_path` 是 deployment 預先建立、由 ingest effective UID:GID 擁有且
+  mode 為 0700 的真實 bind-mount root；runtime 不得建立 mount root 或依賴容器內
+  不可見的 host parent fsync。root 下每個 managed directory 與 persistent
+  control file 建立或 replay 時必須 child fsync、parent fsync，再重驗 exact
+  identity、owner 與 mode；只有 exclusive create 明確證明本次建立的 entry 才可
+  fchmod。既有 entry 只能驗證，metadata drift 必須保持原狀並 fail closed；涵蓋
+  lock files、hash shards 與 SQLite database 的首次 parent entry。
+- 所有 CBZ-enabled deployment 在建立 consumers 前都必須預建立空的 `current/`
+  與 `.h2hdb-coordination/` reader bind sources，兩者均由 ingest effective
+  UID:GID 擁有且 mode 為 0755。Runtime 必須 idempotently durable revalidate
+  這兩個 mount roots，不得建立或修改其 metadata；`.h2hdb-state/` 及其 private
+  descendants 仍只由 ingest 建立。
 - Legacy `.h2hdb-state/coordination` entry 無論為 directory、symlink 或
-  其他類型都必須在建立新 sibling 前 fail closed；不得 migrate、fallback
-  或同時接納兩個 coordination layouts。
+  其他類型都必須在修改 private state 前 fail closed；不得 migrate、fallback
+  或接納舊 coordination layout。
 - `library_path` parent、`.h2hdb-state/` 與 `.h2hdb-coordination/` 是
   ingest-owned single-writer namespace；其他程序即使使用相同 UID 也不得
   mutate。Komga 與 OPDS 只能 read-only mount 所需路徑；public
