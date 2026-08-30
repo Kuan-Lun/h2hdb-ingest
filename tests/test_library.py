@@ -151,18 +151,25 @@ def test_layout_durably_accepts_preexisting_reader_mount_roots(
     assert stat.S_IMODE(coordination.stat().st_mode) == 0o777
 
 
-def test_layout_never_chmods_managed_entries(
+def test_layout_never_changes_managed_entry_permissions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "library"
+    _provision_library_root(root)
 
-    def reject_fchmod(descriptor: int, mode: int) -> None:
-        del descriptor, mode
+    def reject_permission_change(*args: object, **kwargs: object) -> None:
+        del args, kwargs
         raise AssertionError("library permission policy belongs to deployment")
 
-    monkeypatch.setattr("h2hdb_ingest.library.os.fchmod", reject_fchmod)
-    _adapter(root)._ensure_layout()
+    for name in ("chmod", "fchmod", "chown", "fchown", "lchown"):
+        monkeypatch.setattr(
+            f"h2hdb_ingest.library.os.{name}",
+            reject_permission_change,
+        )
+
+    ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)._ensure_layout()
+    ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)._ensure_layout()
 
 
 def test_layout_accepts_precreated_reader_mode_without_mutation(

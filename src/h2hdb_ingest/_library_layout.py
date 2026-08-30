@@ -17,7 +17,7 @@ _DIRECTORY_FLAGS = (
 
 
 class LibraryLayoutValidationError(RuntimeError):
-    """Raised when host-provisioned library metadata is not authoritative."""
+    """Raised when a host-provisioned library path is structurally unsafe."""
 
 
 def validate_precreated_library_layout(root: Path, *, durable: bool) -> None:

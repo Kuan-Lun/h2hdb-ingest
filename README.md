@@ -178,8 +178,8 @@ three paths must be real directories. Compose owns the service identity, mount
 scope, and read-only/read-write policy; host ACLs or modes need only let that
 identity perform the mounted operation. Ingest validates and fsyncs these
 externally provisioned roots, but does not enforce or change their UID, GID, or
-POSIX mode. Creation calls provide conservative initial modes for new private
-entries without treating the resulting metadata as a replay contract. Do not
+POSIX mode. Creation calls provide conservative initial modes for new entries
+without treating the resulting metadata as a replay contract. Do not
 pre-create `.h2hdb-state`: ingest owns and durably creates that private tree.
 The former
 `.h2hdb-state/coordination` layout is unsupported and is neither read nor
