@@ -4,6 +4,16 @@ on:
   push:
     paths:
       - pyproject.toml
+  workflow_dispatch:
+    inputs:
+      expected_version:
+        description: Exact unpublished project version to recover
+        required: true
+        type: string
+      expected_revision:
+        description: Exact default-branch commit SHA to build and publish
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -32,9 +42,25 @@ jobs:
         id: version
         env:
           BEFORE_SHA: ${{ github.event.before }}
-        run: >-
-          python scripts/check-publish-version.py
-          --before-revision "${BEFORE_SHA}"
+          EXPECTED_REVISION: ${{ inputs.expected_revision }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_EVENT_NAME}" in
+            push)
+              python scripts/check-publish-version.py \
+                --before-revision "${BEFORE_SHA}"
+              ;;
+            workflow_dispatch)
+              python scripts/check-publish-recovery.py \
+                --expected-version "${EXPECTED_VERSION}" \
+                --expected-revision "${EXPECTED_REVISION}"
+              ;;
+            *)
+              printf 'unsupported GitHub event: %s\n' "${GITHUB_EVENT_NAME}" >&2
+              exit 1
+              ;;
+          esac
 
       - name: Build distributions
         if: steps.version.outputs.bumped == 'true'
