@@ -64,11 +64,11 @@ library/
 ├── .h2hdb-coordination/             # pre-created reader bind source
 │   ├── publication.lock
 │   └── ACTIVATING                   # only during unfinished cutover
-└── .h2hdb-state/                    # mode 0700, ingest-private
-    ├── staging/                     # mode 0700, complete candidates
-    ├── quarantine/                  # mode 0700, stale-removal recovery
-    ├── journal/                     # mode 0700, SQLite activation journal
-    └── locks/                       # mode 0700, adapter state lock
+└── .h2hdb-state/                    # ingest-private
+    ├── staging/                     # complete candidates
+    ├── quarantine/                  # stale-removal recovery
+    ├── journal/                     # SQLite activation journal
+    └── locks/                       # adapter state lock
 ```
 
 Core owns the stable GID storage key. The registered
@@ -174,17 +174,14 @@ SQLite example with artifacts enabled is:
 Setting it to `null` disables artifact output. `download_path` and
 `library_path` must be distinct and non-nested. When enabled, it must already
 exist with empty `current` and `.h2hdb-coordination` reader bind sources. All
-three real directories must be owned by the ingest effective UID:GID; the root
-mode must be `0700` and both children must be `0755`. Creating these paths in a
-NAS file manager is not sufficient when its default numeric owner or POSIX mode
-differs from the Compose `MEDIA_UID:MEDIA_GID` contract. Startup errors report
-the actual and expected numeric UID, GID, and mode so the host metadata can be
-corrected directly. Ingest only validates and fsyncs these externally
-provisioned roots; it never creates them or changes their metadata. Do not
+three paths must be real directories. Compose owns the service identity, mount
+scope, and read-only/read-write policy; host ACLs or modes need only let that
+identity perform the mounted operation. Ingest validates and fsyncs these
+externally provisioned roots, but does not enforce or change their UID, GID, or
+POSIX mode. Creation calls provide conservative initial modes for new private
+entries without treating the resulting metadata as a replay contract. Do not
 pre-create `.h2hdb-state`: ingest owns and durably creates that private tree.
-For every ingest-created persistent entry, only an exclusive create may set
-its mode. Replay validates existing owner, mode, type, and identity without
-repairing drift. The former
+The former
 `.h2hdb-state/coordination` layout is unsupported and is neither read nor
 migrated; any such entry makes startup fail closed before private state is
 modified.

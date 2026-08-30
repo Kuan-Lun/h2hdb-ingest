@@ -71,11 +71,11 @@ def _gallery(
 
 
 def _provision_library_root(root: Path) -> None:
-    root.mkdir(mode=0o700)
-    root.chmod(0o700)
+    root.mkdir(mode=0o777)
+    root.chmod(0o777)
     for path in (root / "current", root / ".h2hdb-coordination"):
-        path.mkdir(mode=0o755)
-        path.chmod(0o755)
+        path.mkdir(mode=0o777)
+        path.chmod(0o777)
 
 
 class _CapacityThenSuccessService:

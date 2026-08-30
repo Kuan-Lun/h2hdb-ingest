@@ -38,8 +38,6 @@ from ._library_layout import (
     COORDINATION_DIRECTORY_NAME as _COORDINATION_DIRECTORY_NAME,
 )
 from ._library_layout import CURRENT_DIRECTORY_NAME as _CURRENT_DIRECTORY_NAME
-from ._library_layout import PRIVATE_MODE as _PRIVATE_MODE
-from ._library_layout import PUBLIC_DIRECTORY_MODE as _PUBLIC_DIRECTORY_MODE
 from ._library_layout import STATE_DIRECTORY_NAME as _STATE_DIRECTORY_NAME
 from ._library_layout import validate_precreated_library_layout
 from .artifact import ARTIFACT_ADAPTER_ID, ArtifactProducerIdentity
@@ -58,7 +56,10 @@ _MARKER_FORMAT = "h2hdb-library-activation-v1"
 _MAX_PAGE_ITEMS = 128
 _MAX_CLEANUP_ITEMS = 8
 _MAX_JOURNAL_CLEANUP_ITEMS = 128
-_PUBLIC_FILE_MODE = 0o644
+_PRIVATE_DIRECTORY_CREATION_MODE = 0o700
+_PUBLIC_DIRECTORY_CREATION_MODE = 0o755
+_PRIVATE_FILE_CREATION_MODE = 0o600
+_PUBLIC_FILE_CREATION_MODE = 0o644
 _STAGE_LEAF = re.compile(r"[0-9a-f]{64}\.cbz")
 _TEMPORARY_LEAF = re.compile(r"\.[0-9a-f]{64}\.tmp")
 
@@ -2107,26 +2108,24 @@ class ManagedFilesystemLibraryAdapter:
         validate_precreated_library_layout(self._root, durable=True)
         _ensure_managed_directory(
             self._state,
-            _PRIVATE_MODE,
+            _PRIVATE_DIRECTORY_CREATION_MODE,
             label="library state",
         )
         for path in (self._staging, self._quarantine, self._journal, self._locks):
             _ensure_managed_directory(
                 path,
-                _PRIVATE_MODE,
+                _PRIVATE_DIRECTORY_CREATION_MODE,
                 label=f"private library {path.name}",
             )
         validate_precreated_library_layout(self._root, durable=True)
         _require_directory(
             self._state,
             label="library state",
-            expected_mode=_PRIVATE_MODE,
         )
         for path in (self._staging, self._quarantine, self._journal, self._locks):
             _require_directory(
                 path,
                 label=f"private library {path.name}",
-                expected_mode=_PRIVATE_MODE,
             )
         devices = {
             self._current.stat().st_dev,
@@ -2139,17 +2138,17 @@ class ManagedFilesystemLibraryAdapter:
             )
         _ensure_managed_file(
             self._state_lock_path,
-            0o600,
+            _PRIVATE_FILE_CREATION_MODE,
             label="library state lock",
         )
         _ensure_managed_file(
             self._publication_lock_path,
-            _PUBLIC_FILE_MODE,
+            _PUBLIC_FILE_CREATION_MODE,
             label="library publication lock",
         )
         _ensure_managed_file(
             self._database_path,
-            0o600,
+            _PRIVATE_FILE_CREATION_MODE,
             label="library activation database",
         )
         with self._connection():
@@ -2166,7 +2165,6 @@ class ManagedFilesystemLibraryAdapter:
                 _require_managed_file_descriptor(
                     self._state_lock_path,
                     descriptor,
-                    expected_mode=0o600,
                     label="library state lock",
                 )
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -2189,7 +2187,6 @@ class ManagedFilesystemLibraryAdapter:
             _require_managed_file_descriptor(
                 self._publication_lock_path,
                 descriptor,
-                expected_mode=_PUBLIC_FILE_MODE,
                 label="library publication lock",
             )
             fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -2247,7 +2244,7 @@ class ManagedFilesystemLibraryAdapter:
             connection.commit()
             _ensure_managed_file(
                 self._database_path,
-                0o600,
+                _PRIVATE_FILE_CREATION_MODE,
                 label="library activation database",
                 create=False,
             )
@@ -2449,45 +2446,27 @@ def _reconcile_cursor(kind: bytes, key: bytes) -> bytes:
     return digest.digest()
 
 
-def _require_directory(path: Path, *, label: str, expected_mode: int) -> None:
+def _require_directory(path: Path, *, label: str) -> None:
     value = path.lstat()
     if not stat.S_ISDIR(value.st_mode) or stat.S_ISLNK(value.st_mode):
         raise RuntimeError(f"{label} is not a safe directory: {path}")
-    permissions = stat.S_IMODE(value.st_mode)
-    expected_uid = os.geteuid()
-    expected_gid = os.getegid()
-    if value.st_uid != expected_uid:
-        raise RuntimeError(
-            f"{label} owner UID mismatch: {path}; "
-            f"actual_uid={value.st_uid}; expected_uid={expected_uid}; "
-            f"actual_mode={permissions:#05o}"
-        )
-    if value.st_gid != expected_gid:
-        raise RuntimeError(
-            f"{label} owner GID mismatch: {path}; "
-            f"actual_gid={value.st_gid}; expected_gid={expected_gid}; "
-            f"actual_mode={permissions:#05o}"
-        )
-    if permissions != expected_mode:
-        raise RuntimeError(
-            f"{label} mode mismatch: {path}; "
-            f"actual_mode={permissions:#05o}; expected_mode={expected_mode:#05o}"
-        )
 
 
-def _ensure_managed_directory(path: Path, mode: int, *, label: str) -> None:
+def _ensure_managed_directory(
+    path: Path,
+    creation_mode: int,
+    *,
+    label: str,
+) -> None:
     leaf = path.name
     if not leaf or leaf in {".", ".."} or "/" in leaf:
         raise RuntimeError(f"managed directory has an unsafe name: {path}")
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     with _open_directory(path.parent) as parent_descriptor:
-        created = False
         try:
-            os.mkdir(leaf, mode, dir_fd=parent_descriptor)
+            os.mkdir(leaf, creation_mode, dir_fd=parent_descriptor)
         except FileExistsError:
             pass
-        else:
-            created = True
         try:
             child_descriptor = os.open(leaf, flags, dir_fd=parent_descriptor)
         except OSError as error:
@@ -2503,28 +2482,6 @@ def _ensure_managed_directory(path: Path, mode: int, *, label: str) -> None:
                 or (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino)
             ):
                 raise RuntimeError(f"managed directory identity is unsafe: {path}")
-            expected_uid = os.geteuid()
-            expected_gid = os.getegid()
-            if opened.st_uid != expected_uid:
-                raise RuntimeError(
-                    f"{label} owner UID mismatch: {path}; "
-                    f"actual_uid={opened.st_uid}; expected_uid={expected_uid}; "
-                    f"actual_mode={stat.S_IMODE(opened.st_mode):#05o}"
-                )
-            if opened.st_gid != expected_gid:
-                raise RuntimeError(
-                    f"{label} owner GID mismatch: {path}; "
-                    f"actual_gid={opened.st_gid}; expected_gid={expected_gid}; "
-                    f"actual_mode={stat.S_IMODE(opened.st_mode):#05o}"
-                )
-            if created:
-                os.fchmod(child_descriptor, mode)
-            elif stat.S_IMODE(opened.st_mode) != mode:
-                raise RuntimeError(
-                    f"{label} mode mismatch: {path}; "
-                    f"actual_mode={stat.S_IMODE(opened.st_mode):#05o}; "
-                    f"expected_mode={mode:#05o}"
-                )
             os.fsync(child_descriptor)
             os.fsync(parent_descriptor)
             durable = os.fstat(child_descriptor)
@@ -2533,20 +2490,15 @@ def _ensure_managed_directory(path: Path, mode: int, *, label: str) -> None:
                 not stat.S_ISDIR(durable.st_mode)
                 or stat.S_ISLNK(visible.st_mode)
                 or (durable.st_dev, durable.st_ino) != (visible.st_dev, visible.st_ino)
-                or stat.S_IMODE(durable.st_mode) != mode
-                or durable.st_uid != os.geteuid()
-                or durable.st_gid != os.getegid()
             ):
-                raise RuntimeError(
-                    f"managed directory changed durable identity or mode: {path}"
-                )
+                raise RuntimeError(f"managed directory changed identity: {path}")
         finally:
             os.close(child_descriptor)
 
 
 def _ensure_managed_file(
     path: Path,
-    mode: int,
+    creation_mode: int,
     *,
     label: str,
     create: bool = True,
@@ -2556,7 +2508,6 @@ def _ensure_managed_file(
         raise RuntimeError(f"{label} has an unsafe name: {path}")
     flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
     with _open_directory(path.parent) as parent_descriptor:
-        created = False
         try:
             if not create:
                 descriptor = os.open(leaf, flags, dir_fd=parent_descriptor)
@@ -2565,31 +2516,25 @@ def _ensure_managed_file(
                     descriptor = os.open(
                         leaf,
                         flags | os.O_CREAT | os.O_EXCL,
-                        mode,
+                        creation_mode,
                         dir_fd=parent_descriptor,
                     )
                 except FileExistsError:
                     descriptor = os.open(leaf, flags, dir_fd=parent_descriptor)
-                else:
-                    created = True
         except OSError as error:
             raise RuntimeError(f"{label} is not safely openable: {path}") from error
         try:
             _require_managed_file_descriptor(
                 path,
                 descriptor,
-                expected_mode=None if created else mode,
                 label=label,
                 parent_descriptor=parent_descriptor,
             )
-            if created:
-                os.fchmod(descriptor, mode)
             os.fsync(descriptor)
             os.fsync(parent_descriptor)
             _require_managed_file_descriptor(
                 path,
                 descriptor,
-                expected_mode=mode,
                 label=label,
                 parent_descriptor=parent_descriptor,
             )
@@ -2601,7 +2546,6 @@ def _require_managed_file_descriptor(
     path: Path,
     descriptor: int,
     *,
-    expected_mode: int | None,
     label: str,
     parent_descriptor: int | None = None,
 ) -> None:
@@ -2618,12 +2562,9 @@ def _require_managed_file_descriptor(
         not stat.S_ISREG(opened.st_mode)
         or stat.S_ISLNK(visible.st_mode)
         or (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino)
-        or opened.st_uid != os.geteuid()
-        or opened.st_gid != os.getegid()
         or opened.st_nlink != 1
-        or (expected_mode is not None and stat.S_IMODE(opened.st_mode) != expected_mode)
     ):
-        raise RuntimeError(f"{label} changed durable identity or mode: {path}")
+        raise RuntimeError(f"{label} changed durable identity: {path}")
 
 
 @contextmanager
@@ -2662,18 +2603,15 @@ def _open_directory_chain(
         for component in components:
             if component in {"", ".", ".."} or "/" in component:
                 raise RuntimeError("library storage key contains an unsafe segment")
-            created = False
             if create:
                 try:
                     os.mkdir(
                         component,
-                        _PUBLIC_DIRECTORY_MODE,
+                        _PUBLIC_DIRECTORY_CREATION_MODE,
                         dir_fd=current_descriptor,
                     )
                 except FileExistsError:
                     pass
-                else:
-                    created = True
             try:
                 next_descriptor = os.open(
                     component,
@@ -2699,22 +2637,6 @@ def _open_directory_chain(
             ):
                 os.close(next_descriptor)
                 raise RuntimeError(f"library shard identity is unsafe: {component}")
-            if opened.st_uid != os.geteuid() or opened.st_gid != os.getegid():
-                os.close(next_descriptor)
-                raise RuntimeError(
-                    f"library shard owner mismatch: {component}; "
-                    f"actual_uid={opened.st_uid}; expected_uid={os.geteuid()}; "
-                    f"actual_gid={opened.st_gid}; expected_gid={os.getegid()}"
-                )
-            if created:
-                os.fchmod(next_descriptor, _PUBLIC_DIRECTORY_MODE)
-            elif stat.S_IMODE(opened.st_mode) != _PUBLIC_DIRECTORY_MODE:
-                os.close(next_descriptor)
-                raise RuntimeError(
-                    f"library shard mode mismatch: {component}; "
-                    f"actual_mode={stat.S_IMODE(opened.st_mode):#05o}; "
-                    f"expected_mode={_PUBLIC_DIRECTORY_MODE:#05o}"
-                )
             if create:
                 os.fsync(next_descriptor)
                 os.fsync(current_descriptor)
@@ -2724,16 +2646,9 @@ def _open_directory_chain(
                     dir_fd=current_descriptor,
                     follow_symlinks=False,
                 )
-                if (
-                    (durable.st_dev, durable.st_ino) != (visible.st_dev, visible.st_ino)
-                    or stat.S_IMODE(durable.st_mode) != _PUBLIC_DIRECTORY_MODE
-                    or durable.st_uid != os.geteuid()
-                    or durable.st_gid != os.getegid()
-                ):
+                if (durable.st_dev, durable.st_ino) != (visible.st_dev, visible.st_ino):
                     os.close(next_descriptor)
-                    raise RuntimeError(
-                        f"library shard changed durable identity or mode: {component}"
-                    )
+                    raise RuntimeError(f"library shard changed identity: {component}")
             descriptors.append(next_descriptor)
             current_descriptor = next_descriptor
         yield root_descriptor, current_descriptor
@@ -2785,9 +2700,6 @@ def _require_managed_file_metadata(
     if (
         _Signature.from_stat(value) != expected_signature
         or not stat.S_ISREG(value.st_mode)
-        or stat.S_IMODE(value.st_mode) != _PUBLIC_FILE_MODE
-        or value.st_uid != os.geteuid()
-        or value.st_gid != os.getegid()
         or value.st_nlink != 1
     ):
         raise RuntimeError(f"{label} changed exact metadata authority")
@@ -2813,10 +2725,9 @@ def _publish_resumable_file(
                 file_descriptor = os.open(
                     temporary_leaf,
                     flags | os.O_CREAT | os.O_EXCL,
-                    _PUBLIC_FILE_MODE,
+                    _PUBLIC_FILE_CREATION_MODE,
                     dir_fd=directory_descriptor,
                 )
-                os.fchmod(file_descriptor, _PUBLIC_FILE_MODE)
             except FileExistsError:
                 file_descriptor = os.open(
                     temporary_leaf,
@@ -3211,9 +3122,6 @@ def _verify_same_inode_rename_names(
         if (
             named is None
             or _Signature.from_stat(named) != source
-            or stat.S_IMODE(named.st_mode) != _PUBLIC_FILE_MODE
-            or named.st_uid != os.geteuid()
-            or named.st_gid != os.getegid()
             or named.st_nlink != 2
         ):
             raise RuntimeError(f"{label} changed shared-link authority")

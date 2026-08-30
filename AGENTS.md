@@ -185,18 +185,18 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
   與 OPDS 共用的唯一 persistent CBZ tree；`.h2hdb-coordination/` 是
   reader-visible publication fencing namespace；`.h2hdb-state/` 只擁有
   private staging、quarantine、journal 與 locks。
-- `library_path` 是 deployment 預先建立、由 ingest effective UID:GID 擁有且
-  mode 為 0700 的真實 bind-mount root；runtime 不得建立 mount root 或依賴容器內
-  不可見的 host parent fsync。root 下每個 managed directory 與 persistent
-  control file 建立或 replay 時必須 child fsync、parent fsync，再重驗 exact
-  identity、owner 與 mode；只有 exclusive create 明確證明本次建立的 entry 才可
-  fchmod。既有 entry 只能驗證，metadata drift 必須保持原狀並 fail closed；涵蓋
-  lock files、hash shards 與 SQLite database 的首次 parent entry。
+- `library_path` 是 deployment 預先建立的真實 bind-mount root；runtime 不得建立
+  mount root 或依賴容器內不可見的 host parent fsync。Compose 擁有 service identity、
+  mount scope 與 read-only/read-write policy；runtime 不得把 host UID、GID 或 POSIX
+  mode 當成資料正確性條件，也不得 `chmod` 或 `chown` 既有或新建 entry。建立 API
+  可以傳入安全的初始 mode，但它受 umask 與 host filesystem policy 約束。每個
+  managed directory 與 persistent control file 建立或 replay 時仍必須 child fsync、
+  parent fsync，再重驗 real type、exact dev/inode identity 與必要的 link authority。
 - 所有 CBZ-enabled deployment 在建立 consumers 前都必須預建立空的 `current/`
-  與 `.h2hdb-coordination/` reader bind sources，兩者均由 ingest effective
-  UID:GID 擁有且 mode 為 0755。Runtime 必須 idempotently durable revalidate
-  這兩個 mount roots，不得建立或修改其 metadata；`.h2hdb-state/` 及其 private
-  descendants 仍只由 ingest 建立。
+  與 `.h2hdb-coordination/` reader bind sources。Runtime 必須 idempotently durable
+  revalidate 這兩個 mount roots的 type 與 identity，不得建立或修改其 metadata；
+  `.h2hdb-state/` 及其 private descendants 仍只由 ingest 建立。Host ACL或mode必須
+  讓 Compose指定的 ingest identity實際完成所需I/O，但 runtime不規定其具體值。
 - Legacy `.h2hdb-state/coordination` entry 無論為 directory、symlink 或
   其他類型都必須在修改 private state 前 fail closed；不得 migrate、fallback
   或接納舊 coordination layout。
@@ -207,8 +207,8 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
 - filesystem path 只能使用 core `ArtifactStorageKey` 的固定
   `gid-sha256-12-v1` codec；不得重建 content-addressed locator、日期 grouping、
   friendly title path 或第二份 persistent CBZ tree。
-- artifact 必須先在同 filesystem 的 mode-0700 staging 以 exact-prefix
-  resumable temp 完整寫入、驗證 SHA-256/size 並 fsync。activation 先以 atomic
+- artifact 必須先在同 filesystem 的 private staging 以 exact-prefix resumable
+  temp 完整寫入、驗證 SHA-256/size 並 fsync。activation 先以 atomic
   no-replace capture 舊 current，再以 descriptor-relative、逐層
   `O_NOFOLLOW` 的 atomic no-replace rename 把 stage 移入 current；不得
   hard-link 或 byte-copy persistent CBZ。rename 成功與 response-loss replay
@@ -229,8 +229,8 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
   SIGINT/SIGTERM 在 bounded step 間停止且不得再 claim；SIGKILL 後由 exact
   receipt、journal、marker、digest 與 stat identity 繼續，不得要求 rollback。
 - 只能 capture/install/delete journal 記錄為 managed 且 exact authority 相符的
-  path。unknown path、中間 symlink、owner/mode/inode/entry 變更一律 fail
-  closed。唯一 partial-content 例外是 durable `WRITING` token 所綁定的
+  path。unknown path、中間 symlink、name/inode/link/content authority變更一律
+  fail closed。唯一 partial-content 例外是 durable `WRITING` token 所綁定的
   deterministic private temp；terminal release 必須先 durable tombstone，再
   捕獲其實際 digest/stat identity 後 descriptor-relative delete。
 - terminal `RELEASED` protection token tombstone 永久保留並 fence delayed
