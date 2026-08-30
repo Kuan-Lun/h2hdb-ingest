@@ -36,8 +36,9 @@ development_site="$("$repository_root/.venv/bin/python" -c \
     'import sysconfig; print(sysconfig.get_path("purelib"))')"
 smoke_site="$("$smoke_python" -c \
     'import sysconfig; print(sysconfig.get_path("purelib"))')"
-printf '%s\n' "$development_site" > \
-    "$smoke_site/development-dependencies.pth"
+"$repository_root/.venv/bin/python" -c \
+    'import sys; print(f"import site; site.addsitedir({sys.argv[1]!r})")' \
+    "$development_site" > "$smoke_site/development-dependencies.pth"
 (
     cd "$artifact_root"
     "$smoke_python" -I -c \
