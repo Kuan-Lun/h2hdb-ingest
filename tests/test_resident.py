@@ -109,6 +109,18 @@ class _LibraryMaintenance:
         return next(self._results, LibraryMaintenanceOutcome.DONE)
 
 
+class _FailingLibraryMaintenance(_LibraryMaintenance):
+    def maintain_cleanup(self) -> LibraryMaintenanceOutcome:
+        self.calls += 1
+        raise RuntimeError("library layout unavailable")
+
+
+class _InvalidLibraryMaintenance(_LibraryMaintenance):
+    def maintain_cleanup(self) -> LibraryMaintenanceOutcome:
+        self.calls += 1
+        return cast(LibraryMaintenanceOutcome, object())
+
+
 class _Service:
     def __init__(self, events: list[object]) -> None:
         self._events = events
@@ -230,11 +242,53 @@ def test_startup_only_checks_existing_epoch_and_processes_one_session(
     )
 
 
+def test_startup_propagates_library_layout_failure() -> None:
+    events: list[object] = []
+    library_maintenance = _FailingLibraryMaintenance()
+    resident = _resident(events, library_maintenance=library_maintenance)
+
+    with pytest.raises(RuntimeError, match="library layout unavailable"):
+        resident.initialize()
+
+    assert library_maintenance.calls == 1
+    assert events == ["check"]
+
+
+def test_startup_rejects_invalid_library_maintenance_outcome() -> None:
+    events: list[object] = []
+    library_maintenance = _InvalidLibraryMaintenance()
+    resident = _resident(events, library_maintenance=library_maintenance)
+
+    with pytest.raises(TypeError, match="library maintenance returned an invalid"):
+        resident.initialize()
+
+    assert library_maintenance.calls == 1
+    assert events == ["check"]
+
+
 def test_ordinary_claim_contention_is_not_an_error() -> None:
     events: list[object] = []
     resident = _resident(events, available=False)
 
     assert not resident.process_available(periodic_scan=False)
+    assert events == [
+        ("current-only", 10_000_000),
+        ("claim", False, 10_000_000),
+    ]
+
+
+def test_poll_keeps_library_maintenance_failure_best_effort() -> None:
+    events: list[object] = []
+    library_maintenance = _FailingLibraryMaintenance()
+    resident = _resident(
+        events,
+        available=False,
+        library_maintenance=library_maintenance,
+    )
+
+    assert not resident.process_available(periodic_scan=False)
+
+    assert library_maintenance.calls == 1
     assert events == [
         ("current-only", 10_000_000),
         ("claim", False, 10_000_000),

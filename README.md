@@ -173,9 +173,10 @@ SQLite example with artifacts enabled is:
 Setting it to `null` disables artifact output. `download_path` and
 `library_path` must be distinct and non-nested. When enabled, it must already
 exist as a real bind-mount root owned by the ingest UID without group/world
-write access; for example, pre-create the host bind source with mode `0755`
-before starting Compose. Ingest never creates the mount root because it cannot
-durably fsync the host parent from inside the container.
+write access; for example, pre-create only the host bind source before starting
+Compose. Do not pre-create `current` or `.h2hdb-state`: ingest owns and durably
+creates every managed descendant. Ingest never creates the mount root because
+it cannot durably fsync the host parent from inside the container.
 
 `max_rows` is constrained to 1–128. Core also fixes publication and activation
 pages at 128 rows. These limits bound each database or adapter step, not the

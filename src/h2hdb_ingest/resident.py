@@ -79,7 +79,7 @@ class ResidentIngestor:
         """Validate an existing READY epoch without creating or migrating it."""
 
         report = self._database_admin.check()
-        self._try_library_maintenance()
+        self._run_library_maintenance()
         self._try_current_only_maintenance()
         return report
 
@@ -220,13 +220,16 @@ class ResidentIngestor:
         """Make one bounded ingest-owned CBZ cleanup attempt."""
 
         try:
-            outcome = self._library_maintenance.maintain_cleanup()
-            if not isinstance(outcome, LibraryMaintenanceOutcome):
-                raise TypeError("library maintenance returned an invalid outcome")
-            return outcome
+            return self._run_library_maintenance()
         except Exception:
             logger.exception("library maintenance attempt failed")
             return None
+
+    def _run_library_maintenance(self) -> LibraryMaintenanceOutcome:
+        outcome = self._library_maintenance.maintain_cleanup()
+        if not isinstance(outcome, LibraryMaintenanceOutcome):
+            raise TypeError("library maintenance returned an invalid outcome")
+        return outcome
 
     def _try_current_only_maintenance(
         self,
