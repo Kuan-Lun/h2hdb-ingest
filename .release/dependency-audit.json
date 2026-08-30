@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-08-30T11:26:26+00:00",
-  "manifest_sha256": "c3bad7823f102a30396fc809e6d00050f24f27ef5b0c384370ab29115960af7f",
+  "checked_at": "2026-08-30T17:22:23+00:00",
+  "manifest_sha256": "51208caab8619434ef1bea72b9e9fad3f3a6a3aac5754b1645ed76828e0a74e1",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.9.1",
+  "project_version": "0.9.2",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,10 +30,10 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.26.0,<0.27",
+      "declared": "h2hdb>=0.27.0,<0.28",
       "group": "runtime",
       "latest": "0.26.0",
-      "latest_satisfies": true,
+      "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
       "url": "https://pypi.org/project/h2hdb/"
@@ -130,7 +130,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all direct build, runtime, optional development, and Node dependencies for h2hdb-ingest 0.9.1. This compatible fix delegates service access policy to Compose mounts and removes runtime exact UID/GID/mode enforcement without changing dependency APIs or bounds. Current registry candidates remain compatible with Python 3.14 and the tested h2hdb 0.26 cohort; no bound exception is required.",
+    "note": "Reviewed the h2hdb 0.27 compatibility-lane update against the sibling core source; ingest uses unchanged public ingest facades, while all other direct dependency candidates remain within their declared Python 3.14-compatible ranges.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
