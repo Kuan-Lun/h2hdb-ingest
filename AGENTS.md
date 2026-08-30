@@ -182,17 +182,18 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
 ### Single-library activation safety
 
 - CBZ-enabled deployment 只有一個 `library_path` parent。`current/` 是 Komga
-  與 OPDS 共用的唯一 persistent CBZ tree；`.h2hdb-state/` 擁有 private
-  staging、quarantine、journal、locks 與 reader-visible coordination。
+  與 OPDS 共用的唯一 persistent CBZ tree；`.h2hdb-coordination/` 是
+  reader-visible publication fencing namespace；`.h2hdb-state/` 只擁有
+  private staging、quarantine、journal 與 locks。
 - `library_path` 是 deployment 預先建立、由 ingest UID 擁有且不可 group/world
   write 的真實 bind-mount root；runtime 不得建立 mount root 或依賴容器內不可見
   的 host parent fsync。root 下每個 managed directory 與 persistent control file
   建立或 replay 時必須 child fsync、parent fsync，再重驗 exact identity、owner
   與 mode；涵蓋 lock files 與 SQLite database 的首次 parent entry。
-- `library_path` parent 與 `.h2hdb-state/` 是 ingest-owned single-writer
-  namespace；其他程序即使使用相同 UID 也不得 mutate。Komga 與 OPDS 只能
-  read-only mount 所需路徑；public `current/` 的 unknown entry race 仍須
-  preserve bytes 並 fail closed。
+- `library_path` parent、`.h2hdb-state/` 與 `.h2hdb-coordination/` 是
+  ingest-owned single-writer namespace；其他程序即使使用相同 UID 也不得
+  mutate。Komga 與 OPDS 只能 read-only mount 所需路徑；public
+  `current/` 的 unknown entry race 仍須 preserve bytes 並 fail closed。
 - filesystem path 只能使用 core `ArtifactStorageKey` 的固定
   `gid-sha256-12-v1` codec；不得重建 content-addressed locator、日期 grouping、
   friendly title path 或第二份 persistent CBZ tree。
@@ -209,7 +210,8 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
   捕獲 post-unlink exact signature、fsync survivor inode 與兩側 directory，再
   重驗 survivor；不同 inode 即使 bytes 相同也必須 preserve 並 fail closed。
 - core reader head 在 library durable `READY` 前不得 advance。activation 從
-  reader-invisible DB commit 起持有 `coordination/publication.lock` exclusive
+  reader-invisible DB commit 起持有
+  `.h2hdb-coordination/publication.lock` exclusive
   flock，建立並 fsync `ACTIVATING`；core finalization 成功後才可 durable unlink
   marker 並 unlock。OPDS 只取得 nonblocking shared flock，marker/lock異常時
   fail closed。

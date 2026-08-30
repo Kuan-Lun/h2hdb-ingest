@@ -152,16 +152,16 @@ def test_layout_mkdir_response_loss_replays_child_before_parent_fsync(
     state = root / ".h2hdb-state"
     expected_edges = (
         (root / "current", root),
+        (root / ".h2hdb-coordination", root),
         (state, root),
         (state / "staging", state),
         (state / "quarantine", state),
         (state / "journal", state),
         (state / "locks", state),
-        (state / "coordination", state),
         (state / "locks" / "state.lock", state / "locks"),
         (
-            state / "coordination" / "publication.lock",
-            state / "coordination",
+            root / ".h2hdb-coordination" / "publication.lock",
+            root / ".h2hdb-coordination",
         ),
         (state / "journal" / "library-activation.sqlite3", state / "journal"),
     )
@@ -170,6 +170,21 @@ def test_layout_mkdir_response_loss_replays_child_before_parent_fsync(
         child_identity = (child.stat().st_dev, child.stat().st_ino)
         parent_identity = (parent.stat().st_dev, parent.stat().st_ino)
         assert (child_identity, parent_identity) in observed_pairs
+
+    coordination = root / ".h2hdb-coordination"
+    assert stat.S_IMODE((root / "current").stat().st_mode) == 0o755
+    assert stat.S_IMODE(coordination.stat().st_mode) == 0o755
+    assert stat.S_IMODE((coordination / "publication.lock").stat().st_mode) == 0o644
+    assert stat.S_IMODE(state.stat().st_mode) == 0o700
+    for private_child in ("staging", "quarantine", "journal", "locks"):
+        assert stat.S_IMODE((state / private_child).stat().st_mode) == 0o700
+    assert stat.S_IMODE((state / "locks" / "state.lock").stat().st_mode) == 0o600
+    assert {path.name for path in state.iterdir()} == {
+        "journal",
+        "locks",
+        "quarantine",
+        "staging",
+    }
 
 
 def test_layout_child_swap_after_parent_fsync_fails_closed(
@@ -224,7 +239,7 @@ def test_activation_moves_staging_into_one_canonical_current_file(
     state = tmp_path / "library" / ".h2hdb-state"
     assert not list((state / "staging").glob("*.cbz"))
     assert not list((state / "quarantine").glob("*.cbz"))
-    assert not (state / "coordination" / "ACTIVATING").exists()
+    assert not (tmp_path / "library" / ".h2hdb-coordination" / "ACTIVATING").exists()
     assert list((tmp_path / "library").rglob("*.cbz")) == [target]
 
 
@@ -299,7 +314,7 @@ def test_ready_marker_survives_process_stop_and_replay_clears_it(
             if checkpoint.status is LibraryActivationStatus.READY:
                 break
 
-    marker = root / ".h2hdb-state" / "coordination" / "ACTIVATING"
+    marker = root / ".h2hdb-coordination" / "ACTIVATING"
     assert json.loads(marker.read_text(encoding="ascii")) == {
         "format": "h2hdb-library-activation-v1",
         "receipt_id": receipt.hex(),
@@ -343,7 +358,7 @@ def test_normal_stop_after_first_bounded_activation_page_restarts(
         assert checkpoint.status is LibraryActivationStatus.RECONCILE
         assert checkpoint.cursor is not None
 
-    marker = root / ".h2hdb-state" / "coordination" / "ACTIVATING"
+    marker = root / ".h2hdb-coordination" / "ACTIVATING"
     assert marker.is_file()
     assert len(tuple(adapter.current_path.rglob("*.cbz"))) == 128
 
@@ -392,7 +407,7 @@ def test_publication_exclusive_lock_survives_complete_until_guard_exit(
     item = _item(130, b"payload")
     _protect(adapter, item, b"payload", 130)
     receipt = b"l" * 16
-    lock_path = root / ".h2hdb-state" / "coordination" / "publication.lock"
+    lock_path = root / ".h2hdb-coordination" / "publication.lock"
 
     def shared_lock_is_blocked() -> bool:
         descriptor = os.open(lock_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -538,7 +553,7 @@ def test_install_fault_boundaries_recover_exact_current_file(
     target = restarted.current_path.joinpath(*item.storage_key.segments)
     assert target.read_bytes() == b"payload"
     assert list(root.rglob("*.cbz")) == [target]
-    assert not (root / ".h2hdb-state" / "coordination" / "ACTIVATING").exists()
+    assert not (root / ".h2hdb-coordination" / "ACTIVATING").exists()
 
 
 def test_renamed_stage_authority_and_current_entry_commit_atomically(
@@ -974,7 +989,7 @@ def test_completion_fault_boundaries_recover_terminal_marker(
         checkpoint = restarted.begin(1, receipt)
         assert checkpoint.status is LibraryActivationStatus.COMPLETE
 
-    assert not (root / ".h2hdb-state" / "coordination" / "ACTIVATING").exists()
+    assert not (root / ".h2hdb-coordination" / "ACTIVATING").exists()
 
 
 def test_marker_unlink_response_loss_fsyncs_absence_before_complete_replay(
@@ -1009,7 +1024,7 @@ def test_marker_unlink_response_loss_fsyncs_absence_before_complete_replay(
             with pytest.raises(RuntimeError, match="marker-unlink-return-lost"):
                 adapter.complete(1, receipt)
 
-    coordination = root / ".h2hdb-state" / "coordination"
+    coordination = root / ".h2hdb-coordination"
     coordination_identity = (
         coordination.stat().st_dev,
         coordination.stat().st_ino,
@@ -1550,7 +1565,7 @@ def test_marker_rename_response_loss_replay_fsyncs_coordination_before_journal(
             with pytest.raises(RuntimeError, match="marker-rename-return-lost"):
                 adapter.reconcile_page(1, receipt, limit=128)
 
-    coordination = root / ".h2hdb-state" / "coordination"
+    coordination = root / ".h2hdb-coordination"
     coordination_identity = (
         coordination.stat().st_dev,
         coordination.stat().st_ino,
@@ -1598,7 +1613,7 @@ def test_marker_publish_same_inode_duplicate_heals_to_final_name(
                 adapter.reconcile_page(1, receipt, limit=128)
 
     payload = library_module._marker_payload(1, receipt)
-    coordination = root / ".h2hdb-state" / "coordination"
+    coordination = root / ".h2hdb-coordination"
     temporary = coordination / f".ACTIVATING-{sha256(payload).hexdigest()}.tmp"
     marker = coordination / "ACTIVATING"
     os.link(temporary, marker)
@@ -1638,7 +1653,7 @@ def test_marker_duplicate_unlink_response_loss_replays_final_authority(
                 adapter.reconcile_page(1, receipt, limit=128)
 
     payload = library_module._marker_payload(1, receipt)
-    coordination = root / ".h2hdb-state" / "coordination"
+    coordination = root / ".h2hdb-coordination"
     temporary = coordination / f".ACTIVATING-{sha256(payload).hexdigest()}.tmp"
     marker = coordination / "ACTIVATING"
     os.link(temporary, marker)
@@ -1699,7 +1714,7 @@ def test_marker_publish_different_inode_duplicate_fails_closed(
                 adapter.reconcile_page(1, receipt, limit=128)
 
     payload = library_module._marker_payload(1, receipt)
-    coordination = root / ".h2hdb-state" / "coordination"
+    coordination = root / ".h2hdb-coordination"
     temporary = coordination / f".ACTIVATING-{sha256(payload).hexdigest()}.tmp"
     marker = coordination / "ACTIVATING"
     marker.write_bytes(payload)
@@ -1919,7 +1934,7 @@ def test_marker_temporary_leaf_swap_before_publish_preserves_both_files(
     _protect(adapter, item, b"payload", 174)
     receipt = b"q" * 16
     payload = library_module._marker_payload(1, receipt)
-    coordination = root / ".h2hdb-state" / "coordination"
+    coordination = root / ".h2hdb-coordination"
     temporary = coordination / f".ACTIVATING-{sha256(payload).hexdigest()}.tmp"
     marker = coordination / "ACTIVATING"
     saved = tmp_path / "saved-marker-temporary"

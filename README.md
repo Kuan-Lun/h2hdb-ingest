@@ -61,14 +61,14 @@ CBZ-enabled deployments configure one `library_path` parent:
 ```text
 library/
 ├── current/                         # Komga and OPDS read-only mount
-└── .h2hdb-state/
+├── .h2hdb-coordination/             # separately mounted read-only
+│   ├── publication.lock
+│   └── ACTIVATING                   # only during unfinished cutover
+└── .h2hdb-state/                    # mode 0700, ingest-private
     ├── staging/                     # mode 0700, complete candidates
     ├── quarantine/                  # mode 0700, stale-removal recovery
     ├── journal/                     # mode 0700, SQLite activation journal
-    ├── locks/                       # mode 0700, adapter state lock
-    └── coordination/                # separately mounted read-only by OPDS
-        ├── publication.lock
-        └── ACTIVATING               # exists only during an unfinished cutover
+    └── locks/                       # mode 0700, adapter state lock
 ```
 
 Core owns the stable GID storage key. The registered
@@ -106,10 +106,10 @@ exist only during a pending or interrupted activation. SIGINT/SIGTERM stops at
 the next bounded durable step and does not claim new work. A forced container
 kill leaves the marker and journal so restart continues before readers resume.
 
-The `library_path` parent and `.h2hdb-state` are ingest-owned, single-writer
-namespaces. No other process, including one running under the same UID, may
-mutate them; Komga and OPDS mounts remain read-only. Races on public `current`
-entries still fail closed and preserve unknown bytes.
+The `library_path` parent, `.h2hdb-state`, and `.h2hdb-coordination` are
+ingest-owned, single-writer namespaces. No other process, including one running
+under the same UID, may mutate them; Komga and OPDS mounts remain read-only.
+Races on public `current` entries still fail closed and preserve unknown bytes.
 
 A terminal release tombstones its protection token before cleanup, so delayed
 or response-lost `protect()` calls cannot recreate bytes. A durable `WRITING`
@@ -169,14 +169,16 @@ SQLite example with artifacts enabled is:
 }
 ```
 
-`library_path` points at the parent containing `current` and `.h2hdb-state`.
+`library_path` points at the parent containing `current`,
+`.h2hdb-coordination`, and `.h2hdb-state`.
 Setting it to `null` disables artifact output. `download_path` and
 `library_path` must be distinct and non-nested. When enabled, it must already
 exist as a real bind-mount root owned by the ingest UID without group/world
 write access; for example, pre-create only the host bind source before starting
-Compose. Do not pre-create `current` or `.h2hdb-state`: ingest owns and durably
-creates every managed descendant. Ingest never creates the mount root because
-it cannot durably fsync the host parent from inside the container.
+Compose. Do not pre-create `current`, `.h2hdb-coordination`, or
+`.h2hdb-state`: ingest owns and durably creates every managed descendant.
+Ingest never creates the mount root because it cannot durably fsync the host
+parent from inside the container.
 
 `max_rows` is constrained to 1–128. Core also fixes publication and activation
 pages at 128 rows. These limits bound each database or adapter step, not the
@@ -188,11 +190,11 @@ variables and unknown configuration fields fail startup.
 
 The download root must already be a nonempty directory. Under the pre-existing
 library mount, ingest durably creates `current`, the private state directories,
-coordination directory, journal, and permanent lock. Each managed directory is
+`.h2hdb-coordination`, journal, and permanent locks. Each managed directory is
 fsynced before its parent entry and then revalidated. Mount only `current` into
-Komga. Mount
-`current` and `.h2hdb-state/coordination` separately and read-only into OPDS;
-never expose staging, quarantine, or the journal to readers.
+Komga. Mount `current` and `.h2hdb-coordination` separately and read-only into
+OPDS; never expose `.h2hdb-state`, staging, quarantine, or the journal to
+readers.
 
 ## Development
 

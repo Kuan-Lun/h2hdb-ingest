@@ -44,7 +44,7 @@ _STAGING_DIRECTORY_NAME = "staging"
 _QUARANTINE_DIRECTORY_NAME = "quarantine"
 _JOURNAL_DIRECTORY_NAME = "journal"
 _LOCKS_DIRECTORY_NAME = "locks"
-_COORDINATION_DIRECTORY_NAME = "coordination"
+_COORDINATION_DIRECTORY_NAME = ".h2hdb-coordination"
 _DATABASE_NAME = "library-activation.sqlite3"
 _STATE_LOCK_NAME = "state.lock"
 _PUBLICATION_LOCK_NAME = "publication.lock"
@@ -127,10 +127,11 @@ class _StagedAuthority:
 class ManagedFilesystemLibraryAdapter:
     """Render, stage, activate, and release one authoritative CBZ tree.
 
-    Only ``current`` is public.  Candidate bytes and the durable activation
-    journal remain below ``.h2hdb-state`` on the same filesystem.  The adapter
-    never derives a filesystem location itself: it accepts only the core-owned
-    stable GID storage key and validates it against the public resolver.
+    Only ``current`` and ``.h2hdb-coordination`` are reader-visible. Candidate
+    bytes and the durable activation journal remain below ``.h2hdb-state`` on
+    the same filesystem. The adapter never derives a filesystem location
+    itself: it accepts only the core-owned stable GID storage key and validates
+    it against the public resolver.
     """
 
     adapter_id = ARTIFACT_ADAPTER_ID
@@ -153,7 +154,7 @@ class ManagedFilesystemLibraryAdapter:
         self._quarantine = self._state / _QUARANTINE_DIRECTORY_NAME
         self._journal = self._state / _JOURNAL_DIRECTORY_NAME
         self._locks = self._state / _LOCKS_DIRECTORY_NAME
-        self._coordination = self._state / _COORDINATION_DIRECTORY_NAME
+        self._coordination = self._root / _COORDINATION_DIRECTORY_NAME
         self._database_path = self._journal / _DATABASE_NAME
         self._state_lock_path = self._locks / _STATE_LOCK_NAME
         self._publication_lock_path = self._coordination / _PUBLICATION_LOCK_NAME

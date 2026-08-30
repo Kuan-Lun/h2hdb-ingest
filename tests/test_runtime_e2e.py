@@ -334,7 +334,7 @@ def test_fresh_artifact_runtime_publishes_one_current_cbz(
     state = library_root / ".h2hdb-state"
     assert not list((state / "staging").glob("*.cbz"))
     assert not list((state / "quarantine").glob("*.cbz"))
-    assert not (state / "coordination" / "ACTIVATING").exists()
+    assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
 
 
 def test_many_replacements_keep_one_stable_current_file_per_gid(
@@ -412,4 +412,4 @@ def test_many_replacements_keep_one_stable_current_file_per_gid(
     state = library_root / ".h2hdb-state"
     assert not list((state / "staging").glob("*.cbz"))
     assert not list((state / "quarantine").glob("*.cbz"))
-    assert not (state / "coordination" / "ACTIVATING").exists()
+    assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
