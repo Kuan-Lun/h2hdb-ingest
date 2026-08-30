@@ -109,6 +109,70 @@ def test_layout_requires_a_preexisting_real_library_root(tmp_path: Path) -> None
     assert not root.exists()
 
 
+def test_layout_durably_accepts_preexisting_reader_mount_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir(mode=0o755)
+    current = root / "current"
+    coordination = root / ".h2hdb-coordination"
+    current.mkdir(mode=0o755)
+    coordination.mkdir(mode=0o755)
+    expected_identities = {
+        (current.stat().st_dev, current.stat().st_ino),
+        (coordination.stat().st_dev, coordination.stat().st_ino),
+    }
+    fsynced: list[tuple[int, int]] = []
+    original_fsync = os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        value = os.fstat(descriptor)
+        fsynced.append((value.st_dev, value.st_ino))
+        original_fsync(descriptor)
+
+    monkeypatch.setattr("h2hdb_ingest.library.os.fsync", record_fsync)
+    adapter = ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)
+    adapter._ensure_layout()
+
+    assert {
+        (current.stat().st_dev, current.stat().st_ino),
+        (coordination.stat().st_dev, coordination.stat().st_ino),
+    } == expected_identities
+    assert expected_identities <= set(fsynced)
+    assert stat.S_IMODE(current.stat().st_mode) == 0o755
+    assert stat.S_IMODE(coordination.stat().st_mode) == 0o755
+    assert stat.S_IMODE((coordination / "publication.lock").stat().st_mode) == 0o644
+    assert stat.S_IMODE((root / ".h2hdb-state").stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("legacy_kind", ("directory", "file", "symlink"))
+def test_layout_rejects_legacy_coordination_before_creating_new_sibling(
+    tmp_path: Path,
+    legacy_kind: str,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir(mode=0o755)
+    state = root / ".h2hdb-state"
+    state.mkdir(mode=0o700)
+    legacy = state / "coordination"
+    if legacy_kind == "directory":
+        legacy.mkdir(mode=0o755)
+    elif legacy_kind == "file":
+        legacy.write_bytes(b"legacy")
+    else:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        legacy.symlink_to(outside, target_is_directory=True)
+
+    adapter = ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)
+    with pytest.raises(RuntimeError, match="unsupported legacy"):
+        adapter._ensure_layout()
+
+    assert legacy.exists() or legacy.is_symlink()
+    assert not (root / ".h2hdb-coordination").exists()
+
+
 def test_layout_mkdir_response_loss_replays_child_before_parent_fsync(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

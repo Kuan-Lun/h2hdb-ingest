@@ -190,6 +190,13 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
   的 host parent fsync。root 下每個 managed directory 與 persistent control file
   建立或 replay 時必須 child fsync、parent fsync，再重驗 exact identity、owner
   與 mode；涵蓋 lock files 與 SQLite database 的首次 parent entry。
+- Synology deployment 在建立 consumer containers 前預建立空的 `current/`
+  與 `.h2hdb-coordination/` reader bind sources，兩者均由 ingest UID
+  擁有且 mode 為 0755。Runtime 必須 idempotently durable revalidate 這兩個
+  mount roots，但 `.h2hdb-state/` 及其 private descendants 仍只由 ingest 建立。
+- Legacy `.h2hdb-state/coordination` entry 無論為 directory、symlink 或
+  其他類型都必須在建立新 sibling 前 fail closed；不得 migrate、fallback
+  或同時接納兩個 coordination layouts。
 - `library_path` parent、`.h2hdb-state/` 與 `.h2hdb-coordination/` 是
   ingest-owned single-writer namespace；其他程序即使使用相同 UID 也不得
   mutate。Komga 與 OPDS 只能 read-only mount 所需路徑；public

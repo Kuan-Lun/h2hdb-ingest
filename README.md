@@ -60,8 +60,8 @@ CBZ-enabled deployments configure one `library_path` parent:
 
 ```text
 library/
-├── current/                         # Komga and OPDS read-only mount
-├── .h2hdb-coordination/             # separately mounted read-only
+├── current/                         # pre-created reader bind source
+├── .h2hdb-coordination/             # pre-created reader bind source
 │   ├── publication.lock
 │   └── ACTIVATING                   # only during unfinished cutover
 └── .h2hdb-state/                    # mode 0700, ingest-private
@@ -174,11 +174,16 @@ SQLite example with artifacts enabled is:
 Setting it to `null` disables artifact output. `download_path` and
 `library_path` must be distinct and non-nested. When enabled, it must already
 exist as a real bind-mount root owned by the ingest UID without group/world
-write access; for example, pre-create only the host bind source before starting
-Compose. Do not pre-create `current`, `.h2hdb-coordination`, or
-`.h2hdb-state`: ingest owns and durably creates every managed descendant.
-Ingest never creates the mount root because it cannot durably fsync the host
-parent from inside the container.
+write access. For Synology Compose, pre-create the root plus empty `current`
+and `.h2hdb-coordination` reader bind sources, all owned by the ingest UID;
+their modes must be `0755`. Do not pre-create `.h2hdb-state`: ingest owns and
+durably creates that private tree. Ingest idempotently creates the two public
+children for non-Compose use, and always fsyncs and revalidates their exact
+identity, owner, and mode. It never creates the mount root because it cannot
+durably fsync the host parent from inside the container. The former
+`.h2hdb-state/coordination` layout is unsupported and is neither read nor
+migrated; any such entry makes startup fail closed before the new coordination
+sibling is created.
 
 `max_rows` is constrained to 1–128. Core also fixes publication and activation
 pages at 128 rows. These limits bound each database or adapter step, not the
@@ -189,12 +194,12 @@ string such as `"${H2HDB_RW_DB_PASSWORD}"` is substituted recursively; missing
 variables and unknown configuration fields fail startup.
 
 The download root must already be a nonempty directory. Under the pre-existing
-library mount, ingest durably creates `current`, the private state directories,
-`.h2hdb-coordination`, journal, and permanent locks. Each managed directory is
-fsynced before its parent entry and then revalidated. Mount only `current` into
-Komga. Mount `current` and `.h2hdb-coordination` separately and read-only into
-OPDS; never expose `.h2hdb-state`, staging, quarantine, or the journal to
-readers.
+library mount, ingest durably validates the pre-created `current` and
+`.h2hdb-coordination` mount roots, creates the private state directories,
+journal, and permanent locks, and revalidates every managed identity. Mount
+only `current` into Komga. Mount `current` and `.h2hdb-coordination` separately
+and read-only into OPDS; never expose `.h2hdb-state`, staging, quarantine, or
+the journal to readers.
 
 ## Development
 

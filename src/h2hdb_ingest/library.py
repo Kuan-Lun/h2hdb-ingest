@@ -45,6 +45,7 @@ _QUARANTINE_DIRECTORY_NAME = "quarantine"
 _JOURNAL_DIRECTORY_NAME = "journal"
 _LOCKS_DIRECTORY_NAME = "locks"
 _COORDINATION_DIRECTORY_NAME = ".h2hdb-coordination"
+_UNSUPPORTED_LEGACY_COORDINATION_NAME = "coordination"
 _DATABASE_NAME = "library-activation.sqlite3"
 _STATE_LOCK_NAME = "state.lock"
 _PUBLICATION_LOCK_NAME = "publication.lock"
@@ -2109,6 +2110,20 @@ class ManagedFilesystemLibraryAdapter:
             ) from error
         _ensure_managed_directory(self._current, _PUBLIC_DIRECTORY_MODE)
         _ensure_managed_directory(self._state, _PRIVATE_MODE)
+        with _open_directory(self._state) as state_descriptor:
+            try:
+                os.stat(
+                    _UNSUPPORTED_LEGACY_COORDINATION_NAME,
+                    dir_fd=state_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise RuntimeError(
+                    "unsupported legacy library coordination layout; "
+                    "a fresh library root is required"
+                )
         for path in (self._staging, self._quarantine, self._journal, self._locks):
             _ensure_managed_directory(path, _PRIVATE_MODE)
         _ensure_managed_directory(self._coordination, _PUBLIC_DIRECTORY_MODE)
