@@ -68,6 +68,7 @@ def build_runtime(
     else:
         library = ManagedFilesystemLibraryAdapter(
             config.paths.library_path,
+            source_root=config.paths.download_path,
             max_image_short_side=config.paths.max_image_short_side,
         )
         artifact_adapters[library.adapter_id] = library

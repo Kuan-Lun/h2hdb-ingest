@@ -4,9 +4,11 @@ import ctypes
 import fcntl
 import json
 import os
+import sqlite3
 import stat
 import sys
-from collections.abc import Callable
+from collections.abc import Buffer, Callable
+from datetime import UTC, datetime
 from hashlib import sha256
 from io import BytesIO
 from itertools import pairwise
@@ -15,14 +17,34 @@ from typing import cast
 
 import pytest
 from h2hdb import (
+    CatalogResourceKind,
     LibraryActivationStatus,
+    StorageObjectDescriptor,
+    StorageObjectKey,
+    VNextLibraryActivationCursor,
     VNextLibraryActivationItem,
-    artifact_storage_key,
 )
 
 import h2hdb_ingest.library as library_module
 from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
 from h2hdb_ingest.maintenance import LibraryMaintenanceOutcome
+from h2hdb_ingest.storage import acquisition_storage_key, thumbnail_storage_key
+
+_MODIFIED_AT = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+class _ActivationItem(VNextLibraryActivationItem):
+    @property
+    def storage_key(self) -> StorageObjectKey:
+        return self.storage_object.key
+
+    @property
+    def artifact_sha256(self) -> bytes:
+        return bytes.fromhex(self.storage_object.sha256)
+
+    @property
+    def size_bytes(self) -> int:
+        return self.storage_object.size_bytes
 
 
 def _publication_key(gid: int) -> bytes:
@@ -32,28 +54,59 @@ def _publication_key(gid: int) -> bytes:
     return digest.digest()
 
 
-def _item(gid: int, payload: bytes) -> VNextLibraryActivationItem:
-    return VNextLibraryActivationItem(
+def _item(gid: int, payload: bytes) -> _ActivationItem:
+    return _item_kind(gid, payload, CatalogResourceKind.ACQUISITION)
+
+
+def _item_kind(
+    gid: int,
+    payload: bytes,
+    resource_kind: CatalogResourceKind,
+) -> _ActivationItem:
+    storage_key = (
+        acquisition_storage_key(gid)
+        if resource_kind is CatalogResourceKind.ACQUISITION
+        else thumbnail_storage_key(gid)
+    )
+    return _ActivationItem(
         publication_key=_publication_key(gid),
         gid=gid,
-        source_gallery_name=f"gallery-{gid}",
-        upload_time=0,
-        storage_key=artifact_storage_key(gid),
-        artifact_sha256=sha256(payload).digest(),
-        size_bytes=len(payload),
+        resource_kind=resource_kind,
+        storage_object=StorageObjectDescriptor(
+            key=storage_key,
+            size_bytes=len(payload),
+            sha256=sha256(payload).hexdigest(),
+            modified_at=_MODIFIED_AT,
+        ),
     )
 
 
 def _adapter(root: Path) -> ManagedFilesystemLibraryAdapter:
     if not root.exists():
         _provision_library_root(root)
-    return ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)
+    return ManagedFilesystemLibraryAdapter(
+        root,
+        source_root=_source_root(root),
+        max_image_short_side=768,
+    )
+
+
+def _source_root(root: Path) -> Path:
+    source = root.parent / "download-source"
+    source.mkdir(exist_ok=True)
+    return source
 
 
 def _provision_library_root(root: Path) -> None:
     root.mkdir(mode=0o777, exist_ok=True)
     root.chmod(0o777)
-    for path in (root / "current", root / ".h2hdb-coordination"):
+    current = root / "current"
+    for path in (
+        current,
+        current / "acquisitions",
+        current / "artwork",
+        root / ".h2hdb-coordination",
+    ):
         path.mkdir(mode=0o777, exist_ok=True)
         path.chmod(0o777)
 
@@ -71,18 +124,44 @@ class _PartialThenError(BytesIO):
         raise RuntimeError("fault: interrupted staging write")
 
 
+class _ShortWriter(BytesIO):
+    def write(self, content: Buffer, /) -> int:
+        view = memoryview(content)
+        return super().write(view[: max(1, len(view) // 2)])
+
+
+class _NoProgressWriter(BytesIO):
+    def write(self, content: Buffer, /) -> int:
+        del content
+        return 0
+
+
+def test_private_staging_writer_completes_short_writes_and_rejects_zero() -> None:
+    short = _ShortWriter()
+    library_module._write_all(short, b"complete-payload", label="test staging")
+    assert short.getvalue() == b"complete-payload"
+
+    with pytest.raises(RuntimeError, match="made no progress"):
+        library_module._write_all(
+            _NoProgressWriter(),
+            b"blocked",
+            label="test staging",
+        )
+
+
 def _protect(
     adapter: ManagedFilesystemLibraryAdapter,
-    item: VNextLibraryActivationItem,
+    item: _ActivationItem,
     payload: bytes,
     token_byte: int,
 ) -> bytes:
-    token = bytes((token_byte,)) * 184
+    token = bytes((token_byte,)) * 32
     evidence = adapter.protect(
         BytesIO(payload),
         item.storage_key,
         item.artifact_sha256,
         item.size_bytes,
+        item.storage_object.modified_at,
         token,
     )
     assert evidence.stored
@@ -109,7 +188,11 @@ def _activate(
 
 def test_layout_requires_a_preexisting_real_library_root(tmp_path: Path) -> None:
     root = tmp_path / "missing-library"
-    adapter = ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)
+    adapter = ManagedFilesystemLibraryAdapter(
+        root,
+        source_root=_source_root(root),
+        max_image_short_side=768,
+    )
 
     with pytest.raises(RuntimeError, match="pre-existing real directory"):
         with adapter.publication_guard():
@@ -128,6 +211,14 @@ def test_layout_durably_accepts_preexisting_reader_mount_roots(
     coordination = root / ".h2hdb-coordination"
     expected_identities = {
         (current.stat().st_dev, current.stat().st_ino),
+        (
+            (current / "acquisitions").stat().st_dev,
+            (current / "acquisitions").stat().st_ino,
+        ),
+        (
+            (current / "artwork").stat().st_dev,
+            (current / "artwork").stat().st_ino,
+        ),
         (coordination.stat().st_dev, coordination.stat().st_ino),
     }
     fsynced: list[tuple[int, int]] = []
@@ -139,11 +230,23 @@ def test_layout_durably_accepts_preexisting_reader_mount_roots(
         original_fsync(descriptor)
 
     monkeypatch.setattr("h2hdb_ingest.library.os.fsync", record_fsync)
-    adapter = ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)
+    adapter = ManagedFilesystemLibraryAdapter(
+        root,
+        source_root=_source_root(root),
+        max_image_short_side=768,
+    )
     adapter._ensure_layout()
 
     assert {
         (current.stat().st_dev, current.stat().st_ino),
+        (
+            (current / "acquisitions").stat().st_dev,
+            (current / "acquisitions").stat().st_ino,
+        ),
+        (
+            (current / "artwork").stat().st_dev,
+            (current / "artwork").stat().st_ino,
+        ),
         (coordination.stat().st_dev, coordination.stat().st_ino),
     } == expected_identities
     assert expected_identities <= set(fsynced)
@@ -168,8 +271,12 @@ def test_layout_never_changes_managed_entry_permissions(
             reject_permission_change,
         )
 
-    ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)._ensure_layout()
-    ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)._ensure_layout()
+    ManagedFilesystemLibraryAdapter(
+        root, source_root=_source_root(root), max_image_short_side=768
+    )._ensure_layout()
+    ManagedFilesystemLibraryAdapter(
+        root, source_root=_source_root(root), max_image_short_side=768
+    )._ensure_layout()
 
 
 def test_layout_accepts_precreated_reader_mode_without_mutation(
@@ -182,6 +289,7 @@ def test_layout_accepts_precreated_reader_mode_without_mutation(
 
     ManagedFilesystemLibraryAdapter(
         root,
+        source_root=_source_root(root),
         max_image_short_side=768,
     )._ensure_layout()
 
@@ -200,6 +308,7 @@ def test_layout_accepts_private_directory_mode_drift_without_repair(
 
     ManagedFilesystemLibraryAdapter(
         root,
+        source_root=_source_root(root),
         max_image_short_side=768,
     )._ensure_layout()
 
@@ -217,6 +326,7 @@ def test_layout_accepts_existing_lock_mode_drift_without_repair(
 
     ManagedFilesystemLibraryAdapter(
         root,
+        source_root=_source_root(root),
         max_image_short_side=768,
     )._ensure_layout()
 
@@ -234,6 +344,7 @@ def test_layout_accepts_database_mode_without_repair(
 
     ManagedFilesystemLibraryAdapter(
         root,
+        source_root=_source_root(root),
         max_image_short_side=768,
     )._ensure_layout()
 
@@ -260,12 +371,61 @@ def test_layout_rejects_legacy_coordination_before_creating_new_sibling(
         outside.mkdir()
         legacy.symlink_to(outside, target_is_directory=True)
 
-    adapter = ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)
+    adapter = ManagedFilesystemLibraryAdapter(
+        root,
+        source_root=_source_root(root),
+        max_image_short_side=768,
+    )
     with pytest.raises(RuntimeError, match="unsupported legacy"):
         adapter._ensure_layout()
 
     assert legacy.exists() or legacy.is_symlink()
     assert (root / ".h2hdb-coordination").is_dir()
+
+
+@pytest.mark.parametrize("legacy_kind", ("directory", "file", "symlink"))
+def test_layout_rejects_legacy_current_artifact_tree_without_deleting_it(
+    tmp_path: Path,
+    legacy_kind: str,
+) -> None:
+    root = tmp_path / "library"
+    _provision_library_root(root)
+    legacy = root / "current" / "hash-v1"
+    if legacy_kind == "directory":
+        legacy.mkdir(mode=0o755)
+    elif legacy_kind == "file":
+        legacy.write_bytes(b"legacy")
+    else:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        legacy.symlink_to(outside, target_is_directory=True)
+
+    adapter = ManagedFilesystemLibraryAdapter(
+        root,
+        source_root=_source_root(root),
+        max_image_short_side=768,
+    )
+    with pytest.raises(RuntimeError, match="rebuild into a fresh library root"):
+        adapter._ensure_layout()
+
+    assert legacy.exists() or legacy.is_symlink()
+
+
+def test_layout_allows_unmanaged_operating_system_metadata_at_current_root(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    _provision_library_root(root)
+    metadata = root / "current" / ".DS_Store"
+    metadata.write_bytes(b"unmanaged")
+
+    ManagedFilesystemLibraryAdapter(
+        root,
+        source_root=_source_root(root),
+        max_image_short_side=768,
+    )._ensure_layout()
+
+    assert metadata.read_bytes() == b"unmanaged"
 
 
 def test_layout_mkdir_response_loss_replays_child_before_parent_fsync(
@@ -274,7 +434,11 @@ def test_layout_mkdir_response_loss_replays_child_before_parent_fsync(
 ) -> None:
     root = tmp_path / "library"
     _provision_library_root(root)
-    adapter = ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)
+    adapter = ManagedFilesystemLibraryAdapter(
+        root,
+        source_root=_source_root(root),
+        max_image_short_side=768,
+    )
     original_mkdir = os.mkdir
     interrupted = False
 
@@ -347,7 +511,11 @@ def test_layout_child_swap_after_parent_fsync_fails_closed(
 ) -> None:
     root = tmp_path / "library"
     _provision_library_root(root)
-    adapter = ManagedFilesystemLibraryAdapter(root, max_image_short_side=768)
+    adapter = ManagedFilesystemLibraryAdapter(
+        root,
+        source_root=_source_root(root),
+        max_image_short_side=768,
+    )
     root_identity = (root.stat().st_dev, root.stat().st_ino)
     current = root / "current"
     saved = root / "saved-current"
@@ -384,14 +552,57 @@ def test_activation_moves_staging_into_one_canonical_current_file(
 
     target = adapter.current_path.joinpath(*item.storage_key.segments)
     assert target.read_bytes() == payload
-    assert item.storage_key.segments[0] == "hash-v1"
-    assert len(item.storage_key.segments[1]) == 2
-    assert len(item.storage_key.segments[2]) == 1
+    assert item.storage_key.segments[:2] == ("acquisitions", "hash-v2")
+    assert len(item.storage_key.segments[2]) == 2
+    assert len(item.storage_key.segments[3]) == 1
     state = tmp_path / "library" / ".h2hdb-state"
     assert not list((state / "staging").glob("*.cbz"))
     assert not list((state / "quarantine").glob("*.cbz"))
     assert not (tmp_path / "library" / ".h2hdb-coordination" / "ACTIVATING").exists()
     assert list((tmp_path / "library").rglob("*.cbz")) == [target]
+
+
+def test_activation_rejects_key_gid_and_resource_kind_mismatch(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    payload = b"payload"
+
+    def mismatched_item(
+        *,
+        key_gid: int,
+        kind: CatalogResourceKind,
+    ) -> _ActivationItem:
+        return _ActivationItem(
+            publication_key=_publication_key(42),
+            gid=42,
+            resource_kind=kind,
+            storage_object=StorageObjectDescriptor(
+                key=acquisition_storage_key(key_gid),
+                size_bytes=len(payload),
+                sha256=sha256(payload).hexdigest(),
+                modified_at=_MODIFIED_AT,
+            ),
+        )
+
+    with adapter.publication_guard():
+        adapter.begin(1, b"m" * 16)
+        with pytest.raises(ValueError, match="another GID"):
+            adapter.activate_page(
+                1,
+                (mismatched_item(key_gid=43, kind=CatalogResourceKind.ACQUISITION),),
+            )
+        with pytest.raises(ValueError, match="another resource kind"):
+            adapter.activate_page(
+                1,
+                (mismatched_item(key_gid=42, kind=CatalogResourceKind.THUMBNAIL),),
+            )
+
+    with adapter._exclusive_state() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM pending_entries"
+        ).fetchone() == (0,)
 
 
 def test_existing_shard_mode_drift_is_accepted_without_repair(tmp_path: Path) -> None:
@@ -487,7 +698,7 @@ def test_ready_marker_survives_process_stop_and_replay_clears_it(
 
     marker = root / ".h2hdb-coordination" / "ACTIVATING"
     assert json.loads(marker.read_text(encoding="ascii")) == {
-        "format": "h2hdb-library-activation-v1",
+        "format": "h2hdb-library-activation-v2",
         "receipt_id": receipt.hex(),
         "revision": 1,
     }
@@ -545,6 +756,52 @@ def test_normal_stop_after_first_bounded_activation_page_restarts(
     assert len(tuple(restarted.current_path.rglob("*.cbz"))) == 129
     assert not list((root / ".h2hdb-state" / "staging").glob("*.cbz"))
     assert not marker.exists()
+
+
+def test_stale_removal_crosses_128_boundary_and_restarts(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    payloads = {gid: f"removal-{gid}".encode() for gid in range(1, 130)}
+    items = tuple(
+        sorted(
+            (_item(gid, payload) for gid, payload in payloads.items()),
+            key=lambda item: item.publication_key,
+        )
+    )
+    for item in items:
+        _protect(adapter, item, payloads[item.gid], item.gid)
+
+    with adapter.publication_guard():
+        adapter.begin(1, b"a" * 16)
+        adapter.activate_page(1, items[:128])
+        adapter.activate_page(1, items[128:])
+        adapter.seal(1)
+        checkpoint = adapter.reconcile_page(1, b"a" * 16, limit=128)
+        while checkpoint.status is not LibraryActivationStatus.READY:
+            checkpoint = adapter.reconcile_page(1, b"a" * 16, limit=128)
+        adapter.complete(1, b"a" * 16)
+
+    with adapter.publication_guard():
+        adapter.begin(2, b"b" * 16)
+        adapter.activate_page(2, ())
+        adapter.seal(2)
+        checkpoint = adapter.reconcile_page(2, b"b" * 16, limit=128)
+        assert checkpoint.status is LibraryActivationStatus.RECONCILE
+        assert checkpoint.cursor is not None
+
+    assert len(tuple(adapter.current_path.rglob("*.cbz"))) == 1
+
+    restarted = _adapter(root)
+    with restarted.publication_guard():
+        checkpoint = restarted.begin(2, b"b" * 16)
+        assert checkpoint.status is LibraryActivationStatus.RECONCILE
+        while True:
+            checkpoint = restarted.reconcile_page(2, b"b" * 16, limit=128)
+            if checkpoint.status is LibraryActivationStatus.READY:
+                break
+        restarted.complete(2, b"b" * 16)
+
+    assert not tuple(restarted.current_path.rglob("*.cbz"))
 
 
 def test_completion_is_constant_state_flip_and_private_spool_cleanup_is_bounded(
@@ -1258,6 +1515,7 @@ def test_release_is_terminal_and_deletes_only_exact_managed_staging(
         item.storage_key,
         item.artifact_sha256,
         item.size_bytes,
+        item.storage_object.modified_at,
         token,
     ).stored
 
@@ -1323,7 +1581,7 @@ def test_staging_rename_response_loss_replays_writing_journal(
     root = tmp_path / "library"
     adapter = _adapter(root)
     item = _item(170, b"payload")
-    token = bytes((170,)) * 184
+    token = bytes((170,)) * 32
     original_rename = library_module._rename_noreplace
     interrupted = False
 
@@ -1353,6 +1611,7 @@ def test_staging_rename_response_loss_replays_writing_journal(
                 item.storage_key,
                 item.artifact_sha256,
                 item.size_bytes,
+                item.storage_object.modified_at,
                 token,
             )
 
@@ -1373,6 +1632,7 @@ def test_staging_rename_response_loss_replays_writing_journal(
             item.storage_key,
             item.artifact_sha256,
             item.size_bytes,
+            item.storage_object.modified_at,
             token,
         ).stored
 
@@ -1390,7 +1650,7 @@ def test_staging_publish_same_inode_duplicate_heals_to_final_name(
     root = tmp_path / "library"
     adapter = _adapter(root)
     item = _item(180, b"payload")
-    token = bytes((180,)) * 184
+    token = bytes((180,)) * 32
     original_rename = library_module._rename_noreplace
 
     def interrupt_before_rename(
@@ -1417,6 +1677,7 @@ def test_staging_publish_same_inode_duplicate_heals_to_final_name(
                 item.storage_key,
                 item.artifact_sha256,
                 item.size_bytes,
+                item.storage_object.modified_at,
                 token,
             )
 
@@ -1432,6 +1693,7 @@ def test_staging_publish_same_inode_duplicate_heals_to_final_name(
         item.storage_key,
         item.artifact_sha256,
         item.size_bytes,
+        item.storage_object.modified_at,
         token,
     ).stored
 
@@ -1447,7 +1709,7 @@ def test_staging_duplicate_unlink_response_loss_replays_final_authority(
     root = tmp_path / "library"
     adapter = _adapter(root)
     item = _item(195, b"payload")
-    token = bytes((195,)) * 184
+    token = bytes((195,)) * 32
 
     def interrupt_before_rename(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("fault: stage-publish-before-rename")
@@ -1460,6 +1722,7 @@ def test_staging_duplicate_unlink_response_loss_replays_final_authority(
                 item.storage_key,
                 item.artifact_sha256,
                 item.size_bytes,
+                item.storage_object.modified_at,
                 token,
             )
 
@@ -1490,6 +1753,7 @@ def test_staging_duplicate_unlink_response_loss_replays_final_authority(
                 item.storage_key,
                 item.artifact_sha256,
                 item.size_bytes,
+                item.storage_object.modified_at,
                 token,
             )
 
@@ -1501,6 +1765,7 @@ def test_staging_duplicate_unlink_response_loss_replays_final_authority(
         item.storage_key,
         item.artifact_sha256,
         item.size_bytes,
+        item.storage_object.modified_at,
         token,
     ).stored
     assert final.stat().st_nlink == 1
@@ -1513,7 +1778,7 @@ def test_staging_publish_different_inode_duplicate_fails_closed(
     root = tmp_path / "library"
     adapter = _adapter(root)
     item = _item(181, b"payload")
-    token = bytes((181,)) * 184
+    token = bytes((181,)) * 32
 
     def interrupt_before_rename(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("fault: stage-publish-before-rename")
@@ -1526,6 +1791,7 @@ def test_staging_publish_different_inode_duplicate_fails_closed(
                 item.storage_key,
                 item.artifact_sha256,
                 item.size_bytes,
+                item.storage_object.modified_at,
                 token,
             )
 
@@ -1542,6 +1808,7 @@ def test_staging_publish_different_inode_duplicate_fails_closed(
             item.storage_key,
             item.artifact_sha256,
             item.size_bytes,
+            item.storage_object.modified_at,
             token,
         )
 
@@ -1558,7 +1825,7 @@ def test_staging_duplicate_requires_exact_writing_journal_authority(
     root = tmp_path / "library"
     adapter = _adapter(root)
     item = _item(192, b"payload")
-    token = bytes((192,)) * 184
+    token = bytes((192,)) * 32
 
     def interrupt_before_rename(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("fault: stage-publish-before-rename")
@@ -1571,6 +1838,7 @@ def test_staging_duplicate_requires_exact_writing_journal_authority(
                 item.storage_key,
                 item.artifact_sha256,
                 item.size_bytes,
+                item.storage_object.modified_at,
                 token,
             )
 
@@ -1600,6 +1868,7 @@ def test_staging_duplicate_requires_exact_writing_journal_authority(
             item.storage_key,
             item.artifact_sha256,
             item.size_bytes,
+            item.storage_object.modified_at,
             token,
         )
 
@@ -1615,7 +1884,7 @@ def test_staging_duplicate_changed_ctime_across_fsync_fails_closed(
     root = tmp_path / "library"
     adapter = _adapter(root)
     item = _item(193, b"payload")
-    token = bytes((193,)) * 184
+    token = bytes((193,)) * 32
 
     def interrupt_before_rename(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("fault: stage-publish-before-rename")
@@ -1628,6 +1897,7 @@ def test_staging_duplicate_changed_ctime_across_fsync_fails_closed(
                 item.storage_key,
                 item.artifact_sha256,
                 item.size_bytes,
+                item.storage_object.modified_at,
                 token,
             )
 
@@ -1665,6 +1935,7 @@ def test_staging_duplicate_changed_ctime_across_fsync_fails_closed(
                 item.storage_key,
                 item.artifact_sha256,
                 item.size_bytes,
+                item.storage_object.modified_at,
                 token,
             )
 
@@ -1692,6 +1963,7 @@ def test_staged_journal_leaf_must_match_protection_token(tmp_path: Path) -> None
             item.storage_key,
             item.artifact_sha256,
             item.size_bytes,
+            item.storage_object.modified_at,
             token,
         )
 
@@ -1905,7 +2177,7 @@ def test_staging_temporary_exact_prefix_resumes_without_deleting_it(
     root = tmp_path / "library"
     adapter = _adapter(root)
     item = _item(172, b"payload")
-    token = bytes((172,)) * 184
+    token = bytes((172,)) * 32
     adapter._ensure_layout()
     temporary = root / ".h2hdb-state" / "staging" / f".{sha256(token).hexdigest()}.tmp"
     temporary.write_bytes(b"pay")
@@ -1916,6 +2188,7 @@ def test_staging_temporary_exact_prefix_resumes_without_deleting_it(
         item.storage_key,
         item.artifact_sha256,
         item.size_bytes,
+        item.storage_object.modified_at,
         token,
     ).stored
 
@@ -1930,7 +2203,7 @@ def test_pending_partial_staging_release_tombstones_and_fences_delayed_protect(
     root = tmp_path / "library"
     adapter = _adapter(root)
     item = _item(175, b"payload")
-    token = bytes((175,)) * 184
+    token = bytes((175,)) * 32
     temporary = root / ".h2hdb-state" / "staging" / f".{sha256(token).hexdigest()}.tmp"
 
     with pytest.raises(RuntimeError, match="interrupted staging write"):
@@ -1939,6 +2212,7 @@ def test_pending_partial_staging_release_tombstones_and_fences_delayed_protect(
             item.storage_key,
             item.artifact_sha256,
             item.size_bytes,
+            item.storage_object.modified_at,
             token,
         )
     assert temporary.read_bytes() == b"pay"
@@ -1955,6 +2229,7 @@ def test_pending_partial_staging_release_tombstones_and_fences_delayed_protect(
         item.storage_key,
         item.artifact_sha256,
         item.size_bytes,
+        item.storage_object.modified_at,
         token,
     ).stored
     assert not list((root / ".h2hdb-state" / "staging").iterdir())
@@ -1969,7 +2244,7 @@ def test_pending_partial_release_response_loss_replays_terminal_cleanup(
     root = tmp_path / "library"
     adapter = _adapter(root)
     item = _item(176, b"payload")
-    token = bytes((176,)) * 184
+    token = bytes((176,)) * 32
     temporary = root / ".h2hdb-state" / "staging" / f".{sha256(token).hexdigest()}.tmp"
     with pytest.raises(RuntimeError, match="interrupted staging write"):
         adapter.protect(
@@ -1977,6 +2252,7 @@ def test_pending_partial_release_response_loss_replays_terminal_cleanup(
             item.storage_key,
             item.artifact_sha256,
             item.size_bytes,
+            item.storage_object.modified_at,
             token,
         )
 
@@ -2013,6 +2289,7 @@ def test_pending_partial_release_response_loss_replays_terminal_cleanup(
         item.storage_key,
         item.artifact_sha256,
         item.size_bytes,
+        item.storage_object.modified_at,
         token,
     ).stored
     staging = root / ".h2hdb-state" / "staging"
@@ -2046,7 +2323,7 @@ def test_staging_temporary_leaf_swap_before_publish_preserves_both_files(
     root = tmp_path / "library"
     adapter = _adapter(root)
     item = _item(173, b"payload")
-    token = bytes((173,)) * 184
+    token = bytes((173,)) * 32
     token_name = sha256(token).hexdigest()
     temporary = root / ".h2hdb-state" / "staging" / f".{token_name}.tmp"
     staged = temporary.with_name(f"{token_name}.cbz")
@@ -2085,6 +2362,7 @@ def test_staging_temporary_leaf_swap_before_publish_preserves_both_files(
             item.storage_key,
             item.artifact_sha256,
             item.size_bytes,
+            item.storage_object.modified_at,
             token,
         )
 
@@ -2092,6 +2370,118 @@ def test_staging_temporary_leaf_swap_before_publish_preserves_both_files(
     assert not staged.exists()
     assert temporary.read_bytes() == b"foreign"
     assert saved.read_bytes() == b"payload"
+
+
+def test_staging_temporary_identical_inode_swap_before_authority_capture_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    assert adapter.maintain_cleanup() is LibraryMaintenanceOutcome.DONE
+    payload = b"byte-identical-payload"
+    item = _item(183, payload)
+    token = bytes((183,)) * 32
+    token_name = sha256(token).hexdigest()
+    staging = root / ".h2hdb-state" / "staging"
+    staging_identity = (staging.stat().st_dev, staging.stat().st_ino)
+    temporary = staging / f".{token_name}.tmp"
+    staged = staging / f"{token_name}.cbz"
+    saved = tmp_path / "saved-identical-staging-temporary"
+    original_fsync = os.fsync
+    swapped = False
+
+    def swap_before_named_authority_capture(descriptor: int) -> None:
+        nonlocal swapped
+        value = os.fstat(descriptor)
+        if (
+            not swapped
+            and stat.S_ISDIR(value.st_mode)
+            and (value.st_dev, value.st_ino) == staging_identity
+            and temporary.exists()
+            and temporary.stat().st_size == len(payload)
+        ):
+            temporary.rename(saved)
+            temporary.write_bytes(payload)
+            swapped = True
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(
+        "h2hdb_ingest.library.os.fsync",
+        swap_before_named_authority_capture,
+    )
+    with pytest.raises(RuntimeError, match="changed durable identity before publish"):
+        adapter.protect(
+            BytesIO(payload),
+            item.storage_key,
+            item.artifact_sha256,
+            item.size_bytes,
+            item.storage_object.modified_at,
+            token,
+        )
+
+    assert swapped
+    assert not staged.exists()
+    assert temporary.read_bytes() == payload
+    assert saved.read_bytes() == payload
+    assert temporary.stat().st_ino != saved.stat().st_ino
+
+
+def test_staging_temporary_identical_inode_swap_before_rename_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    payload = b"same-bytes-different-inode"
+    item = _item(184, payload)
+    token = bytes((184,)) * 32
+    token_name = sha256(token).hexdigest()
+    temporary = root / ".h2hdb-state" / "staging" / f".{token_name}.tmp"
+    staged = temporary.with_name(f"{token_name}.cbz")
+    saved = tmp_path / "saved-before-staging-rename"
+    original_rename = library_module._rename_noreplace
+    swapped = False
+
+    def rename_after_identical_source_swap(
+        source: str,
+        destination: str,
+        *,
+        source_descriptor: int,
+        destination_descriptor: int,
+    ) -> None:
+        nonlocal swapped
+        if destination.endswith(".cbz") and not swapped:
+            temporary.rename(saved)
+            temporary.write_bytes(payload)
+            swapped = True
+        original_rename(
+            source,
+            destination,
+            source_descriptor=source_descriptor,
+            destination_descriptor=destination_descriptor,
+        )
+
+    monkeypatch.setattr(
+        library_module,
+        "_rename_noreplace",
+        rename_after_identical_source_swap,
+    )
+    with pytest.raises(RuntimeError, match="published staged artifact is foreign"):
+        adapter.protect(
+            BytesIO(payload),
+            item.storage_key,
+            item.artifact_sha256,
+            item.size_bytes,
+            item.storage_object.modified_at,
+            token,
+        )
+
+    assert swapped
+    assert not staged.exists()
+    assert temporary.read_bytes() == payload
+    assert saved.read_bytes() == payload
+    assert temporary.stat().st_ino != saved.stat().st_ino
 
 
 def test_marker_temporary_leaf_swap_before_publish_preserves_both_files(
@@ -2189,8 +2579,129 @@ def test_release_tombstone_response_loss_is_terminal_and_bounded_cleanup_replays
         item.storage_key,
         item.artifact_sha256,
         item.size_bytes,
+        item.storage_object.modified_at,
         token,
     ).stored
+
+
+@pytest.mark.parametrize("entrypoint", ("release", "maintenance"))
+def test_released_cleanup_replays_same_inode_stage_publish_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    item = _item(185, b"payload")
+    token = bytes((185,)) * 32
+
+    def interrupt_before_rename(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("fault: stage-publish-before-rename")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(library_module, "_rename_noreplace", interrupt_before_rename)
+        with pytest.raises(RuntimeError, match="stage-publish-before-rename"):
+            adapter.protect(
+                BytesIO(b"payload"),
+                item.storage_key,
+                item.artifact_sha256,
+                item.size_bytes,
+                item.storage_object.modified_at,
+                token,
+            )
+
+    staging = root / ".h2hdb-state" / "staging"
+    stem = sha256(token).hexdigest()
+    temporary = staging / f".{stem}.tmp"
+    final = staging / f"{stem}.cbz"
+    os.link(temporary, final)
+    assert temporary.stat().st_ino == final.stat().st_ino
+    assert temporary.stat().st_nlink == 2
+
+    database = root / ".h2hdb-state" / "journal" / "library-activation.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE protection_tokens SET state = 'RELEASED' WHERE token = ?",
+            (token,),
+        )
+        connection.commit()
+
+    if entrypoint == "release":
+        assert adapter.release(
+            item.storage_key,
+            item.artifact_sha256,
+            item.size_bytes,
+            token,
+        ).released
+        assert adapter.maintain_cleanup() is LibraryMaintenanceOutcome.PROGRESSED
+    else:
+        assert adapter.maintain_cleanup() is LibraryMaintenanceOutcome.PROGRESSED
+    assert not temporary.exists()
+    assert not final.exists()
+    assert not adapter.protect(
+        BytesIO(b"payload"),
+        item.storage_key,
+        item.artifact_sha256,
+        item.size_bytes,
+        item.storage_object.modified_at,
+        token,
+    ).stored
+
+
+@pytest.mark.parametrize("entrypoint", ("release", "maintenance"))
+def test_released_cleanup_preserves_foreign_two_name_stage_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    item = _item(186, b"payload")
+    token = bytes((186,)) * 32
+
+    def interrupt_before_rename(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("fault: stage-publish-before-rename")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(library_module, "_rename_noreplace", interrupt_before_rename)
+        with pytest.raises(RuntimeError, match="stage-publish-before-rename"):
+            adapter.protect(
+                BytesIO(b"payload"),
+                item.storage_key,
+                item.artifact_sha256,
+                item.size_bytes,
+                item.storage_object.modified_at,
+                token,
+            )
+
+    staging = root / ".h2hdb-state" / "staging"
+    stem = sha256(token).hexdigest()
+    temporary = staging / f".{stem}.tmp"
+    final = staging / f"{stem}.cbz"
+    final.write_bytes(b"payload")
+    assert temporary.stat().st_ino != final.stat().st_ino
+    database = root / ".h2hdb-state" / "journal" / "library-activation.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE protection_tokens SET state = 'RELEASED' WHERE token = ?",
+            (token,),
+        )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="exact inode authority"):
+        if entrypoint == "release":
+            adapter.release(
+                item.storage_key,
+                item.artifact_sha256,
+                item.size_bytes,
+                token,
+            )
+        else:
+            adapter.maintain_cleanup()
+
+    assert temporary.read_bytes() == b"payload"
+    assert final.read_bytes() == b"payload"
+    assert temporary.stat().st_ino != final.stat().st_ino
 
 
 def test_intermediate_shard_symlink_fails_closed(tmp_path: Path) -> None:
@@ -2201,7 +2712,12 @@ def test_intermediate_shard_symlink_fails_closed(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
     current = root / "current"
-    (current / "hash-v1").symlink_to(outside, target_is_directory=True)
+    shard_parent = current.joinpath(*item.storage_key.segments[:2])
+    shard_parent.mkdir(parents=True)
+    (shard_parent / item.storage_key.segments[2]).symlink_to(
+        outside,
+        target_is_directory=True,
+    )
 
     with adapter.publication_guard():
         adapter.begin(1, b"s" * 16)
@@ -2235,8 +2751,9 @@ def test_intermediate_shard_swap_during_replace_is_detected(
     ) -> None:
         nonlocal swapped
         if destination.startswith("h2h-") and not swapped:
-            shard = root / "current" / "hash-v1"
-            moved = root / "current" / "detached-hash-v1"
+            shard_parent = root / "current" / "acquisitions" / "hash-v2"
+            shard = shard_parent / item.storage_key.segments[2]
+            moved = shard_parent / f"detached-{item.storage_key.segments[2]}"
             shard.rename(moved)
             shard.symlink_to(outside, target_is_directory=True)
             swapped = True
@@ -2931,15 +3448,23 @@ def test_stale_current_quarantine_same_inode_duplicate_heals(
         "quarantine-retirement-return-lost",
     ),
 )
+@pytest.mark.parametrize(
+    "resource_kind",
+    (
+        CatalogResourceKind.ACQUISITION,
+        CatalogResourceKind.THUMBNAIL,
+    ),
+)
 def test_replacement_response_loss_reconciles_one_exact_current_link(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     boundary: str,
+    resource_kind: CatalogResourceKind,
 ) -> None:
     root = tmp_path / "library"
     adapter = _adapter(root)
-    first = _item(66, b"first")
-    second = _item(66, b"second")
+    first = _item_kind(66, b"first", resource_kind)
+    second = _item_kind(66, b"second", resource_kind)
     _protect(adapter, first, b"first", 69)
     _activate(adapter, 1, b"a" * 16, (first,))
     _protect(adapter, second, b"second", 70)
@@ -2969,7 +3494,7 @@ def test_replacement_response_loss_reconciles_one_exact_current_link(
                     source_descriptor=source_descriptor,
                     destination_descriptor=destination_descriptor,
                 )
-                if destination.startswith("h2h-"):
+                if destination == second.storage_key.segments[-1]:
                     raise RuntimeError("fault: rename-return-lost")
 
             scoped.setattr(
@@ -3010,7 +3535,8 @@ def test_replacement_response_loss_reconciles_one_exact_current_link(
     target = restarted.current_path.joinpath(*second.storage_key.segments)
     assert target.read_bytes() == b"second"
     assert target.stat().st_nlink == 1
-    assert list(root.rglob("*.cbz")) == [target]
+    suffix = "*.cbz" if resource_kind is CatalogResourceKind.ACQUISITION else "*.jpg"
+    assert list(root.rglob(suffix)) == [target]
     assert not list((root / ".h2hdb-state" / "staging").iterdir())
     assert not list((root / ".h2hdb-state" / "quarantine").iterdir())
     _activate(restarted, 3, b"c" * 16, (second,))
@@ -3211,3 +3737,274 @@ def test_linux_no_replace_unknown_syscall_architecture_fails_closed(
         )
 
     assert function.calls == []
+
+
+def test_release_preserves_unowned_temporary_without_journal_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    adapter._ensure_layout()
+    payload = b"unowned exact payload"
+    item = _item(9001, payload)
+    token = b"u" * 32
+    temporary = root / ".h2hdb-state" / "staging" / f".{sha256(token).hexdigest()}.tmp"
+    temporary.write_bytes(payload)
+
+    with pytest.raises(RuntimeError, match="without journal authority"):
+        adapter.release(
+            item.storage_key,
+            item.artifact_sha256,
+            item.size_bytes,
+            token,
+        )
+
+    assert temporary.read_bytes() == payload
+
+
+def test_release_preserves_unowned_final_stage_without_journal_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    adapter._ensure_layout()
+    payload = b"unowned final stage"
+    item = _item(9002, payload)
+    token = b"v" * 32
+    staged = root / ".h2hdb-state" / "staging" / f"{sha256(token).hexdigest()}.cbz"
+    staged.write_bytes(payload)
+
+    with pytest.raises(RuntimeError, match="without journal authority"):
+        adapter.release(
+            item.storage_key,
+            item.artifact_sha256,
+            item.size_bytes,
+            token,
+        )
+
+    assert staged.read_bytes() == payload
+
+
+def test_release_rejects_stage_suffix_swapped_in_journal(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    payload = b"exact acquisition"
+    item = _item(9003, payload)
+    token = _protect(adapter, item, payload, 202)
+    staged = root / ".h2hdb-state" / "staging" / f"{sha256(token).hexdigest()}.cbz"
+    database = root / ".h2hdb-state" / "journal" / "library-activation.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE protection_tokens SET staging_leaf = ? WHERE token = ?",
+            (f"{sha256(token).hexdigest()}.jpg", token),
+        )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="unsafe path"):
+        adapter.release(
+            item.storage_key,
+            item.artifact_sha256,
+            item.size_bytes,
+            token,
+        )
+
+    assert staged.read_bytes() == payload
+
+
+def test_journal_rejects_extra_v2_schema_surface(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    adapter._ensure_layout()
+    database = root / ".h2hdb-state" / "journal" / "library-activation.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE current_entries ADD COLUMN foreign_value TEXT")
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="journal shape"):
+        _adapter(root)._ensure_layout()
+
+
+def test_journal_rejects_missing_v2_schema_without_repairing_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    adapter._ensure_layout()
+    database = root / ".h2hdb-state" / "journal" / "library-activation.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP INDEX pending_entries_activation_idx")
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="journal shape"):
+        _adapter(root)._ensure_layout()
+
+    with sqlite3.connect(database) as connection:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'pending_entries_activation_idx'"
+            ).fetchone()
+            is None
+        )
+
+
+def test_journal_rejects_forged_activation_cursor_tag(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    receipt = b"f" * 16
+    with adapter.publication_guard():
+        adapter.begin(1, receipt)
+    database = root / ".h2hdb-state" / "journal" / "library-activation.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE library_state SET last_cursor = ? WHERE singleton = 1",
+            (_publication_key(1) + b"\x02",),
+        )
+        connection.commit()
+
+    restarted = _adapter(root)
+    with restarted.publication_guard():
+        with pytest.raises(RuntimeError, match="cursor is corrupt"):
+            restarted.begin(1, receipt)
+
+
+def test_journal_rejects_valid_cursor_without_pending_membership(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    receipt = b"g" * 16
+    with adapter.publication_guard():
+        adapter.begin(1, receipt)
+    database = root / ".h2hdb-state" / "journal" / "library-activation.sqlite3"
+    forged = VNextLibraryActivationCursor(
+        _publication_key(1),
+        CatalogResourceKind.ACQUISITION,
+    ).to_bytes()
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE library_state SET last_cursor = ? WHERE singleton = 1",
+            (forged,),
+        )
+        connection.commit()
+
+    restarted = _adapter(root)
+    with restarted.publication_guard():
+        with pytest.raises(RuntimeError, match="pending membership"):
+            restarted.begin(1, receipt)
+
+
+def test_stale_removal_uses_publication_resource_order_not_storage_path(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    lower_gid, higher_gid = next(
+        (left, right)
+        for left in range(1, 64)
+        for right in range(64, 128)
+        if _publication_key(left) < _publication_key(right)
+    )
+    thumbnail_payload = b"thumbnail"
+    acquisition_payload = b"acquisition"
+    thumbnail = _item_kind(
+        lower_gid,
+        thumbnail_payload,
+        CatalogResourceKind.THUMBNAIL,
+    )
+    acquisition = _item_kind(
+        higher_gid,
+        acquisition_payload,
+        CatalogResourceKind.ACQUISITION,
+    )
+    assert _publication_key(lower_gid) < _publication_key(higher_gid)
+    assert "/".join(acquisition.storage_key.segments) < "/".join(
+        thumbnail.storage_key.segments
+    )
+    _protect(adapter, thumbnail, thumbnail_payload, 210)
+    _protect(adapter, acquisition, acquisition_payload, 211)
+    items = tuple(
+        sorted(
+            (thumbnail, acquisition),
+            key=lambda item: VNextLibraryActivationCursor(
+                item.publication_key,
+                item.resource_kind,
+            ).to_bytes(),
+        )
+    )
+    _activate(adapter, 1, b"a" * 16, items)
+
+    with adapter.publication_guard():
+        adapter.begin(2, b"b" * 16)
+        adapter.activate_page(2, ())
+        adapter.seal(2)
+        checkpoint = adapter.reconcile_page(2, b"b" * 16, limit=1)
+        assert checkpoint.cursor == VNextLibraryActivationCursor(
+            thumbnail.publication_key,
+            CatalogResourceKind.THUMBNAIL,
+        )
+        assert not adapter.current_path.joinpath(
+            *thumbnail.storage_key.segments
+        ).exists()
+        assert adapter.current_path.joinpath(
+            *acquisition.storage_key.segments
+        ).is_file()
+        while checkpoint.status is not LibraryActivationStatus.READY:
+            checkpoint = adapter.reconcile_page(2, b"b" * 16, limit=1)
+        adapter.complete(2, b"b" * 16)
+
+
+def test_two_resource_activation_crosses_128_boundary_and_restarts(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    resources: list[_ActivationItem] = []
+    for gid in range(1, 66):
+        for kind in (
+            CatalogResourceKind.ACQUISITION,
+            CatalogResourceKind.THUMBNAIL,
+        ):
+            payload = f"{gid}:{kind.value}".encode("ascii")
+            item = _item_kind(gid, payload, kind)
+            resources.append(item)
+    resources.sort(
+        key=lambda item: VNextLibraryActivationCursor(
+            item.publication_key,
+            item.resource_kind,
+        ).to_bytes()
+    )
+    for token_byte, item in enumerate(resources, start=1):
+        payload = f"{item.gid}:{item.resource_kind.value}".encode("ascii")
+        _protect(adapter, item, payload, token_byte)
+
+    receipt = b"m" * 16
+    with adapter.publication_guard():
+        adapter.begin(1, receipt)
+        adapter.activate_page(1, tuple(resources[:128]))
+
+    restarted = _adapter(root)
+    with restarted.publication_guard():
+        checkpoint = restarted.begin(1, receipt)
+        assert checkpoint.cursor == VNextLibraryActivationCursor(
+            resources[127].publication_key,
+            resources[127].resource_kind,
+        )
+        restarted.activate_page(1, tuple(resources[128:]))
+        restarted.seal(1)
+        checkpoint = restarted.reconcile_page(1, receipt, limit=128)
+        assert checkpoint.status is LibraryActivationStatus.RECONCILE
+
+    resumed = _adapter(root)
+    with resumed.publication_guard():
+        checkpoint = resumed.begin(1, receipt)
+        assert checkpoint.status is LibraryActivationStatus.RECONCILE
+        assert checkpoint.cursor is not None
+        while True:
+            checkpoint = resumed.reconcile_page(1, receipt, limit=128)
+            if checkpoint.status is LibraryActivationStatus.READY:
+                break
+        resumed.complete(1, receipt)
+
+    assert len(tuple(resumed.current_path.rglob("*.cbz"))) == 65
+    assert len(tuple(resumed.current_path.rglob("*.jpg"))) == 65

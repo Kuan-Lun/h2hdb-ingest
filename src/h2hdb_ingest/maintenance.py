@@ -1,4 +1,4 @@
-"""Public bounded maintenance contract for ingest-owned CBZ state."""
+"""Public bounded maintenance contract for ingest-owned presentation state."""
 
 from __future__ import annotations
 

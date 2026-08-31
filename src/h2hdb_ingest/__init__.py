@@ -1,10 +1,10 @@
-"""Filesystem ingest and managed CBZ storage for H2HDB vNext."""
+"""Filesystem ingest and managed presentation storage for H2HDB vNext."""
 
 from __future__ import annotations
 
 __all__ = [
     "FILESYSTEM_OBSERVATION_VERSION",
-    "ArtifactProducerIdentity",
+    "FilesystemArtifactSourceRole",
     "FilesystemEntryType",
     "FilesystemGalleryObservation",
     "FilesystemObservationError",
@@ -26,7 +26,6 @@ __all__ = [
     "load_config",
 ]
 
-from .artifact import ArtifactProducerIdentity
 from .config import (
     IngestConfig,
     IngestPathsConfig,
@@ -36,6 +35,7 @@ from .config import (
 from .core_source import VNextFilesystemSourceAdapter
 from .filesystem import (
     FILESYSTEM_OBSERVATION_VERSION,
+    FilesystemArtifactSourceRole,
     FilesystemEntryType,
     FilesystemGalleryObservation,
     FilesystemObservationError,

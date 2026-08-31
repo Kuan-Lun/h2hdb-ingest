@@ -1,150 +1,125 @@
 # h2hdb-ingest
 
-`h2hdb-ingest` is the filesystem-facing application for the H2HDB vNext
-schema epoch. It observes downloaded galleries, renders and activates canonical
-CBZ artifacts in one shared library, and drives the public
-core ingest facade under a renewable lease.
+`h2hdb-ingest` watches a completed Hentai@Home download tree, publishes its
+metadata to an H2HDB catalog, and optionally builds the CBZ, cover, thumbnail,
+and page-location data used by Komga and OPDS readers.
 
-The boundary is intentionally strict. The `h2hdb` package owns schema and
-epoch administration, transactions, queues, source checkpoints, analysis and
-deduplication policy, artifact selection, catalog publication, and release.
-This package imports only public vNext domain types, protocols, and facades. It
-does not initialize or migrate a database and has no legacy `H2HDB` API path.
+This service writes data. Komga and `h2hdb-opds` only receive read-only views
+of the finished library.
 
-## Runtime model
+## What it produces
 
-One ingest turn performs these steps:
+When `library_path` is enabled, each selected gallery has these resources:
 
-1. Claim a public vNext ingest session and start its lease heartbeat.
-2. Idempotently resolve the immutable natural ingest policy in core.
-3. Freeze one filesystem discovery snapshot in a temporary SQLite keyset index.
-4. Drive source, analysis, artifact, publication, and finalization state
-   machines through bounded public facade calls.
-5. If CBZ output is enabled, stage complete verified CBZs privately, spool the
-   pinned stable storage keys, and activate bounded pages under a durable
-   maintenance marker.
-6. Finalize the reader-visible core head only after the library reaches
-   `READY`, then clear the marker.
-7. Complete the ingest session.
-8. Advance one bounded page in the ingest-owned private cleanup queue.
-9. After the SHARED session gate is released, make one response-loss-safe core
-   current-only maintenance attempt. A typed local or core `PROGRESSED` outcome
-   is retried immediately without resetting the periodic deadline; `BLOCKED`,
-   `CONTENDED`, `DONE`, and transient failures use the ordinary idle poll
-   cadence.
+- one acquisition CBZ named `h2h-<gid>.cbz`;
+- page zero as the full-size cover, without a second cover copy;
+- one standalone `thumbnail-320.jpg` derived from page zero;
+- verified byte offsets for every page, so OPDS can serve a page without
+  opening or decompressing the ZIP during the request.
 
-Core gallery-staging capacity exhaustion is bounded backpressure rather than a
-fatal resident error. After the rejected request commits no rows, the resident
-stops the heartbeat, completes the exact ingest session, and runs both bounded
-maintenance actions. Any `PROGRESSED` result is retried immediately; otherwise
-the resident uses the ordinary idle poll cadence so it cannot busy-loop. If
-exact session completion fails, the original capacity exception is preserved
-with the completion failure attached as a note. Source-manifest mismatch
-remains fail-closed.
+Every eligible page becomes a deterministic JPEG. Eligible filenames use an
+ASCII case-insensitive `.avif`, `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, or
+`.webp` suffix. Other regular files remain source observations but are not
+pages; they are never opened by the artifact renderer. Animated GIF input uses
+its first frame. A source is rejected if it is
+truncated, cannot be decoded, is larger than 40 megapixels, has a side longer
+than 8192 pixels, or if its source or rendered JPEG exceeds 32 MiB. A gallery
+may contain at most 4096 pages. The configurable short-side limit defaults to
+768 pixels; images are never enlarged. Pages use JPEG quality 90. The separate
+thumbnail has a maximum side of 320 pixels and uses JPEG quality 85.
 
-Database operations and local work are split explicitly. The controller lock
-is held only for a bounded core issue or commit call. Directory walks, hashing,
-parsing, image conversion, ZIP creation, activation spooling, and filesystem
-reconciliation run outside that lock, so lease renewal is never blocked by
-corpus-sized I/O.
+The canonical CBZ contains only:
 
-Filesystem pages are deterministic and keyset-addressed. The first gallery
-request builds one spill-to-disk discovery index in O(N) work; later pages use
-indexed lookup instead of rescanning the corpus. Gallery file, directory, and
-tag observations are also bounded and audited. A source mutation observed
-between pages fails closed.
+```text
+galleryinfo.txt
+pages/0000.jpg
+pages/0001.jpg
+...
+```
 
-## Single CBZ library
+`galleryinfo.txt` uses DEFLATE. Page members use `ZIP_STORED`, which makes their
+verified byte ranges directly readable. ZIP comments, ZIP64, extra fields,
+data descriptors, duplicate names, and any other members are rejected. The
+metadata may be at most 1 MiB after decompression; the writer and verifier allow
+the corresponding worst-case DEFLATE size. The non-ZIP64 archive limit is
+2,147,483,647 bytes.
 
-CBZ-enabled deployments configure one `library_path` parent:
+A gallery with no eligible pages still has a valid metadata-only acquisition
+containing `galleryinfo.txt`. Its presentation page list is empty and it has no
+cover extent or thumbnail resource.
+
+## Important upgrade notice
+
+Presentation storage v2 is intentionally not compatible with the old library
+layout. There is no in-place migration or compatibility fallback.
+
+Startup rejects these known legacy states without deleting them:
+
+- `current/hash-v1`;
+- `.h2hdb-state/coordination`;
+- a version-1 activation journal.
+
+Rebuild artifacts into a fresh library root. This prevents old and new paths
+from silently coexisting under one reader mount.
+
+## Prepare the library directories
+
+Before starting ingest, create these four real directories on the same
+filesystem:
 
 ```text
 library/
-├── current/                         # pre-created reader bind source
-├── .h2hdb-coordination/             # pre-created reader bind source
+├── current/
+│   ├── acquisitions/
+│   └── artwork/
+└── .h2hdb-coordination/
+```
+
+Do not pre-create `.h2hdb-state`; ingest creates and owns it. After operation,
+the complete layout is:
+
+```text
+library/
+├── current/
+│   ├── acquisitions/
+│   │   └── hash-v2/<2 hex>/<1 hex>/h2h-<gid>.cbz
+│   └── artwork/
+│       └── hash-v2/<2 hex>/<1 hex>/h2h-<gid>/thumbnail-320.jpg
+├── .h2hdb-coordination/
 │   ├── publication.lock
-│   └── ACTIVATING                   # only during unfinished cutover
-└── .h2hdb-state/                    # ingest-private
-    ├── staging/                     # complete candidates
-    ├── quarantine/                  # stale-removal recovery
-    ├── journal/                     # SQLite activation journal
-    └── locks/                       # adapter state lock
+│   └── ACTIVATING                 # present only during an unfinished cutover
+└── .h2hdb-state/                  # ingest-private; never mount into a reader
+    ├── staging/
+    ├── quarantine/
+    ├── journal/
+    └── locks/
 ```
 
-Core owns the stable GID storage key. The registered
-`gid-sha256-12-v1` codec resolves to
-`hash-v1/<2 hex>/<1 hex>/h2h-<gid>.cbz`; content, title, date, and revision
-changes therefore retain the same Komga identity. Ingest never derives a
-second locator or grouping layout.
+The shard is deterministic but deliberately opaque to H2HDB core. Its digest
+is derived from the GID by the ingest-owned `managed-filesystem-v2` codec.
 
-`protect()` resumes only an exact private staging prefix, then hashes,
-size-checks, and fsyncs the complete file. A reader-invisible core publication
-is then spooled to the activation journal. Each `reconcile_page()` advances at
-most 128 installs or removals. It creates the durable `ACTIVATING` marker while
-holding `publication.lock` exclusively, uses atomic no-replace capture and a
-same-filesystem no-replace rename for changed paths, and records exact
-regular-file identities. Stage authority becomes terminal in the same SQLite
-transaction that records current authority. Core advances the reader-visible
-head only after durable `READY`; `complete()` then removes and fsyncs the
-marker before unlocking.
+## Mount the right subtree
 
-If publishing a staging leaf or activation marker loses its response after the
-rename, replay verifies the exact leaf, re-fsyncs its owning directory, and
-verifies the same identity again before advancing the SQLite journal.
-Conservative power-loss recovery may expose both rename names. Replay collapses
-them only when the journal facts and digest identify one exact shared two-link
-inode; it syncs both directories, removes the source duplicate, syncs again,
-fsyncs the survivor inode, and revalidates its post-unlink identity before
-retiring journal authority. Byte-identical names on different inodes are
-preserved and fail closed.
+The reader mounts are deliberately different:
 
-OPDS holds a shared flock while resolving the current head and opening the
-file. Lock contention, a present/invalid marker, an unknown target, an
-intermediate symlink, or externally changed managed bytes fails closed. Komga
-and OPDS therefore read the same persistent CBZ; staging/quarantine bytes may
-exist only during a pending or interrupted activation. SIGINT/SIGTERM stops at
-the next bounded durable step and does not claim new work. A forced container
-kill leaves the marker and journal so restart continues before readers resume.
+| Service | Mount source | Access |
+| --- | --- | --- |
+| `h2hdb-ingest` | the whole `library/` parent | read-write |
+| Komga | `library/current/acquisitions/` | read-only |
+| `h2hdb-opds` | `library/current/` | read-only |
+| `h2hdb-opds` | `library/.h2hdb-coordination/` | read-only |
 
-The `library_path` parent, `.h2hdb-state`, and `.h2hdb-coordination` are
-ingest-owned, single-writer namespaces. No other process, including one running
-under the same UID, may mutate them; Komga and OPDS mounts remain read-only.
-Races on public `current` entries still fail closed and preserve unknown bytes.
+Do not mount all of `current/` into Komga. The `artwork/` subtree contains
+standalone JPEG thumbnails and is not a Komga comic library. OPDS needs all of
+`current/` because it serves both acquisitions and artwork.
 
-A terminal release tombstones its protection token before cleanup, so delayed
-or response-lost `protect()` calls cannot recreate bytes. A durable `WRITING`
-row authorizes cleanup of its deterministic partial private temp after the
-adapter captures that temp's stable digest and file identity. If replay sees an
-authorized stage, temp, quarantine, or marker already absent, it re-fsyncs the
-owning directory and confirms absence before retiring the journal authority.
-
-## Installation and commands
-
-The distribution command is hyphenated while the Python package uses an
-underscore:
-
-```bash
-h2hdb-ingest --config /config/h2hdb-ingest.json
-python -m h2hdb_ingest --config /config/h2hdb-ingest.json
-```
-
-Use `--once` for one coordinated turn. Core schema initialization is a
-separate operator action; normal ingest startup only runs
-`VNextDatabaseAdminFacade.check()` against an existing READY epoch.
-
-For a fresh, already initialized epoch, publish the first nonempty source with:
-
-```bash
-h2hdb-ingest-bootstrap --config /config/h2hdb-ingest.json
-```
-
-The bootstrap command refuses an empty source and a catalog that already has a
-published revision. It does not create or migrate schema.
+The library parent, `.h2hdb-state`, and `.h2hdb-coordination` are ingest-owned
+single-writer namespaces. No other process may modify them, even if it uses the
+same operating-system account.
 
 ## Configuration
 
-The ingest configuration embeds the public core configuration. A minimal
-SQLite example with artifacts enabled is:
+A minimal SQLite configuration with artifacts enabled is:
 
 ```json
 {
@@ -169,42 +144,80 @@ SQLite example with artifacts enabled is:
 }
 ```
 
-`library_path` points at the parent containing `current`,
-`.h2hdb-coordination`, and `.h2hdb-state`.
-Setting it to `null` disables artifact output. `download_path` and
-`library_path` must be distinct and non-nested. When enabled, it must already
-exist with empty `current` and `.h2hdb-coordination` reader bind sources. All
-three paths must be real directories. Compose owns the service identity, mount
-scope, and read-only/read-write policy; host ACLs or modes need only let that
-identity perform the mounted operation. Ingest validates and fsyncs these
-externally provisioned roots, but does not enforce or change their UID, GID, or
-POSIX mode. Creation calls provide conservative initial modes for new entries
-without treating the resulting metadata as a replay contract. Do not
-pre-create `.h2hdb-state`: ingest owns and durably creates that private tree.
-The former
-`.h2hdb-state/coordination` layout is unsupported and is neither read nor
-migrated; any such entry makes startup fail closed before private state is
-modified.
+Set `library_path` to `null` to publish catalog metadata without producing
+artifacts. `download_path` must already be a nonempty directory. The download
+and library roots must be distinct and must not contain one another.
 
-`max_rows` is constrained to 1–128. Core also fixes publication and activation
-pages at 128 rows. These limits bound each database or adapter step, not the
-total corpus size.
+Configuration rejects unknown fields. A complete string value such as
+`"${H2HDB_RW_DB_PASSWORD}"` is replaced from the environment before validation;
+a missing variable fails startup.
 
-Core environment placeholders are resolved before validation. A complete
-string such as `"${H2HDB_RW_DB_PASSWORD}"` is substituted recursively; missing
-variables and unknown configuration fields fail startup.
+## Run the service
 
-The download root must already be a nonempty directory. Under the pre-existing
-library mount, ingest durably validates the pre-created `current` and
-`.h2hdb-coordination` mount roots, creates the private state directories,
-journal, and permanent locks, and revalidates every managed identity. Mount
-only `current` into Komga. Mount `current` and `.h2hdb-coordination` separately
-and read-only into OPDS; never expose `.h2hdb-state`, staging, quarantine, or
-the journal to readers.
+H2HDB core schema creation is a separate administrator action. Normal ingest
+startup checks that the database already has a READY schema epoch; it never
+creates or migrates the core schema.
+
+Run one coordinated scan:
+
+```bash
+h2hdb-ingest --config /config/h2hdb-ingest.json --once
+```
+
+Run the resident service:
+
+```bash
+h2hdb-ingest --config /config/h2hdb-ingest.json
+```
+
+The equivalent module command is:
+
+```bash
+python -m h2hdb_ingest --config /config/h2hdb-ingest.json
+```
+
+For the first nonempty publication in a fresh, already initialized catalog:
+
+```bash
+h2hdb-ingest-bootstrap --config /config/h2hdb-ingest.json
+```
+
+Bootstrap refuses an empty source or a catalog that already has a published
+revision.
+
+## Crash and restart behavior
+
+Ingest first writes complete candidates into private staging and verifies their
+size and SHA-256. It activates acquisitions and thumbnails in bounded pages of
+at most 128 resources while holding the publication fence. Files move into
+`current/` with same-filesystem, no-replace renames; they are never copied or
+hard-linked into a second persistent tree.
+
+The H2HDB reader head advances only after the library journal reaches `READY`.
+An interrupted rename, journal update, or marker update is replayed from exact
+digest and filesystem identity evidence on restart. Unknown files, symlinks,
+changed bytes, or ambiguous inode identities fail closed and are preserved for
+operator inspection.
+
+`SIGINT` and `SIGTERM` stop between bounded durable steps. A forced kill may
+leave `ACTIVATING`, private staged bytes, or quarantine bytes; restart resumes
+the same receipt before readers are allowed through the shared fence.
+
+## Common startup failures
+
+- **`download_path is empty`**: check that the download volume is mounted.
+- **`must be a pre-existing real directory`**: create the required library
+  directories before starting the container; symlinks are not accepted.
+- **`unsupported legacy ... fresh library root`**: keep the old tree as a
+  backup and configure an empty v2 root for a full artifact rebuild.
+- **`library ... changed identity`**: another process modified a managed path;
+  stop all writers and inspect the mount before retrying.
+- **database is not READY**: initialize or repair the schema with the H2HDB
+  administrator command, not with ingest.
 
 ## Development
 
-This repository uses a `src` layout and a repository-local virtual environment:
+The project requires Python 3.14 and uses a repository-local environment:
 
 ```bash
 ./scripts/rebuild-env.sh
@@ -212,44 +225,22 @@ This repository uses a `src` layout and a repository-local virtual environment:
 ./scripts/check-full.sh
 ```
 
-Dependencies resolve from the configured package index. An integration task
-may override a dependency explicitly without relying on sibling checkouts:
+An explicit integration dependency can be supplied without relying on a
+sibling checkout:
 
 ```bash
-./scripts/rebuild-env.sh \
-  --source h2hdb=/tmp/h2hdb.whl \
-  --source h2h-galleryinfo-parser='git+https://github.com/Kuan-Lun/h2h-galleryinfo-parser.git@ref'
+./scripts/rebuild-env.sh --source h2hdb=/tmp/h2hdb.whl
 ```
 
-The source-to-analysis-to-publication resident E2E runs against SQLite by
-default. Enable its pinned MariaDB 10.11.11 testcontainer with Docker available:
+SQLite integration tests run by default. With Docker available, enable the
+pinned MariaDB 10.11.11 case explicitly:
 
 ```bash
 H2HDB_TEST_MARIADB=1 .venv/bin/pytest tests/test_runtime_e2e.py
 ```
 
-The PyPI validation workflow always enables the MariaDB case.
-
-The opt-in private-corpus regression test automatically uses
-`.local-test-data/hath-download`. This repository-local directory is ignored by
-Git and must contain a complete Hentai@Home download tree. Set
-`H2HDB_INGEST_TEST_DOWNLOAD_PATH` only when testing a corpus stored elsewhere.
-
-The independent Python oracle and Lean model under `verification/` specify
-cross-component analysis semantics; core owns the production implementation.
-The TLA+ model covers crash-safe single-library activation behavior. Run the required
-formal checks with:
-
-```bash
-.venv/bin/python scripts/verify-formal.py lean
-.venv/bin/python scripts/fetch-formal-tools.py
-.venv/bin/python scripts/verify-formal.py tla \
-  --tla-jar .formal-tools/tla2tools-1.7.4.jar
-```
-
-TLC uses host Java when available. If no working JRE is present, the default
-`auto` mode falls back to the digest-pinned, network-off Docker runtime in
-`tools.lock.toml`.
+The private corpus regression is opt-in through
+`.local-test-data/hath-download` or `H2HDB_INGEST_TEST_DOWNLOAD_PATH`.
 
 ## License
 

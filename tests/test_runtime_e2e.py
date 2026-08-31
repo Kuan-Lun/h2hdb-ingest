@@ -73,7 +73,13 @@ def _gallery(
 def _provision_library_root(root: Path) -> None:
     root.mkdir(mode=0o777)
     root.chmod(0o777)
-    for path in (root / "current", root / ".h2hdb-coordination"):
+    current = root / "current"
+    for path in (
+        current,
+        current / "acquisitions",
+        current / "artwork",
+        root / ".h2hdb-coordination",
+    ):
         path.mkdir(mode=0o777)
         path.chmod(0o777)
 
@@ -205,7 +211,7 @@ def test_same_locator_content_a_b_a_creates_three_revisions_then_replays(
     runtime.database_admin.initialize()
 
     def current_content() -> str:
-        page = runtime.catalog.list_publications()
+        page = runtime.catalog.discover_publications(limit=128)
         assert page.total == len(page.publications) == 2
         # These deterministic fixture GIDs occupy different cleanup shards, so
         # their two child-first cycles require more than 32 advances.
@@ -243,9 +249,18 @@ def test_same_locator_content_a_b_a_creates_three_revisions_then_replays(
     # readable, rejects the stale revision-1 pin, and leaves the FK-on epoch
     # READY after removing every gallery-linear revision-1 catalog row.
     assert runtime.database_admin.check().state == "READY"
-    assert runtime.catalog.list_publications(revision=second_revision).total == 2
+    assert (
+        runtime.catalog.discover_publications(
+            revision=second_revision,
+            limit=128,
+        ).total
+        == 2
+    )
     with pytest.raises(CatalogRevisionNotFoundError):
-        runtime.catalog.list_publications(revision=first_revision)
+        runtime.catalog.discover_publications(
+            revision=first_revision,
+            limit=128,
+        )
     (source / "1001" / "001.jpg").write_bytes(b"content-A")
     assert runtime.resident.process_available(periodic_scan=True)
     third_revision = runtime.catalog.get_catalog_revision()
@@ -257,7 +272,7 @@ def test_same_locator_content_a_b_a_creates_three_revisions_then_replays(
     restarted.resident.initialize()
     assert restarted.resident.process_available(periodic_scan=True)
     assert restarted.catalog.get_catalog_revision() == third_revision
-    replayed = restarted.catalog.list_publications()
+    replayed = restarted.catalog.discover_publications(limit=128)
     assert replayed.total == len(replayed.publications) == 2
     assert next(
         item for item in replayed.publications if item.gid == 1001
@@ -293,51 +308,77 @@ def test_fresh_artifact_runtime_publishes_one_current_cbz(
 
     runtime.database_admin.initialize()
     assert runtime.resident.process_available(periodic_scan=True)
-    page = runtime.catalog.list_artifact_publications()
+    page = runtime.catalog.discover_publications()
     current = tuple(current_root.rglob("*.cbz"))
 
     assert page.total == 1
     assert len(page.publications) == 1
-    assert len(page.publications[0].artifacts) == 1
+    publication = page.publications[0]
+    assert len(publication.artifacts) == 1
+    assert publication.page_count == 1
+    assert publication.cover is not None
+    assert publication.thumbnail is not None
     assert len(current) == 1
     first_path = current_root.joinpath(
-        *page.publications[0].artifacts[0].storage_key.segments
+        *publication.artifacts[0].storage_object.key.segments
     )
-    first_digest = page.publications[0].artifacts[0].sha256
+    thumbnail_path = current_root.joinpath(
+        *publication.thumbnail.storage_object.key.segments
+    )
+    first_digest = publication.artifacts[0].storage_object.sha256
     assert current == (first_path,)
+    assert thumbnail_path.is_file()
     assert sha256(first_path.read_bytes()).hexdigest() == (
-        page.publications[0].artifacts[0].sha256
+        publication.artifacts[0].storage_object.sha256
+    )
+    assert sha256(thumbnail_path.read_bytes()).hexdigest() == (
+        publication.thumbnail.storage_object.sha256
     )
     with ZipFile(first_path) as archive:
         assert archive.namelist() == [
-            "0000000000000000__content.jpg",
-            "0000000000000001__metadata.txt",
+            "galleryinfo.txt",
+            "pages/0000.jpg",
         ]
         assert (
-            archive.read("0000000000000001__metadata.txt")
+            archive.read("galleryinfo.txt")
             == (source / "2001" / "galleryinfo.txt").read_bytes()
         )
-        with Image.open(
-            BytesIO(archive.read("0000000000000000__content.jpg"))
-        ) as image:
+        with Image.open(BytesIO(archive.read("pages/0000.jpg"))) as image:
             assert image.format == "JPEG"
             assert image.size == (8, 12)
+        archive_bytes = first_path.read_bytes()
+        cover = publication.cover
+        assert cover.storage_object == publication.artifacts[0].storage_object
+        assert (
+            sha256(
+                archive_bytes[
+                    cover.extent.offset : cover.extent.offset + cover.extent.length
+                ]
+            ).hexdigest()
+            == cover.sha256
+        )
+    with Image.open(thumbnail_path) as thumbnail:
+        assert thumbnail.format == "JPEG"
+        assert max(thumbnail.size) <= 320
 
     Image.new("RGB", (8, 12), "blue").save(source / "2001" / "001.jpg")
     assert runtime.resident.process_available(periodic_scan=True)
-    second_page = runtime.catalog.list_artifact_publications()
+    second_page = runtime.catalog.discover_publications()
     second_current = tuple(current_root.rglob("*.cbz"))
 
     assert second_page.revision.revision == 2
     assert second_page.total == len(second_page.publications) == 1
     assert len(second_page.publications[0].artifacts) == 1
     second_artifact = second_page.publications[0].artifacts[0]
-    assert second_artifact.sha256 != first_digest
-    second_path = current_root.joinpath(*second_artifact.storage_key.segments)
+    assert second_artifact.storage_object.sha256 != first_digest
+    second_path = current_root.joinpath(*second_artifact.storage_object.key.segments)
     assert second_path == first_path
     assert len(second_current) == 1
     assert second_current == (second_path,)
-    assert sha256(second_path.read_bytes()).hexdigest() == second_artifact.sha256
+    assert (
+        sha256(second_path.read_bytes()).hexdigest()
+        == second_artifact.storage_object.sha256
+    )
     assert runtime.database_admin.check().state == "READY"
     state = library_root / ".h2hdb-state"
     assert not list((state / "staging").glob("*.cbz"))
@@ -379,14 +420,14 @@ def test_many_replacements_keep_one_stable_current_file_per_gid(
     runtime.database_admin.initialize()
 
     assert runtime.resident.process_available(periodic_scan=True)
-    first = runtime.catalog.list_artifact_publications()
+    first = runtime.catalog.discover_publications()
     assert first.total == len(first.publications) == gallery_count
     old_paths = {
-        current_root.joinpath(*publication.artifacts[0].storage_key.segments)
+        current_root.joinpath(*publication.artifacts[0].storage_object.key.segments)
         for publication in first.publications
     }
     old_digests = {
-        publication.gid: publication.artifacts[0].sha256
+        publication.gid: publication.artifacts[0].storage_object.sha256
         for publication in first.publications
     }
     assert len(old_paths) == gallery_count
@@ -402,9 +443,9 @@ def test_many_replacements_keep_one_stable_current_file_per_gid(
             break
     assert runtime.catalog.get_catalog_revision().revision == 2
 
-    second = runtime.catalog.list_artifact_publications()
+    second = runtime.catalog.discover_publications()
     current_paths = {
-        current_root.joinpath(*publication.artifacts[0].storage_key.segments)
+        current_root.joinpath(*publication.artifacts[0].storage_object.key.segments)
         for publication in second.publications
     }
     assert second.revision.revision == 2
@@ -414,7 +455,7 @@ def test_many_replacements_keep_one_stable_current_file_per_gid(
     projected_paths = tuple(current_root.rglob("*.cbz"))
     assert len(projected_paths) == gallery_count
     assert {
-        publication.gid: publication.artifacts[0].sha256
+        publication.gid: publication.artifacts[0].storage_object.sha256
         for publication in second.publications
     } != old_digests
     state = library_root / ".h2hdb-state"

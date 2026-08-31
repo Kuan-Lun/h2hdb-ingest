@@ -20,6 +20,7 @@ GALLERYINFO_FILE_NAME = "galleryinfo.txt"
 ALREADY_UPLOADED_TAG_VALUE = "already uploaded"
 SPAM_FILE_MINIMUM_OCCURRENCES = 3
 SPAM_ARTIST_RATIO_THRESHOLD = 2
+_PAGE_SUFFIXES = frozenset({".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".webp"})
 
 
 def _validate_sha256(value: str) -> None:
@@ -215,54 +216,29 @@ class ReferenceCandidate:
 
 @dataclass(frozen=True, slots=True)
 class ArtifactMemberPlanEntry:
-    """One exact ordered source/generated entry in the CBZ input contract."""
+    """One neutral ordered source observation and its archive-selection fact."""
 
     position: int
-    entry_kind: Literal["source", "generated"]
-    source_name: str | None
-    generated_identity: str | None
-    source_sha256: str | None
-    source_size_bytes: int | None
-    payload_sha256: str
-    excluded: bool
-    file_role: str
-    archive_member_name: str | None
-    transform_kind: str
+    source_name: str
+    source_sha256: str
+    source_size_bytes: int
+    source_role: Literal["metadata", "page", "other"]
+    selected_for_archive: bool
 
     def __post_init__(self) -> None:
         if self.position < 0:
             raise ValueError("A member-plan position must not be negative")
-        if self.entry_kind == "source":
-            if not self.source_name:
-                raise ValueError("A source entry requires its exact source name")
-            if self.generated_identity is not None:
-                raise ValueError("A source entry cannot have a generated identity")
-            if self.source_sha256 is None or self.source_size_bytes is None:
-                raise ValueError("A source entry requires its digest and size")
-            _validate_sha256(self.source_sha256)
-            if self.source_size_bytes < 0:
-                raise ValueError("A source-entry size must not be negative")
-        elif self.entry_kind == "generated":
-            if not self.generated_identity:
-                raise ValueError("A generated entry requires its exact identity")
-            if (
-                self.source_name is not None
-                or self.source_sha256 is not None
-                or self.source_size_bytes is not None
-            ):
-                raise ValueError("A generated entry cannot have source identity fields")
-        else:
-            raise ValueError(f"Unsupported member-plan entry kind: {self.entry_kind}")
-        _validate_sha256(self.payload_sha256)
-        if not self.file_role:
-            raise ValueError("A member-plan entry requires a file role")
-        if not self.transform_kind:
-            raise ValueError("A member-plan entry requires a transform kind")
-        if self.excluded:
-            if self.archive_member_name is not None:
-                raise ValueError("An excluded entry cannot have an archive member name")
-        elif not self.archive_member_name:
-            raise ValueError("An emitted entry requires an archive member name")
+        if not self.source_name:
+            raise ValueError("A source entry requires its exact source name")
+        _validate_sha256(self.source_sha256)
+        if self.source_size_bytes < 0:
+            raise ValueError("A source-entry size must not be negative")
+        if self.source_role not in {"metadata", "page", "other"}:
+            raise ValueError("A member-plan entry requires a registered source role")
+        if type(self.selected_for_archive) is not bool:
+            raise TypeError("selected_for_archive must be bool")
+        if self.source_role == "other" and self.selected_for_archive:
+            raise ValueError("OTHER sources must never be selected for archive render")
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,20 +487,25 @@ def _artifact_member_plan(
     result: list[ArtifactMemberPlanEntry] = []
     for position, source_file in enumerate(ordered):
         metadata = source_file.name == GALLERYINFO_FILE_NAME
-        excluded = not metadata and spam.get(source_file.sha256, False)
+        suffix = "." + source_file.name.rsplit(".", 1)[-1].casefold()
+        source_role: Literal["metadata", "page", "other"]
+        if metadata:
+            source_role = "metadata"
+        elif suffix in _PAGE_SUFFIXES:
+            source_role = "page"
+        else:
+            source_role = "other"
+        selected = metadata or (
+            source_role == "page" and not spam.get(source_file.sha256, False)
+        )
         result.append(
             ArtifactMemberPlanEntry(
                 position=position,
-                entry_kind="source",
                 source_name=source_file.name,
-                generated_identity=None,
                 source_sha256=source_file.sha256,
                 source_size_bytes=source_file.size_bytes,
-                payload_sha256=source_file.sha256,
-                excluded=excluded,
-                file_role="metadata" if metadata else "content",
-                archive_member_name=None if excluded else source_file.name,
-                transform_kind="source_copy",
+                source_role=source_role,
+                selected_for_archive=selected,
             )
         )
     return tuple(result)

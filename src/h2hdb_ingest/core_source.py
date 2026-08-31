@@ -5,6 +5,7 @@ from __future__ import annotations
 __all__ = ["VNextFilesystemSourceAdapter"]
 
 from h2hdb import (
+    ArtifactSourceRole,
     DirectoryObservation,
     FileContentReceipt,
     FileObservation,
@@ -158,6 +159,7 @@ def _file(value: FilesystemFileObservation) -> FileObservation:
     return FileObservation(
         name_bytes=value.name_bytes,
         content=content,
+        artifact_role=ArtifactSourceRole(value.artifact_role.value),
         device=source_stat.device,
         inode=source_stat.inode,
         modified_ns=source_stat.modified_ns,

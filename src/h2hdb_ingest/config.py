@@ -15,6 +15,7 @@ from ._library_layout import (
     LibraryLayoutValidationError,
     validate_precreated_library_layout,
 )
+from .artifact import MAX_IMAGE_LONG_SIDE
 
 DEFAULT_MAX_ROWS = 128
 
@@ -29,9 +30,11 @@ class IngestPathsConfig(ConfigModel):
     max_image_short_side: int = Field(
         default=768,
         ge=1,
+        le=MAX_IMAGE_LONG_SIDE,
         description=(
-            "Maximum short-side pixels for CBZ images; aspect ratio is preserved "
-            "and images are never enlarged"
+            "Maximum short-side pixels for canonical JPEG pages; aspect ratio is "
+            "preserved, images are never enlarged, and the fixed long-side ceiling "
+            "is 8192 pixels"
         ),
     )
 

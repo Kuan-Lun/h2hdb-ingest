@@ -13,7 +13,13 @@ from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig, load_c
 def _provision_library_root(root: Path) -> None:
     root.mkdir(mode=0o777)
     root.chmod(0o777)
-    for path in (root / "current", root / ".h2hdb-coordination"):
+    current = root / "current"
+    for path in (
+        current,
+        current / "acquisitions",
+        current / "artwork",
+        root / ".h2hdb-coordination",
+    ):
         path.mkdir(mode=0o777)
         path.chmod(0o777)
 
@@ -119,12 +125,22 @@ def test_runtime_paths_delegate_host_permission_policy_to_deployment(
         stat.S_IMODE(path.stat().st_mode) == 0o777
         for path in (
             library_path / "current",
+            library_path / "current" / "acquisitions",
+            library_path / "current" / "artwork",
             library_path / ".h2hdb-coordination",
         )
     )
 
 
-@pytest.mark.parametrize("missing_leaf", ("current", ".h2hdb-coordination"))
+@pytest.mark.parametrize(
+    "missing_leaf",
+    (
+        "current",
+        "current/acquisitions",
+        "current/artwork",
+        ".h2hdb-coordination",
+    ),
+)
 def test_runtime_paths_reject_missing_precreated_reader_root_without_mutation(
     tmp_path: Path,
     missing_leaf: str,
@@ -134,7 +150,11 @@ def test_runtime_paths_reject_missing_precreated_reader_root_without_mutation(
     (download_path / "gallery").mkdir()
     library_path = tmp_path / "library"
     _provision_library_root(library_path)
-    (library_path / missing_leaf).rmdir()
+    missing = library_path / missing_leaf
+    if missing_leaf == "current":
+        (missing / "acquisitions").rmdir()
+        (missing / "artwork").rmdir()
+    missing.rmdir()
     config = IngestConfig(
         paths=IngestPathsConfig(
             download_path=download_path,
@@ -145,7 +165,7 @@ def test_runtime_paths_reject_missing_precreated_reader_root_without_mutation(
     with pytest.raises(ValueError, match="pre-existing real directory"):
         config.ensure_paths()
 
-    assert not (library_path / missing_leaf).exists()
+    assert not missing.exists()
     assert not (library_path / ".h2hdb-state").exists()
 
 
@@ -200,6 +220,12 @@ def test_bounded_runtime_defaults() -> None:
     resident = ResidentConfig()
 
     assert resident.max_rows == 128
+
+
+@pytest.mark.parametrize("value", (0, 8193))
+def test_image_short_side_limit_is_bounded(value: int) -> None:
+    with pytest.raises(ValidationError):
+        IngestPathsConfig(download_path=Path("/download"), max_image_short_side=value)
 
 
 @pytest.mark.parametrize(

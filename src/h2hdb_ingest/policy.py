@@ -5,13 +5,11 @@ from __future__ import annotations
 __all__ = ["build_ingest_policy"]
 
 from h2hdb import (
-    VNextArtifactProducer,
-    VNextArtifactStoragePolicy,
-    VNextArtifactZipPolicy,
+    VNextArtifactAdapterPolicy,
     VNextIngestPolicy,
 )
 
-from .artifact import ARTIFACT_ADAPTER_ID, ArtifactProducerIdentity
+from .artifact import ARTIFACT_ADAPTER_ID, artifact_policy_fingerprint_sha256
 from .config import IngestConfig
 
 
@@ -20,18 +18,13 @@ def build_ingest_policy(config: IngestConfig) -> VNextIngestPolicy:
 
     if not isinstance(config, IngestConfig):
         raise TypeError("config must be IngestConfig")
-    identity = ArtifactProducerIdentity.current()
     return VNextIngestPolicy(
-        producer=VNextArtifactProducer(
-            writer_id=identity.writer_id,
-            python_abi=identity.python_abi,
-            pillow_build=identity.pillow_build,
-            libjpeg_build=identity.libjpeg_build,
-            zlib_build=identity.zlib_build,
+        artifact=VNextArtifactAdapterPolicy(
+            adapter_id=ARTIFACT_ADAPTER_ID,
+            policy_fingerprint_sha256=artifact_policy_fingerprint_sha256(
+                config.paths.max_image_short_side
+            ),
         ),
-        storage=VNextArtifactStoragePolicy(adapter_id=ARTIFACT_ADAPTER_ID),
-        max_image_short_side=config.paths.max_image_short_side,
-        zip=VNextArtifactZipPolicy(),
         operational_max_batch_rows=config.resident.max_rows,
         artifacts_required=config.paths.library_path is not None,
     )

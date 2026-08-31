@@ -7,7 +7,7 @@ import pytest
 from h2hdb import CoreConfig
 
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
-from h2hdb_ingest.filesystem import FilesystemSource
+from h2hdb_ingest.filesystem import FilesystemArtifactSourceRole, FilesystemSource
 from h2hdb_ingest.runtime import build_runtime
 
 _DOWNLOAD_PATH_ENVIRONMENT = "H2HDB_INGEST_TEST_DOWNLOAD_PATH"
@@ -71,14 +71,12 @@ def test_opt_in_local_download_corpus_is_bounded_and_replayable() -> None:
                 gallery_count += 1
                 observation = source.observe_gallery(locator)
                 assert observation.metadata.source_file_count >= 1
-                assert (
-                    observation.metadata.page_count
-                    == observation.metadata.source_file_count - 1
-                )
 
                 after_name: bytes | None = None
                 previous_name: bytes | None = None
                 gallery_file_count = 0
+                gallery_page_count = 0
+                gallery_metadata_count = 0
                 while True:
                     replayed, files = source.list_files(
                         locator,
@@ -92,6 +90,12 @@ def test_opt_in_local_download_corpus_is_bounded_and_replayable() -> None:
                         previous_name = item.name_bytes
                         file_count += 1
                         gallery_file_count += 1
+                        gallery_page_count += int(
+                            item.artifact_role is FilesystemArtifactSourceRole.PAGE
+                        )
+                        gallery_metadata_count += int(
+                            item.artifact_role is FilesystemArtifactSourceRole.METADATA
+                        )
                         for part in item.content_parts():
                             bytes_read += len(part)
                     if files.terminal:
@@ -99,6 +103,8 @@ def test_opt_in_local_download_corpus_is_bounded_and_replayable() -> None:
                     assert files.items
                     after_name = files.items[-1].name_bytes
                 assert gallery_file_count == observation.metadata.source_file_count
+                assert gallery_page_count == observation.metadata.page_count
+                assert gallery_metadata_count == 1
 
                 after_name = None
                 previous_name = None
@@ -166,7 +172,7 @@ def test_private_corpus_completes_mariadb_resident_cycle_and_restart_replay(
     assert initialized.epoch == checked.epoch
     assert runtime.resident.process_available(periodic_scan=True)
     first_revision = runtime.catalog.get_catalog_revision()
-    first_page = runtime.catalog.list_publications(
+    first_page = runtime.catalog.discover_publications(
         revision=first_revision,
         limit=128,
     )
@@ -179,7 +185,7 @@ def test_private_corpus_completes_mariadb_resident_cycle_and_restart_replay(
     restarted.resident.initialize()
     assert restarted.resident.process_available(periodic_scan=True)
     replayed_revision = restarted.catalog.get_catalog_revision()
-    replayed_page = restarted.catalog.list_publications(
+    replayed_page = restarted.catalog.discover_publications(
         revision=replayed_revision,
         limit=128,
     )

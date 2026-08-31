@@ -10,6 +10,8 @@ from h2hdb import VNextIngestSourceAdapter
 
 from h2hdb_ingest.core_source import VNextFilesystemSourceAdapter
 from h2hdb_ingest.filesystem import (
+    FILESYSTEM_OBSERVATION_VERSION,
+    FilesystemArtifactSourceRole,
     FilesystemEntryType,
     FilesystemObservationError,
     FilesystemSource,
@@ -131,6 +133,28 @@ def test_observation_replay_rejects_changed_source(tmp_path: Path) -> None:
         FilesystemObservationError, match="changed between bounded pages"
     ):
         source.list_files(("1002",), after_name=b"001.jpg", limit=1)
+
+
+def test_artifact_roles_and_page_count_are_adapter_owned(tmp_path: Path) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "1004")
+    (folder / "003.GIF").write_bytes(b"gif")
+    (folder / "notes.json").write_bytes(b"not a page")
+
+    source = FilesystemSource(root)
+    observation, page = source.list_files(("1004",), after_name=None, limit=256)
+
+    assert FILESYSTEM_OBSERVATION_VERSION == 2
+    assert observation.metadata.scan_observation_version == 2
+    assert observation.metadata.source_file_count == 5
+    assert observation.metadata.page_count == 3
+    assert {item.name_bytes: item.artifact_role for item in page.items} == {
+        b"001.jpg": FilesystemArtifactSourceRole.PAGE,
+        b"002.jpg": FilesystemArtifactSourceRole.PAGE,
+        b"003.GIF": FilesystemArtifactSourceRole.PAGE,
+        b"galleryinfo.txt": FilesystemArtifactSourceRole.METADATA,
+        b"notes.json": FilesystemArtifactSourceRole.OTHER,
+    }
 
 
 def test_discovery_rejects_symlink_metadata(tmp_path: Path) -> None:

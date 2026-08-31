@@ -160,8 +160,11 @@
 
 - deterministic、keyset-paged filesystem discovery 與
   `galleryinfo.txt` parsing；
-- exact source-byte observations；
-- consumer-side artifact rendering 與 storage；
+- exact source-byte observations與 PAGE/OTHER eligibility classification；
+- deterministic JPEG/GIF-frame-zero rendering、canonical CBZ writer/parser、
+  page byte-extent與 thumbnail-320 evidence；
+- opaque filesystem storage-key issuance、artifact protection與 multi-resource
+  activation；
 - crash-safe Komga current-view reconciliation；
 - resident ingest loop 與 ingest-lease heartbeat orchestration。
 
@@ -173,6 +176,14 @@ import core repository、connector internals，或重建已移除的 `H2HDB`
 compatibility surface。startup 只能呼叫 `VNextDatabaseAdminFacade.check()`，
 不得初始化或 migrate core schema。
 
+Core 只能封存 neutral ordered source member、role、position、hash/size與
+adapter回傳的 opaque locator/evidence；不得擁有 CBZ/ZIP member name、
+compression、timestamp、Pillow、image eligibility、thumbnail rendering policy或
+filesystem layout語意。Core 可以擁有 generic thumbnail destination與封存
+neutral descriptor，但不得決定其格式、尺寸、品質、storage key或 bytes。Ingest
+filesystem observation負責分類 PAGE/OTHER；canonical writer
+對每個 PAGE 都必須輸出一個 dense JPEG page，decode失敗則整個artifact fail。
+
 每個 core operation 維持 issue/prepare/commit 分離。session controller lock
 只包住有界的 database issue 或 commit call；filesystem scan、hash、image/ZIP
 work、artifact staging、activation spooling 與其他 local I/O 必須在 lock
@@ -181,10 +192,10 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
 
 ### Single-library activation safety
 
-- CBZ-enabled deployment 只有一個 `library_path` parent。`current/` 是 Komga
-  與 OPDS 共用的唯一 persistent CBZ tree；`.h2hdb-coordination/` 是
-  reader-visible publication fencing namespace；`.h2hdb-state/` 只擁有
-  private staging、quarantine、journal 與 locks。
+- CBZ-enabled deployment 只有一個 `library_path` parent。`current/acquisitions/`
+  是唯一 persistent CBZ tree；`current/artwork/` 是 standalone thumbnail
+  tree；`.h2hdb-coordination/` 是 reader-visible publication fencing namespace；
+  `.h2hdb-state/` 只擁有 private staging、quarantine、journal 與 locks。
 - `library_path` 是 deployment 預先建立的真實 bind-mount root；runtime 不得建立
   mount root 或依賴容器內不可見的 host parent fsync。Compose 擁有 service identity、
   mount scope 與 read-only/read-write policy；runtime 不得把 host UID、GID 或 POSIX
@@ -192,26 +203,43 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
   可以傳入安全的初始 mode，但它受 umask 與 host filesystem policy 約束。每個
   managed directory 與 persistent control file 建立或 replay 時仍必須 child fsync、
   parent fsync，再重驗 real type、exact dev/inode identity 與必要的 link authority。
-- 所有 CBZ-enabled deployment 在建立 consumers 前都必須預建立空的 `current/`
-  與 `.h2hdb-coordination/` reader bind sources。Runtime 必須 idempotently durable
-  revalidate 這兩個 mount roots的 type 與 identity，不得建立或修改其 metadata；
+- 所有 CBZ-enabled deployment 在建立 consumers 前都必須預建立空的 `current/`、
+  `current/acquisitions/`、`current/artwork/`與 `.h2hdb-coordination/` reader
+  bind sources。Runtime 必須 idempotently durable revalidate這四個 roots的 type
+  與 identity，不得建立或修改其 metadata；
   `.h2hdb-state/` 及其 private descendants 仍只由 ingest 建立。Host ACL或mode必須
   讓 Compose指定的 ingest identity實際完成所需I/O，但 runtime不規定其具體值。
 - Legacy `.h2hdb-state/coordination` entry 無論為 directory、symlink 或
   其他類型都必須在修改 private state 前 fail closed；不得 migrate、fallback
   或接納舊 coordination layout。
+- Legacy `current/hash-v1`與 activation journal format v1必須明確 fail closed並
+  要求 fresh rebuild；不得自動刪除、migrate或和v2 tree混合啟動。
 - `library_path` parent、`.h2hdb-state/` 與 `.h2hdb-coordination/` 是
   ingest-owned single-writer namespace；其他程序即使使用相同 UID 也不得
-  mutate。Komga 與 OPDS 只能 read-only mount 所需路徑；public
-  `current/` 的 unknown entry race 仍須 preserve bytes 並 fail closed。
-- filesystem path 只能使用 core `ArtifactStorageKey` 的固定
-  `gid-sha256-12-v1` codec；不得重建 content-addressed locator、日期 grouping、
-  friendly title path 或第二份 persistent CBZ tree。
-- artifact 必須先在同 filesystem 的 private staging 以 exact-prefix resumable
-  temp 完整寫入、驗證 SHA-256/size 並 fsync。activation 先以 atomic
+  mutate。Komga只能 read-only mount `current/acquisitions/`；OPDS read-only mount
+  `current/`與 `.h2hdb-coordination/`。不得把含 artwork的整個 `current/`交給
+  Komga；public `current/` unknown-entry race仍須 preserve bytes並 fail closed。
+- filesystem path只能使用 ingest adapter發出的 opaque `managed-filesystem-v2`
+  key。Acquisition為 `acquisitions/hash-v2/<2>/<1>/h2h-<gid>.cbz`；thumbnail為
+  `artwork/hash-v2/<2>/<1>/h2h-<gid>/thumbnail-320.jpg`；兩者 shard皆為
+  `sha256(b"h2hdb-storage-object-shard-v2\0" + u64be(gid))`。Constructor只在
+  ingest，core不得重算或解讀segments。Activation必須驗codec、canonical path、
+  GID與resource kind完全一致；不得提供舊key shim、日期 grouping、friendly title
+  path或第二份 persistent CBZ tree。
+- canonical archive必須是 closed-world `galleryinfo.txt`加dense
+  `pages/{page_index:04d}.jpg`。Metadata固定DEFLATE；PAGE固定ZIP_STORED；flags、
+  comment、extra、data descriptor與ZIP64皆禁止。最多4096 PAGE、每個source/output
+  encoded page 32 MiB、decoded 40 MP、long side 8192、aggregate archive
+  2,147,483,647 bytes。所有頁為quality 90 JPEG，GIF只取frame zero；page zero是
+  full-size cover alias。Standalone thumbnail-320為quality 85且不得request-time
+  resize。Writer完成後必須重驗central/local header、CRC、SHA-256、size與page
+  extents，destination partial write必須fail closed。
+- acquisition與thumbnail artifact必須先在同 filesystem 的 private staging以
+  exact-prefix resumable temp完整寫入、驗證 SHA-256/size並fsync。activation先以
+  atomic
   no-replace capture 舊 current，再以 descriptor-relative、逐層
   `O_NOFOLLOW` 的 atomic no-replace rename 把 stage 移入 current；不得
-  hard-link 或 byte-copy persistent CBZ。rename 成功與 response-loss replay
+  hard-link 或 byte-copy persistent resource。rename 成功與 response-loss replay
   都必須 fsync current parent 及 staging directory。temp publish 到 stage 或
   marker 的 response-loss replay 也必須重新 fsync owning directory，才能推進
   journal state。若保守的 power-loss recovery 同時顯示 rename 兩個名稱，只能
@@ -225,7 +253,9 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
   flock，建立並 fsync `ACTIVATING`；core finalization 成功後才可 durable unlink
   marker 並 unlock。OPDS 只取得 nonblocking shared flock，marker/lock異常時
   fail closed。
-- `reconcile_page` 每次最多處理 128 個 install/removal 並回寫 opaque cursor。
+- `reconcile_page` 每次最多處理 128 個依 `(publication_key, resource_kind)`排序的
+  install/removal並回寫 opaque cursor。同一GID可同時有ACQUISITION與THUMBNAIL；
+  下一revision未引用的resource必須exact stale removal。
   SIGINT/SIGTERM 在 bounded step 間停止且不得再 claim；SIGKILL 後由 exact
   receipt、journal、marker、digest 與 stat identity 繼續，不得要求 rollback。
 - 只能 capture/install/delete journal 記錄為 managed 且 exact authority 相符的

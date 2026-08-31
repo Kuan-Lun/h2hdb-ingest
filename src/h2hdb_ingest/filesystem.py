@@ -4,6 +4,7 @@ from __future__ import annotations
 
 __all__ = [
     "FILESYSTEM_OBSERVATION_VERSION",
+    "FilesystemArtifactSourceRole",
     "FilesystemEntryType",
     "FilesystemFileObservation",
     "FilesystemGalleryMetadata",
@@ -22,17 +23,20 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from hashlib import sha256
 from pathlib import Path
 
 from h2h_galleryinfo_parser import parse_galleryinfo
 
-FILESYSTEM_OBSERVATION_VERSION = 1
+FILESYSTEM_OBSERVATION_VERSION = 2
 GALLERY_INFO_NAME = "galleryinfo.txt"
 _READ_BYTES = 4 * 1024 * 1024
-_ENTRY_AUDIT_PREFIX = b"h2hdb-ingest-filesystem-entry-audit-v1\0"
-_GALLERY_AUDIT_PREFIX = b"h2hdb-ingest-filesystem-gallery-audit-v1\0"
+_ENTRY_AUDIT_PREFIX = b"h2hdb-ingest-filesystem-entry-audit-v2\0"
+_GALLERY_AUDIT_PREFIX = b"h2hdb-ingest-filesystem-gallery-audit-v2\0"
+_PAGE_SUFFIXES = frozenset(
+    {b".avif", b".bmp", b".gif", b".jpeg", b".jpg", b".png", b".webp"}
+)
 
 
 class FilesystemObservationError(RuntimeError):
@@ -44,6 +48,14 @@ class FilesystemEntryType(IntEnum):
     DIRECTORY = 1
     SYMLINK = 2
     OTHER = 3
+
+
+class FilesystemArtifactSourceRole(StrEnum):
+    """Adapter-owned interpretation of a regular source file."""
+
+    METADATA = "metadata"
+    PAGE = "page"
+    OTHER = "other"
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +95,7 @@ class FilesystemFileObservation:
     folder: Path
     name_bytes: bytes
     stat: FilesystemStat
+    artifact_role: FilesystemArtifactSourceRole
     expected_sha256: bytes | None = None
 
     def content_parts(self) -> Iterator[bytes]:
@@ -303,7 +316,9 @@ class FilesystemSource:
             raise FilesystemObservationError(
                 f"gallery metadata bytes changed while parsing: {metadata_path}"
             )
-        audit, regular_count = self._directory_audit(folder, expected_directory)
+        audit, regular_count, page_count = self._directory_audit(
+            folder, expected_directory
+        )
         if regular_count < 1:
             raise FilesystemObservationError(
                 f"gallery contains no regular metadata file: {folder}"
@@ -320,7 +335,7 @@ class FilesystemSource:
                 modified_time=metadata_before.modified_ns // 1_000,
                 scan_observation_version=FILESYSTEM_OBSERVATION_VERSION,
                 source_file_count=regular_count,
-                page_count=regular_count - 1,
+                page_count=page_count,
             )
         )
         self._require_or_record_gallery_audit(
@@ -649,14 +664,14 @@ class FilesystemSource:
     def _directory_audit(
         folder: Path,
         expected_directory: FilesystemStat,
-    ) -> tuple[bytes, int]:
+    ) -> tuple[bytes, int, int]:
         with _entry_index(folder, expected_directory) as index:
             row = index.execute(
-                "SELECT audit_sha256, regular_count FROM snapshot"
+                "SELECT audit_sha256, regular_count, page_count FROM snapshot"
             ).fetchone()
             if row is None:
                 raise RuntimeError("filesystem entry index lacks its snapshot")
-            return bytes(row[0]), int(row[1])
+            return bytes(row[0]), int(row[1]), int(row[2])
 
 
 class _ReplayableFiles:
@@ -702,6 +717,7 @@ class _ReplayableFiles:
                     folder=self._folder,
                     name_bytes=bytes(row[0]),
                     stat=_stat_from_row(row[1:]),
+                    artifact_role=_artifact_source_role(bytes(row[0])),
                     expected_sha256=(
                         self._metadata_sha256
                         if bytes(row[0]) == GALLERY_INFO_NAME.encode("ascii")
@@ -791,7 +807,8 @@ def _entry_index(
             );
             CREATE TABLE snapshot (
                 audit_sha256 BLOB NOT NULL,
-                regular_count INTEGER NOT NULL
+                regular_count INTEGER NOT NULL,
+                page_count INTEGER NOT NULL
             );
             """)
         before = FilesystemSource._directory_stat(folder)
@@ -829,6 +846,7 @@ def _entry_index(
             )
         digest = sha256(_ENTRY_AUDIT_PREFIX)
         regular_count = 0
+        page_count = 0
         rows = connection.execute(
             "SELECT name_bytes, device, inode, size_bytes, modified_ns, "
             "changed_ns, file_type FROM entries ORDER BY name_bytes"
@@ -846,9 +864,13 @@ def _entry_index(
                 file_type = int(row[6])
                 digest.update(file_type.to_bytes(1, "big"))
                 regular_count += int(file_type == FilesystemEntryType.REGULAR)
+                page_count += int(
+                    file_type == FilesystemEntryType.REGULAR
+                    and _artifact_source_role(name) is FilesystemArtifactSourceRole.PAGE
+                )
         connection.execute(
-            "INSERT INTO snapshot VALUES (?, ?)",
-            (digest.digest(), regular_count),
+            "INSERT INTO snapshot VALUES (?, ?, ?)",
+            (digest.digest(), regular_count, page_count),
         )
         connection.commit()
         yield connection
@@ -973,6 +995,15 @@ def _entry_type(mode: int) -> FilesystemEntryType:
     if stat.S_ISLNK(mode):
         return FilesystemEntryType.SYMLINK
     return FilesystemEntryType.OTHER
+
+
+def _artifact_source_role(name_bytes: bytes) -> FilesystemArtifactSourceRole:
+    if name_bytes == GALLERY_INFO_NAME.encode("ascii"):
+        return FilesystemArtifactSourceRole.METADATA
+    _stem, separator, suffix = name_bytes.rpartition(b".")
+    if separator and b"." + suffix.lower() in _PAGE_SUFFIXES:
+        return FilesystemArtifactSourceRole.PAGE
+    return FilesystemArtifactSourceRole.OTHER
 
 
 def _strict_component(value: str) -> str:

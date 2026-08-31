@@ -7,9 +7,12 @@ import stat
 from pathlib import Path
 
 CURRENT_DIRECTORY_NAME = "current"
+ACQUISITIONS_DIRECTORY_NAME = "acquisitions"
+ARTWORK_DIRECTORY_NAME = "artwork"
 COORDINATION_DIRECTORY_NAME = ".h2hdb-coordination"
 STATE_DIRECTORY_NAME = ".h2hdb-state"
 UNSUPPORTED_LEGACY_COORDINATION_NAME = "coordination"
+UNSUPPORTED_LEGACY_CURRENT_NAME = "hash-v1"
 
 _DIRECTORY_FLAGS = (
     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -53,6 +56,11 @@ def validate_precreated_library_layout(root: Path, *, durable: bool) -> None:
                 label=label,
                 durable=durable,
             )
+        _validate_current_subtrees(
+            root_descriptor,
+            root,
+            durable=durable,
+        )
         _reject_legacy_coordination(
             root_descriptor,
             root,
@@ -69,6 +77,63 @@ def validate_precreated_library_layout(root: Path, *, durable: bool) -> None:
         )
     finally:
         os.close(root_descriptor)
+
+
+def _validate_current_subtrees(
+    root_descriptor: int,
+    root: Path,
+    *,
+    durable: bool,
+) -> None:
+    current_path = root / CURRENT_DIRECTORY_NAME
+    try:
+        current_descriptor = os.open(
+            CURRENT_DIRECTORY_NAME,
+            _DIRECTORY_FLAGS,
+            dir_fd=root_descriptor,
+        )
+    except OSError as error:
+        raise LibraryLayoutValidationError(
+            f"current library is not safely openable: {current_path}"
+        ) from error
+    try:
+        _reject_legacy_current_layout(current_descriptor, current_path)
+        for leaf, label in (
+            (ACQUISITIONS_DIRECTORY_NAME, "acquisition library"),
+            (ARTWORK_DIRECTORY_NAME, "artwork library"),
+        ):
+            _validate_child_directory(
+                current_descriptor,
+                current_path,
+                leaf,
+                label=label,
+                durable=durable,
+            )
+        if durable:
+            os.fsync(current_descriptor)
+            os.fsync(root_descriptor)
+    finally:
+        os.close(current_descriptor)
+
+
+def _reject_legacy_current_layout(
+    current_descriptor: int,
+    current_path: Path,
+) -> None:
+    legacy_path = current_path / UNSUPPORTED_LEGACY_CURRENT_NAME
+    try:
+        os.stat(
+            UNSUPPORTED_LEGACY_CURRENT_NAME,
+            dir_fd=current_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return
+    raise LibraryLayoutValidationError(
+        "unsupported legacy current/hash-v1 artifact layout at "
+        f"{legacy_path}; rebuild into a fresh library root because automatic "
+        "migration is not supported"
+    )
 
 
 def _validate_child_directory(

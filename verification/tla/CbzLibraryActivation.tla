@@ -2,7 +2,7 @@
 EXTENDS FiniteSets, TLC
 
 (***************************************************************************
-Finite crash model for the single-copy CBZ library activation protocol.
+Finite crash model for single-copy acquisition and thumbnail activation.
 
 PrepareInvisible seals a core publication without moving the reader head.
 StartActivation creates the durable maintenance marker.  Individual current

@@ -217,7 +217,7 @@ class ResidentIngestor:
     def _try_library_maintenance(
         self,
     ) -> LibraryMaintenanceOutcome | None:
-        """Make one bounded ingest-owned CBZ cleanup attempt."""
+        """Make one bounded ingest-owned presentation cleanup attempt."""
 
         try:
             return self._run_library_maintenance()
