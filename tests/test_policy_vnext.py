@@ -21,7 +21,7 @@ def test_policy_is_derived_only_from_natural_consumer_facts(tmp_path: Path) -> N
 
     assert policy.artifact.adapter_id == b"managed-filesystem"
     assert policy.artifact.policy_fingerprint_sha256 == (
-        artifact_policy_fingerprint_sha256(1024)
+        artifact_policy_fingerprint_sha256(config.paths.artifact_render_policy())
     )
     assert policy.operational_max_batch_rows == 64
     assert policy.artifacts_required

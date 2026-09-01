@@ -25,6 +25,7 @@ from .maintenance import (
     LibraryMaintenanceAdapter,
     LibraryMaintenanceOutcome,
 )
+from .metrics import TextIngestMetricSink
 from .policy import build_ingest_policy
 from .resident import ResidentIngestor
 from .service import VNextIngestService
@@ -54,6 +55,8 @@ def build_runtime(
     facade = VNextIngestFacade(config.core)
     database_admin = VNextDatabaseAdminFacade(config.core)
     catalog = VNextCatalogFacade(config.core)
+    runtime_event_logger = event_logger or logger.info
+    metrics_sink = TextIngestMetricSink(runtime_event_logger)
 
     artifact_adapters: dict[bytes, ManagedFilesystemLibraryAdapter] = {}
     finalization_adapters: dict[bytes, ManagedFilesystemLibraryAdapter] = {}
@@ -69,7 +72,9 @@ def build_runtime(
         library = ManagedFilesystemLibraryAdapter(
             config.paths.library_path,
             source_root=config.paths.download_path,
-            max_image_short_side=config.paths.max_image_short_side,
+            render_policy=config.paths.artifact_render_policy(),
+            page_render_workers=config.paths.page_render_workers,
+            metrics_sink=metrics_sink,
         )
         artifact_adapters[library.adapter_id] = library
         finalization_adapters[library.adapter_id] = library
@@ -85,6 +90,7 @@ def build_runtime(
         finalization_adapters=finalization_adapters,
         library_activation=library_activation,
         publication_guard=publication_guard,
+        metrics_sink=metrics_sink,
     )
     resident = ResidentIngestor(
         service=service,
@@ -93,7 +99,7 @@ def build_runtime(
         library_maintenance=library_maintenance,
         config=config.resident,
         database_type=config.core.database.sql_type,
-        event_logger=event_logger or logger.info,
+        event_logger=runtime_event_logger,
     )
     return IngestRuntime(facade, database_admin, catalog, resident)
 

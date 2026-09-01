@@ -14,6 +14,7 @@ from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic_ns
 
 from h2hdb import (
     ArtifactReleaseAdapter,
@@ -30,6 +31,13 @@ from h2hdb import (
 
 from .core_source import VNextFilesystemSourceAdapter
 from .filesystem import FilesystemSource
+from .metrics import (
+    IngestMetric,
+    IngestMetricOperation,
+    IngestMetricSink,
+    IngestMetricValue,
+    emit_ingest_metric,
+)
 from .session import IngestSessionController
 
 _ANALYSIS_SNAPSHOT_STAGE = b"snapshot_manifest"
@@ -37,6 +45,17 @@ _ANALYSIS_SNAPSHOT_STAGE = b"snapshot_manifest"
 
 class _IngestStopRequested(Exception):
     """Normal resident termination observed between bounded durable steps."""
+
+
+@dataclass(slots=True)
+class _PublicationMetricAccumulator:
+    issue_ns: int = 0
+    prepare_ns: int = 0
+    commit_ns: int = 0
+    cleanup_ns: int = 0
+    steps: int = 0
+    processed_rows: int = 0
+    replayed_steps: int = 0
 
 
 def _never_stop() -> bool:
@@ -85,6 +104,7 @@ class VNextIngestService:
         finalization_adapters: Mapping[bytes, ArtifactReleaseAdapter],
         library_activation: VNextLibraryActivationAdapter,
         publication_guard: Callable[[], AbstractContextManager[None]],
+        metrics_sink: IngestMetricSink | None = None,
     ) -> None:
         if not isinstance(source_root, Path):
             raise TypeError("source_root must be Path")
@@ -101,6 +121,8 @@ class VNextIngestService:
             )
         if not callable(publication_guard):
             raise TypeError("publication_guard must be callable")
+        if metrics_sink is not None and not callable(metrics_sink):
+            raise TypeError("metrics_sink must be callable")
         self._source_root = source_root
         self._policy = policy
         self._max_rows = max_rows
@@ -108,6 +130,7 @@ class VNextIngestService:
         self._finalization_adapters = dict(finalization_adapters)
         self._library_activation = library_activation
         self._publication_guard = publication_guard
+        self._metrics_sink = metrics_sink
 
     def synchronize_once(
         self,
@@ -146,6 +169,7 @@ class VNextIngestService:
                 finalization_adapters=self._finalization_adapters,
                 library_activation=self._library_activation,
                 should_stop=stop_requested,
+                metrics_sink=self._metrics_sink,
             )
         return VNextIngestSynchronizationResult(
             source_receipt,
@@ -229,6 +253,7 @@ def synchronize_publication(
     finalization_adapters: Mapping[bytes, ArtifactReleaseAdapter],
     library_activation: VNextLibraryActivationAdapter,
     should_stop: Callable[[], bool] = _never_stop,
+    metrics_sink: IngestMetricSink | None = None,
 ) -> VNextIngestAdvanceResult:
     """Drive publication and finalization inside the caller's outer guard."""
 
@@ -238,12 +263,27 @@ def synchronize_publication(
         raise TypeError(
             "library_activation must implement VNextLibraryActivationAdapter"
         )
+    if metrics_sink is not None and not callable(metrics_sink):
+        raise TypeError("metrics_sink must be callable")
+    started_ns = monotonic_ns()
+    operation_metrics: dict[str, _PublicationMetricAccumulator] = {}
     while True:
         _raise_if_stopping(should_stop)
+        issue_started_ns = monotonic_ns()
         issued = session.call(
             lambda facade, receipt: facade.issue_publication_step(receipt, policy)
         )
+        issue_ns = monotonic_ns() - issue_started_ns
+        operation = issued.operation
+        if type(operation) is not str or not operation:
+            raise RuntimeError("issued publication operation name is invalid")
+        aggregate = operation_metrics.setdefault(
+            operation,
+            _PublicationMetricAccumulator(),
+        )
+        aggregate.issue_ns += issue_ns
         # outside_session invokes its callback before this loop advances.
+        prepare_started_ns = monotonic_ns()
         prepared = session.outside_session(
             lambda facade: facade.prepare_publication_step(
                 issued,  # noqa: B023
@@ -252,19 +292,32 @@ def synchronize_publication(
                 library_activation=library_activation,
             )
         )
+        aggregate.prepare_ns += monotonic_ns() - prepare_started_ns
         with prepared:
             # call invokes its callback before prepared can be reassigned.
+            commit_started_ns = monotonic_ns()
             result = session.call(
                 lambda facade, receipt: facade.commit_publication_step(
                     receipt,
                     prepared,  # noqa: B023
                 )
             )
+            aggregate.commit_ns += monotonic_ns() - commit_started_ns
+            cleanup_started_ns = monotonic_ns()
+        aggregate.cleanup_ns += monotonic_ns() - cleanup_started_ns
         _require_publication_result(result)
+        aggregate.steps += 1
+        aggregate.processed_rows += result.processed_rows
+        aggregate.replayed_steps += int(result.replayed)
         _raise_if_stopping(should_stop)
         if result.terminal:
             if result.phase is not VNextIngestPhase.FINALIZATION:
                 raise RuntimeError("terminal publication advancement is not finalized")
+            _emit_publication_metric(
+                metrics_sink,
+                started_ns=started_ns,
+                operation_metrics=operation_metrics,
+            )
             return result
 
 
@@ -339,6 +392,60 @@ def _require_publication_result(result: VNextIngestAdvanceResult) -> None:
         VNextIngestPhase.FINALIZATION,
     }:
         raise RuntimeError("publication advancement returned another ingest phase")
+
+
+def _emit_publication_metric(
+    sink: IngestMetricSink | None,
+    *,
+    started_ns: int,
+    operation_metrics: Mapping[str, _PublicationMetricAccumulator],
+) -> None:
+    operations = tuple(
+        IngestMetricOperation(
+            operation=operation,
+            phases_ns=(
+                IngestMetricValue("issue", aggregate.issue_ns),
+                IngestMetricValue("prepare", aggregate.prepare_ns),
+                IngestMetricValue("commit", aggregate.commit_ns),
+                IngestMetricValue("cleanup", aggregate.cleanup_ns),
+            ),
+            counters=(
+                IngestMetricValue("steps", aggregate.steps),
+                IngestMetricValue("processed_rows", aggregate.processed_rows),
+                IngestMetricValue("replayed_steps", aggregate.replayed_steps),
+            ),
+        )
+        for operation, aggregate in operation_metrics.items()
+    )
+    emit_ingest_metric(
+        sink,
+        IngestMetric(
+            scope="publication",
+            operation="synchronize",
+            elapsed_ns=monotonic_ns() - started_ns,
+            counters=(
+                IngestMetricValue(
+                    "steps",
+                    sum(aggregate.steps for aggregate in operation_metrics.values()),
+                ),
+                IngestMetricValue(
+                    "processed_rows",
+                    sum(
+                        aggregate.processed_rows
+                        for aggregate in operation_metrics.values()
+                    ),
+                ),
+                IngestMetricValue(
+                    "replayed_steps",
+                    sum(
+                        aggregate.replayed_steps
+                        for aggregate in operation_metrics.values()
+                    ),
+                ),
+            ),
+            operations=operations,
+        ),
+    )
 
 
 def _raise_if_stopping(should_stop: Callable[[], bool]) -> None:

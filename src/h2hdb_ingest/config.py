@@ -1,4 +1,6 @@
 __all__ = [
+    "ArtifactRenderPolicyConfig",
+    "ArtifactRenderPreset",
     "IngestConfig",
     "IngestPathsConfig",
     "ResidentConfig",
@@ -6,16 +8,35 @@ __all__ = [
 ]
 
 import json
+from collections.abc import Mapping
+from enum import StrEnum
 from pathlib import Path
+from typing import cast
 
 from h2hdb import CoreConfig, resolve_environment_placeholders
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    model_validator,
+)
 
 from ._library_layout import (
     LibraryLayoutValidationError,
     validate_precreated_library_layout,
 )
-from .artifact import MAX_IMAGE_LONG_SIDE
+from .artifact import (
+    MAX_IMAGE_LONG_SIDE,
+    MAX_PAGE_RENDER_WORKERS,
+    MAX_SUPPORTED_JPEG_QUALITY,
+    MIN_SUPPORTED_JPEG_QUALITY,
+    PAGE_JPEG_QUALITY,
+    THUMBNAIL_JPEG_QUALITY,
+    ArtifactImageResampler,
+    ArtifactRenderPolicy,
+)
 
 DEFAULT_MAX_ROWS = 128
 
@@ -24,10 +45,79 @@ class ConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class ArtifactRenderPreset(StrEnum):
+    """Named effective render policies; presets never alter the default implicitly."""
+
+    CANONICAL = "canonical"
+    BENCHMARK_LOW_COST = "benchmark-low-cost"
+
+
+_RENDER_PRESET_VALUES: dict[ArtifactRenderPreset, dict[str, object]] = {
+    ArtifactRenderPreset.CANONICAL: {
+        "page_jpeg_quality": PAGE_JPEG_QUALITY,
+        "thumbnail_jpeg_quality": THUMBNAIL_JPEG_QUALITY,
+        "optimize": True,
+        "resampler": ArtifactImageResampler.LANCZOS,
+    },
+    ArtifactRenderPreset.BENCHMARK_LOW_COST: {
+        "page_jpeg_quality": 70,
+        "thumbnail_jpeg_quality": 70,
+        "optimize": False,
+        "resampler": ArtifactImageResampler.BILINEAR,
+    },
+}
+
+
+class ArtifactRenderPolicyConfig(ConfigModel):
+    """Frozen, bounded configuration for all byte-affecting image choices."""
+
+    preset: ArtifactRenderPreset = ArtifactRenderPreset.CANONICAL
+    page_jpeg_quality: StrictInt = Field(
+        default=PAGE_JPEG_QUALITY,
+        ge=MIN_SUPPORTED_JPEG_QUALITY,
+        le=MAX_SUPPORTED_JPEG_QUALITY,
+    )
+    thumbnail_jpeg_quality: StrictInt = Field(
+        default=THUMBNAIL_JPEG_QUALITY,
+        ge=MIN_SUPPORTED_JPEG_QUALITY,
+        le=MAX_SUPPORTED_JPEG_QUALITY,
+    )
+    optimize: StrictBool = True
+    resampler: ArtifactImageResampler = ArtifactImageResampler.LANCZOS
+
+    @model_validator(mode="before")
+    @classmethod
+    def apply_preset(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            return value
+        configured = dict(cast(Mapping[str, object], value))
+        raw_preset = configured.get("preset", ArtifactRenderPreset.CANONICAL)
+        if not isinstance(raw_preset, str):
+            return configured
+        try:
+            preset = ArtifactRenderPreset(raw_preset)
+        except TypeError, ValueError:
+            return configured
+        for field, default in _RENDER_PRESET_VALUES[preset].items():
+            configured.setdefault(field, default)
+        return configured
+
+    def to_domain(self, *, max_image_short_side: int) -> ArtifactRenderPolicy:
+        """Resolve this config into the immutable renderer boundary value."""
+
+        return ArtifactRenderPolicy(
+            max_image_short_side=max_image_short_side,
+            page_jpeg_quality=self.page_jpeg_quality,
+            thumbnail_jpeg_quality=self.thumbnail_jpeg_quality,
+            optimize=self.optimize,
+            resampler=self.resampler,
+        )
+
+
 class IngestPathsConfig(ConfigModel):
     download_path: Path
     library_path: Path | None = None
-    max_image_short_side: int = Field(
+    max_image_short_side: StrictInt = Field(
         default=768,
         ge=1,
         le=MAX_IMAGE_LONG_SIDE,
@@ -37,6 +127,25 @@ class IngestPathsConfig(ConfigModel):
             "is 8192 pixels"
         ),
     )
+    render_policy: ArtifactRenderPolicyConfig = Field(
+        default_factory=ArtifactRenderPolicyConfig
+    )
+    page_render_workers: StrictInt = Field(
+        default=2,
+        ge=1,
+        le=MAX_PAGE_RENDER_WORKERS,
+        description=(
+            "Maximum image pages rendered concurrently before deterministic "
+            "in-order CBZ serialization"
+        ),
+    )
+
+    def artifact_render_policy(self) -> ArtifactRenderPolicy:
+        """Return the exact effective render policy used by policy and runtime."""
+
+        return self.render_policy.to_domain(
+            max_image_short_side=self.max_image_short_side
+        )
 
     @model_validator(mode="after")
     def validate_library_root(self) -> IngestPathsConfig:

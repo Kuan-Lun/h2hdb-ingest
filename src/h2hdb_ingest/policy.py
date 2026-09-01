@@ -22,7 +22,7 @@ def build_ingest_policy(config: IngestConfig) -> VNextIngestPolicy:
         artifact=VNextArtifactAdapterPolicy(
             adapter_id=ARTIFACT_ADAPTER_ID,
             policy_fingerprint_sha256=artifact_policy_fingerprint_sha256(
-                config.paths.max_image_short_side
+                config.paths.artifact_render_policy()
             ),
         ),
         operational_max_batch_rows=config.resident.max_rows,

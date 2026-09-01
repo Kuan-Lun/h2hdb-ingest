@@ -7,7 +7,15 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig, load_config
+from h2hdb_ingest import (
+    ArtifactImageResampler,
+    ArtifactRenderPolicyConfig,
+    ArtifactRenderPreset,
+    IngestConfig,
+    IngestPathsConfig,
+    ResidentConfig,
+    load_config,
+)
 
 
 def _provision_library_root(root: Path) -> None:
@@ -52,6 +60,33 @@ def test_loader_resolves_nested_core_secret_and_path_environment_values(
 
     assert config.core.database.password == "write-secret"
     assert config.paths.download_path == download_path
+
+
+def test_loader_resolves_benchmark_preset_and_explicit_render_override(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "ingest.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "paths": {
+                    "download_path": "/download",
+                    "render_policy": {
+                        "preset": "benchmark-low-cost",
+                        "page_jpeg_quality": 77,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.paths.render_policy.page_jpeg_quality == 77
+    assert config.paths.render_policy.thumbnail_jpeg_quality == 70
+    assert not config.paths.render_policy.optimize
+    assert config.paths.render_policy.resampler is ArtifactImageResampler.BILINEAR
 
 
 def test_artifacts_can_be_disabled_without_creating_output_directories(
@@ -226,6 +261,114 @@ def test_bounded_runtime_defaults() -> None:
 def test_image_short_side_limit_is_bounded(value: int) -> None:
     with pytest.raises(ValidationError):
         IngestPathsConfig(download_path=Path("/download"), max_image_short_side=value)
+
+
+def test_default_render_policy_preserves_canonical_encoder_parameters() -> None:
+    paths = IngestPathsConfig(download_path=Path("/download"))
+
+    assert paths.render_policy == ArtifactRenderPolicyConfig(
+        preset=ArtifactRenderPreset.CANONICAL,
+        page_jpeg_quality=90,
+        thumbnail_jpeg_quality=85,
+        optimize=True,
+        resampler=ArtifactImageResampler.LANCZOS,
+    )
+    assert paths.artifact_render_policy().max_image_short_side == 768
+    assert paths.page_render_workers == 2
+
+
+@pytest.mark.parametrize("value", (1, 2, 3, 4))
+def test_page_render_workers_accept_every_bounded_value(value: int) -> None:
+    paths = IngestPathsConfig(
+        download_path=Path("/download"),
+        page_render_workers=value,
+    )
+
+    assert paths.page_render_workers == value
+
+
+@pytest.mark.parametrize("value", (0, 5, True, 1.0, "2", None))
+def test_page_render_workers_reject_unbounded_or_coerced_values(value: object) -> None:
+    with pytest.raises(ValidationError):
+        IngestPathsConfig.model_validate(
+            {"download_path": "/download", "page_render_workers": value}
+        )
+
+
+def test_benchmark_render_preset_is_explicit_and_can_be_overridden() -> None:
+    benchmark = ArtifactRenderPolicyConfig(
+        preset=ArtifactRenderPreset.BENCHMARK_LOW_COST,
+    )
+    overridden = ArtifactRenderPolicyConfig(
+        preset=ArtifactRenderPreset.BENCHMARK_LOW_COST,
+        page_jpeg_quality=91,
+        optimize=True,
+    )
+
+    assert benchmark.page_jpeg_quality == 70
+    assert benchmark.thumbnail_jpeg_quality == 70
+    assert not benchmark.optimize
+    assert benchmark.resampler is ArtifactImageResampler.BILINEAR
+    assert overridden.page_jpeg_quality == 91
+    assert overridden.thumbnail_jpeg_quality == 70
+    assert overridden.optimize
+
+
+@pytest.mark.parametrize("quality", range(96))
+def test_every_supported_jpeg_quality_is_validated_without_coercion(
+    quality: int,
+) -> None:
+    config = ArtifactRenderPolicyConfig(
+        page_jpeg_quality=quality,
+        thumbnail_jpeg_quality=95 - quality,
+    )
+
+    assert config.page_jpeg_quality == quality
+    assert config.thumbnail_jpeg_quality == 95 - quality
+    assert config.to_domain(max_image_short_side=1).page_jpeg_quality == quality
+
+
+@pytest.mark.parametrize("optimize", (False, True))
+@pytest.mark.parametrize("resampler", tuple(ArtifactImageResampler))
+def test_every_optimize_resampler_combination_is_validated(
+    optimize: bool,
+    resampler: ArtifactImageResampler,
+) -> None:
+    config = ArtifactRenderPolicyConfig(
+        optimize=optimize,
+        resampler=resampler,
+    )
+
+    domain = config.to_domain(max_image_short_side=768)
+    assert domain.optimize is optimize
+    assert domain.resampler is resampler
+
+
+@pytest.mark.parametrize("field", ("page_jpeg_quality", "thumbnail_jpeg_quality"))
+@pytest.mark.parametrize("value", (-1, 96, True, 1.0, "90", None))
+def test_render_policy_rejects_unbounded_or_non_integer_quality(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        ArtifactRenderPolicyConfig.model_validate({field: value})
+
+
+@pytest.mark.parametrize("value", (0, 1, "true", None))
+def test_render_policy_rejects_non_boolean_optimize(value: object) -> None:
+    with pytest.raises(ValidationError):
+        ArtifactRenderPolicyConfig.model_validate({"optimize": value})
+
+
+@pytest.mark.parametrize("value", ("spline", "LANCZOS", 1, None))
+def test_render_policy_rejects_unsupported_resampler(value: object) -> None:
+    with pytest.raises(ValidationError):
+        ArtifactRenderPolicyConfig.model_validate({"resampler": value})
+
+
+def test_render_policy_rejects_unsupported_preset() -> None:
+    with pytest.raises(ValidationError):
+        ArtifactRenderPolicyConfig.model_validate({"preset": "fastest"})
 
 
 @pytest.mark.parametrize(

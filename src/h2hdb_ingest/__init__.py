@@ -4,6 +4,10 @@ from __future__ import annotations
 
 __all__ = [
     "FILESYSTEM_OBSERVATION_VERSION",
+    "ArtifactImageResampler",
+    "ArtifactRenderPolicy",
+    "ArtifactRenderPolicyConfig",
+    "ArtifactRenderPreset",
     "FilesystemArtifactSourceRole",
     "FilesystemEntryType",
     "FilesystemGalleryObservation",
@@ -12,6 +16,10 @@ __all__ = [
     "FilesystemSource",
     "IngestConfig",
     "IngestLeaseHeartbeat",
+    "IngestMetric",
+    "IngestMetricOperation",
+    "IngestMetricSink",
+    "IngestMetricValue",
     "IngestPathsConfig",
     "IngestSessionController",
     "LibraryMaintenanceAdapter",
@@ -19,6 +27,7 @@ __all__ = [
     "ManagedFilesystemLibraryAdapter",
     "ResidentConfig",
     "ResidentIngestor",
+    "TextIngestMetricSink",
     "VNextFilesystemSourceAdapter",
     "VNextIngestService",
     "VNextIngestSynchronizationResult",
@@ -26,7 +35,10 @@ __all__ = [
     "load_config",
 ]
 
+from .artifact import ArtifactImageResampler, ArtifactRenderPolicy
 from .config import (
+    ArtifactRenderPolicyConfig,
+    ArtifactRenderPreset,
     IngestConfig,
     IngestPathsConfig,
     ResidentConfig,
@@ -46,6 +58,13 @@ from .library import ManagedFilesystemLibraryAdapter
 from .maintenance import (
     LibraryMaintenanceAdapter,
     LibraryMaintenanceOutcome,
+)
+from .metrics import (
+    IngestMetric,
+    IngestMetricOperation,
+    IngestMetricSink,
+    IngestMetricValue,
+    TextIngestMetricSink,
 )
 from .policy import build_ingest_policy
 from .resident import ResidentIngestor

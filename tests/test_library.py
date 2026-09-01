@@ -13,6 +13,7 @@ from hashlib import sha256
 from io import BytesIO
 from itertools import pairwise
 from pathlib import Path
+from threading import Event, Thread
 from typing import cast
 
 import pytest
@@ -26,11 +27,13 @@ from h2hdb import (
 )
 
 import h2hdb_ingest.library as library_module
+from h2hdb_ingest.artifact import ArtifactRenderPolicy
 from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
 from h2hdb_ingest.maintenance import LibraryMaintenanceOutcome
 from h2hdb_ingest.storage import acquisition_storage_key, thumbnail_storage_key
 
 _MODIFIED_AT = datetime(2026, 1, 1, tzinfo=UTC)
+_RENDER_POLICY = ArtifactRenderPolicy()
 
 
 class _ActivationItem(VNextLibraryActivationItem):
@@ -87,7 +90,7 @@ def _adapter(root: Path) -> ManagedFilesystemLibraryAdapter:
     return ManagedFilesystemLibraryAdapter(
         root,
         source_root=_source_root(root),
-        max_image_short_side=768,
+        render_policy=_RENDER_POLICY,
     )
 
 
@@ -122,6 +125,28 @@ class _PartialThenError(BytesIO):
             bound = 3 if size is None or size < 0 else min(3, size)
             return super().read(bound)
         raise RuntimeError("fault: interrupted staging write")
+
+
+class _BlockingReader(BytesIO):
+    def __init__(self, payload: bytes, entered: Event, proceed: Event) -> None:
+        super().__init__(payload)
+        self._entered = entered
+        self._proceed = proceed
+
+    def read(self, size: int | None = -1) -> bytes:
+        self._entered.set()
+        if not self._proceed.wait(5):
+            raise RuntimeError("timed out waiting to resume blocked source read")
+        return super().read(size)
+
+
+class _CountingReader(BytesIO):
+    bytes_read: int = 0
+
+    def read(self, size: int | None = -1) -> bytes:
+        part = super().read(size)
+        self.bytes_read += len(part)
+        return part
 
 
 class _ShortWriter(BytesIO):
@@ -191,7 +216,7 @@ def test_layout_requires_a_preexisting_real_library_root(tmp_path: Path) -> None
     adapter = ManagedFilesystemLibraryAdapter(
         root,
         source_root=_source_root(root),
-        max_image_short_side=768,
+        render_policy=_RENDER_POLICY,
     )
 
     with pytest.raises(RuntimeError, match="pre-existing real directory"):
@@ -199,6 +224,57 @@ def test_layout_requires_a_preexisting_real_library_root(tmp_path: Path) -> None
             pass
 
     assert not root.exists()
+
+
+@pytest.mark.parametrize("workers", (True, 1.0, "2"))
+def test_library_rejects_non_integer_page_render_workers(
+    tmp_path: Path,
+    workers: object,
+) -> None:
+    with pytest.raises(TypeError, match="page_render_workers must be int"):
+        ManagedFilesystemLibraryAdapter(
+            tmp_path / "library",
+            source_root=_source_root(tmp_path / "library"),
+            render_policy=_RENDER_POLICY,
+            page_render_workers=workers,  # type: ignore[arg-type]  # boundary probe
+        )
+
+
+@pytest.mark.parametrize("workers", (0, 5))
+def test_library_rejects_out_of_range_page_render_workers(
+    tmp_path: Path,
+    workers: int,
+) -> None:
+    with pytest.raises(ValueError, match="must be from 1 through 4"):
+        ManagedFilesystemLibraryAdapter(
+            tmp_path / "library",
+            source_root=_source_root(tmp_path / "library"),
+            render_policy=_RENDER_POLICY,
+            page_render_workers=workers,
+        )
+
+
+def test_library_passes_page_render_workers_to_archive_renderer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = ManagedFilesystemLibraryAdapter(
+        tmp_path / "library",
+        source_root=_source_root(tmp_path / "library"),
+        render_policy=_RENDER_POLICY,
+        page_render_workers=4,
+    )
+    observed: list[int] = []
+
+    def fake_render(*args: object, **kwargs: object) -> object:
+        del args
+        observed.append(cast(int, kwargs["page_render_workers"]))
+        return object()
+
+    monkeypatch.setattr(library_module, "render_archive", fake_render)
+    adapter.render_archive((), BytesIO(), gid=1)
+
+    assert observed == [4]
 
 
 def test_layout_durably_accepts_preexisting_reader_mount_roots(
@@ -233,7 +309,7 @@ def test_layout_durably_accepts_preexisting_reader_mount_roots(
     adapter = ManagedFilesystemLibraryAdapter(
         root,
         source_root=_source_root(root),
-        max_image_short_side=768,
+        render_policy=_RENDER_POLICY,
     )
     adapter._ensure_layout()
 
@@ -272,10 +348,10 @@ def test_layout_never_changes_managed_entry_permissions(
         )
 
     ManagedFilesystemLibraryAdapter(
-        root, source_root=_source_root(root), max_image_short_side=768
+        root, source_root=_source_root(root), render_policy=_RENDER_POLICY
     )._ensure_layout()
     ManagedFilesystemLibraryAdapter(
-        root, source_root=_source_root(root), max_image_short_side=768
+        root, source_root=_source_root(root), render_policy=_RENDER_POLICY
     )._ensure_layout()
 
 
@@ -290,7 +366,7 @@ def test_layout_accepts_precreated_reader_mode_without_mutation(
     ManagedFilesystemLibraryAdapter(
         root,
         source_root=_source_root(root),
-        max_image_short_side=768,
+        render_policy=_RENDER_POLICY,
     )._ensure_layout()
 
     assert stat.S_IMODE(current.stat().st_mode) == 0o777
@@ -309,7 +385,7 @@ def test_layout_accepts_private_directory_mode_drift_without_repair(
     ManagedFilesystemLibraryAdapter(
         root,
         source_root=_source_root(root),
-        max_image_short_side=768,
+        render_policy=_RENDER_POLICY,
     )._ensure_layout()
 
     assert stat.S_IMODE(state.stat().st_mode) == 0o755
@@ -327,7 +403,7 @@ def test_layout_accepts_existing_lock_mode_drift_without_repair(
     ManagedFilesystemLibraryAdapter(
         root,
         source_root=_source_root(root),
-        max_image_short_side=768,
+        render_policy=_RENDER_POLICY,
     )._ensure_layout()
 
     assert stat.S_IMODE(state_lock.stat().st_mode) == 0o644
@@ -345,7 +421,7 @@ def test_layout_accepts_database_mode_without_repair(
     ManagedFilesystemLibraryAdapter(
         root,
         source_root=_source_root(root),
-        max_image_short_side=768,
+        render_policy=_RENDER_POLICY,
     )._ensure_layout()
 
     assert stat.S_IMODE(database.stat().st_mode) == 0o644
@@ -374,7 +450,7 @@ def test_layout_rejects_legacy_coordination_before_creating_new_sibling(
     adapter = ManagedFilesystemLibraryAdapter(
         root,
         source_root=_source_root(root),
-        max_image_short_side=768,
+        render_policy=_RENDER_POLICY,
     )
     with pytest.raises(RuntimeError, match="unsupported legacy"):
         adapter._ensure_layout()
@@ -403,7 +479,7 @@ def test_layout_rejects_legacy_current_artifact_tree_without_deleting_it(
     adapter = ManagedFilesystemLibraryAdapter(
         root,
         source_root=_source_root(root),
-        max_image_short_side=768,
+        render_policy=_RENDER_POLICY,
     )
     with pytest.raises(RuntimeError, match="rebuild into a fresh library root"):
         adapter._ensure_layout()
@@ -422,7 +498,7 @@ def test_layout_allows_unmanaged_operating_system_metadata_at_current_root(
     ManagedFilesystemLibraryAdapter(
         root,
         source_root=_source_root(root),
-        max_image_short_side=768,
+        render_policy=_RENDER_POLICY,
     )._ensure_layout()
 
     assert metadata.read_bytes() == b"unmanaged"
@@ -437,7 +513,7 @@ def test_layout_mkdir_response_loss_replays_child_before_parent_fsync(
     adapter = ManagedFilesystemLibraryAdapter(
         root,
         source_root=_source_root(root),
-        max_image_short_side=768,
+        render_policy=_RENDER_POLICY,
     )
     original_mkdir = os.mkdir
     interrupted = False
@@ -514,7 +590,7 @@ def test_layout_child_swap_after_parent_fsync_fails_closed(
     adapter = ManagedFilesystemLibraryAdapter(
         root,
         source_root=_source_root(root),
-        max_image_short_side=768,
+        render_policy=_RENDER_POLICY,
     )
     root_identity = (root.stat().st_dev, root.stat().st_ino)
     current = root / "current"
@@ -861,6 +937,56 @@ def test_publication_exclusive_lock_survives_complete_until_guard_exit(
         assert shared_lock_is_blocked()
 
     assert not shared_lock_is_blocked()
+
+
+def test_publication_guard_rejects_foreign_thread_activation_entrypoints(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    payload = b"thread-owned-publication"
+    item = _item(211, payload)
+    _protect(adapter, item, payload, 211)
+    receipt = b"t" * 16
+
+    def foreign_call(call: Callable[[], object]) -> BaseException | None:
+        failures: list[BaseException] = []
+
+        def invoke() -> None:
+            try:
+                call()
+            except BaseException as error:  # test thread must relay every failure
+                failures.append(error)
+
+        thread = Thread(target=invoke)
+        thread.start()
+        thread.join(5)
+        assert not thread.is_alive()
+        return failures[0] if failures else None
+
+    with adapter.publication_guard():
+        begin_error = foreign_call(lambda: adapter.begin(1, receipt))
+        assert isinstance(begin_error, RuntimeError)
+        assert "requires publication_guard" in str(begin_error)
+
+        checkpoint = adapter.begin(1, receipt)
+        assert checkpoint.status is LibraryActivationStatus.SPOOL
+        adapter.activate_page(1, (item,))
+
+        seal_error = foreign_call(lambda: adapter.seal(1))
+        assert isinstance(seal_error, RuntimeError)
+        assert "requires publication_guard" in str(seal_error)
+
+        adapter.seal(1)
+        while True:
+            checkpoint = adapter.reconcile_page(1, receipt, limit=128)
+            if checkpoint.status is LibraryActivationStatus.READY:
+                break
+        adapter.complete(1, receipt)
+
+    assert adapter.current_path.joinpath(*item.storage_key.segments).read_bytes() == (
+        payload
+    )
 
 
 @pytest.mark.parametrize(
@@ -3109,40 +3235,48 @@ def test_quarantine_leaf_swap_immediately_before_unlink_fails_closed(
         adapter.seal(2)
         adapter.reconcile_page(2, receipt, limit=128)
 
-        original_verify = library_module._verify_regular_at
-        verified_count = 0
+        original_require = cast(
+            Callable[..., object],
+            library_module._require_regular_authority_at,
+        )
+        swapped = False
         saved = tmp_path / "captured-removed.cbz"
 
-        def verify_then_swap(
+        def require_then_swap(
             descriptor: int,
             leaf: str,
             *,
-            expected_sha256: bytes,
             expected_size: int,
+            expected_signature: object,
+            allow_renamed_identity: bool,
             label: str,
         ) -> object:
-            nonlocal verified_count
-            result = original_verify(
+            nonlocal swapped
+            result = original_require(
                 descriptor,
                 leaf,
-                expected_sha256=expected_sha256,
                 expected_size=expected_size,
+                expected_signature=expected_signature,
+                allow_renamed_identity=allow_renamed_identity,
                 label=label,
             )
-            if label == "quarantined stale library artifact":
-                verified_count += 1
-                if verified_count == 2:
-                    quarantine = root / ".h2hdb-state" / "quarantine" / leaf
-                    quarantine.rename(saved)
-                    quarantine.write_bytes(b"foreign")
+            if label == "quarantined stale library artifact" and not swapped:
+                swapped = True
+                quarantine = root / ".h2hdb-state" / "quarantine" / leaf
+                quarantine.rename(saved)
+                quarantine.write_bytes(b"foreign")
             return result
 
-        monkeypatch.setattr(library_module, "_verify_regular_at", verify_then_swap)
+        monkeypatch.setattr(
+            library_module,
+            "_require_regular_authority_at",
+            require_then_swap,
+        )
         with pytest.raises(RuntimeError, match="immediately before unlink"):
             adapter.reconcile_page(2, receipt, limit=128)
 
     quarantine = tuple((root / ".h2hdb-state" / "quarantine").glob("*.cbz"))
-    assert verified_count == 2
+    assert swapped
     assert len(quarantine) == 1
     assert quarantine[0].read_bytes() == b"foreign"
     assert saved.read_bytes() == b"removed"
@@ -4008,3 +4142,497 @@ def test_two_resource_activation_crosses_128_boundary_and_restarts(
 
     assert len(tuple(resumed.current_path.rglob("*.cbz"))) == 65
     assert len(tuple(resumed.current_path.rglob("*.jpg"))) == 65
+
+
+def test_normal_protect_replace_stale_and_replay_do_not_rehash_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    payload = b"verified-once" * (1024 * 128)
+    replacement_payload = b"replacement-bytes" * (1024 * 96)
+    item = _item(203, payload)
+    replacement = _item(203, replacement_payload)
+    token = bytes((203,)) * 32
+    reader = _CountingReader(payload)
+    large_traversals: list[str] = []
+    original_verify = library_module._verify_regular_at
+
+    def track_verify(
+        descriptor: int,
+        leaf: str,
+        *,
+        expected_sha256: bytes,
+        expected_size: int,
+        label: str,
+    ) -> object:
+        if expected_size in {len(payload), len(replacement_payload)}:
+            large_traversals.append(label)
+        return original_verify(
+            descriptor,
+            leaf,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+            label=label,
+        )
+
+    monkeypatch.setattr(library_module, "_verify_regular_at", track_verify)
+    assert adapter.protect(
+        reader,
+        item.storage_key,
+        item.artifact_sha256,
+        item.size_bytes,
+        item.storage_object.modified_at,
+        token,
+    ).stored
+    assert reader.bytes_read == len(payload)
+
+    _activate(adapter, 1, b"v" * 16, (item,))
+    assert adapter.protect(
+        BytesIO(payload),
+        item.storage_key,
+        item.artifact_sha256,
+        item.size_bytes,
+        item.storage_object.modified_at,
+        token,
+    ).stored
+
+    replacement_reader = _CountingReader(replacement_payload)
+    assert adapter.protect(
+        replacement_reader,
+        replacement.storage_key,
+        replacement.artifact_sha256,
+        replacement.size_bytes,
+        replacement.storage_object.modified_at,
+        bytes((202,)) * 32,
+    ).stored
+    assert replacement_reader.bytes_read == len(replacement_payload)
+    _activate(adapter, 2, b"w" * 16, (replacement,))
+    assert adapter.current_path.joinpath(
+        *replacement.storage_key.segments
+    ).read_bytes() == (replacement_payload)
+
+    _activate(adapter, 3, b"x" * 16, ())
+    assert not adapter.current_path.joinpath(*replacement.storage_key.segments).exists()
+    assert large_traversals == []
+
+
+def test_protect_source_io_does_not_hold_state_lock(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    writer = _adapter(root)
+    observer = _adapter(root)
+    payload = b"lock-free-copy" * (1024 * 64)
+    item = _item(204, payload)
+    entered = Event()
+    proceed = Event()
+    acquired = Event()
+    failures: list[BaseException] = []
+
+    def protect() -> None:
+        try:
+            writer.protect(
+                _BlockingReader(payload, entered, proceed),
+                item.storage_key,
+                item.artifact_sha256,
+                item.size_bytes,
+                item.storage_object.modified_at,
+                bytes((204,)) * 32,
+            )
+        except BaseException as error:  # test thread must relay every failure
+            failures.append(error)
+
+    def observe_state() -> None:
+        try:
+            with observer._exclusive_state() as connection:
+                assert connection.execute(
+                    "SELECT state FROM protection_tokens"
+                ).fetchone() == ("WRITING",)
+                acquired.set()
+        except BaseException as error:  # test thread must relay every failure
+            failures.append(error)
+
+    protect_thread = Thread(target=protect)
+    protect_thread.start()
+    assert entered.wait(5)
+    observer_thread = Thread(target=observe_state)
+    observer_thread.start()
+    assert acquired.wait(5)
+    proceed.set()
+    protect_thread.join(5)
+    observer_thread.join(5)
+
+    assert not protect_thread.is_alive()
+    assert not observer_thread.is_alive()
+    assert failures == []
+
+
+def test_same_adapter_shared_protects_do_not_hold_process_lock_during_io(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter(tmp_path / "library")
+    first_payload = b"first-concurrent-protect" * (1024 * 16)
+    second_payload = b"second-concurrent-protect" * (1024 * 16)
+    first = _item(207, first_payload)
+    second = _item(208, second_payload)
+    first_entered = Event()
+    second_entered = Event()
+    proceed = Event()
+    failures: list[BaseException] = []
+
+    def protect(
+        item: _ActivationItem,
+        payload: bytes,
+        token_byte: int,
+        entered: Event,
+    ) -> None:
+        try:
+            assert adapter.protect(
+                _BlockingReader(payload, entered, proceed),
+                item.storage_key,
+                item.artifact_sha256,
+                item.size_bytes,
+                item.storage_object.modified_at,
+                bytes((token_byte,)) * 32,
+            ).stored
+        except BaseException as error:  # test thread must relay every failure
+            failures.append(error)
+
+    first_thread = Thread(
+        target=protect,
+        args=(first, first_payload, 207, first_entered),
+    )
+    second_thread = Thread(
+        target=protect,
+        args=(second, second_payload, 208, second_entered),
+    )
+    first_thread.start()
+    assert first_entered.wait(5)
+    second_thread.start()
+    assert second_entered.wait(5)
+    proceed.set()
+    first_thread.join(5)
+    second_thread.join(5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert failures == []
+
+
+@pytest.mark.parametrize("same_adapter", (True, False))
+@pytest.mark.parametrize("first_crashes", (True, False))
+def test_concurrent_identical_protect_replays_rename_terminalize_gap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    same_adapter: bool,
+    first_crashes: bool,
+) -> None:
+    root = tmp_path / "library"
+    first_adapter = _adapter(root)
+    second_adapter = first_adapter if same_adapter else _adapter(root)
+    payload = b"same-token-concurrent" * (1024 * 32)
+    item = _item(210, payload)
+    token = bytes((210,)) * 32
+    renamed = Event()
+    allow_terminalization = Event()
+    second_started = Event()
+    second_finished = Event()
+    original_write = cast(Callable[..., object], first_adapter._write_stage)
+    stored: dict[str, bool] = {}
+    failures: dict[str, BaseException] = {}
+
+    def pause_after_rename(*args: object, **kwargs: object) -> object:
+        result = original_write(*args, **kwargs)
+        renamed.set()
+        if not allow_terminalization.wait(5):
+            raise RuntimeError("timed out waiting to resume first protect")
+        if first_crashes:
+            raise RuntimeError("fault: rename-before-protect-terminalization")
+        return result
+
+    monkeypatch.setattr(first_adapter, "_write_stage", pause_after_rename)
+
+    def protect(
+        name: str,
+        adapter: ManagedFilesystemLibraryAdapter,
+    ) -> None:
+        if name == "second":
+            second_started.set()
+        try:
+            stored[name] = adapter.protect(
+                BytesIO(payload),
+                item.storage_key,
+                item.artifact_sha256,
+                item.size_bytes,
+                item.storage_object.modified_at,
+                token,
+            ).stored
+        except BaseException as error:  # test thread must relay every failure
+            failures[name] = error
+        finally:
+            if name == "second":
+                second_finished.set()
+
+    first_thread = Thread(
+        name="first-protect",
+        target=protect,
+        args=("first", first_adapter),
+    )
+    second_thread = Thread(
+        name="second-protect",
+        target=protect,
+        args=("second", second_adapter),
+    )
+    first_thread.start()
+    assert renamed.wait(5)
+    second_thread.start()
+    assert second_started.wait(5)
+    assert not second_finished.wait(0.1)
+    allow_terminalization.set()
+    first_thread.join(5)
+    second_thread.join(5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    if first_crashes:
+        assert tuple(failures) == ("first",)
+        assert "rename-before-protect-terminalization" in str(failures["first"])
+        assert stored == {"second": True}
+    else:
+        assert failures == {}
+        assert stored == {"first": True, "second": True}
+    with second_adapter._exclusive_state() as connection:
+        assert connection.execute(
+            "SELECT state FROM protection_tokens WHERE token = ?",
+            (token,),
+        ).fetchone() == ("STAGED",)
+    assert len(tuple((root / ".h2hdb-state" / "staging").glob("*.cbz"))) == 1
+    assert not tuple((root / ".h2hdb-state" / "staging").glob("*.tmp"))
+
+
+def test_activation_filesystem_io_does_not_hold_state_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "library"
+    activator = _adapter(root)
+    observer = _adapter(root)
+    payload = b"lock-free-activation" * (1024 * 32)
+    item = _item(205, payload)
+    _protect(activator, item, payload, 205)
+    entered = Event()
+    proceed = Event()
+    acquired = Event()
+    failures: list[BaseException] = []
+    original_install = cast(Callable[..., object], activator._install_staged)
+
+    def blocked_install(*args: object, **kwargs: object) -> object:
+        entered.set()
+        if not proceed.wait(5):
+            raise RuntimeError("timed out waiting to resume activation")
+        return original_install(*args, **kwargs)
+
+    monkeypatch.setattr(activator, "_install_staged", blocked_install)
+
+    def activate() -> None:
+        try:
+            with activator.publication_guard():
+                activator.begin(1, b"w" * 16)
+                activator.activate_page(1, (item,))
+                activator.seal(1)
+                checkpoint = activator.reconcile_page(1, b"w" * 16, limit=128)
+                assert checkpoint.status is LibraryActivationStatus.RECONCILE
+        except BaseException as error:  # test thread must relay every failure
+            failures.append(error)
+
+    def observe_state() -> None:
+        try:
+            with observer._exclusive_state() as connection:
+                assert connection.execute(
+                    "SELECT operation_started FROM pending_entries"
+                ).fetchone() == (1,)
+                acquired.set()
+        except BaseException as error:  # test thread must relay every failure
+            failures.append(error)
+
+    activation_thread = Thread(target=activate)
+    activation_thread.start()
+    assert entered.wait(5)
+    observer_thread = Thread(target=observe_state)
+    observer_thread.start()
+    assert acquired.wait(5)
+    proceed.set()
+    activation_thread.join(5)
+    observer_thread.join(5)
+
+    assert not activation_thread.is_alive()
+    assert not observer_thread.is_alive()
+    assert failures == []
+    assert activator.current_path.joinpath(*item.storage_key.segments).read_bytes() == (
+        payload
+    )
+
+
+def test_concurrent_release_waits_for_reserved_protect_then_tombstones(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    writer = _adapter(root)
+    releaser = _adapter(root)
+    observer = _adapter(root)
+    payload = b"publication-fenced" * (1024 * 32)
+    item = _item(206, payload)
+    token = bytes((206,)) * 32
+    entered = Event()
+    proceed = Event()
+    release_started = Event()
+    failures: list[BaseException] = []
+
+    def protect() -> None:
+        try:
+            assert writer.protect(
+                _BlockingReader(payload, entered, proceed),
+                item.storage_key,
+                item.artifact_sha256,
+                item.size_bytes,
+                item.storage_object.modified_at,
+                token,
+            ).stored
+        except BaseException as error:  # test thread must relay every failure
+            failures.append(error)
+
+    def release() -> None:
+        release_started.set()
+        try:
+            assert releaser.release(
+                item.storage_key,
+                item.artifact_sha256,
+                item.size_bytes,
+                token,
+            ).released
+        except BaseException as error:  # test thread must relay every failure
+            failures.append(error)
+
+    protect_thread = Thread(target=protect)
+    protect_thread.start()
+    assert entered.wait(5)
+    release_thread = Thread(target=release)
+    release_thread.start()
+    assert release_started.wait(5)
+    with observer._exclusive_state() as connection:
+        assert connection.execute(
+            "SELECT state FROM protection_tokens WHERE token = ?",
+            (token,),
+        ).fetchone() == ("WRITING",)
+
+    proceed.set()
+    protect_thread.join(5)
+    release_thread.join(5)
+    assert not protect_thread.is_alive()
+    assert not release_thread.is_alive()
+    assert failures == []
+    with observer._exclusive_state() as connection:
+        assert connection.execute(
+            "SELECT state, staging_leaf FROM protection_tokens WHERE token = ?",
+            (token,),
+        ).fetchone() == ("RELEASED", None)
+    assert not tuple((root / ".h2hdb-state" / "staging").iterdir())
+
+
+def test_concurrent_release_cannot_cross_rename_terminalize_crash_gap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    payload = b"rename-terminalize-gap"
+    item = _item(209, payload)
+    token = _protect(adapter, item, payload, 209)
+    receipt = b"x" * 16
+    renamed = Event()
+    allow_failure = Event()
+    release_started = Event()
+    release_finished = Event()
+    activation_failures: list[BaseException] = []
+    release_failures: list[BaseException] = []
+
+    def interrupt_terminalization(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        renamed.set()
+        if not allow_failure.wait(5):
+            raise RuntimeError("timed out waiting to inject activation failure")
+        raise RuntimeError("fault: renamed-before-terminalization")
+
+    monkeypatch.setattr(
+        adapter,
+        "_terminalize_stage_in_transaction",
+        interrupt_terminalization,
+    )
+
+    def activate() -> None:
+        try:
+            with adapter.publication_guard():
+                adapter.begin(1, receipt)
+                adapter.activate_page(1, (item,))
+                adapter.seal(1)
+                adapter.reconcile_page(1, receipt, limit=128)
+        except BaseException as error:  # test thread must relay every failure
+            activation_failures.append(error)
+
+    releaser = _adapter(root)
+
+    def release() -> None:
+        release_started.set()
+        try:
+            releaser.release(
+                item.storage_key,
+                item.artifact_sha256,
+                item.size_bytes,
+                token,
+            )
+        except BaseException as error:  # test thread must relay every failure
+            release_failures.append(error)
+        finally:
+            release_finished.set()
+
+    activation_thread = Thread(target=activate)
+    activation_thread.start()
+    assert renamed.wait(5)
+
+    release_thread = Thread(target=release)
+    release_thread.start()
+    assert release_started.wait(5)
+    assert not release_finished.wait(0.1)
+    allow_failure.set()
+    activation_thread.join(5)
+    release_thread.join(5)
+
+    assert not activation_thread.is_alive()
+    assert not release_thread.is_alive()
+    assert len(activation_failures) == 1
+    assert "renamed-before-terminalization" in str(activation_failures[0])
+    assert len(release_failures) == 1
+    assert "unfinished library activation" in str(release_failures[0])
+
+    target = adapter.current_path.joinpath(*item.storage_key.segments)
+    assert target.read_bytes() == payload
+    restarted = _adapter(root)
+    with restarted._exclusive_state() as connection:
+        assert connection.execute(
+            "SELECT state FROM protection_tokens WHERE token = ?",
+            (token,),
+        ).fetchone() == ("STAGED",)
+
+    with restarted.publication_guard():
+        checkpoint = restarted.begin(1, receipt)
+        while checkpoint.status is not LibraryActivationStatus.READY:
+            checkpoint = restarted.reconcile_page(1, receipt, limit=128)
+        restarted.complete(1, receipt)
+
+    assert target.read_bytes() == payload
+    with restarted._exclusive_state() as connection:
+        assert connection.execute(
+            "SELECT state FROM protection_tokens WHERE token = ?",
+            (token,),
+        ).fetchone() == ("INSTALLED",)

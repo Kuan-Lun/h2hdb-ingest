@@ -11,9 +11,14 @@ __all__ = [
     "MAX_IMAGE_LONG_SIDE",
     "MAX_METADATA_BYTES",
     "MAX_PAGE_COUNT",
+    "MAX_PAGE_RENDER_WORKERS",
+    "MAX_SUPPORTED_JPEG_QUALITY",
+    "MIN_SUPPORTED_JPEG_QUALITY",
     "PAGE_JPEG_QUALITY",
     "THUMBNAIL_JPEG_QUALITY",
     "THUMBNAIL_MAX_SIDE",
+    "ArtifactImageResampler",
+    "ArtifactRenderPolicy",
     "CanonicalImageEvidence",
     "PreparedPageEvidence",
     "PreparedPresentationEvidence",
@@ -29,11 +34,16 @@ import struct
 import sys
 import warnings
 import zlib
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from contextlib import ExitStack
 from dataclasses import dataclass
+from enum import StrEnum
 from hashlib import sha256
 from io import BytesIO
 from itertools import pairwise
 from tempfile import SpooledTemporaryFile
+from threading import Lock
+from time import monotonic_ns
 from typing import BinaryIO, cast
 from zipfile import (
     ZIP_DEFLATED,
@@ -57,12 +67,19 @@ from h2hdb import (
 from PIL import Image, ImageFile, ImageOps, UnidentifiedImageError, features
 from PIL import __version__ as PILLOW_VERSION
 
+from .metrics import (
+    IngestMetric,
+    IngestMetricSink,
+    IngestMetricValue,
+    emit_ingest_metric,
+)
 from .storage import artifact_name
 
 ARTIFACT_ADAPTER_ID = b"managed-filesystem"
 ARTIFACT_WRITER_ID = b"h2hdb-ingest-presentation-v2"
 
 MAX_PAGE_COUNT = 4096
+MAX_PAGE_RENDER_WORKERS = 4
 MAX_ENCODED_PAGE_BYTES = 32 * 1024 * 1024
 # v2 forbids ZIP64. This deliberately matches the standard library's safe
 # non-ZIP64 ceiling and is checked before a completed archive is exposed.
@@ -73,6 +90,8 @@ MAX_METADATA_BYTES = 1024 * 1024
 PAGE_JPEG_QUALITY = 90
 THUMBNAIL_MAX_SIDE = 320
 THUMBNAIL_JPEG_QUALITY = 85
+MIN_SUPPORTED_JPEG_QUALITY = 0
+MAX_SUPPORTED_JPEG_QUALITY = 95
 PAGE_MEDIA_TYPE = "image/jpeg"
 THUMBNAIL_VARIANT = "thumbnail-320"
 ARCHIVE_MEDIA_TYPE = "application/vnd.comicbook+zip"
@@ -92,6 +111,7 @@ _CANONICAL_ZIP_DATE_TIME = (1980, 1, 1, 0, 0, 0)
 _CANONICAL_CREATE_SYSTEM = 3
 _CANONICAL_ZIP_VERSION = 20
 _CANONICAL_EXTERNAL_ATTR = 0o100644 << 16
+_IMAGE_HEADER_WARNING_LOCK = Lock()
 
 # Pillow normally warns at MAX_IMAGE_PIXELS and raises only above twice that
 # value. Rendering below turns the warning into a hard error and validates the
@@ -104,6 +124,57 @@ class PresentationImageError(ValueError):
     """Raised when a source cannot safely become a presentation-v2 image."""
 
 
+class ArtifactImageResampler(StrEnum):
+    """Closed set of Pillow resamplers accepted by the artifact policy."""
+
+    NEAREST = "nearest"
+    BOX = "box"
+    BILINEAR = "bilinear"
+    HAMMING = "hamming"
+    BICUBIC = "bicubic"
+    LANCZOS = "lanczos"
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactRenderPolicy:
+    """Validated byte-affecting image render policy."""
+
+    max_image_short_side: int = 768
+    page_jpeg_quality: int = PAGE_JPEG_QUALITY
+    thumbnail_jpeg_quality: int = THUMBNAIL_JPEG_QUALITY
+    optimize: bool = True
+    resampler: ArtifactImageResampler = ArtifactImageResampler.LANCZOS
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.max_image_short_side) is not int
+            or not 1 <= self.max_image_short_side <= MAX_IMAGE_LONG_SIDE
+        ):
+            raise ValueError("max_image_short_side is outside presentation policy")
+        _validate_jpeg_quality(self.page_jpeg_quality, label="page JPEG quality")
+        _validate_jpeg_quality(
+            self.thumbnail_jpeg_quality,
+            label="thumbnail JPEG quality",
+        )
+        if type(self.optimize) is not bool:
+            raise TypeError("artifact optimize must be bool")
+        if type(self.resampler) is not ArtifactImageResampler:
+            raise TypeError("artifact resampler must be ArtifactImageResampler")
+
+    @property
+    def pillow_resampler(self) -> Image.Resampling:
+        """Resolve the validated neutral name to Pillow's exact enum."""
+
+        return {
+            ArtifactImageResampler.NEAREST: Image.Resampling.NEAREST,
+            ArtifactImageResampler.BOX: Image.Resampling.BOX,
+            ArtifactImageResampler.BILINEAR: Image.Resampling.BILINEAR,
+            ArtifactImageResampler.HAMMING: Image.Resampling.HAMMING,
+            ArtifactImageResampler.BICUBIC: Image.Resampling.BICUBIC,
+            ArtifactImageResampler.LANCZOS: Image.Resampling.LANCZOS,
+        }[self.resampler]
+
+
 @dataclass(frozen=True, slots=True)
 class _RawCentralMember:
     name: bytes
@@ -112,6 +183,15 @@ class _RawCentralMember:
     compressed_size: int
     uncompressed_size: int
     local_offset: int
+
+
+@dataclass(slots=True)
+class _RenderedPageBuffer:
+    image: CanonicalImageEvidence
+    stream: BinaryIO
+
+    def close(self) -> None:
+        self.stream.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,13 +280,12 @@ class PreparedPresentationEvidence:
         return self.pages[0] if self.pages else None
 
 
-def artifact_policy_fingerprint_sha256(max_image_short_side: int) -> bytes:
+def artifact_policy_fingerprint_sha256(policy: ArtifactRenderPolicy) -> bytes:
     """Bind policy identity to every byte-affecting implementation fact."""
 
-    if type(max_image_short_side) is not int or not 1 <= max_image_short_side <= (
-        MAX_IMAGE_LONG_SIDE
-    ):
-        raise ValueError("max_image_short_side is outside presentation policy")
+    if not isinstance(policy, ArtifactRenderPolicy):
+        raise TypeError("artifact policy must be ArtifactRenderPolicy")
+    policy.__post_init__()
     cache_tag = sys.implementation.cache_tag or (
         f"cpython-{sys.version_info.major}.{sys.version_info.minor}"
     )
@@ -217,16 +296,28 @@ def artifact_policy_fingerprint_sha256(max_image_short_side: int) -> bytes:
         PILLOW_VERSION.encode("ascii", errors="strict"),
         jpeg.encode("ascii", errors="strict"),
         zlib.ZLIB_RUNTIME_VERSION.encode("ascii", errors="strict"),
-        str(max_image_short_side).encode("ascii"),
-        str(PAGE_JPEG_QUALITY).encode("ascii"),
-        str(THUMBNAIL_JPEG_QUALITY).encode("ascii"),
+        str(policy.max_image_short_side).encode("ascii"),
+        str(policy.page_jpeg_quality).encode("ascii"),
+        str(policy.thumbnail_jpeg_quality).encode("ascii"),
+        str(policy.optimize).encode("ascii"),
+        policy.resampler.value.encode("ascii"),
         str(THUMBNAIL_MAX_SIDE).encode("ascii"),
     )
-    framed = sha256(b"h2hdb-ingest-artifact-policy-v3\0")
+    framed = sha256(b"h2hdb-ingest-artifact-policy-v4\0")
     for value in fields:
         framed.update(len(value).to_bytes(4, "big"))
         framed.update(value)
     return framed.digest()
+
+
+def _validate_jpeg_quality(value: int, *, label: str) -> None:
+    if type(value) is not int:
+        raise TypeError(f"{label} must be int")
+    if not MIN_SUPPORTED_JPEG_QUALITY <= value <= MAX_SUPPORTED_JPEG_QUALITY:
+        raise ValueError(
+            f"{label} must be from {MIN_SUPPORTED_JPEG_QUALITY} through "
+            f"{MAX_SUPPORTED_JPEG_QUALITY}"
+        )
 
 
 def render_archive(
@@ -234,17 +325,20 @@ def render_archive(
     destination: BinaryIO,
     *,
     gid: int,
-    max_image_short_side: int,
+    policy: ArtifactRenderPolicy,
+    page_render_workers: int = 1,
+    metrics_sink: IngestMetricSink | None = None,
 ) -> ArtifactArchiveRenderEvidence:
     """Render one closed-world non-ZIP64 CBZ before exposing destination bytes."""
 
+    started_ns = monotonic_ns()
     download_name = artifact_name(gid)
     if type(members) is not tuple:
         raise TypeError("archive members must be an exact tuple")
-    if type(max_image_short_side) is not int or not 1 <= max_image_short_side <= (
-        MAX_IMAGE_LONG_SIDE
-    ):
-        raise ValueError("max_image_short_side is outside presentation policy")
+    if not isinstance(policy, ArtifactRenderPolicy):
+        raise TypeError("artifact policy must be ArtifactRenderPolicy")
+    policy.__post_init__()
+    workers = _validate_page_render_workers(page_render_workers)
     if not all(
         hasattr(destination, method) for method in ("seek", "truncate", "write")
     ):
@@ -289,63 +383,75 @@ def render_archive(
                     maximum_size=MAX_METADATA_BYTES,
                 )
                 member_names.append(_METADATA_MEMBER_NAME)
-                for member in pages:
-                    page_index = len(page_evidence)
-                    _verify_source_stream(
-                        member,
-                        maximum_size=MAX_ENCODED_PAGE_BYTES,
+                render_pages_started_ns = monotonic_ns()
+                executor = (
+                    ThreadPoolExecutor(
+                        max_workers=workers,
+                        thread_name_prefix="h2hdb-page-render",
                     )
-                    with SpooledTemporaryFile(
-                        max_size=4 * 1024 * 1024,
-                        mode="w+b",
-                    ) as rendered:
-                        image = _render_page(
-                            member.source,
-                            cast(BinaryIO, rendered),
-                            max_image_short_side=max_image_short_side,
+                    if workers > 1
+                    else None
+                )
+                try:
+                    for batch_start in range(0, len(pages), workers):
+                        batch = pages[batch_start : batch_start + workers]
+                        rendered_batch = _render_page_batch(
+                            batch,
+                            policy=policy,
+                            executor=executor,
                         )
-                        _verify_source_stream(
-                            member,
-                            maximum_size=MAX_ENCODED_PAGE_BYTES,
-                        )
-                        locator = canonical_page_member_name(page_index)
-                        _require_projected_archive_size(
-                            staged.tell(),
-                            member_names,
-                            locator,
-                            image.size_bytes,
-                        )
-                        info = _canonical_zip_info(
-                            locator,
-                            compression=ZIP_STORED,
-                            file_size=image.size_bytes,
-                        )
-                        rendered.seek(0)
-                        with archive.open(
-                            info,
-                            mode="w",
-                            force_zip64=False,
-                        ) as target:
-                            _copy_exact_bytes(
-                                cast(BinaryIO, rendered),
-                                cast(BinaryIO, target),
-                                size=image.size_bytes,
-                                label="rendered JPEG page",
-                            )
-                    member_names.append(locator)
-                    page_evidence.append(
-                        ArtifactRenderedPage(
-                            page_index=page_index,
-                            source_position=member.position,
-                            locator=locator,
-                        )
-                    )
+                        try:
+                            for offset, (member, rendered) in enumerate(
+                                zip(batch, rendered_batch, strict=True)
+                            ):
+                                page_index = batch_start + offset
+                                image = rendered.image
+                                locator = canonical_page_member_name(page_index)
+                                _require_projected_archive_size(
+                                    staged.tell(),
+                                    member_names,
+                                    locator,
+                                    image.size_bytes,
+                                )
+                                info = _canonical_zip_info(
+                                    locator,
+                                    compression=ZIP_STORED,
+                                    file_size=image.size_bytes,
+                                )
+                                rendered.stream.seek(0)
+                                with archive.open(
+                                    info,
+                                    mode="w",
+                                    force_zip64=False,
+                                ) as target:
+                                    _copy_exact_bytes(
+                                        rendered.stream,
+                                        cast(BinaryIO, target),
+                                        size=image.size_bytes,
+                                        label="rendered JPEG page",
+                                    )
+                                member_names.append(locator)
+                                page_evidence.append(
+                                    ArtifactRenderedPage(
+                                        page_index=page_index,
+                                        source_position=member.position,
+                                        locator=locator,
+                                    )
+                                )
+                        finally:
+                            for rendered in rendered_batch:
+                                rendered.close()
+                finally:
+                    if executor is not None:
+                        executor.shutdown(wait=True, cancel_futures=True)
+                render_pages_ns = monotonic_ns() - render_pages_started_ns
         except LargeZipFile as error:
             raise PresentationImageError("presentation-v2 forbids ZIP64") from error
 
         size_bytes = staged.tell()
         if not 1 <= size_bytes <= MAX_ARCHIVE_SIZE_BYTES:
             raise PresentationImageError("rendered archive exceeds the v2 size cap")
+        archive_inspect_started_ns = monotonic_ns()
         staged.seek(0)
         artifact_sha256 = _stream_digest(cast(BinaryIO, staged), size_bytes)
         staged.seek(0)
@@ -360,6 +466,8 @@ def render_archive(
             raise PresentationImageError(
                 "rendered archive inspection changed its byte authority"
             )
+        archive_inspect_ns = monotonic_ns() - archive_inspect_started_ns
+        archive_copy_started_ns = monotonic_ns()
         staged.seek(0)
         destination.seek(0)
         destination.truncate(0)
@@ -373,13 +481,107 @@ def render_archive(
         if callable(flush):
             flush()
         destination.seek(0)
-    return ArtifactArchiveRenderEvidence(
+        archive_copy_ns = monotonic_ns() - archive_copy_started_ns
+    evidence = ArtifactArchiveRenderEvidence(
         artifact_sha256=artifact_sha256,
         size_bytes=size_bytes,
         media_type=ARCHIVE_MEDIA_TYPE,
         download_name=download_name,
         pages=tuple(page_evidence),
     )
+    emit_ingest_metric(
+        metrics_sink,
+        IngestMetric(
+            scope="artifact",
+            operation="render_archive",
+            elapsed_ns=monotonic_ns() - started_ns,
+            phases_ns=(
+                IngestMetricValue("render_pages", render_pages_ns),
+                IngestMetricValue("archive_inspect", archive_inspect_ns),
+                IngestMetricValue("archive_copy", archive_copy_ns),
+            ),
+            counters=(
+                IngestMetricValue("source_members", len(members)),
+                IngestMetricValue(
+                    "source_bytes",
+                    sum(member.expected_size_bytes for member in members),
+                ),
+                IngestMetricValue("pages", len(page_evidence)),
+                IngestMetricValue("page_render_workers", workers),
+                IngestMetricValue("archive_bytes", size_bytes),
+            ),
+        ),
+    )
+    return evidence
+
+
+def _validate_page_render_workers(value: int) -> int:
+    if type(value) is not int:
+        raise TypeError("page_render_workers must be int")
+    if not 1 <= value <= MAX_PAGE_RENDER_WORKERS:
+        raise ValueError(
+            f"page_render_workers must be from 1 through {MAX_PAGE_RENDER_WORKERS}"
+        )
+    return value
+
+
+def _render_page_member(
+    member: ArtifactSourceMember,
+    *,
+    policy: ArtifactRenderPolicy,
+) -> _RenderedPageBuffer:
+    _verify_source_stream(member, maximum_size=MAX_ENCODED_PAGE_BYTES)
+    stream = cast(
+        BinaryIO,
+        SpooledTemporaryFile(max_size=4 * 1024 * 1024, mode="w+b"),
+    )
+    try:
+        image = _render_page(member.source, stream, policy=policy)
+        _verify_source_stream(member, maximum_size=MAX_ENCODED_PAGE_BYTES)
+        stream.seek(0)
+        return _RenderedPageBuffer(image=image, stream=stream)
+    except BaseException:
+        stream.close()
+        raise
+
+
+def _render_page_batch(
+    members: tuple[ArtifactSourceMember, ...],
+    *,
+    policy: ArtifactRenderPolicy,
+    executor: ThreadPoolExecutor | None,
+) -> tuple[_RenderedPageBuffer, ...]:
+    if executor is None:
+        rendered_members: list[_RenderedPageBuffer] = []
+        try:
+            for member in members:
+                rendered_members.append(_render_page_member(member, policy=policy))
+        except BaseException:
+            for rendered in rendered_members:
+                rendered.close()
+            raise
+        return tuple(rendered_members)
+
+    futures: tuple[Future[_RenderedPageBuffer], ...] = tuple(
+        executor.submit(_render_page_member, member, policy=policy)
+        for member in members
+    )
+    try:
+        return tuple(future.result() for future in futures)
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        wait(futures)
+        closed: set[int] = set()
+        for future in futures:
+            if future.cancelled() or future.exception() is not None:
+                continue
+            rendered = future.result()
+            identity = id(rendered)
+            if identity not in closed:
+                rendered.close()
+                closed.add(identity)
+        raise
 
 
 def _preflight_archive_members(
@@ -664,6 +866,8 @@ def render_presentation(
     thumbnail_destination: BinaryIO,
     *,
     rendered_pages: tuple[ArtifactRenderedPage, ...],
+    policy: ArtifactRenderPolicy,
+    metrics_sink: IngestMetricSink | None = None,
 ) -> ArtifactPresentationRenderEvidence:
     """Derive neutral page facts and write one standalone thumbnail.
 
@@ -672,8 +876,12 @@ def render_presentation(
     complete thumbnail before it persists or protects either resource.
     """
 
+    started_ns = monotonic_ns()
     if type(rendered_pages) is not tuple:
         raise TypeError("rendered_pages must be an exact tuple")
+    if not isinstance(policy, ArtifactRenderPolicy):
+        raise TypeError("artifact policy must be ArtifactRenderPolicy")
+    policy.__post_init__()
     if not hasattr(thumbnail_destination, "write"):
         raise TypeError("thumbnail_destination must be writable")
     for page_index, page in enumerate(rendered_pages):
@@ -692,10 +900,13 @@ def render_presentation(
             "rendered page source positions must be strictly increasing"
         )
 
+    archive_inspect_started_ns = monotonic_ns()
     inspected = inspect_presentation_archive(
         archive,
         tuple(page.locator for page in rendered_pages),
     )
+    archive_inspect_ns = monotonic_ns() - archive_inspect_started_ns
+    presentation_started_ns = monotonic_ns()
     pages = tuple(
         ArtifactPagePresentationEvidence(
             page_index=page.page_index,
@@ -708,12 +919,16 @@ def render_presentation(
         )
         for page in inspected.pages
     )
+    presentation_ns = monotonic_ns() - presentation_started_ns
     thumbnail: ArtifactThumbnailPresentationEvidence | None = None
+    thumbnail_ns = 0
     if inspected.cover is not None:
+        thumbnail_started_ns = monotonic_ns()
         image = _render_thumbnail(
             archive,
             inspected.cover,
             thumbnail_destination,
+            policy=policy,
         )
         thumbnail = ArtifactThumbnailPresentationEvidence(
             size_bytes=image.size_bytes,
@@ -722,8 +937,31 @@ def render_presentation(
             width=image.width,
             height=image.height,
         )
+        thumbnail_ns = monotonic_ns() - thumbnail_started_ns
     archive.seek(0)
-    return ArtifactPresentationRenderEvidence(pages=pages, thumbnail=thumbnail)
+    evidence = ArtifactPresentationRenderEvidence(pages=pages, thumbnail=thumbnail)
+    emit_ingest_metric(
+        metrics_sink,
+        IngestMetric(
+            scope="artifact",
+            operation="render_presentation",
+            elapsed_ns=monotonic_ns() - started_ns,
+            phases_ns=(
+                IngestMetricValue("archive_inspect", archive_inspect_ns),
+                IngestMetricValue("presentation", presentation_ns),
+                IngestMetricValue("thumbnail", thumbnail_ns),
+            ),
+            counters=(
+                IngestMetricValue("pages", len(pages)),
+                IngestMetricValue("archive_bytes", inspected.archive_size_bytes),
+                IngestMetricValue(
+                    "thumbnail_bytes",
+                    0 if thumbnail is None else thumbnail.size_bytes,
+                ),
+            ),
+        ),
+    )
+    return evidence
 
 
 def canonical_page_member_name(page_index: int) -> str:
@@ -1055,24 +1293,22 @@ def _render_page(
     source: BinaryIO,
     destination: BinaryIO,
     *,
-    max_image_short_side: int,
+    policy: ArtifactRenderPolicy,
 ) -> CanonicalImageEvidence:
-    if type(max_image_short_side) is not int or max_image_short_side < 1:
-        raise ValueError("max_image_short_side must be positive")
-    if max_image_short_side > MAX_IMAGE_LONG_SIDE:
-        raise ValueError("max_image_short_side exceeds max_image_long_side")
+    policy.__post_init__()
     image = _load_safe_image(source)
     try:
         if image.height >= image.width:
-            bounds = (max_image_short_side, MAX_IMAGE_LONG_SIDE)
+            bounds = (policy.max_image_short_side, MAX_IMAGE_LONG_SIDE)
         else:
-            bounds = (MAX_IMAGE_LONG_SIDE, max_image_short_side)
-        image.thumbnail(bounds, Image.Resampling.LANCZOS)
+            bounds = (MAX_IMAGE_LONG_SIDE, policy.max_image_short_side)
+        image.thumbnail(bounds, policy.pillow_resampler)
         image = _rgb_on_white(image)
         return _encode_jpeg(
             image,
             destination,
-            quality=PAGE_JPEG_QUALITY,
+            quality=policy.page_jpeg_quality,
+            optimize=policy.optimize,
             max_long_side=MAX_IMAGE_LONG_SIDE,
         )
     finally:
@@ -1081,20 +1317,26 @@ def _render_page(
 
 def _load_safe_image(source: BinaryIO) -> Image.Image:
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(source) as opened:
-                opened.seek(0)
-                _validate_dimensions(
-                    opened.width,
-                    opened.height,
-                    max_long_side=MAX_IMAGE_LONG_SIDE,
-                )
-                opened.load()
-                transposed = ImageOps.exif_transpose(opened)
-                image = transposed.copy()
-                if transposed is not opened:
-                    transposed.close()
+        with ExitStack() as opened_context:
+            # CPython's process-global warnings filter is not concurrency-safe
+            # when context_aware_warnings is disabled.  Only the lazy header
+            # open and initial size check need the Pillow warning conversion;
+            # decoding and image conversion remain outside this short lock.
+            with _IMAGE_HEADER_WARNING_LOCK:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", Image.DecompressionBombWarning)
+                    opened = opened_context.enter_context(Image.open(source))
+                    opened.seek(0)
+                    _validate_dimensions(
+                        opened.width,
+                        opened.height,
+                        max_long_side=MAX_IMAGE_LONG_SIDE,
+                    )
+            opened.load()
+            transposed = ImageOps.exif_transpose(opened)
+            image = transposed.copy()
+            if transposed is not opened:
+                transposed.close()
     except (Image.DecompressionBombError, Image.DecompressionBombWarning) as error:
         raise PresentationImageError(
             "image exceeds the decoded pixel policy"
@@ -1126,15 +1368,19 @@ def _encode_jpeg(
     destination: BinaryIO,
     *,
     quality: int,
+    optimize: bool,
     max_long_side: int,
 ) -> CanonicalImageEvidence:
+    _validate_jpeg_quality(quality, label="JPEG quality")
+    if type(optimize) is not bool:
+        raise TypeError("JPEG optimize must be bool")
     _validate_dimensions(image.width, image.height, max_long_side=max_long_side)
     with SpooledTemporaryFile(max_size=4 * 1024 * 1024, mode="w+b") as encoded:
         image.save(
             encoded,
             format="JPEG",
             quality=quality,
-            optimize=True,
+            optimize=optimize,
             progressive=False,
         )
         size = encoded.tell()
@@ -1293,6 +1539,8 @@ def _render_thumbnail(
     archive: BinaryIO,
     cover: PreparedPageEvidence,
     destination: BinaryIO,
+    *,
+    policy: ArtifactRenderPolicy,
 ) -> CanonicalImageEvidence:
     content = _read_extent(
         archive,
@@ -1303,13 +1551,14 @@ def _render_thumbnail(
     try:
         image.thumbnail(
             (THUMBNAIL_MAX_SIDE, THUMBNAIL_MAX_SIDE),
-            Image.Resampling.LANCZOS,
+            policy.pillow_resampler,
         )
         image = _rgb_on_white(image)
         evidence = _encode_jpeg(
             image,
             destination,
-            quality=THUMBNAIL_JPEG_QUALITY,
+            quality=policy.thumbnail_jpeg_quality,
+            optimize=policy.optimize,
             max_long_side=THUMBNAIL_MAX_SIDE,
         )
     finally:

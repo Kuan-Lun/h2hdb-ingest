@@ -25,6 +25,7 @@ from h2hdb import (
 
 import h2hdb_ingest.service as service_module
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, build_ingest_policy
+from h2hdb_ingest.metrics import IngestMetric
 from h2hdb_ingest.service import (
     VNextIngestService,
     _IngestStopRequested,
@@ -471,6 +472,15 @@ class _PreparedPublication:
         self._events.append(("publication-close", self.step))
 
 
+class _IssuedPublication:
+    def __init__(self, step: int) -> None:
+        self.step = step
+
+    @property
+    def operation(self) -> str:
+        return "PREPARE_ARTIFACT" if self.step == 0 else "FINALIZE"
+
+
 class _PublicationFacade:
     def __init__(self, events: list[object]) -> None:
         self._events = events
@@ -480,15 +490,15 @@ class _PublicationFacade:
         self,
         session: VNextIngestSession,
         policy: object,
-    ) -> tuple[str, int]:
+    ) -> _IssuedPublication:
         self._events.append(
             ("publication-issue", self._step, session.ingest_lease_expires_at, policy)
         )
-        return ("issued", self._step)
+        return _IssuedPublication(self._step)
 
     def prepare_publication_step(
         self,
-        issued: tuple[str, int],
+        issued: _IssuedPublication,
         *,
         artifact_adapters: Mapping[bytes, ArtifactStorageAdapter],
         finalization_adapters: Mapping[bytes, ArtifactReleaseAdapter],
@@ -497,13 +507,13 @@ class _PublicationFacade:
         self._events.append(
             (
                 "publication-prepare",
-                issued[1],
+                issued.step,
                 artifact_adapters,
                 finalization_adapters,
                 library_activation,
             )
         )
-        return _PreparedPublication(self._events, issued[1])
+        return _PreparedPublication(self._events, issued.step)
 
     def commit_publication_step(
         self,
@@ -561,6 +571,50 @@ def test_publication_orchestration_closes_each_prepared_step() -> None:
         "publication-commit",
         "publication-close",
     ]
+
+
+def test_publication_metrics_aggregate_each_issued_operation_and_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = iter(range(0, 1000, 10))
+    monkeypatch.setattr(service_module, "monotonic_ns", lambda: next(ticks))
+    events: list[object] = []
+    metrics: list[IngestMetric] = []
+    facade = _PublicationFacade(events)
+    controller = IngestSessionController(
+        cast(VNextIngestFacade, facade),
+        _session(),
+        lease_duration_microseconds=10_000_000,
+        database_type="sqlite",
+    )
+
+    synchronize_publication(
+        controller,
+        cast(VNextResolvedIngestPolicy, object()),
+        artifact_adapters={},
+        finalization_adapters={},
+        library_activation=_LibraryActivation(),
+        metrics_sink=metrics.append,
+    )
+
+    assert len(metrics) == 1
+    metric = metrics[0]
+    assert metric.scope == "publication"
+    assert metric.operation == "synchronize"
+    assert metric.elapsed_ns == 170
+    assert [operation.operation for operation in metric.operations] == [
+        "PREPARE_ARTIFACT",
+        "FINALIZE",
+    ]
+    assert all(
+        [value.value for value in operation.phases_ns] == [10, 10, 10, 10]
+        for operation in metric.operations
+    )
+    assert [value.value for value in metric.counters] == [2, 2, 0]
+    assert all(
+        [value.value for value in operation.counters] == [1, 1, 0]
+        for operation in metric.operations
+    )
 
 
 def test_publication_stop_is_observed_after_one_committed_bounded_step() -> None:

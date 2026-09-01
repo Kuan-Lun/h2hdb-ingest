@@ -21,7 +21,7 @@ from hashlib import sha256
 from io import BytesIO
 from itertools import pairwise
 from pathlib import Path
-from threading import RLock
+from threading import RLock, get_ident
 from typing import BinaryIO, cast
 
 from h2hdb import (
@@ -48,11 +48,14 @@ from ._library_layout import STATE_DIRECTORY_NAME as _STATE_DIRECTORY_NAME
 from ._library_layout import validate_precreated_library_layout
 from .artifact import (
     ARTIFACT_ADAPTER_ID,
+    MAX_PAGE_RENDER_WORKERS,
+    ArtifactRenderPolicy,
     artifact_policy_fingerprint_sha256,
     render_archive,
     render_presentation,
 )
 from .maintenance import LibraryMaintenanceOutcome
+from .metrics import IngestMetricSink
 from .storage import (
     STORAGE_OBJECT_CODEC,
     storage_key_gid,
@@ -70,6 +73,7 @@ _LOCKS_DIRECTORY_NAME = "locks"
 _DATABASE_NAME = "library-activation.sqlite3"
 _STATE_LOCK_NAME = "state.lock"
 _PUBLICATION_LOCK_NAME = "publication.lock"
+_PROTECTION_LOCK_PREFIX = "protection-"
 _ACTIVATING_MARKER_NAME = "ACTIVATING"
 _MARKER_FORMAT = "h2hdb-library-activation-v2"
 _MAX_PAGE_ITEMS = 128
@@ -147,6 +151,23 @@ class _StagedAuthority:
     signature: _Signature
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingInstall:
+    revision: int
+    receipt: bytes
+    publication_key: bytes
+    resource_kind: str
+    key: StorageObjectKey
+    digest: bytes
+    size_bytes: int
+    modified_text: str
+    fresh_authorization: bool
+    staged: _StagedAuthority | None
+    current_digest: bytes | None
+    current_size: int | None
+    current_signature: _Signature | None
+
+
 class ManagedFilesystemLibraryAdapter:
     """Render, stage, activate, and release presentation-v2 resources.
 
@@ -163,12 +184,23 @@ class ManagedFilesystemLibraryAdapter:
         library_path: Path,
         *,
         source_root: Path,
-        max_image_short_side: int,
+        render_policy: ArtifactRenderPolicy,
+        page_render_workers: int = 1,
+        metrics_sink: IngestMetricSink | None = None,
     ) -> None:
         if not isinstance(library_path, Path):
             raise TypeError("library_path must be Path")
-        if type(max_image_short_side) is not int or max_image_short_side < 1:
-            raise ValueError("max_image_short_side must be positive")
+        if not isinstance(render_policy, ArtifactRenderPolicy):
+            raise TypeError("render_policy must be ArtifactRenderPolicy")
+        render_policy.__post_init__()
+        if type(page_render_workers) is not int:
+            raise TypeError("page_render_workers must be int")
+        if not 1 <= page_render_workers <= MAX_PAGE_RENDER_WORKERS:
+            raise ValueError(
+                f"page_render_workers must be from 1 through {MAX_PAGE_RENDER_WORKERS}"
+            )
+        if metrics_sink is not None and not callable(metrics_sink):
+            raise TypeError("metrics_sink must be callable")
         if not isinstance(source_root, Path):
             raise TypeError("source_root must be Path")
         try:
@@ -195,12 +227,15 @@ class ManagedFilesystemLibraryAdapter:
         self._state_lock_path = self._locks / _STATE_LOCK_NAME
         self._publication_lock_path = self._coordination / _PUBLICATION_LOCK_NAME
         self._marker_path = self._coordination / _ACTIVATING_MARKER_NAME
-        self._max_image_short_side = max_image_short_side
+        self._render_policy = render_policy
+        self._page_render_workers = page_render_workers
+        self._metrics_sink = metrics_sink
         self.policy_fingerprint_sha256 = artifact_policy_fingerprint_sha256(
-            max_image_short_side
+            render_policy
         )
         self._process_lock = RLock()
-        self._guard_depth = 0
+        self._state_process_lock = RLock()
+        self._guard_owner: int | None = None
         self._publication_descriptor: int | None = None
 
     @property
@@ -234,16 +269,20 @@ class ManagedFilesystemLibraryAdapter:
     def publication_guard(self) -> Iterator[None]:
         """Keep one local publication turn and its activation lifecycle paired."""
 
+        owner = get_ident()
         with self._process_lock:
-            if self._guard_depth != 0:
+            if self._guard_owner is not None:
                 raise RuntimeError("library publication guard is not reentrant")
-            self._guard_depth = 1
-            try:
-                self._ensure_layout()
-                yield
-            finally:
+            self._guard_owner = owner
+        try:
+            self._ensure_layout()
+            yield
+        finally:
+            with self._process_lock:
+                if self._guard_owner != owner:
+                    raise RuntimeError("library publication guard owner changed")
                 self._release_publication_lock()
-                self._guard_depth = 0
+                self._guard_owner = None
 
     def open_source(
         self,
@@ -355,7 +394,9 @@ class ManagedFilesystemLibraryAdapter:
             members,
             destination,
             gid=gid,
-            max_image_short_side=self._max_image_short_side,
+            policy=self._render_policy,
+            page_render_workers=self._page_render_workers,
+            metrics_sink=self._metrics_sink,
         )
 
     def protect(
@@ -368,6 +409,29 @@ class ManagedFilesystemLibraryAdapter:
         protection_token: bytes,
     ) -> ArtifactStorageEvidence:
         """Durably stage one exact immutable acquisition or thumbnail object."""
+
+        self._ensure_layout()
+        with self._publication_io_guard(exclusive=False):
+            with self._protection_io_guard(_token(protection_token)):
+                return self._protect(
+                    content,
+                    storage_key,
+                    expected_sha256,
+                    expected_size_bytes,
+                    modified_at,
+                    protection_token,
+                )
+
+    def _protect(
+        self,
+        content: BinaryIO,
+        storage_key: StorageObjectKey,
+        expected_sha256: bytes,
+        expected_size_bytes: int,
+        modified_at: datetime,
+        protection_token: bytes,
+    ) -> ArtifactStorageEvidence:
+        """Run one protected staging attempt below the shared publication gate."""
 
         key = _storage_key(storage_key)
         digest = _digest(expected_sha256)
@@ -384,7 +448,14 @@ class ManagedFilesystemLibraryAdapter:
         token_name = sha256(token).hexdigest()
         stage_leaf = f"{token_name}{_storage_suffix(key)}"
         temporary_leaf = f".{token_name}.tmp"
-        self._ensure_layout()
+        expected_facts = (
+            key.codec,
+            _key_text(key),
+            digest,
+            size_bytes,
+            modified_text,
+        )
+        installed_signature: _Signature | None = None
         with self._exclusive_state() as connection:
             existing = connection.execute(
                 "SELECT storage_codec, storage_path, object_sha256, size_bytes, "
@@ -393,13 +464,6 @@ class ManagedFilesystemLibraryAdapter:
                 "FROM protection_tokens WHERE token = ?",
                 (token,),
             ).fetchone()
-            expected_facts = (
-                key.codec,
-                _key_text(key),
-                digest,
-                size_bytes,
-                modified_text,
-            )
             if existing is not None:
                 if tuple(existing[:4]) != expected_facts[:4]:
                     raise RuntimeError(
@@ -416,34 +480,42 @@ class ManagedFilesystemLibraryAdapter:
                     raise RuntimeError(
                         "resource protection token was reused with another modified_at"
                     )
-                if state == "INSTALLED":
-                    self._verify_current(
-                        key,
-                        expected_sha256=digest,
-                        expected_size=size_bytes,
-                        label="installed library resource",
-                    )
-                    return ArtifactStorageEvidence(True, storage_object)
                 if state == "STAGED":
                     if existing[6] != stage_leaf:
                         raise RuntimeError(
                             "staged resource journal leaf disagrees with its token"
                         )
-                    self._verify_stage_row(
-                        existing[6:],
-                        token=token,
-                        key=key,
-                        digest=digest,
-                        size=size_bytes,
-                    )
-                    return ArtifactStorageEvidence(True, storage_object)
-                if state != "WRITING":
+                elif state not in {"WRITING", "INSTALLED"}:
                     raise RuntimeError("resource protection journal state is corrupt")
-                if existing[6] != stage_leaf or any(
-                    value is not None for value in existing[7:]
+                if state == "WRITING" and (
+                    existing[6] != stage_leaf
+                    or any(value is not None for value in existing[7:])
                 ):
                     raise RuntimeError(
                         "writing resource journal authority is inconsistent"
+                    )
+                if state == "INSTALLED" and (
+                    existing[6] is not None
+                    or any(value is not None for value in existing[7:])
+                ):
+                    raise RuntimeError(
+                        "installed resource journal authority is inconsistent"
+                    )
+                if state == "INSTALLED":
+                    installed = connection.execute(
+                        "SELECT device, inode, modified_ns, changed_ns "
+                        "FROM current_entries WHERE storage_codec = ? "
+                        "AND storage_path = ? AND object_sha256 = ? "
+                        "AND size_bytes = ? AND published_modified_at = ?",
+                        expected_facts,
+                    ).fetchone()
+                    if installed is None:
+                        raise RuntimeError(
+                            "installed resource lacks current journal authority"
+                        )
+                    installed_signature = _storage_signature(
+                        installed,
+                        size=size_bytes,
                     )
             else:
                 connection.execute("BEGIN IMMEDIATE")
@@ -460,8 +532,29 @@ class ManagedFilesystemLibraryAdapter:
                     connection.rollback()
                     raise
 
-            final_path = self._staging / stage_leaf
-            temporary_path = self._staging / temporary_leaf
+        if existing is not None and state == "INSTALLED":
+            if installed_signature is None:
+                raise RuntimeError("installed resource authority is incomplete")
+            self._require_current_authority(
+                key,
+                expected_size=size_bytes,
+                expected_signature=installed_signature,
+                label="installed library resource",
+            )
+            return ArtifactStorageEvidence(True, storage_object)
+        if existing is not None and state == "STAGED":
+            self._verify_stage_row(
+                existing[6:],
+                token=token,
+                key=key,
+                digest=digest,
+                size=size_bytes,
+            )
+            return ArtifactStorageEvidence(True, storage_object)
+
+        final_path = self._staging / stage_leaf
+        temporary_path = self._staging / temporary_leaf
+        try:
             if final_path.exists() or final_path.is_symlink():
                 if temporary_path.exists() or temporary_path.is_symlink():
                     with _open_directory(self._staging) as descriptor:
@@ -492,28 +585,169 @@ class ManagedFilesystemLibraryAdapter:
                     expected_sha256=digest,
                     expected_size=size_bytes,
                 )
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                affected = connection.execute(
-                    "UPDATE protection_tokens SET state = 'STAGED', "
-                    "device = ?, inode = ?, modified_ns = ?, changed_ns = ? "
-                    "WHERE token = ? AND state = 'WRITING'",
-                    (
-                        signature.device,
-                        signature.inode,
-                        signature.modified_ns,
-                        signature.changed_ns,
-                        token,
-                    ),
-                ).rowcount
-                if affected != 1:
+        except BaseException:
+            replay = self._protection_replay_result(
+                token=token,
+                key=key,
+                digest=digest,
+                size=size_bytes,
+                modified_text=modified_text,
+                stage_leaf=stage_leaf,
+                storage_object=storage_object,
+            )
+            if replay is not None:
+                content.seek(0)
+                return replay
+            raise
+
+        released = False
+        terminal_signature = signature
+        with self._exclusive_state() as connection:
+            current = connection.execute(
+                "SELECT storage_codec, storage_path, object_sha256, size_bytes, "
+                "published_modified_at, state, staging_leaf, device, inode, "
+                "modified_ns, changed_ns FROM protection_tokens WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if current is None or tuple(current[:5]) != expected_facts:
+                raise RuntimeError("resource protection journal changed")
+            state = str(current[5])
+            if state == "RELEASED":
+                released = True
+            elif state == "STAGED":
+                if current[6] != stage_leaf:
+                    raise RuntimeError(
+                        "staged resource journal leaf disagrees with its token"
+                    )
+                journal_signature = _storage_signature(current[7:], size=size_bytes)
+                if not _same_content_identity(journal_signature, signature):
                     raise RuntimeError("resource protection journal changed")
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
+                terminal_signature = journal_signature
+            elif (
+                state != "WRITING"
+                or current[6] != stage_leaf
+                or any(value is not None for value in current[7:])
+            ):
+                raise RuntimeError("resource protection journal changed")
+            else:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    affected = connection.execute(
+                        "UPDATE protection_tokens SET state = 'STAGED', "
+                        "device = ?, inode = ?, modified_ns = ?, changed_ns = ? "
+                        "WHERE token = ? AND state = 'WRITING' "
+                        "AND storage_codec = ? AND storage_path = ? "
+                        "AND object_sha256 = ? AND size_bytes = ? "
+                        "AND published_modified_at = ? AND staging_leaf = ? "
+                        "AND device IS NULL AND inode IS NULL "
+                        "AND modified_ns IS NULL AND changed_ns IS NULL",
+                        (
+                            signature.device,
+                            signature.inode,
+                            signature.modified_ns,
+                            signature.changed_ns,
+                            token,
+                            *expected_facts,
+                            stage_leaf,
+                        ),
+                    ).rowcount
+                    if affected != 1:
+                        raise RuntimeError("resource protection journal changed")
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+
+        if released:
+            self._discard_uncommitted_stage(
+                token=token,
+                key=key,
+                digest=digest,
+                size=size_bytes,
+                stage_leaf=stage_leaf,
+                signature=terminal_signature,
+            )
+            content.seek(0)
+            return ArtifactStorageEvidence(False)
         content.seek(0)
         return ArtifactStorageEvidence(True, storage_object)
+
+    def _protection_replay_result(
+        self,
+        *,
+        token: bytes,
+        key: StorageObjectKey,
+        digest: bytes,
+        size: int,
+        modified_text: str,
+        stage_leaf: str,
+        storage_object: StorageObjectDescriptor,
+    ) -> ArtifactStorageEvidence | None:
+        """Resolve a concurrent or response-lost terminal state after local I/O."""
+
+        with self._exclusive_state() as connection:
+            row = connection.execute(
+                "SELECT storage_codec, storage_path, object_sha256, size_bytes, "
+                "published_modified_at, state, staging_leaf, device, inode, "
+                "modified_ns, changed_ns FROM protection_tokens WHERE token = ?",
+                (token,),
+            ).fetchone()
+        expected = (key.codec, _key_text(key), digest, size, modified_text)
+        if row is None or tuple(row[:5]) != expected:
+            return None
+        state = str(row[5])
+        if state == "RELEASED":
+            return ArtifactStorageEvidence(False)
+        if state == "INSTALLED":
+            self._verify_current(
+                key,
+                expected_sha256=digest,
+                expected_size=size,
+                label="installed library resource",
+            )
+            return ArtifactStorageEvidence(True, storage_object)
+        if state != "STAGED" or row[6] != stage_leaf:
+            return None
+        self._verify_stage_row(
+            row[6:],
+            token=token,
+            key=key,
+            digest=digest,
+            size=size,
+        )
+        return ArtifactStorageEvidence(True, storage_object)
+
+    def _discard_uncommitted_stage(
+        self,
+        *,
+        token: bytes,
+        key: StorageObjectKey,
+        digest: bytes,
+        size: int,
+        stage_leaf: str,
+        signature: _Signature,
+    ) -> None:
+        """Remove only bytes this stale writer proved before observing RELEASED."""
+
+        self._remove_stage_from_row(
+            (
+                stage_leaf,
+                signature.device,
+                signature.inode,
+                signature.modified_ns,
+                signature.changed_ns,
+            ),
+            token=token,
+            key=key,
+            digest=digest,
+            size=size,
+        )
+        self._remove_stage_temporary(
+            token,
+            digest=digest,
+            size=size,
+            allow_partial=True,
+        )
 
     def render_presentation(
         self,
@@ -528,6 +762,8 @@ class ManagedFilesystemLibraryAdapter:
             archive,
             thumbnail_destination,
             rendered_pages=rendered_pages,
+            policy=self._render_policy,
+            metrics_sink=self._metrics_sink,
         )
 
     def release(
@@ -539,38 +775,75 @@ class ManagedFilesystemLibraryAdapter:
     ) -> ArtifactReleaseStorageEvidence:
         """Persist a terminal tombstone and remove only exact private staging."""
 
+        self._ensure_layout()
+        with self._publication_io_guard(exclusive=True):
+            return self._release(
+                storage_key,
+                expected_sha256,
+                expected_size_bytes,
+                protection_token,
+            )
+
+    def _release(
+        self,
+        storage_key: StorageObjectKey,
+        expected_sha256: bytes,
+        expected_size_bytes: int,
+        protection_token: bytes,
+    ) -> ArtifactReleaseStorageEvidence:
+        """Run one terminal cleanup below the exclusive publication gate."""
+
         key = _storage_key(storage_key)
         digest = _digest(expected_sha256)
         size_bytes = _size(expected_size_bytes)
         token = _token(protection_token)
-        self._ensure_layout()
+        facts = (key.codec, _key_text(key), digest, size_bytes)
         with self._exclusive_state() as connection:
+            journal = _journal_state(connection)
             row = connection.execute(
                 "SELECT storage_codec, storage_path, object_sha256, size_bytes, "
                 "state, staging_leaf, device, inode, modified_ns, changed_ns "
                 "FROM protection_tokens WHERE token = ?",
                 (token,),
             ).fetchone()
-            facts = (key.codec, _key_text(key), digest, size_bytes)
-            if row is None:
-                with _open_directory(self._staging) as descriptor:
-                    unexpected_stage = _lstat_at(
-                        descriptor,
-                        _stage_leaf(token, key),
-                    )
-                if unexpected_stage is not None:
-                    raise RuntimeError(
-                        "unowned staged resource exists without journal authority"
-                    )
-                unexpected_temporary = self._verify_stage_temporary(
-                    token,
-                    digest=digest,
-                    size=size_bytes,
+            if row is not None and tuple(row[:4]) != facts:
+                raise RuntimeError(
+                    "artifact release token refers to another exact artifact"
                 )
-                if unexpected_temporary is not None:
+            if journal.pending_revision is not None and row is not None:
+                referenced = connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM pending_entries "
+                    "WHERE activation_revision = ? AND storage_codec = ? "
+                    "AND storage_path = ? AND object_sha256 = ? "
+                    "AND size_bytes = ? AND activated = 0)",
+                    (journal.pending_revision, *facts),
+                ).fetchone()
+                if referenced not in {(0,), (1,)}:
+                    raise RuntimeError("library activation reference is corrupt")
+                if referenced == (1,):
                     raise RuntimeError(
-                        "unowned staging temporary exists without journal authority"
+                        "artifact release is blocked by unfinished library activation"
                     )
+        if row is None:
+            with _open_directory(self._staging) as descriptor:
+                unexpected_stage = _lstat_at(
+                    descriptor,
+                    _stage_leaf(token, key),
+                )
+            if unexpected_stage is not None:
+                raise RuntimeError(
+                    "unowned staged resource exists without journal authority"
+                )
+            unexpected_temporary = self._verify_stage_temporary(
+                token,
+                digest=digest,
+                size=size_bytes,
+            )
+            if unexpected_temporary is not None:
+                raise RuntimeError(
+                    "unowned staging temporary exists without journal authority"
+                )
+            with self._exclusive_state() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 try:
                     connection.execute(
@@ -584,7 +857,18 @@ class ManagedFilesystemLibraryAdapter:
                 except BaseException:
                     connection.rollback()
                     raise
-                return ArtifactReleaseStorageEvidence(True)
+            return ArtifactReleaseStorageEvidence(True)
+
+        with self._exclusive_state() as connection:
+            current = connection.execute(
+                "SELECT storage_codec, storage_path, object_sha256, size_bytes, "
+                "state, staging_leaf, device, inode, modified_ns, changed_ns "
+                "FROM protection_tokens WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if current is None:
+                raise RuntimeError("artifact release journal disappeared")
+            row = current
             if tuple(row[:4]) != facts:
                 raise RuntimeError(
                     "artifact release token refers to another exact artifact"
@@ -599,70 +883,66 @@ class ManagedFilesystemLibraryAdapter:
                 raise RuntimeError("artifact release journal state is corrupt")
             if (state == "WRITING") != partial_authorized and state != "RELEASED":
                 raise RuntimeError("artifact release journal state is inconsistent")
-            if state == "RELEASED":
-                self._heal_released_stage_duplicate(
-                    row[5:],
-                    token=token,
-                    key=key,
-                    digest=digest,
-                    size=size_bytes,
-                )
-                self._remove_stage_from_row(
-                    row[5:],
-                    token=token,
-                    key=key,
-                    digest=digest,
-                    size=size_bytes,
-                )
-                self._remove_stage_temporary(
-                    token,
-                    digest=digest,
-                    size=size_bytes,
-                    allow_partial=partial_authorized,
-                )
-                return ArtifactReleaseStorageEvidence(True)
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                connection.execute(
-                    "UPDATE protection_tokens SET state = 'RELEASED' WHERE token = ?",
-                    (token,),
-                )
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
-            self._heal_released_stage_duplicate(
-                row[5:],
-                token=token,
-                key=key,
-                digest=digest,
-                size=size_bytes,
-            )
-            self._remove_stage_from_row(
-                row[5:],
-                token=token,
-                key=key,
-                digest=digest,
-                size=size_bytes,
-            )
-            self._remove_stage_temporary(
-                token,
-                digest=digest,
-                size=size_bytes,
-                allow_partial=partial_authorized,
-            )
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                connection.execute(
-                    "UPDATE protection_tokens SET staging_leaf = NULL, "
-                    "device = NULL, inode = NULL, modified_ns = NULL, "
-                    "changed_ns = NULL WHERE token = ? AND state = 'RELEASED'",
-                    (token,),
-                )
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
+            newly_released = state != "RELEASED"
+            if newly_released:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    affected = connection.execute(
+                        "UPDATE protection_tokens SET state = 'RELEASED' "
+                        "WHERE token = ? AND storage_codec = ? "
+                        "AND storage_path = ? AND object_sha256 = ? "
+                        "AND size_bytes = ? AND state = ? "
+                        "AND staging_leaf IS ? AND device IS ? AND inode IS ? "
+                        "AND modified_ns IS ? AND changed_ns IS ?",
+                        (token, *facts, state, *row[5:]),
+                    ).rowcount
+                    if affected != 1:
+                        raise RuntimeError("artifact release authorization changed")
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+
+        self._heal_released_stage_duplicate(
+            row[5:],
+            token=token,
+            key=key,
+            digest=digest,
+            size=size_bytes,
+        )
+        self._remove_stage_from_row(
+            row[5:],
+            token=token,
+            key=key,
+            digest=digest,
+            size=size_bytes,
+        )
+        self._remove_stage_temporary(
+            token,
+            digest=digest,
+            size=size_bytes,
+            allow_partial=partial_authorized,
+        )
+        if newly_released and row[5] is not None:
+            with self._exclusive_state() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    affected = connection.execute(
+                        "UPDATE protection_tokens SET staging_leaf = NULL, "
+                        "device = NULL, inode = NULL, modified_ns = NULL, "
+                        "changed_ns = NULL WHERE token = ? AND state = 'RELEASED' "
+                        "AND storage_codec = ? AND storage_path = ? "
+                        "AND object_sha256 = ? AND size_bytes = ? "
+                        "AND staging_leaf IS ? AND device IS ? AND inode IS ? "
+                        "AND modified_ns IS ? AND changed_ns IS ?",
+                        (token, *facts, *row[5:]),
+                    ).rowcount
+                    if affected != 1:
+                        raise RuntimeError("artifact release cleanup authority changed")
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
         return ArtifactReleaseStorageEvidence(True)
 
     def begin(
@@ -878,12 +1158,13 @@ class ManagedFilesystemLibraryAdapter:
             else:
                 self._verify_marker(target, receipt)
 
-            install_cursor = self._activate_pending(
-                connection,
-                revision=target,
-                limit=limit,
-            )
-            if install_cursor is not None:
+        install_cursor = self._activate_pending(
+            revision=target,
+            receipt=receipt,
+            limit=limit,
+        )
+        if install_cursor is not None:
+            with self._exclusive_state() as connection:
                 return self._record_reconcile_cursor(
                     connection,
                     revision=target,
@@ -891,6 +1172,14 @@ class ManagedFilesystemLibraryAdapter:
                     cursor=install_cursor,
                 )
 
+        with self._exclusive_state() as connection:
+            state = _journal_state(connection)
+            if (
+                state.pending_revision != target
+                or state.pending_receipt != receipt
+                or state.phase != "ACTIVATING"
+            ):
+                raise RuntimeError("library activation changed after installation")
             removal_rows = connection.execute(
                 "SELECT EXISTS(SELECT 1 FROM pending_removals "
                 "WHERE activation_revision = ?)",
@@ -922,12 +1211,14 @@ class ManagedFilesystemLibraryAdapter:
                 except BaseException:
                     connection.rollback()
                     raise
-            removal_cursor = self._remove_stale(
-                connection,
-                revision=target,
-                limit=limit,
-            )
-            if removal_cursor is not None:
+
+        removal_cursor = self._remove_stale(
+            revision=target,
+            receipt=receipt,
+            limit=limit,
+        )
+        if removal_cursor is not None:
+            with self._exclusive_state() as connection:
                 return self._record_reconcile_cursor(
                     connection,
                     revision=target,
@@ -935,6 +1226,14 @@ class ManagedFilesystemLibraryAdapter:
                     cursor=removal_cursor,
                 )
 
+        with self._exclusive_state() as connection:
+            state = _journal_state(connection)
+            if (
+                state.pending_revision != target
+                or state.pending_receipt != receipt
+                or state.phase != "ACTIVATING"
+            ):
+                raise RuntimeError("library activation changed after removal")
             remaining = connection.execute(
                 "SELECT EXISTS(SELECT 1 FROM pending_entries "
                 "WHERE activation_revision = ? AND activated = 0), "
@@ -1046,6 +1345,12 @@ class ManagedFilesystemLibraryAdapter:
         """Remove one bounded page of terminal private staging bytes."""
 
         self._ensure_layout()
+        with self._publication_io_guard(exclusive=True):
+            return self._maintain_cleanup()
+
+    def _maintain_cleanup(self) -> LibraryMaintenanceOutcome:
+        """Run bounded cleanup while fenced from publication filesystem work."""
+
         with self._exclusive_state() as connection:
             state = _journal_state(connection)
             if state.pending_revision is not None:
@@ -1058,48 +1363,60 @@ class ManagedFilesystemLibraryAdapter:
                 "ORDER BY token LIMIT ?",
                 (_MAX_CLEANUP_ITEMS,),
             ).fetchall()
-            for row in rows:
-                token = bytes(row[0])
-                key = _key_from_row(str(row[1]), str(row[2]))
-                digest = bytes(row[3])
-                size = int(row[4])
-                partial_authorized = _stage_row_authorizes_partial_temporary(
-                    row[5:],
-                    token=token,
-                    key=key,
-                )
-                self._heal_released_stage_duplicate(
-                    row[5:],
-                    token=token,
-                    key=key,
-                    digest=digest,
-                    size=size,
-                )
-                self._remove_stage_from_row(
-                    row[5:],
-                    token=token,
-                    key=key,
-                    digest=digest,
-                    size=size,
-                )
-                self._remove_stage_temporary(
-                    token,
-                    digest=digest,
-                    size=size,
-                    allow_partial=partial_authorized,
-                )
+        for row in rows:
+            token = bytes(row[0])
+            key = _key_from_row(str(row[1]), str(row[2]))
+            digest = bytes(row[3])
+            size = int(row[4])
+            partial_authorized = _stage_row_authorizes_partial_temporary(
+                row[5:],
+                token=token,
+                key=key,
+            )
+            self._heal_released_stage_duplicate(
+                row[5:],
+                token=token,
+                key=key,
+                digest=digest,
+                size=size,
+            )
+            self._remove_stage_from_row(
+                row[5:],
+                token=token,
+                key=key,
+                digest=digest,
+                size=size,
+            )
+            self._remove_stage_temporary(
+                token,
+                digest=digest,
+                size=size,
+                allow_partial=partial_authorized,
+            )
+            with self._exclusive_state() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 try:
-                    connection.execute(
+                    affected = connection.execute(
                         "UPDATE protection_tokens SET staging_leaf = NULL, "
                         "device = NULL, inode = NULL, modified_ns = NULL, "
-                        "changed_ns = NULL WHERE token = ? AND state = 'RELEASED'",
-                        (token,),
-                    )
+                        "changed_ns = NULL WHERE token = ? AND state = 'RELEASED' "
+                        "AND storage_codec = ? AND storage_path = ? "
+                        "AND object_sha256 = ? AND size_bytes = ? "
+                        "AND staging_leaf IS ? AND device IS ? AND inode IS ? "
+                        "AND modified_ns IS ? AND changed_ns IS ?",
+                        (token, *row[1:5], *row[5:]),
+                    ).rowcount
+                    if affected != 1:
+                        raise RuntimeError("library cleanup authority changed")
                     connection.commit()
                 except BaseException:
                     connection.rollback()
                     raise
+
+        with self._exclusive_state() as connection:
+            state = _journal_state(connection)
+            if state.pending_revision is not None:
+                return LibraryMaintenanceOutcome.BLOCKED
             remaining = connection.execute(
                 "SELECT EXISTS(SELECT 1 FROM protection_tokens "
                 "WHERE state = 'RELEASED' AND staging_leaf IS NOT NULL)"
@@ -1134,30 +1451,85 @@ class ManagedFilesystemLibraryAdapter:
 
     def _activate_pending(
         self,
-        connection: sqlite3.Connection,
         *,
         revision: int,
+        receipt: bytes,
         limit: int,
     ) -> VNextLibraryActivationCursor | None:
-        rows = connection.execute(
-            "SELECT p.storage_codec, p.storage_path, p.object_sha256, "
-            "p.size_bytes, p.operation_started, p.activated, p.device, p.inode, "
-            "p.modified_ns, p.changed_ns, c.storage_path, c.object_sha256, "
-            "c.size_bytes, c.device, c.inode, c.modified_ns, c.changed_ns, "
-            "p.resource_kind, p.published_modified_at, p.publication_key "
-            "FROM pending_entries AS p LEFT JOIN current_entries AS c "
-            "ON c.publication_key = p.publication_key "
-            "AND c.resource_kind = p.resource_kind "
-            "WHERE p.activation_revision = ? AND p.activated = 0 "
-            "ORDER BY p.publication_key, p.resource_kind LIMIT ?",
-            (revision, limit),
-        ).fetchall()
+        with self._exclusive_state() as connection:
+            state = _journal_state(connection)
+            if (
+                state.pending_revision != revision
+                or state.pending_receipt != receipt
+                or state.phase != "ACTIVATING"
+            ):
+                raise RuntimeError("library activation changed before installation")
+            rows = connection.execute(
+                "SELECT publication_key, resource_kind FROM pending_entries "
+                "WHERE activation_revision = ? AND activated = 0 "
+                "ORDER BY publication_key, resource_kind LIMIT ?",
+                (revision, limit),
+            ).fetchall()
+
         last_cursor: VNextLibraryActivationCursor | None = None
-        for row in rows:
+        for publication_key, resource_kind in rows:
+            plan = self._claim_pending_install(
+                revision=revision,
+                receipt=receipt,
+                publication_key=bytes(publication_key),
+                resource_kind=str(resource_kind),
+            )
+            signature, terminal_token = self._perform_pending_install(plan)
+            self._commit_pending_install(
+                plan,
+                signature=signature,
+                terminal_token=terminal_token,
+            )
+            last_cursor = _activation_cursor_from_fields(
+                plan.publication_key,
+                plan.resource_kind,
+            )
+        return last_cursor
+
+    def _claim_pending_install(
+        self,
+        *,
+        revision: int,
+        receipt: bytes,
+        publication_key: bytes,
+        resource_kind: str,
+    ) -> _PendingInstall:
+        """Durably reserve one exact pending row in a short state transaction."""
+
+        with self._exclusive_state() as connection:
+            state = _journal_state(connection)
+            if (
+                state.pending_revision != revision
+                or state.pending_receipt != receipt
+                or state.phase != "ACTIVATING"
+            ):
+                raise RuntimeError("library activation changed before reservation")
+            row = connection.execute(
+                "SELECT p.storage_codec, p.storage_path, p.object_sha256, "
+                "p.size_bytes, p.operation_started, p.activated, p.device, p.inode, "
+                "p.modified_ns, p.changed_ns, c.storage_path, c.object_sha256, "
+                "c.size_bytes, c.device, c.inode, c.modified_ns, c.changed_ns, "
+                "p.published_modified_at "
+                "FROM pending_entries AS p LEFT JOIN current_entries AS c "
+                "ON c.publication_key = p.publication_key "
+                "AND c.resource_kind = p.resource_kind "
+                "WHERE p.activation_revision = ? AND p.publication_key = ? "
+                "AND p.resource_kind = ?",
+                (revision, publication_key, resource_kind),
+            ).fetchone()
+            if row is None or bool(row[5]):
+                raise RuntimeError("pending library activation changed")
+            if any(value is not None for value in row[6:10]):
+                raise RuntimeError("pending library activation authority is corrupt")
             key = _key_from_row(str(row[0]), str(row[1]))
             digest = bytes(row[2])
             size_bytes = int(row[3])
-            target = self._target(key)
+            modified_text = str(row[17])
             current_exists = row[10] is not None
             current_digest = bytes(row[11]) if current_exists else None
             current_size = int(row[12]) if current_exists else None
@@ -1166,43 +1538,36 @@ class ManagedFilesystemLibraryAdapter:
                 if current_exists
                 else None
             )
-            current_content_unchanged = (
-                current_exists
-                and current_digest == digest
-                and current_size == size_bytes
-            )
             staged = self._staged_candidate_authority(
                 connection,
                 key=key,
                 digest=digest,
                 size=size_bytes,
-                modified_text=str(row[18]),
+                modified_text=modified_text,
             )
-            target_value = self._current_lstat(key)
-            if not bool(row[4]):
-                if current_exists:
-                    if (
-                        target_value is None
-                        or current_signature is None
-                        or _Signature.from_stat(target_value) != current_signature
-                    ):
-                        raise RuntimeError(
-                            f"managed library path changed before replace: {target}"
-                        )
-                elif target_value is not None:
-                    raise RuntimeError(f"unknown library path appeared: {target}")
-                if staged is None and not current_content_unchanged:
-                    raise RuntimeError(
-                        f"library activation lacks staged bytes for {_key_text(key)}"
-                    )
+            fresh_authorization = not bool(row[4])
+            if fresh_authorization:
                 connection.execute("BEGIN IMMEDIATE")
                 try:
                     affected = connection.execute(
                         "UPDATE pending_entries SET operation_started = 1 "
                         "WHERE activation_revision = ? AND publication_key = ? "
-                        "AND resource_kind = ? "
-                        "AND operation_started = 0 AND activated = 0",
-                        (revision, bytes(row[19]), str(row[17])),
+                        "AND resource_kind = ? AND storage_codec = ? "
+                        "AND storage_path = ? AND object_sha256 = ? "
+                        "AND size_bytes = ? AND published_modified_at = ? "
+                        "AND operation_started = 0 AND activated = 0 "
+                        "AND device IS NULL AND inode IS NULL "
+                        "AND modified_ns IS NULL AND changed_ns IS NULL",
+                        (
+                            revision,
+                            publication_key,
+                            resource_kind,
+                            key.codec,
+                            _key_text(key),
+                            digest,
+                            size_bytes,
+                            modified_text,
+                        ),
                     ).rowcount
                     if affected != 1:
                         raise RuntimeError("library activation authorization changed")
@@ -1211,72 +1576,149 @@ class ManagedFilesystemLibraryAdapter:
                     connection.rollback()
                     raise
 
-            terminal_token: bytes | None
-            if staged is None:
-                if not current_content_unchanged or current_signature is None:
-                    raise RuntimeError(
-                        f"library activation lacks staged authority for {target}"
-                    )
-                quarantine = self._quarantine / _quarantine_leaf(
-                    _key_text(key),
-                    digest,
+        return _PendingInstall(
+            revision=revision,
+            receipt=receipt,
+            publication_key=publication_key,
+            resource_kind=resource_kind,
+            key=key,
+            digest=digest,
+            size_bytes=size_bytes,
+            modified_text=modified_text,
+            fresh_authorization=fresh_authorization,
+            staged=staged,
+            current_digest=current_digest,
+            current_size=current_size,
+            current_signature=current_signature,
+        )
+
+    def _perform_pending_install(
+        self,
+        plan: _PendingInstall,
+    ) -> tuple[_Signature, bytes | None]:
+        """Perform reserved filesystem work without holding state.lock."""
+
+        current_content_unchanged = (
+            plan.current_signature is not None
+            and plan.current_digest == plan.digest
+            and plan.current_size == plan.size_bytes
+        )
+        if plan.staged is None:
+            if not current_content_unchanged or plan.current_signature is None:
+                raise RuntimeError(
+                    f"library activation lacks staged authority for "
+                    f"{self._target(plan.key)}"
                 )
-                if _safe_lstat(quarantine) is not None:
-                    raise RuntimeError(
-                        "unchanged library path has replacement quarantine"
-                    )
-                signature = self._verify_current(
-                    key,
-                    expected_sha256=digest,
-                    expected_size=size_bytes,
-                    label="unchanged library artifact",
-                )
-                if signature != current_signature:
-                    raise RuntimeError(f"unchanged library path changed: {target}")
-                terminal_token = None
-            else:
-                signature = self._install_staged(
-                    key=key,
-                    digest=digest,
-                    size=size_bytes,
-                    staged=staged,
-                    current_digest=current_digest,
-                    current_size=current_size,
-                    current_signature=current_signature,
-                )
-                terminal_token = staged.token
-            if (
-                current_signature is not None
-                and current_digest is not None
-                and current_size is not None
-                and staged is not None
-            ):
-                self._retire_replaced_current(
-                    key,
-                    digest=current_digest,
-                    size=current_size,
-                    expected_signature=current_signature,
-                )
-            durable_signature = self._verify_current(
-                key,
-                expected_sha256=digest,
-                expected_size=size_bytes,
-                label="activation-commit library artifact",
+            quarantine = self._quarantine / _quarantine_leaf(
+                _key_text(plan.key),
+                plan.digest,
             )
-            if staged is not None:
-                if not _same_content_identity(durable_signature, staged.signature):
-                    raise RuntimeError(
-                        "activation current lost its staged inode authority"
-                    )
-            elif durable_signature != signature:
-                raise RuntimeError("unchanged current lost its exact authority")
-            signature = durable_signature
+            if _safe_lstat(quarantine) is not None:
+                raise RuntimeError("unchanged library path has replacement quarantine")
+            signature = self._require_current_authority(
+                plan.key,
+                expected_size=plan.size_bytes,
+                expected_signature=plan.current_signature,
+                label="unchanged library artifact",
+            )
+            terminal_token = None
+        else:
+            signature = self._install_staged(
+                key=plan.key,
+                digest=plan.digest,
+                size=plan.size_bytes,
+                staged=plan.staged,
+                current_digest=plan.current_digest,
+                current_size=plan.current_size,
+                current_signature=plan.current_signature,
+                fresh_authorization=plan.fresh_authorization,
+            )
+            terminal_token = plan.staged.token
+        if (
+            plan.current_signature is not None
+            and plan.current_digest is not None
+            and plan.current_size is not None
+            and plan.staged is not None
+        ):
+            self._retire_replaced_current(
+                plan.key,
+                digest=plan.current_digest,
+                size=plan.current_size,
+                expected_signature=plan.current_signature,
+                reuse_verified_digest=plan.fresh_authorization,
+            )
+        durable = self._require_current_authority(
+            plan.key,
+            expected_size=plan.size_bytes,
+            expected_signature=signature,
+            label="activation-commit library artifact",
+        )
+        if plan.staged is not None and not _same_content_identity(
+            durable,
+            plan.staged.signature,
+        ):
+            raise RuntimeError("activation current lost its staged inode authority")
+        return durable, terminal_token
+
+    def _commit_pending_install(
+        self,
+        plan: _PendingInstall,
+        *,
+        signature: _Signature,
+        terminal_token: bytes | None,
+    ) -> None:
+        """Fence one filesystem outcome into the exact reserved journal row."""
+
+        with self._exclusive_state() as connection:
+            state = _journal_state(connection)
+            if (
+                state.pending_revision != plan.revision
+                or state.pending_receipt != plan.receipt
+                or state.phase != "ACTIVATING"
+            ):
+                raise RuntimeError("library activation changed before terminalization")
+            pending = connection.execute(
+                "SELECT storage_codec, storage_path, object_sha256, size_bytes, "
+                "published_modified_at, operation_started, activated, device, inode, "
+                "modified_ns, changed_ns FROM pending_entries "
+                "WHERE activation_revision = ? AND publication_key = ? "
+                "AND resource_kind = ?",
+                (plan.revision, plan.publication_key, plan.resource_kind),
+            ).fetchone()
+            expected_pending = (
+                plan.key.codec,
+                _key_text(plan.key),
+                plan.digest,
+                plan.size_bytes,
+                plan.modified_text,
+                1,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+            if pending is None or tuple(pending) != expected_pending:
+                raise RuntimeError("pending library activation changed")
+            exact_signature = self._require_current_authority(
+                plan.key,
+                expected_size=plan.size_bytes,
+                expected_signature=signature,
+                label="activation terminal library artifact",
+            )
             connection.execute("BEGIN IMMEDIATE")
             try:
                 if terminal_token is not None:
+                    if plan.staged is None:
+                        raise RuntimeError("activation terminal token lacks authority")
                     self._terminalize_stage_in_transaction(
                         connection,
                         terminal_token,
+                        key=plan.key,
+                        digest=plan.digest,
+                        size=plan.size_bytes,
+                        modified_text=plan.modified_text,
+                        staged=plan.staged,
                     )
                 connection.execute(
                     "INSERT INTO current_entries "
@@ -1290,38 +1732,47 @@ class ManagedFilesystemLibraryAdapter:
                     "object_sha256 = excluded.object_sha256, "
                     "size_bytes = excluded.size_bytes, "
                     "published_modified_at = excluded.published_modified_at, "
-                    "device = excluded.device, "
-                    "inode = excluded.inode, modified_ns = excluded.modified_ns, "
+                    "device = excluded.device, inode = excluded.inode, "
+                    "modified_ns = excluded.modified_ns, "
                     "changed_ns = excluded.changed_ns",
                     (
-                        bytes(row[19]),
-                        str(row[17]),
-                        _key_text(key),
-                        key.codec,
-                        _gid_from_key(key),
-                        digest,
-                        size_bytes,
-                        str(row[18]),
-                        signature.device,
-                        signature.inode,
-                        signature.modified_ns,
-                        signature.changed_ns,
+                        plan.publication_key,
+                        plan.resource_kind,
+                        _key_text(plan.key),
+                        plan.key.codec,
+                        _gid_from_key(plan.key),
+                        plan.digest,
+                        plan.size_bytes,
+                        plan.modified_text,
+                        exact_signature.device,
+                        exact_signature.inode,
+                        exact_signature.modified_ns,
+                        exact_signature.changed_ns,
                     ),
                 )
                 affected = connection.execute(
                     "UPDATE pending_entries SET activated = 1, device = ?, "
                     "inode = ?, modified_ns = ?, changed_ns = ? "
                     "WHERE activation_revision = ? AND publication_key = ? "
-                    "AND resource_kind = ? "
-                    "AND activated = 0",
+                    "AND resource_kind = ? AND storage_codec = ? "
+                    "AND storage_path = ? AND object_sha256 = ? "
+                    "AND size_bytes = ? AND published_modified_at = ? "
+                    "AND operation_started = 1 AND activated = 0 "
+                    "AND device IS NULL AND inode IS NULL "
+                    "AND modified_ns IS NULL AND changed_ns IS NULL",
                     (
-                        signature.device,
-                        signature.inode,
-                        signature.modified_ns,
-                        signature.changed_ns,
-                        revision,
-                        bytes(row[19]),
-                        str(row[17]),
+                        exact_signature.device,
+                        exact_signature.inode,
+                        exact_signature.modified_ns,
+                        exact_signature.changed_ns,
+                        plan.revision,
+                        plan.publication_key,
+                        plan.resource_kind,
+                        plan.key.codec,
+                        _key_text(plan.key),
+                        plan.digest,
+                        plan.size_bytes,
+                        plan.modified_text,
                     ),
                 ).rowcount
                 if affected != 1:
@@ -1330,11 +1781,6 @@ class ManagedFilesystemLibraryAdapter:
             except BaseException:
                 connection.rollback()
                 raise
-            last_cursor = _activation_cursor_from_fields(
-                bytes(row[19]),
-                str(row[17]),
-            )
-        return last_cursor
 
     def _install_staged(
         self,
@@ -1346,7 +1792,17 @@ class ManagedFilesystemLibraryAdapter:
         current_digest: bytes | None,
         current_size: int | None,
         current_signature: _Signature | None,
+        fresh_authorization: bool,
     ) -> _Signature:
+        if fresh_authorization:
+            return self._install_fresh_staged(
+                key=key,
+                size=size,
+                staged=staged,
+                current_digest=current_digest,
+                current_size=current_size,
+                current_signature=current_signature,
+            )
         target = self._target(key)
         if (current_signature is None) != (current_digest is None) or (
             current_signature is None
@@ -1510,6 +1966,102 @@ class ManagedFilesystemLibraryAdapter:
             )
             return installed
 
+    def _install_fresh_staged(
+        self,
+        *,
+        key: StorageObjectKey,
+        size: int,
+        staged: _StagedAuthority,
+        current_digest: bytes | None,
+        current_size: int | None,
+        current_signature: _Signature | None,
+    ) -> _Signature:
+        """Install continuously owned verified bytes without rehashing the inode."""
+
+        target = self._target(key)
+        if (current_signature is None) != (current_digest is None) or (
+            current_signature is None
+        ) != (current_size is None):
+            raise RuntimeError("current library replacement authority is incomplete")
+        if staged.leaf != _stage_leaf(staged.token, key):
+            raise RuntimeError("staged authority token disagrees with its leaf")
+        _require_regular_path_authority(
+            self._staging / staged.leaf,
+            expected_size=size,
+            expected_signature=staged.signature,
+            label="staged library artifact",
+        )
+        current_value = self._current_lstat(key)
+        if current_signature is not None:
+            if current_value is None or _Signature.from_stat(current_value) != (
+                current_signature
+            ):
+                raise RuntimeError(
+                    f"managed library path changed before replace: {target}"
+                )
+            if current_digest is None or current_size is None:
+                raise RuntimeError(
+                    "current library replacement authority is incomplete"
+                )
+            self._capture_replaced_current(
+                key,
+                digest=current_digest,
+                size=current_size,
+                expected_signature=current_signature,
+                reuse_verified_digest=True,
+            )
+        elif current_value is not None:
+            raise RuntimeError(f"unknown library path appeared: {target}")
+
+        with (
+            _open_directory_chain(
+                self._current,
+                key.segments[:-1],
+                create=True,
+            ) as (current_root_descriptor, parent_descriptor),
+            _open_directory(self._staging) as staging_descriptor,
+        ):
+            if _lstat_at(parent_descriptor, key.segments[-1]) is not None:
+                raise RuntimeError(f"unknown library target appeared: {target}")
+            stage_signature = _require_regular_authority_at(
+                staging_descriptor,
+                staged.leaf,
+                expected_size=size,
+                expected_signature=staged.signature,
+                allow_renamed_identity=False,
+                label="staged library artifact",
+            )
+            try:
+                _rename_noreplace(
+                    staged.leaf,
+                    key.segments[-1],
+                    source_descriptor=staging_descriptor,
+                    destination_descriptor=parent_descriptor,
+                )
+            except FileExistsError as error:
+                raise RuntimeError(
+                    f"unknown library target appeared: {target}"
+                ) from error
+            os.fsync(parent_descriptor)
+            os.fsync(staging_descriptor)
+            installed = _require_regular_authority_at(
+                parent_descriptor,
+                key.segments[-1],
+                expected_size=size,
+                expected_signature=stage_signature,
+                allow_renamed_identity=True,
+                label="newly activated library artifact",
+            )
+            if _lstat_at(staging_descriptor, staged.leaf) is not None:
+                raise RuntimeError("renamed staging artifact retained a source path")
+            _require_chain_identity(
+                self._current,
+                key.segments[:-1],
+                current_root_descriptor,
+                parent_descriptor,
+            )
+            return installed
+
     def _heal_recovered_install_duplicate(
         self,
         key: StorageObjectKey,
@@ -1596,6 +2148,7 @@ class ManagedFilesystemLibraryAdapter:
         digest: bytes,
         size: int,
         expected_signature: _Signature,
+        reuse_verified_digest: bool = False,
     ) -> None:
         """Capture an old current leaf without ever overwriting quarantine."""
 
@@ -1639,6 +2192,7 @@ class ManagedFilesystemLibraryAdapter:
             expected_sha256=digest,
             expected_size=size,
             expected_signature=expected_signature,
+            reuse_verified_digest=reuse_verified_digest,
         )
 
     def _retire_replaced_current(
@@ -1648,6 +2202,7 @@ class ManagedFilesystemLibraryAdapter:
         digest: bytes,
         size: int,
         expected_signature: _Signature,
+        reuse_verified_digest: bool,
     ) -> None:
         """Delete only the exact old leaf after the renamed current is durable."""
 
@@ -1658,40 +2213,110 @@ class ManagedFilesystemLibraryAdapter:
             size=size,
             expected_signature=expected_signature,
             label="replaced library artifact",
+            reuse_verified_digest=reuse_verified_digest,
         )
 
     def _terminalize_stage_in_transaction(
         self,
         connection: sqlite3.Connection,
         token: bytes,
+        *,
+        key: StorageObjectKey,
+        digest: bytes,
+        size: int,
+        modified_text: str,
+        staged: _StagedAuthority,
     ) -> None:
         affected = connection.execute(
             "UPDATE protection_tokens SET state = 'INSTALLED', "
             "staging_leaf = NULL, device = NULL, inode = NULL, "
             "modified_ns = NULL, changed_ns = NULL WHERE token = ? "
-            "AND state = 'STAGED'",
-            (token,),
+            "AND state = 'STAGED' AND storage_codec = ? AND storage_path = ? "
+            "AND object_sha256 = ? AND size_bytes = ? "
+            "AND published_modified_at = ? AND staging_leaf = ? "
+            "AND device = ? AND inode = ? AND modified_ns = ? AND changed_ns = ?",
+            (
+                token,
+                key.codec,
+                _key_text(key),
+                digest,
+                size,
+                modified_text,
+                staged.leaf,
+                staged.signature.device,
+                staged.signature.inode,
+                staged.signature.modified_ns,
+                staged.signature.changed_ns,
+            ),
         ).rowcount
         if affected != 1:
             raise RuntimeError("staged authority changed before activation commit")
 
     def _remove_stale(
         self,
-        connection: sqlite3.Connection,
         *,
         revision: int,
+        receipt: bytes,
         limit: int,
     ) -> VNextLibraryActivationCursor | None:
-        rows = connection.execute(
+        query = (
             "SELECT publication_key, resource_kind, storage_codec, storage_path, "
             "object_sha256, size_bytes, device, inode, modified_ns, changed_ns, "
             "operation_started FROM pending_removals "
-            "WHERE activation_revision = ? "
-            "ORDER BY publication_key, resource_kind LIMIT ?",
-            (revision, limit),
-        ).fetchall()
+        )
+        with self._exclusive_state() as connection:
+            state = _journal_state(connection)
+            if (
+                state.pending_revision != revision
+                or state.pending_receipt != receipt
+                or state.phase != "ACTIVATING"
+            ):
+                raise RuntimeError("library activation changed before removal")
+            rows = connection.execute(
+                query + "WHERE activation_revision = ? "
+                "ORDER BY publication_key, resource_kind LIMIT ?",
+                (revision, limit),
+            ).fetchall()
+
         last_cursor: VNextLibraryActivationCursor | None = None
         for row in rows:
+            with self._exclusive_state() as connection:
+                state = _journal_state(connection)
+                if (
+                    state.pending_revision != revision
+                    or state.pending_receipt != receipt
+                    or state.phase != "ACTIVATING"
+                ):
+                    raise RuntimeError(
+                        "library activation changed before removal claim"
+                    )
+                current_row = connection.execute(
+                    query + "WHERE activation_revision = ? AND publication_key = ? "
+                    "AND resource_kind = ?",
+                    (revision, bytes(row[0]), str(row[1])),
+                ).fetchone()
+                if current_row is None or tuple(current_row) != tuple(row):
+                    raise RuntimeError("pending library removal changed")
+                if not bool(row[10]):
+                    connection.execute("BEGIN IMMEDIATE")
+                    try:
+                        affected = connection.execute(
+                            "UPDATE pending_removals SET operation_started = 1 "
+                            "WHERE activation_revision = ? AND publication_key = ? "
+                            "AND resource_kind = ? AND storage_codec = ? "
+                            "AND storage_path = ? AND object_sha256 = ? "
+                            "AND size_bytes = ? AND device = ? AND inode = ? "
+                            "AND modified_ns = ? AND changed_ns = ? "
+                            "AND operation_started = 0",
+                            (revision, *row[:10]),
+                        ).rowcount
+                        if affected != 1:
+                            raise RuntimeError("library removal authorization changed")
+                        connection.commit()
+                    except BaseException:
+                        connection.rollback()
+                        raise
+
             key = _key_from_row(str(row[2]), str(row[3]))
             digest = bytes(row[4])
             size_bytes = int(row[5])
@@ -1709,19 +2334,6 @@ class ManagedFilesystemLibraryAdapter:
                     or quarantine_value is not None
                 ):
                     raise RuntimeError(f"stale library path changed: {target}")
-                connection.execute("BEGIN IMMEDIATE")
-                try:
-                    connection.execute(
-                        "UPDATE pending_removals SET operation_started = 1 "
-                        "WHERE activation_revision = ? AND publication_key = ? "
-                        "AND resource_kind = ? "
-                        "AND operation_started = 0",
-                        (revision, bytes(row[0]), str(row[1])),
-                    )
-                    connection.commit()
-                except BaseException:
-                    connection.rollback()
-                    raise
             if target_value is not None:
                 if quarantine_value is not None:
                     self._heal_recovered_capture_duplicate(
@@ -1742,6 +2354,7 @@ class ManagedFilesystemLibraryAdapter:
                         expected_sha256=digest,
                         expected_size=size_bytes,
                         expected_signature=expected_signature,
+                        reuse_verified_digest=not bool(row[10]),
                     )
             quarantine_value = _safe_lstat(quarantine)
             if quarantine_value is None and not bool(row[10]):
@@ -1762,23 +2375,59 @@ class ManagedFilesystemLibraryAdapter:
                 size=size_bytes,
                 expected_signature=expected_signature,
                 label="quarantined stale library artifact",
+                reuse_verified_digest=not bool(row[10]),
             )
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                connection.execute(
-                    "DELETE FROM pending_removals WHERE activation_revision = ? "
-                    "AND publication_key = ? AND resource_kind = ?",
-                    (revision, bytes(row[0]), str(row[1])),
-                )
-                connection.execute(
-                    "DELETE FROM current_entries WHERE publication_key = ? "
+            with self._exclusive_state() as connection:
+                state = _journal_state(connection)
+                if (
+                    state.pending_revision != revision
+                    or state.pending_receipt != receipt
+                    or state.phase != "ACTIVATING"
+                ):
+                    raise RuntimeError(
+                        "library activation changed before removal terminalization"
+                    )
+                pending = connection.execute(
+                    query + "WHERE activation_revision = ? AND publication_key = ? "
                     "AND resource_kind = ?",
+                    (revision, bytes(row[0]), str(row[1])),
+                ).fetchone()
+                expected_pending = (*row[:10], 1)
+                if pending is None or tuple(pending) != expected_pending:
+                    raise RuntimeError("pending library removal changed")
+                current = connection.execute(
+                    "SELECT storage_codec, storage_path, object_sha256, size_bytes, "
+                    "device, inode, modified_ns, changed_ns FROM current_entries "
+                    "WHERE publication_key = ? AND resource_kind = ?",
                     (bytes(row[0]), str(row[1])),
-                )
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
+                ).fetchone()
+                if current is None or tuple(current) != tuple(row[2:10]):
+                    raise RuntimeError("current library removal authority changed")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    removed_pending = connection.execute(
+                        "DELETE FROM pending_removals WHERE activation_revision = ? "
+                        "AND publication_key = ? AND resource_kind = ? "
+                        "AND storage_codec = ? AND storage_path = ? "
+                        "AND object_sha256 = ? AND size_bytes = ? "
+                        "AND device = ? AND inode = ? AND modified_ns = ? "
+                        "AND changed_ns = ? AND operation_started = 1",
+                        (revision, *row[:10]),
+                    ).rowcount
+                    removed_current = connection.execute(
+                        "DELETE FROM current_entries WHERE publication_key = ? "
+                        "AND resource_kind = ? AND storage_codec = ? "
+                        "AND storage_path = ? AND object_sha256 = ? "
+                        "AND size_bytes = ? AND device = ? AND inode = ? "
+                        "AND modified_ns = ? AND changed_ns = ?",
+                        tuple(row[:10]),
+                    ).rowcount
+                    if removed_pending != 1 or removed_current != 1:
+                        raise RuntimeError("library removal terminalization changed")
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
             last_cursor = _activation_cursor_from_fields(
                 bytes(row[0]),
                 str(row[1]),
@@ -1826,13 +2475,14 @@ class ManagedFilesystemLibraryAdapter:
         leaf = str(row[0])
         if _STAGE_LEAF.fullmatch(leaf) is None or leaf != _stage_leaf(token, key):
             raise RuntimeError("artifact staging journal contains an unsafe path")
-        signature = _verify_regular_file(
+        expected_signature = _storage_signature(row[1:], size=size)
+        signature = _require_regular_path_authority(
             self._staging / leaf,
-            expected_sha256=digest,
             expected_size=size,
+            expected_signature=expected_signature,
             label="staged artifact",
         )
-        if signature != _storage_signature(row[1:], size=size):
+        if signature != expected_signature:
             raise RuntimeError("staged artifact changed identity")
 
     def _remove_stage_from_row(
@@ -1864,6 +2514,16 @@ class ManagedFilesystemLibraryAdapter:
                     label="released staged artifact",
                 )
                 return
+            if expected_signature is not None:
+                _unlink_preserved_authority_at(
+                    descriptor,
+                    leaf,
+                    expected_size=size,
+                    expected_signature=expected_signature,
+                    allow_renamed_identity=False,
+                    label="released staged artifact",
+                )
+                return
             signature = _verify_regular_at(
                 descriptor,
                 leaf,
@@ -1871,8 +2531,6 @@ class ManagedFilesystemLibraryAdapter:
                 expected_size=size,
                 label="released staged artifact",
             )
-            if expected_signature is not None and signature != expected_signature:
-                raise RuntimeError("refusing to delete changed staged artifact")
             _unlink_verified_at(
                 descriptor,
                 leaf,
@@ -2092,6 +2750,42 @@ class ManagedFilesystemLibraryAdapter:
                 f"{label} is unavailable: {self._target(key)}"
             ) from error
 
+    def _require_current_authority(
+        self,
+        key: StorageObjectKey,
+        *,
+        expected_size: int,
+        expected_signature: _Signature,
+        label: str,
+    ) -> _Signature:
+        """Reuse a verified digest while the exact current inode is unchanged."""
+
+        try:
+            with _open_directory_chain(
+                self._current,
+                key.segments[:-1],
+                create=False,
+            ) as (root_descriptor, parent_descriptor):
+                signature = _require_regular_authority_at(
+                    parent_descriptor,
+                    key.segments[-1],
+                    expected_size=expected_size,
+                    expected_signature=expected_signature,
+                    allow_renamed_identity=False,
+                    label=label,
+                )
+                _require_chain_identity(
+                    self._current,
+                    key.segments[:-1],
+                    root_descriptor,
+                    parent_descriptor,
+                )
+                return signature
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                f"{label} is unavailable: {self._target(key)}"
+            ) from error
+
     def _quarantine_current(
         self,
         key: StorageObjectKey,
@@ -2100,6 +2794,7 @@ class ManagedFilesystemLibraryAdapter:
         expected_sha256: bytes,
         expected_size: int,
         expected_signature: _Signature,
+        reuse_verified_digest: bool = False,
     ) -> None:
         with (
             _open_directory_chain(
@@ -2128,13 +2823,23 @@ class ManagedFilesystemLibraryAdapter:
             os.fsync(quarantine_descriptor)
             os.fsync(parent_descriptor)
             try:
-                captured = _verify_regular_at(
-                    quarantine_descriptor,
-                    quarantine_leaf,
-                    expected_sha256=expected_sha256,
-                    expected_size=expected_size,
-                    label="captured library artifact",
-                )
+                if reuse_verified_digest:
+                    captured = _require_regular_authority_at(
+                        quarantine_descriptor,
+                        quarantine_leaf,
+                        expected_size=expected_size,
+                        expected_signature=expected_signature,
+                        allow_renamed_identity=True,
+                        label="captured library artifact",
+                    )
+                else:
+                    captured = _verify_regular_at(
+                        quarantine_descriptor,
+                        quarantine_leaf,
+                        expected_sha256=expected_sha256,
+                        expected_size=expected_size,
+                        label="captured library artifact",
+                    )
                 captured_value = _lstat_at(
                     quarantine_descriptor,
                     quarantine_leaf,
@@ -2329,10 +3034,21 @@ class ManagedFilesystemLibraryAdapter:
         size: int,
         expected_signature: _Signature,
         label: str,
+        reuse_verified_digest: bool = False,
     ) -> None:
         with _open_directory(self._quarantine) as descriptor:
             if _lstat_at(descriptor, leaf) is None:
                 _fsync_absent_at(descriptor, leaf, label=label)
+                return
+            if reuse_verified_digest:
+                _unlink_preserved_authority_at(
+                    descriptor,
+                    leaf,
+                    expected_size=size,
+                    expected_signature=expected_signature,
+                    allow_renamed_identity=True,
+                    label=label,
+                )
                 return
             verified = _verify_regular_at(
                 descriptor,
@@ -2480,7 +3196,7 @@ class ManagedFilesystemLibraryAdapter:
 
     @contextmanager
     def _exclusive_state(self) -> Iterator[sqlite3.Connection]:
-        with self._process_lock:
+        with self._state_process_lock:
             descriptor = os.open(
                 self._state_lock_path,
                 os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
@@ -2501,8 +3217,11 @@ class ManagedFilesystemLibraryAdapter:
                     os.close(descriptor)
 
     def _acquire_publication_lock(self) -> None:
-        if self._publication_descriptor is not None:
-            return
+        with self._process_lock:
+            if self._guard_owner != get_ident():
+                raise RuntimeError("library activation requires publication_guard")
+            if self._publication_descriptor is not None:
+                return
         descriptor = os.open(
             self._publication_lock_path,
             os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
@@ -2517,7 +3236,14 @@ class ManagedFilesystemLibraryAdapter:
         except BaseException:
             os.close(descriptor)
             raise
-        self._publication_descriptor = descriptor
+        with self._process_lock:
+            if self._guard_owner != get_ident():
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+                raise RuntimeError("library publication guard owner changed")
+            self._publication_descriptor = descriptor
 
     def _release_publication_lock(self) -> None:
         descriptor = self._publication_descriptor
@@ -2529,14 +3255,87 @@ class ManagedFilesystemLibraryAdapter:
         finally:
             os.close(descriptor)
 
+    @contextmanager
+    def _publication_io_guard(self, *, exclusive: bool) -> Iterator[None]:
+        """Fence storage mutation against activation without holding state.lock."""
+
+        descriptor: int | None = None
+        uses_existing_exclusive = False
+        with self._process_lock:
+            if (
+                self._publication_descriptor is not None
+                and self._guard_owner == get_ident()
+            ):
+                uses_existing_exclusive = True
+            else:
+                descriptor = os.open(
+                    self._publication_lock_path,
+                    os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+                )
+                try:
+                    _require_managed_file_descriptor(
+                        self._publication_lock_path,
+                        descriptor,
+                        label="library publication lock",
+                    )
+                except BaseException:
+                    os.close(descriptor)
+                    raise
+        if uses_existing_exclusive:
+            yield
+            return
+        if descriptor is None:
+            raise RuntimeError("library publication I/O guard lacks its descriptor")
+        try:
+            operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(descriptor, operation)
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
+    @contextmanager
+    def _protection_io_guard(self, token: bytes) -> Iterator[None]:
+        """Serialize one bounded token stripe without blocking unrelated protects."""
+
+        stripe = sha256(token).hexdigest()[:2]
+        lock_path = self._locks / f"{_PROTECTION_LOCK_PREFIX}{stripe}.lock"
+        _ensure_managed_file(
+            lock_path,
+            _PRIVATE_FILE_CREATION_MODE,
+            label="library protection stripe lock",
+        )
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            _require_managed_file_descriptor(
+                lock_path,
+                descriptor,
+                label="library protection stripe lock",
+            )
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
     def _require_guard(self) -> None:
-        if self._guard_depth != 1:
-            raise RuntimeError("library activation requires publication_guard")
+        with self._process_lock:
+            if self._guard_owner != get_ident():
+                raise RuntimeError("library activation requires publication_guard")
 
     def _require_publication_lock(self) -> None:
-        self._require_guard()
-        if self._publication_descriptor is None:
-            raise RuntimeError("library activation lacks its exclusive lock")
+        with self._process_lock:
+            if self._guard_owner != get_ident():
+                raise RuntimeError("library activation requires publication_guard")
+            if self._publication_descriptor is None:
+                raise RuntimeError("library activation lacks its exclusive lock")
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -3144,6 +3943,49 @@ def _require_managed_file_metadata(
         raise RuntimeError(f"{label} changed exact metadata authority")
 
 
+def _require_regular_authority_at(
+    descriptor: int,
+    leaf: str,
+    *,
+    expected_size: int,
+    expected_signature: _Signature,
+    allow_renamed_identity: bool,
+    label: str,
+) -> _Signature:
+    """Reuse a verified digest only while its private inode authority is intact."""
+
+    value = _lstat_at(descriptor, leaf)
+    if value is None or value.st_size != expected_size or value.st_nlink != 1:
+        raise RuntimeError(f"{label} changed durable inode authority")
+    observed = _Signature.from_stat(value)
+    matches = (
+        _same_content_identity(observed, expected_signature)
+        if allow_renamed_identity
+        else observed == expected_signature
+    )
+    if not matches:
+        raise RuntimeError(f"{label} changed durable inode authority")
+    return observed
+
+
+def _require_regular_path_authority(
+    path: Path,
+    *,
+    expected_size: int,
+    expected_signature: _Signature,
+    label: str,
+) -> _Signature:
+    with _open_directory(path.parent) as descriptor:
+        return _require_regular_authority_at(
+            descriptor,
+            path.name,
+            expected_size=expected_size,
+            expected_signature=expected_signature,
+            allow_renamed_identity=False,
+            label=label,
+        )
+
+
 def _publish_resumable_file(
     source: BinaryIO,
     *,
@@ -3157,6 +3999,7 @@ def _publish_resumable_file(
     """Resume one private exact prefix and publish it without overwriting a leaf."""
 
     source.seek(0)
+    file_descriptor: int | None = None
     try:
         with _open_directory(directory) as directory_descriptor:
             flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
@@ -3174,7 +4017,8 @@ def _publish_resumable_file(
                     flags,
                     dir_fd=directory_descriptor,
                 )
-            try:
+            if file_descriptor is not None:
+                fcntl.flock(file_descriptor, fcntl.LOCK_EX)
                 opened = os.fstat(file_descriptor)
                 opened_signature = _Signature.from_stat(opened)
                 _require_managed_file_metadata(
@@ -3193,6 +4037,7 @@ def _publish_resumable_file(
                 if opened.st_size > expected_size:
                     raise RuntimeError(f"{label} temporary exceeds expected size")
 
+                observed_digest = sha256()
                 with os.fdopen(file_descriptor, "r+b", closefd=False) as destination:
                     destination.seek(0)
                     remaining = opened.st_size
@@ -3207,6 +4052,7 @@ def _publish_resumable_file(
                             raise RuntimeError(
                                 f"{label} temporary is not an exact source prefix"
                             )
+                        observed_digest.update(part)
                         remaining -= len(part)
 
                     size_bytes = opened.st_size
@@ -3216,10 +4062,13 @@ def _publish_resumable_file(
                             raise TypeError(f"{label} source must yield bytes")
                         if size_bytes + len(part) > expected_size:
                             raise RuntimeError(f"{label} source exceeds expected size")
+                        observed_digest.update(part)
                         _write_all(destination, part, label=label)
                         size_bytes += len(part)
                     if size_bytes != expected_size:
                         raise RuntimeError(f"{label} source has an unexpected size")
+                    if observed_digest.digest() != expected_sha256:
+                        raise RuntimeError(f"{label} source has an unexpected digest")
                     destination.flush()
                     os.fsync(destination.fileno())
                 after = os.fstat(file_descriptor)
@@ -3231,17 +4080,22 @@ def _publish_resumable_file(
                     expected_signature=written_signature,
                     label=f"{label} temporary",
                 )
-            finally:
-                os.close(file_descriptor)
-
+            else:  # pragma: no cover - both os.open branches assign or raise
+                raise RuntimeError(f"{label} temporary could not be opened")
             os.fsync(directory_descriptor)
-            temporary_signature = _verify_regular_at(
-                directory_descriptor,
-                temporary_leaf,
-                expected_sha256=expected_sha256,
-                expected_size=expected_size,
-                label=f"{label} temporary",
-            )
+            try:
+                temporary_signature = _require_regular_authority_at(
+                    directory_descriptor,
+                    temporary_leaf,
+                    expected_size=expected_size,
+                    expected_signature=written_signature,
+                    allow_renamed_identity=False,
+                    label=f"{label} temporary",
+                )
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"{label} temporary changed durable identity before publish"
+                ) from error
             if temporary_signature != written_signature:
                 raise RuntimeError(
                     f"{label} temporary changed durable identity before publish"
@@ -3265,11 +4119,12 @@ def _publish_resumable_file(
                 raise RuntimeError(f"{label} destination appeared") from error
             os.fsync(directory_descriptor)
             try:
-                installed = _verify_regular_at(
+                installed = _require_regular_authority_at(
                     directory_descriptor,
                     final_leaf,
-                    expected_sha256=expected_sha256,
                     expected_size=expected_size,
+                    expected_signature=temporary_signature,
+                    allow_renamed_identity=True,
                     label=f"published {label}",
                 )
                 installed_value = _lstat_at(directory_descriptor, final_leaf)
@@ -3297,6 +4152,11 @@ def _publish_resumable_file(
                 raise RuntimeError(f"published {label} is foreign") from error
             return installed
     finally:
+        if file_descriptor is not None:
+            try:
+                fcntl.flock(file_descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(file_descriptor)
         source.seek(0)
 
 
@@ -3615,6 +4475,32 @@ def _unlink_verified_at(
         raise RuntimeError(f"{label} changed before unlink")
     named = _lstat_at(descriptor, leaf)
     if named is None or _Signature.from_stat(named) != verified:
+        raise RuntimeError(f"{label} changed immediately before unlink")
+    os.unlink(leaf, dir_fd=descriptor)
+    os.fsync(descriptor)
+
+
+def _unlink_preserved_authority_at(
+    descriptor: int,
+    leaf: str,
+    *,
+    expected_size: int,
+    expected_signature: _Signature,
+    allow_renamed_identity: bool,
+    label: str,
+) -> None:
+    """Unlink private bytes whose previously verified inode stayed authoritative."""
+
+    observed = _require_regular_authority_at(
+        descriptor,
+        leaf,
+        expected_size=expected_size,
+        expected_signature=expected_signature,
+        allow_renamed_identity=allow_renamed_identity,
+        label=label,
+    )
+    named = _lstat_at(descriptor, leaf)
+    if named is None or _Signature.from_stat(named) != observed:
         raise RuntimeError(f"{label} changed immediately before unlink")
     os.unlink(leaf, dir_fd=descriptor)
     os.fsync(descriptor)

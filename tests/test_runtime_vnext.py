@@ -9,7 +9,13 @@ from h2hdb import (
     VNextIngestFacade,
 )
 
-from h2hdb_ingest import IngestConfig, IngestPathsConfig
+from h2hdb_ingest import (
+    ArtifactImageResampler,
+    ArtifactRenderPolicyConfig,
+    ArtifactRenderPreset,
+    IngestConfig,
+    IngestPathsConfig,
+)
 from h2hdb_ingest.artifact import ARTIFACT_ADAPTER_ID
 from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
 from h2hdb_ingest.runtime import build_runtime
@@ -71,3 +77,34 @@ def test_cbz_runtime_shares_one_adapter_for_protection_and_release(
     assert id(service._finalization_adapters[ARTIFACT_ADAPTER_ID]) == id(storage)
     assert isinstance(service._library_activation, ManagedFilesystemLibraryAdapter)
     assert service._publication_guard == service._library_activation.publication_guard
+
+
+def test_runtime_passes_effective_render_policy_and_one_metric_sink_to_adapter(
+    tmp_path: Path,
+) -> None:
+    source = _source_root(tmp_path)
+    config = IngestConfig(
+        paths=IngestPathsConfig(
+            download_path=source,
+            library_path=tmp_path / "library",
+            max_image_short_side=321,
+            page_render_workers=4,
+            render_policy=ArtifactRenderPolicyConfig(
+                preset=ArtifactRenderPreset.BENCHMARK_LOW_COST,
+                thumbnail_jpeg_quality=73,
+            ),
+        )
+    )
+
+    service = build_runtime(config).resident._service
+    assert isinstance(service, VNextIngestService)
+    adapter = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
+
+    assert isinstance(adapter, ManagedFilesystemLibraryAdapter)
+    assert adapter._render_policy.max_image_short_side == 321
+    assert adapter._render_policy.page_jpeg_quality == 70
+    assert adapter._render_policy.thumbnail_jpeg_quality == 73
+    assert not adapter._render_policy.optimize
+    assert adapter._render_policy.resampler is ArtifactImageResampler.BILINEAR
+    assert adapter._page_render_workers == 4
+    assert adapter._metrics_sink is service._metrics_sink

@@ -230,9 +230,11 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
   `pages/{page_index:04d}.jpg`。Metadata固定DEFLATE；PAGE固定ZIP_STORED；flags、
   comment、extra、data descriptor與ZIP64皆禁止。最多4096 PAGE、每個source/output
   encoded page 32 MiB、decoded 40 MP、long side 8192、aggregate archive
-  2,147,483,647 bytes。所有頁為quality 90 JPEG，GIF只取frame zero；page zero是
-  full-size cover alias。Standalone thumbnail-320為quality 85且不得request-time
-  resize。Writer完成後必須重驗central/local header、CRC、SHA-256、size與page
+  2,147,483,647 bytes。Render policy預設page quality 90、thumbnail quality 85、
+  optimize true與LANCZOS；所有byte-affecting選項都必須bounded、寫入policy
+  fingerprint且由frozen config/domain傳遞。GIF只取frame zero；page zero是
+  full-size cover alias。Standalone thumbnail-320不得request-time resize。
+  Writer完成後必須重驗central/local header、CRC、SHA-256、size與page
   extents，destination partial write必須fail closed。
 - acquisition與thumbnail artifact必須先在同 filesystem 的 private staging以
   exact-prefix resumable temp完整寫入、驗證 SHA-256/size並fsync。activation先以

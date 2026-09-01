@@ -6,18 +6,60 @@ This directory contains executable specifications owned by filesystem ingest.
   produces the same gallery content, spam decisions, and CBZ create/rebuild/
   delete sets as clean full recomputation. A snapshot uses `Option`, so a
   deleted gallery is distinct from an existing empty gallery.
+- `lean/OrderedPageRendering.lean` proves that, for a deterministic pure page
+  renderer, ordered collection after arbitrary worker completion schedules and
+  worker-bounded batches equals the sequential map. Therefore deterministic
+  serialization receives the same ordered results. It also proves that worker,
+  validation, and serialization failures preserve the destination when
+  publication is the final step.
+- `lean/LibraryAuthorityReuse.lean` proves that a previously computed digest
+  equals recomputation only under an explicit preserved-bytes authority
+  premise, that caller digests are accepted only after independent
+  recomputation, and that released/replaced journal facts reject stale exact
+  fences.
 - `tla/CbzLibraryActivation.tla` model-checks crash recovery between
   reader-invisible
   core publication, bounded local library activation, and reader-head
   finalization, including maintenance-marker and unknown-path safety.
+- `tla/OrderedPageRendering.tla` model-checks finite choices of worker count,
+  batch size, page-completion interleavings, ordered collection, validation and
+  serialization failures, and publish-last destination safety. Its required
+  `Small` profile uses four pages and explores worker counts `1..4`.
+- `tla/LibraryIoReservation.tla` model-checks WRITING and activation
+  reservations across unlocked I/O, crash/restart and response loss, exact
+  terminalization, wrong caller digests, stale fence attempts, and the rule
+  that release of an exact object cannot cross its unfinished durable
+  activation entry. Its single-object `PROTECT` gate corresponds to one
+  bounded runtime token-lock stripe; unrelated stripes remain concurrent and
+  are outside this model.
 
-The Lean proof assumes collision-free canonical hash identities, deterministic
-policy/artifact functions, an exact evidence delta, exact shard membership, and
-an old derived cache equal to a prior full recomputation. The TLA+ model checks
-a finite transition system. Neither result by itself proves that scanner,
-MariaDB, SQLite state, or filesystem code implements those functions or
-transitions. Differential and fault-injection tests remain required when the
-vNext design is implemented.
+The incremental Lean proof assumes collision-free canonical hash identities,
+deterministic policy/artifact functions, an exact evidence delta, exact shard
+membership, and an old derived cache equal to a prior full recomputation. Each
+TLA+ model checks a finite transition system. None of these results by itself
+proves that scanner, MariaDB, SQLite state, or filesystem code implements those
+functions or transitions. Differential and fault-injection tests remain
+required when the vNext design is implemented.
+
+The ordered-rendering proofs additionally assume that one page has a pure,
+deterministic render result and that indexed worker results are exact. They do
+not prove Pillow determinism or thread safety, Python `ThreadPoolExecutor` and
+`Future` behavior, cancellation or spool cleanup, ZIP implementation details,
+filesystem atomicity or durability, or that the Python batching and
+publish-last code refines the models. The preservation result covers failures
+before publication; it does not claim that a failure during the final
+destination write is atomic. Exact-byte differential, measured concurrency-
+bound, validation/serialization fault, and destination-preservation tests
+remain the implementation evidence for those boundaries.
+
+The library-authority proofs intentionally assume that the same private inode
+authority still denotes the same bytes. They do not prove `flock` exclusion,
+single-link ownership, metadata/rename behavior, `fsync` durability, Python
+descriptor lifetime, SQLite transaction isolation, or that production
+reservation and terminalization code refines the model. The TLA+ gate and
+filesystem steps are abstract atomic transitions; its finite success is not an
+unbounded proof. Fault/restart, same-adapter concurrency, exact-byte, traversal,
+and state-lock tests remain required refinement evidence.
 
 ## New-gallery invalidation
 

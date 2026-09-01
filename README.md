@@ -25,8 +25,9 @@ its first frame. A source is rejected if it is
 truncated, cannot be decoded, is larger than 40 megapixels, has a side longer
 than 8192 pixels, or if its source or rendered JPEG exceeds 32 MiB. A gallery
 may contain at most 4096 pages. The configurable short-side limit defaults to
-768 pixels; images are never enlarged. Pages use JPEG quality 90. The separate
-thumbnail has a maximum side of 320 pixels and uses JPEG quality 85.
+768 pixels; images are never enlarged. The canonical render policy defaults to
+page JPEG quality 90, thumbnail JPEG quality 85, optimized encoding, and the
+LANCZOS resampler. The separate thumbnail has a maximum side of 320 pixels.
 
 The canonical CBZ contains only:
 
@@ -132,7 +133,14 @@ A minimal SQLite configuration with artifacts enabled is:
   "paths": {
     "download_path": "/download",
     "library_path": "/hentai/library",
-    "max_image_short_side": 768
+    "max_image_short_side": 768,
+    "page_render_workers": 2,
+    "render_policy": {
+      "page_jpeg_quality": 90,
+      "thumbnail_jpeg_quality": 85,
+      "optimize": true,
+      "resampler": "lanczos"
+    }
   },
   "resident": {
     "periodic_scan_seconds": 1800,
@@ -147,6 +155,16 @@ A minimal SQLite configuration with artifacts enabled is:
 Set `library_path` to `null` to publish catalog metadata without producing
 artifacts. `download_path` must already be a nonempty directory. The download
 and library roots must be distinct and must not contain one another.
+
+JPEG qualities are strict integers from 0 through 95. Supported resamplers are
+`nearest`, `box`, `bilinear`, `hamming`, `bicubic`, and `lanczos`. An explicit
+`"preset": "benchmark-low-cost"` selects quality 70, unoptimized encoding, and
+the bilinear resampler for local performance experiments; it never changes the
+default, and any fields supplied beside the preset override its values.
+`page_render_workers` is a strict integer from 1 through 4. It bounds concurrent
+image decoding/encoding while CBZ members are always serialized in canonical
+page order; the default of 2 limits worst-case decoded-image memory on developer
+machines.
 
 Configuration rejects unknown fields. A complete string value such as
 `"${H2HDB_RW_DB_PASSWORD}"` is replaced from the environment before validation;
