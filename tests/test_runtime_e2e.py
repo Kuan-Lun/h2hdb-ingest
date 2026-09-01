@@ -4,6 +4,7 @@ from collections.abc import Callable
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
+from shutil import rmtree
 from typing import cast
 from zipfile import ZipFile
 
@@ -384,6 +385,71 @@ def test_fresh_artifact_runtime_publishes_one_current_cbz(
     assert not list((state / "staging").glob("*.cbz"))
     assert not list((state / "quarantine").glob("*.cbz"))
     assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
+
+
+def test_deleted_gallery_reconciles_catalog_library_and_historical_cleanup(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+) -> None:
+    source = tmp_path / "download"
+    _gallery(source, 2501, "artist")
+    Image.new("RGB", (8, 12), "red").save(source / "2501" / "001.jpg")
+    library_root = tmp_path / "library"
+    _provision_library_root(library_root)
+    current_root = library_root / "current"
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(
+            download_path=source,
+            library_path=library_root,
+        ),
+        resident=ResidentConfig(
+            lease_seconds=30,
+            heartbeat_seconds=5,
+        ),
+    )
+    runtime = build_runtime(config)
+    runtime.database_admin.initialize()
+
+    assert runtime.resident.process_available(periodic_scan=True)
+    first_revision = runtime.catalog.get_catalog_revision()
+    first_page = runtime.catalog.discover_publications()
+    assert first_page.total == len(first_page.publications) == 1
+    publication = first_page.publications[0]
+    archive_path = current_root.joinpath(
+        *publication.artifacts[0].storage_object.key.segments
+    )
+    assert publication.thumbnail is not None
+    thumbnail_path = current_root.joinpath(
+        *publication.thumbnail.storage_object.key.segments
+    )
+    assert archive_path.is_file()
+    assert thumbnail_path.is_file()
+
+    rmtree(source / "2501")
+    assert runtime.resident.process_available(periodic_scan=True)
+    empty_revision = runtime.catalog.get_catalog_revision()
+    empty_page = runtime.catalog.discover_publications()
+    assert empty_revision.revision == first_revision.revision + 1
+    assert empty_revision.publication_count == 0
+    assert empty_page.total == len(empty_page.publications) == 0
+    assert not archive_path.exists()
+    assert not thumbnail_path.exists()
+    assert not tuple(current_root.rglob("*.cbz"))
+
+    outcome = runtime.facade.drain_current_only_maintenance(30_000_000)
+    for _attempt in range(16):
+        if outcome is VNextCurrentOnlyMaintenanceOutcome.DONE:
+            break
+        assert outcome is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED
+        outcome = runtime.facade.drain_current_only_maintenance(30_000_000)
+    assert outcome is VNextCurrentOnlyMaintenanceOutcome.DONE
+    assert runtime.database_admin.check().state == "READY"
+    with pytest.raises(CatalogRevisionNotFoundError):
+        runtime.catalog.discover_publications(
+            revision=first_revision,
+            limit=128,
+        )
 
 
 def test_many_replacements_keep_one_stable_current_file_per_gid(
