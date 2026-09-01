@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-01T05:50:52+00:00",
-  "manifest_sha256": "daab1a7c1376dd41a91f9cdaa88f63cf5f89259ac9fa7d44769bb1b2e13c3abe",
+  "checked_at": "2026-09-01T21:07:40+00:00",
+  "manifest_sha256": "93f3a532b4eaa88a9b0f2961b77f5895599510619ce33d2277c147f6584198c7",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.10.1",
+  "project_version": "0.11.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,9 +30,9 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.28.2,<0.29",
+      "declared": "h2hdb>=0.29.0,<0.30.0",
       "group": "runtime",
-      "latest": "0.28.1",
+      "latest": "0.28.3",
       "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
@@ -130,7 +130,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all direct build, runtime, optional-development, and Node dependencies for the compatible 0.10.1 gallery-deletion cleanup contract. The h2hdb lower bound intentionally increases to >=0.28.2,<0.29 so deployments cannot install the facet-unsafe cleanup implementation. The real add/publish/delete/empty-catalog/CBZ-removal/historical-cleanup E2E passes with the local fixed core on SQLite; its MariaDB 10.11.11 variant is included but was skipped because H2HDB_TEST_MARIADB was not enabled. Registry candidates and Python 3.14 compatibility are recorded in this receipt; no other dependency-bound change is required. Publish ordering must make h2hdb 0.28.2 available before h2hdb-ingest 0.10.1.",
+    "note": "Reviewed all build, runtime, optional, development, and Node direct dependencies for 0.11.0; the h2hdb 0.29 compatibility lane is intentional and source-integrated, while render and filesystem performance changes require no additional dependency upgrade.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
