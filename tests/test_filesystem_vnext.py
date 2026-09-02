@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from collections.abc import Iterator
 from hashlib import sha256
 from pathlib import Path
@@ -224,16 +225,44 @@ def test_gallery_index_is_reused_across_pages_with_exact_reference_output(
         ),
         encoding="utf-8",
     )
-    expected_file_names = tuple(
-        sorted(
-            os.fsencode(entry.name)
-            for entry in folder.iterdir()
-            if entry.is_file() and not entry.is_symlink()
+    direct_entries = tuple(
+        sorted(folder.iterdir(), key=lambda entry: os.fsencode(entry.name))
+    )
+    expected_file_facts: list[tuple[object, ...]] = []
+    expected_directory_facts: list[tuple[object, ...]] = []
+    for entry in direct_entries:
+        value = entry.stat(follow_symlinks=False)
+        name = os.fsencode(entry.name)
+        if stat.S_ISREG(value.st_mode):
+            expected_file_facts.append(
+                (
+                    name,
+                    sha256(entry.read_bytes()).digest(),
+                    value.st_size,
+                    ("metadata" if entry.name == "galleryinfo.txt" else "page"),
+                    value.st_dev,
+                    value.st_ino,
+                    value.st_mtime_ns,
+                    value.st_ctime_ns,
+                )
+            )
+        expected_directory_facts.append(
+            (
+                name,
+                value.st_size,
+                value.st_dev,
+                value.st_ino,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+                (
+                    int(FilesystemEntryType.REGULAR)
+                    if stat.S_ISREG(value.st_mode)
+                    else int(FilesystemEntryType.DIRECTORY)
+                ),
+            )
         )
-    )
-    expected_entry_names = tuple(
-        sorted(os.fsencode(entry.name) for entry in folder.iterdir())
-    )
+    expected_file_names = tuple(fact[0] for fact in expected_file_facts)
+    expected_entry_names = tuple(fact[0] for fact in expected_directory_facts)
 
     source = FilesystemSource(root)
     source.list_gallery_locators(after_locator=None, limit=1)
@@ -253,7 +282,7 @@ def test_gallery_index_is_reused_across_pages_with_exact_reference_output(
     observation = adapter.observe_gallery(("1005",))
 
     file_names: list[bytes] = []
-    file_receipts: list[tuple[bytes, int]] = []
+    file_facts: list[tuple[object, ...]] = []
     after_name: bytes | None = None
     file_page_count = 0
     while True:
@@ -264,8 +293,17 @@ def test_gallery_index_is_reused_across_pages_with_exact_reference_output(
         )
         file_page_count += 1
         file_names.extend(item.name_bytes for item in file_page.items)
-        file_receipts.extend(
-            (item.content.file_sha256, item.content.size_bytes)
+        file_facts.extend(
+            (
+                item.name_bytes,
+                item.content.file_sha256,
+                item.content.size_bytes,
+                item.artifact_role.value,
+                item.device,
+                item.inode,
+                item.modified_ns,
+                item.changed_ns,
+            )
             for item in file_page.items
         )
         if file_page.terminal:
@@ -274,6 +312,7 @@ def test_gallery_index_is_reused_across_pages_with_exact_reference_output(
         after_name = file_page.next_after
 
     entry_names: list[bytes] = []
+    directory_facts: list[tuple[object, ...]] = []
     after_name = None
     directory_page_count = 0
     while True:
@@ -284,6 +323,18 @@ def test_gallery_index_is_reused_across_pages_with_exact_reference_output(
         )
         directory_page_count += 1
         entry_names.extend(item.name_bytes for item in directory_page.items)
+        directory_facts.extend(
+            (
+                item.name_bytes,
+                item.size_bytes,
+                item.device,
+                item.inode,
+                item.modified_ns,
+                item.changed_ns,
+                int(item.file_type),
+            )
+            for item in directory_page.items
+        )
         if directory_page.terminal:
             break
         assert isinstance(directory_page.next_after, bytes)
@@ -308,12 +359,10 @@ def test_gallery_index_is_reused_across_pages_with_exact_reference_output(
     assert tuple(file_names) == expected_file_names
     assert tuple(entry_names) == expected_entry_names
     assert tuple(tags) == tuple(("misc", value) for value in tag_values)
-    assert tuple(file_receipts) == tuple(
-        (
-            sha256((folder / os.fsdecode(name)).read_bytes()).digest(),
-            (folder / os.fsdecode(name)).stat().st_size,
-        )
-        for name in expected_file_names
+    assert tuple(file_facts) == tuple(expected_file_facts)
+    assert tuple(directory_facts) == tuple(expected_directory_facts)
+    assert observation.metadata.modified_time == (
+        (folder / "galleryinfo.txt").stat().st_mtime_ns // 1_000
     )
     assert observation.metadata.source_file_count == len(expected_file_names)
     assert observation.metadata.page_count == 260
@@ -338,21 +387,31 @@ def test_gallery_index_keeps_only_one_payload_and_rebuilds_against_fixed_audit(
 ) -> None:
     root = tmp_path / "download"
     first = _gallery(root, "1006")
-    _gallery(root, "1007")
+    second = _gallery(root, "1007")
+    (second / "only-second.webp").write_bytes(b"second gallery only")
     source = FilesystemSource(root)
     source.list_gallery_locators(after_locator=None, limit=2)
 
     first_observation = source.observe_gallery(("1006",))
-    source.observe_gallery(("1007",))
+    second_observation = source.observe_gallery(("1007",))
     connection = source._discovery_index()
 
-    assert connection.execute("SELECT count(*) FROM gallery_entries").fetchone() == (3,)
+    assert connection.execute("SELECT count(*) FROM gallery_entries").fetchone() == (4,)
     assert connection.execute(
         "SELECT count(*) FROM active_gallery_snapshot"
     ).fetchone() == (1,)
     assert connection.execute("SELECT count(*) FROM gallery_audits").fetchone() == (2,)
     assert source.observe_gallery(("1006",)) == first_observation
-    source.observe_gallery(("1007",))
+    assert source.observe_gallery(("1007",)) == second_observation
+    active_before = connection.execute(
+        "SELECT * FROM active_gallery_snapshot"
+    ).fetchone()
+    entries_before = connection.execute(
+        "SELECT * FROM gallery_entries ORDER BY name_bytes"
+    ).fetchall()
+    tags_before = connection.execute(
+        "SELECT * FROM gallery_tags ORDER BY ordinal"
+    ).fetchall()
 
     (first / "001.jpg").write_bytes(b"changed without a directory entry change")
 
@@ -361,6 +420,28 @@ def test_gallery_index_keeps_only_one_payload_and_rebuilds_against_fixed_audit(
         match="changed between bounded pages",
     ):
         source.observe_gallery(("1006",))
+
+    assert connection.execute("SELECT * FROM active_gallery_snapshot").fetchone() == (
+        active_before
+    )
+    assert (
+        connection.execute(
+            "SELECT * FROM gallery_entries ORDER BY name_bytes"
+        ).fetchall()
+        == entries_before
+    )
+    assert (
+        connection.execute("SELECT * FROM gallery_tags ORDER BY ordinal").fetchall()
+        == tags_before
+    )
+    assert source.observe_gallery(("1007",)) == second_observation
+    _observed, second_files = source.list_files(("1007",), after_name=None, limit=256)
+    assert tuple(item.name_bytes for item in second_files.items) == (
+        b"001.jpg",
+        b"002.jpg",
+        b"galleryinfo.txt",
+        b"only-second.webp",
+    )
 
 
 def test_gallery_page_boundary_rejects_mutation_during_fresh_audit(

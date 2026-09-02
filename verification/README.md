@@ -39,7 +39,8 @@ This directory contains executable specifications owned by filesystem ingest.
   `SystemExit`/`KeyboardInterrupt` CLI exits, and fail-closed reentry/work.
 - `tla/GalleryIndexReuse.tla` model-checks two finite galleries across active
   index reuse, replacement on gallery switches, mutation before a page audit,
-  and rejection when a changed gallery is rebuilt against its fixed audit.
+  rejection when a changed gallery is rebuilt against its fixed audit, and
+  preservation of the previous active payload after that rejected switch.
 - `tla/LibraryIoReservation.tla` model-checks WRITING and activation
   reservations across unlocked I/O, crash/restart and response loss, exact
   terminalization, wrong caller digests, stale fence attempts, and the rule
@@ -89,8 +90,16 @@ audits. Production uses canonical stat facts and SHA-256 plus independent exact
 file-read checks; collision resistance and the mapping from POSIX/SQLite/Python
 operations to the model are explicit assumptions, not Lean or TLC results. The
 TLA+ profile explores only two galleries with one possible mutation each. The
-runtime differential, scan-count, active-cache cardinality, source-mutation,
-and exact archive tests provide implementation evidence at those boundaries.
+runtime semantic differential, full public-field direct-stat oracle,
+scan-count, active-cache cardinality and rollback, source-mutation, and exact
+archive tests provide implementation evidence at those boundaries.
+
+Gallery-index reuse is a structural call-count and constant-factor
+optimization, not an asymptotic claim for one unbounded gallery. For `M`
+direct entries and fixed page size `B`, the required fresh full-entry audit
+after each bounded API page still has worst-case `O(M² / B)` work. The reusable
+active index removes repeated index construction and metadata parsing; a corpus
+of `N` galleries is `O(N)` only when per-gallery entry cardinality is bounded.
 
 The library-authority proofs intentionally assume that the same private inode
 authority still denotes the same bytes. They do not prove `flock` exclusion,

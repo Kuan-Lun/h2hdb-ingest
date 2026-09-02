@@ -3,12 +3,14 @@ import Std
 /-!
 # Gallery-scoped immutable source index
 
-This file models the pure part of reusing one gallery index.  A legacy page is
-selected from the source list; an indexed page is selected from an immutable
-list captured from that source.  Under the explicit exact-snapshot premise,
-every page and every deterministic downstream result is unchanged.  A separate
-exact boundary predicate rejects a current list that differs from the captured
-list, and the active-cache model can contain at most one gallery payload.
+This file models the pure part of reusing one gallery index.  A legacy keyset
+page and an indexed keyset page both use the same explicit strict-after
+decision to select entries after an optional key, retain at most `limit + 1`
+candidates to determine the terminal flag, and return at most `limit` entries.
+Under the explicit exact-snapshot premise, every page and every deterministic
+downstream result is unchanged.  A separate exact boundary predicate rejects a
+current list that differs from the captured list, and the active-cache model
+can contain at most one gallery payload.
 
 The production audit canonicalizes entry names and stat facts and compares a
 SHA-256 digest, while file reads additionally check exact stat and content
@@ -16,32 +18,59 @@ facts.  Lean does not prove SHA-256 collision resistance, Python/SQLite
 refinement, directory iteration semantics, parser behavior, concurrent POSIX
 mutation detection, or CBZ serialization.  Runtime differential, paging,
 mutation, and exact-byte tests remain necessary evidence at those boundaries.
+The model states no asymptotic improvement: production still performs a fresh
+full-entry audit before returning every bounded page.
 -/
 
 namespace H2HDBIngest.Verification.GalleryIndexReuse
 
-def selectPage (values : List Entry) (offset limit : Nat) : List Entry :=
-  (values.drop offset).take limit
+structure KeysetPage (Entry : Type) where
+  items : List Entry
+  terminal : Bool
+
+def selectPage {Key Entry : Type}
+    (key : Entry → Key)
+    (strictlyAfter : Key → Key → Bool)
+    (values : List Entry)
+    (after : Option Key)
+    (limit : Nat) : KeysetPage Entry :=
+  let remaining :=
+    match after with
+    | none => values
+    | some cursor => values.filter fun entry => strictlyAfter cursor (key entry)
+  let bounded := remaining.take (limit + 1)
+  ⟨bounded.take limit, decide (bounded.length ≤ limit)⟩
 
 structure ImmutableIndex (Entry : Type) where
   entries : List Entry
 
-def legacyPage
+def legacyPage {Key Entry : Type}
+    (key : Entry → Key)
+    (strictlyAfter : Key → Key → Bool)
     (source : List Entry)
-    (offset limit : Nat) : List Entry :=
-  selectPage source offset limit
+    (after : Option Key)
+    (limit : Nat) : KeysetPage Entry :=
+  selectPage key strictlyAfter source after limit
 
-def indexedPage
+def indexedPage {Key Entry : Type}
+    (key : Entry → Key)
+    (strictlyAfter : Key → Key → Bool)
     (index : ImmutableIndex Entry)
-    (offset limit : Nat) : List Entry :=
-  selectPage index.entries offset limit
+    (after : Option Key)
+    (limit : Nat) : KeysetPage Entry :=
+  selectPage key strictlyAfter index.entries after limit
 
-theorem indexed_page_equals_legacy_page
+theorem indexed_keyset_page_equals_legacy_page
+    {Key Entry : Type}
     (source : List Entry)
     (index : ImmutableIndex Entry)
     (capturedExactly : index.entries = source)
-    (offset limit : Nat) :
-    indexedPage index offset limit = legacyPage source offset limit := by
+    (key : Entry → Key)
+    (strictlyAfter : Key → Key → Bool)
+    (after : Option Key)
+    (limit : Nat) :
+    indexedPage key strictlyAfter index after limit =
+      legacyPage key strictlyAfter source after limit := by
   simp [indexedPage, legacyPage, capturedExactly]
 
 def deterministicOutput

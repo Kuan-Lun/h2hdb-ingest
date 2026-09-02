@@ -8,12 +8,15 @@ Build captures one source version and records a fixed gallery audit.  Switching
 gallery replaces the active payload.  A return is possible only after the
 modeled boundary audit finds the active version equal to the current version;
 a changed active source is rejected.  Rebuilding a previously audited gallery
-after mutation is also rejected.
+after mutation is also rejected, and the failed switch preserves the previous
+active payload just as the production SQLite transaction rollback does.
 
 TLC exhaustively checks only the configured finite galleries and two source
 versions.  The equality below is an abstract exact audit.  This model does not
 prove SHA-256 collision resistance, Python or SQLite refinement, bounded-batch
 implementation, filesystem/stat behavior, parsing, or CBZ byte equivalence.
+It also makes no asymptotic-complexity claim: each page audit is one abstract
+transition even though production scans every direct entry at that boundary.
 ***************************************************************************)
 
 CONSTANT Galleries
@@ -26,13 +29,16 @@ VARIABLES
     fixedVersion,
     activeGallery,
     activeVersion,
+    previousActiveGallery,
+    previousActiveVersion,
     outcome,
     lastEvent,
     lastGallery
 
 vars ==
     <<sourceVersion, fixedKnown, fixedVersion, activeGallery, activeVersion,
-      outcome, lastEvent, lastGallery>>
+      previousActiveGallery, previousActiveVersion, outcome, lastEvent,
+      lastGallery>>
 
 Init ==
     /\ sourceVersion = [gallery \in Galleries |-> 0]
@@ -40,6 +46,8 @@ Init ==
     /\ fixedVersion = [gallery \in Galleries |-> 0]
     /\ activeGallery = None
     /\ activeVersion = 0
+    /\ previousActiveGallery = None
+    /\ previousActiveVersion = 0
     /\ outcome = "NONE"
     /\ lastEvent = "INIT"
     /\ lastGallery = None
@@ -47,10 +55,12 @@ Init ==
 Build(gallery) ==
     /\ gallery \in Galleries
     /\ activeGallery # gallery
+    /\ previousActiveGallery' = activeGallery
+    /\ previousActiveVersion' = activeVersion
     /\ IF gallery \in fixedKnown /\
            sourceVersion[gallery] # fixedVersion[gallery]
-       THEN /\ activeGallery' = None
-            /\ activeVersion' = 0
+       THEN /\ activeGallery' = activeGallery
+            /\ activeVersion' = activeVersion
             /\ fixedKnown' = fixedKnown
             /\ fixedVersion' = fixedVersion
             /\ outcome' = "REJECT"
@@ -75,7 +85,8 @@ ReadPage(gallery) ==
     /\ lastEvent' = "PAGE"
     /\ lastGallery' = gallery
     /\ UNCHANGED <<sourceVersion, fixedKnown, fixedVersion, activeGallery,
-                    activeVersion>>
+                    activeVersion, previousActiveGallery,
+                    previousActiveVersion>>
 
 Mutate(gallery) ==
     /\ gallery \in Galleries
@@ -84,7 +95,8 @@ Mutate(gallery) ==
     /\ outcome' = "NONE"
     /\ lastEvent' = "MUTATE"
     /\ lastGallery' = gallery
-    /\ UNCHANGED <<fixedKnown, fixedVersion, activeGallery, activeVersion>>
+    /\ UNCHANGED <<fixedKnown, fixedVersion, activeGallery, activeVersion,
+                    previousActiveGallery, previousActiveVersion>>
 
 TerminalStutter ==
     /\ UNCHANGED vars
@@ -103,6 +115,8 @@ TypeOK ==
     /\ fixedVersion \in [Galleries -> 0..1]
     /\ activeGallery \in Galleries \cup {None}
     /\ activeVersion \in 0..1
+    /\ previousActiveGallery \in Galleries \cup {None}
+    /\ previousActiveVersion \in 0..1
     /\ outcome \in {"NONE", "RETURN", "REJECT"}
     /\ lastEvent \in {"INIT", "BUILD", "BUILD_REJECT", "PAGE", "MUTATE"}
     /\ lastGallery \in Galleries \cup {None}
@@ -125,8 +139,13 @@ ChangedFixedAuditCannotBeReactivated ==
     lastEvent = "BUILD_REJECT"
         => /\ lastGallery \in fixedKnown
            /\ sourceVersion[lastGallery] # fixedVersion[lastGallery]
-           /\ activeGallery = None
+           /\ activeGallery # lastGallery
            /\ outcome = "REJECT"
+
+RejectedBuildPreservesPreviousActive ==
+    lastEvent = "BUILD_REJECT"
+        => /\ activeGallery = previousActiveGallery
+           /\ activeVersion = previousActiveVersion
 
 Safety ==
     /\ TypeOK
@@ -134,5 +153,6 @@ Safety ==
     /\ ReturnedPagePassedCurrentBoundaryAudit
     /\ ChangedActiveGalleryFailsClosed
     /\ ChangedFixedAuditCannotBeReactivated
+    /\ RejectedBuildPreservesPreviousActive
 
 =============================================================================

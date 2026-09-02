@@ -6,12 +6,13 @@ import argparse
 import json
 import os
 import resource
+import stat
 import sys
 import tempfile
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Thread, current_thread
 from time import perf_counter
 from typing import Protocol, cast
 from unittest.mock import patch
@@ -244,9 +245,15 @@ def _tree_usage(root: Path) -> tuple[int, int]:
     count = 0
     size = 0
     for path in root.rglob("*"):
-        if path.is_file():
+        try:
+            observed = path.stat()
+        except FileNotFoundError:
+            # Publication activation atomically renames files while the monitor
+            # walks the tree.  A vanished entry contributes no current usage.
+            continue
+        if stat.S_ISREG(observed.st_mode):
             count += 1
-            size += path.stat().st_size
+            size += observed.st_size
     return count, size
 
 
@@ -257,28 +264,33 @@ def _monitor_resources(
     interval_seconds: float,
     benchmark_root: Path,
     database_path: Path,
+    failures: list[Exception],
 ) -> None:
-    while not stop.wait(interval_seconds):
-        file_count, tree_bytes = _tree_usage(benchmark_root)
-        rss_bytes = _rss_bytes()
-        database_bytes = database_path.stat().st_size if database_path.exists() else 0
-        print(
-            json.dumps(
-                {
-                    "event": "progress",
-                    "database_size_bytes": database_bytes,
-                    "scratch_file_count": file_count,
-                    "scratch_tree_bytes": tree_bytes,
-                    "ru_maxrss_bytes": rss_bytes,
-                },
-                sort_keys=True,
-            ),
-            file=sys.stderr,
-            flush=True,
-        )
-        if tree_bytes > 20 * 1024**3 or rss_bytes > 4 * 1024**3:
-            safety_stop.set()
-            return
+    try:
+        while not stop.wait(interval_seconds):
+            file_count, tree_bytes = _tree_usage(benchmark_root)
+            rss_bytes = _rss_bytes()
+            database_bytes = database_path.stat().st_size
+            print(
+                json.dumps(
+                    {
+                        "event": "progress",
+                        "database_size_bytes": database_bytes,
+                        "scratch_file_count": file_count,
+                        "scratch_tree_bytes": tree_bytes,
+                        "ru_maxrss_bytes": rss_bytes,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            if tree_bytes > 20 * 1024**3 or rss_bytes > 4 * 1024**3:
+                safety_stop.set()
+                return
+    except Exception as error:
+        failures.append(error)
+        safety_stop.set()
 
 
 def _run_source_only(gallery_count: int) -> dict[str, object]:
@@ -379,6 +391,7 @@ def _run_pipeline(
             gallery_entry_scans = 0
             original_scandir = os.scandir
             resolved_source_root = source_root.resolve()
+            ingest_thread = current_thread()
 
             def counted_scandir(
                 path: int | os.PathLike[str] | str,
@@ -387,7 +400,8 @@ def _run_pipeline(
                 if not isinstance(path, int):
                     candidate = Path(path)
                     if (
-                        candidate.parent == resolved_source_root
+                        current_thread() is ingest_thread
+                        and candidate.parent == resolved_source_root
                         and candidate.name.isdecimal()
                     ):
                         gallery_entry_scans += 1
@@ -395,6 +409,7 @@ def _run_pipeline(
 
             monitor_stop = Event()
             safety_stop = Event()
+            monitor_failures: list[Exception] = []
             monitor = Thread(
                 target=_monitor_resources,
                 kwargs={
@@ -403,6 +418,7 @@ def _run_pipeline(
                     "interval_seconds": progress_seconds,
                     "benchmark_root": benchmark_root,
                     "database_path": database_path,
+                    "failures": monitor_failures,
                 },
                 name="synthetic-benchmark-resource-monitor",
                 daemon=True,
@@ -433,6 +449,10 @@ def _run_pipeline(
                 monitor_stop.set()
                 monitor.join()
             process_seconds = perf_counter() - process_started
+            if monitor_failures:
+                raise RuntimeError(
+                    "synthetic benchmark resource monitor failed"
+                ) from monitor_failures[0]
             if safety_stop.is_set():
                 raise RuntimeError(
                     "synthetic benchmark crossed its 20 GiB scratch or 4 GiB RSS "
