@@ -288,8 +288,15 @@ pinned MariaDB 10.11.11 case explicitly:
 H2HDB_TEST_MARIADB=1 .venv/bin/pytest tests/test_runtime_e2e.py
 ```
 
-The private corpus regression is opt-in through
-`.local-test-data/hath-download` or `H2HDB_INGEST_TEST_DOWNLOAD_PATH`.
+Private corpus regressions are excluded from `check-full` and require an
+explicit marker. They read `.local-test-data/hath-download` by default; set
+`H2HDB_INGEST_TEST_DOWNLOAD_PATH` to select another source:
+
+```bash
+H2HDB_INGEST_TEST_PRIVATE_CORPUS=1 \
+H2HDB_TEST_MARIADB=1 \
+.venv/bin/pytest tests/test_local_download_corpus.py
+```
 
 ## License
 

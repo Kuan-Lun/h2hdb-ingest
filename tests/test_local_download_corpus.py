@@ -26,8 +26,13 @@ from h2hdb_ingest.filesystem import FilesystemArtifactSourceRole, FilesystemSour
 from h2hdb_ingest.runtime import build_runtime
 
 _DOWNLOAD_PATH_ENVIRONMENT = "H2HDB_INGEST_TEST_DOWNLOAD_PATH"
+_PRIVATE_CORPUS_OPT_IN_ENVIRONMENT = "H2HDB_INGEST_TEST_PRIVATE_CORPUS"
 _DEFAULT_DOWNLOAD_PATH = (
     Path(__file__).resolve().parents[1] / ".local-test-data" / "hath-download"
+)
+_PRIVATE_CORPUS_OPT_IN = pytest.mark.skipif(
+    os.environ.get(_PRIVATE_CORPUS_OPT_IN_ENVIRONMENT) != "1",
+    reason=f"set {_PRIVATE_CORPUS_OPT_IN_ENVIRONMENT}=1 to read a private corpus",
 )
 
 
@@ -129,6 +134,14 @@ def _local_download_path() -> Path:
     return path
 
 
+def _opt_in_local_download_path() -> Path:
+    if os.environ.get(_PRIVATE_CORPUS_OPT_IN_ENVIRONMENT) != "1":
+        pytest.skip(
+            f"set {_PRIVATE_CORPUS_OPT_IN_ENVIRONMENT}=1 to read a private corpus"
+        )
+    return _local_download_path()
+
+
 def test_default_private_corpus_uses_the_ignored_repository_local_root() -> None:
     repository_root = Path(__file__).resolve().parents[1]
     ignored = (repository_root / ".gitignore").read_text(encoding="utf-8").splitlines()
@@ -149,6 +162,24 @@ def test_private_corpus_path_allows_an_environment_override(
     assert _local_download_path() == tmp_path
 
 
+def test_private_corpus_requires_an_explicit_opt_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_DOWNLOAD_PATH_ENVIRONMENT, str(tmp_path))
+    monkeypatch.delenv(_PRIVATE_CORPUS_OPT_IN_ENVIRONMENT, raising=False)
+
+    with pytest.raises(
+        pytest.skip.Exception,
+        match=f"set {_PRIVATE_CORPUS_OPT_IN_ENVIRONMENT}=1",
+    ):
+        _opt_in_local_download_path()
+
+    monkeypatch.setenv(_PRIVATE_CORPUS_OPT_IN_ENVIRONMENT, "1")
+    assert _opt_in_local_download_path() == tmp_path
+
+
+@_PRIVATE_CORPUS_OPT_IN
 def test_opt_in_local_download_corpus_is_bounded_and_replayable() -> None:
     """Exercise discovery, parsing, paging, and exact reads on a private corpus."""
 
@@ -157,7 +188,7 @@ def test_opt_in_local_download_corpus_is_bounded_and_replayable() -> None:
     directory_entry_count = 0
     tag_count = 0
     bytes_read = 0
-    with FilesystemSource(_local_download_path()) as source:
+    with FilesystemSource(_opt_in_local_download_path()) as source:
         after_locator: tuple[str, ...] | None = None
         while True:
             galleries = source.list_gallery_locators(
@@ -248,13 +279,14 @@ def test_opt_in_local_download_corpus_is_bounded_and_replayable() -> None:
     assert bytes_read > 0
 
 
+@_PRIVATE_CORPUS_OPT_IN
 def test_private_corpus_completes_mariadb_resident_cycle_and_restart_replay(
     mariadb_config: CoreConfig,
     tmp_path: Path,
 ) -> None:
     """Build and replay the exact private corpus CBZ tree through MariaDB."""
 
-    download_path = _local_download_path()
+    download_path = _opt_in_local_download_path()
     source_authority = _tree_authority(download_path)
     library_path = tmp_path / "library"
     _provision_library_root(library_path)

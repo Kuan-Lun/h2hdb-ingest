@@ -6,7 +6,11 @@ repository_root="$(git rev-parse --show-toplevel)"
 cd "$repository_root"
 
 scripts/check-fast.sh
-.venv/bin/pytest
+(
+    unset H2HDB_INGEST_TEST_PRIVATE_CORPUS
+    unset H2HDB_TEST_MARIADB
+    .venv/bin/pytest
+)
 
 .venv/bin/python scripts/verify-formal.py lean
 .venv/bin/python scripts/verify-formal.py tla \
