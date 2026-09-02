@@ -1780,3 +1780,62 @@ def test_archive_reads_and_crc_validates_bounded_metadata() -> None:
 
     with pytest.raises(PresentationImageError, match="metadata"):
         inspect_presentation_archive(BytesIO(archive), names)
+
+
+def test_every_worker_path_fails_identically_and_preserves_destination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Differential: the decision-driven automatic path and every manual
+    override raise the same failure on the same corrupt page and leave the
+    destination bytes untouched, exactly like sequential rendering."""
+
+    pages: list[bytes] = []
+    for index in range(3):
+        source = BytesIO()
+        Image.new("RGB", (32 + index, 24), (index * 40, 90, 200)).save(
+            source, format="PNG"
+        )
+        pages.append(source.getvalue())
+    members = (
+        _source_member(
+            0,
+            ArtifactSourceRole.METADATA,
+            b"galleryinfo.txt",
+            b"Title: failure equivalence\n",
+        ),
+        *(
+            _source_member(
+                index + 1,
+                ArtifactSourceRole.PAGE,
+                f"page-{index}.png".encode(),
+                content,
+            )
+            for index, content in enumerate(pages)
+        ),
+        _source_member(4, ArtifactSourceRole.PAGE, b"broken.jpg", b"not-an-image"),
+    )
+    policy = ArtifactRenderPolicy(max_image_short_side=16)
+    monkeypatch.setattr(
+        "h2hdb_ingest.artifact.resolve_page_render_workers",
+        lambda configured: 10 if configured is None else configured,
+    )
+
+    failures: list[tuple[type[BaseException], str]] = []
+    for workers in (1, 2, 4, 16, None):
+        destination = BytesIO(b"preserved")
+        for member in members:
+            member.source.seek(0)
+        with pytest.raises(
+            PresentationImageError, match="truncated or invalid"
+        ) as raised:
+            artifact_module.render_archive(
+                members,
+                destination,
+                gid=42,
+                policy=policy,
+                page_render_workers=workers,
+            )
+        failures.append((type(raised.value), str(raised.value)))
+        assert destination.getvalue() == b"preserved"
+
+    assert all(failure == failures[0] for failure in failures)

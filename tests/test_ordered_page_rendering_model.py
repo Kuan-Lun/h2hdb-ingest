@@ -17,6 +17,16 @@ def test_lean_model_proves_order_serialization_and_publish_last() -> None:
         "ValidWorkerCount",
         "automaticWorkerCount",
         "resolveWorkerCount",
+        "CpuTopology",
+        "WorkerDecision",
+        "plausible",
+        "darwinAutomatic",
+        "otherAutomatic",
+        "automaticDecision",
+        "decide",
+        "legacyDetected",
+        "LogRecord",
+        "observe",
         "nextBatchSize",
         "BoundedExecution",
         "orderedCollect",
@@ -29,6 +39,21 @@ def test_lean_model_proves_order_serialization_and_publish_last() -> None:
         "automatic_resolution_is_valid",
         "explicit_worker_override_is_exact",
         "valid_explicit_worker_override_stays_valid",
+        "manual_decision_is_exact_and_marked",
+        "automatic_decision_shape",
+        "automatic_decision_has_no_configured_value",
+        "automatic_decision_is_valid",
+        "every_decision_is_valid",
+        "darwin_decision_ignores_logical_cpu_counts",
+        "non_darwin_decision_ignores_darwin_facts",
+        "performance_cores_take_priority",
+        "translated_intel_process_falls_back_to_one",
+        "unknown_translation_intel_process_falls_back_to_one",
+        "non_intel_darwin_without_performance_authority_falls_back_to_one",
+        "fallback_reason_selects_exactly_one",
+        "detected_reason_selects_capped_authority",
+        "decision_selects_exactly_the_previous_policy",
+        "observation_reports_the_decision_unchanged",
         "arbitrary_bounded_schedule_ordered_collect_equals_sequential_map",
         "completion_schedule_contains_every_page_exactly_once",
         "worker_count_is_valid_and_every_batch_is_worker_bounded",
@@ -41,6 +66,10 @@ def test_lean_model_proves_order_serialization_and_publish_last() -> None:
 
     assert "deterministic pure function" in prose
     assert "any permutation" in prose
+    assert (
+        "None of this proves that `sysctl`, Python CPU discovery, configuration "
+        "parsing, or Python logging refines these definitions" in prose
+    )
     assert "do not prove Pillow determinism or thread safety" in prose
     assert "Python future/executor behavior" in prose
     assert "filesystem semantics" in prose

@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 from threading import Event, Thread
 from typing import cast
 
 import pytest
 from h2hdb import (
+    ArtifactSourceMember,
+    ArtifactSourceRole,
     LibraryActivationStatus,
     VNextCatalogFacade,
     VNextDatabaseAdminFacade,
     VNextIngestFacade,
 )
 
-import h2hdb_ingest.config as config_module
+import h2hdb_ingest.page_workers as page_workers
 import h2hdb_ingest.runtime as runtime_module
 from h2hdb_ingest import (
     ArtifactImageResampler,
@@ -23,6 +27,7 @@ from h2hdb_ingest import (
 )
 from h2hdb_ingest.artifact import ARTIFACT_ADAPTER_ID
 from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
+from h2hdb_ingest.page_workers import CpuTopology, DarwinTranslation
 from h2hdb_ingest.runtime import IngestRuntime, build_runtime
 from h2hdb_ingest.service import VNextIngestService
 
@@ -237,29 +242,154 @@ def test_runtime_passes_effective_render_policy_and_one_metric_sink_to_adapter(
     assert adapter._metrics_sink is service._metrics_sink
 
 
-def test_runtime_resolves_omitted_page_workers_once_before_adapter_construction(
+def _fixed_topology(monkeypatch: pytest.MonkeyPatch, topology: CpuTopology) -> None:
+    page_workers.detect_cpu_topology.cache_clear()
+    monkeypatch.setattr(page_workers, "_probe_cpu_topology", lambda: topology)
+
+
+_APPLE_SILICON = CpuTopology(
+    platform="darwin",
+    machine="arm64",
+    process_cpu_count=14,
+    cpu_count=14,
+    darwin_performance_cores=10,
+    darwin_physical_cores=14,
+    darwin_translation=DarwinTranslation.NATIVE,
+)
+_CONTAINER = CpuTopology(
+    platform="linux",
+    machine="aarch64",
+    process_cpu_count=4,
+    cpu_count=14,
+    darwin_performance_cores=None,
+    darwin_physical_cores=None,
+    darwin_translation=DarwinTranslation.NOT_PROBED,
+)
+
+
+def _worker_lines(events: list[str]) -> list[str]:
+    return [event for event in events if event.startswith("page_render_workers ")]
+
+
+def test_runtime_decides_omitted_page_workers_once_and_logs_the_decision(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = _source_root(tmp_path)
-    configured_values: list[int | None] = []
-
-    def resolve(configured: int | None) -> int:
-        configured_values.append(configured)
-        return 10
-
-    monkeypatch.setattr(config_module, "resolve_page_render_workers", resolve)
+    _fixed_topology(monkeypatch, _APPLE_SILICON)
+    events: list[str] = []
     config = IngestConfig(
         paths=IngestPathsConfig(
             download_path=source,
             library_path=tmp_path / "library",
         )
     )
-
-    service = build_runtime(config).resident._service
+    try:
+        service = build_runtime(config, event_logger=events.append).resident._service
+    finally:
+        page_workers.detect_cpu_topology.cache_clear()
     assert isinstance(service, VNextIngestService)
     adapter = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
 
     assert isinstance(adapter, ManagedFilesystemLibraryAdapter)
     assert adapter._page_render_workers == 10
-    assert configured_values == [None]
+    assert events == [
+        "page_render_workers mode=auto configured=none selected=10 detected=10 "
+        "hard_cap=16 platform=darwin machine=arm64 process_cpu_count=14 "
+        "cpu_count=14 darwin_performance_cores=10 darwin_physical_cores=14 "
+        "darwin_translation=native reason=darwin-performance-cores"
+    ]
+    assert str(tmp_path) not in events[0]
+
+
+def test_runtime_logs_a_manual_override_as_manual_next_to_the_host_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source_root(tmp_path)
+    _fixed_topology(monkeypatch, _CONTAINER)
+    events: list[str] = []
+    config = IngestConfig(
+        paths=IngestPathsConfig(
+            download_path=source,
+            library_path=tmp_path / "library",
+            page_render_workers=10,
+        )
+    )
+    try:
+        service = build_runtime(config, event_logger=events.append).resident._service
+    finally:
+        page_workers.detect_cpu_topology.cache_clear()
+    assert isinstance(service, VNextIngestService)
+    adapter = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
+
+    assert isinstance(adapter, ManagedFilesystemLibraryAdapter)
+    assert adapter._page_render_workers == 10
+    assert events == [
+        "page_render_workers mode=manual configured=10 selected=10 detected=none "
+        "hard_cap=16 platform=linux machine=aarch64 process_cpu_count=4 "
+        "cpu_count=14 darwin_performance_cores=none darwin_physical_cores=none "
+        "darwin_translation=not-probed reason=manual-override"
+    ]
+
+
+def test_runtime_logs_the_worker_decision_once_not_per_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source_root(tmp_path)
+    _fixed_topology(monkeypatch, _APPLE_SILICON)
+    events: list[str] = []
+    config = IngestConfig(
+        paths=IngestPathsConfig(
+            download_path=source,
+            library_path=tmp_path / "library",
+        )
+    )
+    try:
+        runtime = build_runtime(config, event_logger=events.append)
+    finally:
+        page_workers.detect_cpu_topology.cache_clear()
+    service = runtime.resident._service
+    assert isinstance(service, VNextIngestService)
+    adapter = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
+    assert isinstance(adapter, ManagedFilesystemLibraryAdapter)
+
+    for gid in (1, 2, 3):
+        metadata = b"Title: once\n"
+        adapter.render_archive(
+            (
+                ArtifactSourceMember(
+                    position=0,
+                    role=ArtifactSourceRole.METADATA,
+                    source_name=b"galleryinfo.txt",
+                    expected_sha256=sha256(metadata).digest(),
+                    expected_size_bytes=len(metadata),
+                    source=BytesIO(metadata),
+                ),
+            ),
+            BytesIO(),
+            gid=gid,
+        )
+
+    assert len(_worker_lines(events)) == 1
+    assert sum(event.startswith("ingest_metric ") for event in events) == 3
+
+
+def test_artifact_disabled_runtime_does_not_log_or_probe_worker_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_probe() -> CpuTopology:
+        raise AssertionError("a runtime without a library must not probe workers")
+
+    page_workers.detect_cpu_topology.cache_clear()
+    monkeypatch.setattr(page_workers, "_probe_cpu_topology", reject_probe)
+    events: list[str] = []
+    config = IngestConfig(paths=IngestPathsConfig(download_path=_source_root(tmp_path)))
+    try:
+        build_runtime(config, event_logger=events.append)
+    finally:
+        page_workers.detect_cpu_topology.cache_clear()
+
+    assert _worker_lines(events) == []

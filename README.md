@@ -177,6 +177,33 @@ use the process CPU availability, then the host CPU count, and finally one.
 Every detected value is capped at 16, and platform detection is cached rather
 than repeated per render request.
 
+When a CBZ-enabled runtime is built, the service logs the worker decision
+exactly once as one structured `page_render_workers` line, for example:
+
+```text
+page_render_workers mode=auto configured=none selected=10 detected=10 hard_cap=16 platform=darwin machine=arm64 process_cpu_count=14 cpu_count=14 darwin_performance_cores=10 darwin_physical_cores=14 darwin_translation=native reason=darwin-performance-cores
+```
+
+`mode` is `auto` or `manual`; a manual override keeps its exact configured
+value and reports `reason=manual-override` next to the same host facts.
+`detected` is the raw authority before the hard cap and `none` for a manual
+override or a conservative fallback. `platform` and `machine` come from Python,
+`process_cpu_count` and `cpu_count` from `os.process_cpu_count()` and
+`os.cpu_count()`, and the three `darwin_*` fields are `none`/`not-probed` on
+every non-Darwin process because a Linux container cannot observe the macOS
+host's performance and efficiency cores. `darwin_translation` is `native`,
+`translated` (Rosetta), or `unknown` when the probe failed. The closed
+`reason` set names the authority that was selected or the fallback that forced
+one worker (`darwin-performance-cores`,
+`darwin-intel-native-physical-cores`, `darwin-intel-translated-fallback`,
+`darwin-intel-translation-unknown-fallback`,
+`darwin-intel-physical-cores-unavailable-fallback`,
+`darwin-performance-cores-unavailable-fallback`, `process-cpu-count`,
+`cpu-count`, `cpu-count-unavailable-fallback`). The line never contains a
+path, gallery metadata, or other private data, the host probe runs once per
+process, and no per-gallery or per-page record repeats the decision. A runtime
+whose `library_path` is `null` renders nothing and therefore logs no decision.
+
 Docker Desktop runs the service inside a Linux guest, so a container on a macOS
 host cannot query the host's Darwin performance-level sysctls. Automatic
 selection there uses only the process/container-visible Linux vCPU count and

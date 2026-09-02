@@ -77,6 +77,27 @@ mocked platform, validation, cache, API, and runtime tests provide that evidence
 The cap is a scheduling/resource-count bound, not a memory or RSS proof: decoded
 image size and Pillow/intermediate allocation remain unmodeled.
 
+The same Lean file also models the immutable worker *decision* shape that the
+runtime logs once at startup: an abstract once-per-process `CpuTopology`
+(platform kind, Intel-machine flag, optional process and host CPU counts,
+optional Darwin performance and physical core counts, and a native/translated/
+unknown/not-probed Rosetta state) and a pure `decide` function from the optional
+override and that topology to a `WorkerDecision` carrying mode, configured and
+selected values, the raw detected authority, and a closed reason. Its theorems
+prove that a manual override is exact and marked manual, that every automatic
+decision stays in `1..16`, that a Darwin decision never depends on process or
+host logical CPU counts, that a non-Darwin decision never depends on Darwin
+facts (a container cannot claim to know the host's performance and efficiency
+cores), that every fallback reason selects exactly one worker while every
+detected reason selects its hard-capped plausible authority, and that the
+selected count equals the earlier `resolveWorkerCount` policy applied to the
+same abstract authority. `observe` is a pure projection of a decision into its
+log record. The `OrderedPageRendering` TLA+ model is unchanged because the
+decision only feeds its existing `workerCount \in 1..MaxWorkers` boundary.
+None of this proves that the Python probe, `sysctl` parsing, the `functools`
+cache, or Python logging refines these definitions; the mocked-topology
+differential matrix, cache, log-format, and runtime tests provide that evidence.
+
 The runtime-lifecycle models treat facade close as an atomic linearization point
 and CLI unwinding as an abstract bracketed exit. They do not prove Python
 `Lock` scheduling or waiting, context-manager or `BaseException` mechanics,

@@ -28,6 +28,7 @@ from .maintenance import (
     LibraryMaintenanceOutcome,
 )
 from .metrics import TextIngestMetricSink
+from .page_workers import decide_page_render_workers
 from .policy import build_ingest_policy
 from .resident import ResidentIngestor
 from .service import VNextIngestService
@@ -101,11 +102,18 @@ def build_runtime(
             library_maintenance = disabled_library
             publication_guard = _disabled_publication_guard
         else:
+            # One structured decision record per process: the renderer only
+            # receives the selected integer, and nothing below this line logs
+            # worker selection again per gallery or page.
+            worker_decision = decide_page_render_workers(
+                config.paths.page_render_workers
+            )
+            runtime_event_logger(worker_decision.log_line())
             library = ManagedFilesystemLibraryAdapter(
                 config.paths.library_path,
                 source_root=config.paths.download_path,
                 render_policy=config.paths.artifact_render_policy(),
-                page_render_workers=config.paths.effective_page_render_workers,
+                page_render_workers=worker_decision.selected,
                 metrics_sink=metrics_sink,
             )
             artifact_adapters[library.adapter_id] = library
