@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = [
     "h2h-galleryinfo-parser>=0.5.3,<0.6",
-    "h2hdb>=0.29.0,<0.30.0",
+    "h2hdb>=0.29.1,<0.30.0",
     "pillow>=12.3.0,<13.0.0",
     "pydantic>=2.13.4,<3.0.0",
 ]
