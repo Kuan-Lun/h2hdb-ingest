@@ -205,6 +205,198 @@ def test_discovery_snapshot_is_built_once_and_closed_explicitly(
         source.list_gallery_locators(after_locator=None, limit=1)
 
 
+def test_gallery_index_is_reused_across_pages_with_exact_reference_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "1005")
+    for position in range(3, 261):
+        (folder / f"{position:03d}.jpg").write_bytes(f"page-{position}".encode())
+    for position in range(130):
+        (folder / f"child-{position:03d}").mkdir()
+    tag_values = tuple(f"tag-{position:03d}" for position in range(257))
+    metadata = (folder / "galleryinfo.txt").read_text(encoding="utf-8")
+    (folder / "galleryinfo.txt").write_text(
+        metadata.replace(
+            "Tags: artist:first, language:english",
+            "Tags: " + ", ".join(f"misc:{value}" for value in tag_values),
+        ),
+        encoding="utf-8",
+    )
+    expected_file_names = tuple(
+        sorted(
+            os.fsencode(entry.name)
+            for entry in folder.iterdir()
+            if entry.is_file() and not entry.is_symlink()
+        )
+    )
+    expected_entry_names = tuple(
+        sorted(os.fsencode(entry.name) for entry in folder.iterdir())
+    )
+
+    source = FilesystemSource(root)
+    source.list_gallery_locators(after_locator=None, limit=1)
+    target_scans = 0
+    original_scandir = os.scandir
+
+    def counted_scandir(
+        path: int | os.PathLike[str] | str,
+    ) -> Iterator[os.DirEntry[str]]:
+        nonlocal target_scans
+        if not isinstance(path, int) and Path(path) == folder:
+            target_scans += 1
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", counted_scandir)
+    adapter = VNextFilesystemSourceAdapter(source)
+    observation = adapter.observe_gallery(("1005",))
+
+    file_names: list[bytes] = []
+    file_receipts: list[tuple[bytes, int]] = []
+    after_name: bytes | None = None
+    file_page_count = 0
+    while True:
+        file_page = adapter.list_file_observations(
+            observation,
+            after_name_bytes=after_name,
+            limit=256,
+        )
+        file_page_count += 1
+        file_names.extend(item.name_bytes for item in file_page.items)
+        file_receipts.extend(
+            (item.content.file_sha256, item.content.size_bytes)
+            for item in file_page.items
+        )
+        if file_page.terminal:
+            break
+        assert isinstance(file_page.next_after, bytes)
+        after_name = file_page.next_after
+
+    entry_names: list[bytes] = []
+    after_name = None
+    directory_page_count = 0
+    while True:
+        directory_page = adapter.list_directory_observations(
+            observation,
+            after_name_bytes=after_name,
+            limit=192,
+        )
+        directory_page_count += 1
+        entry_names.extend(item.name_bytes for item in directory_page.items)
+        if directory_page.terminal:
+            break
+        assert isinstance(directory_page.next_after, bytes)
+        after_name = directory_page.next_after
+
+    tags: list[tuple[str, str]] = []
+    after_ordinal: int | None = None
+    tag_page_count = 0
+    while True:
+        tag_page = adapter.list_tag_observations(
+            observation,
+            after_ordinal=after_ordinal,
+            limit=256,
+        )
+        tag_page_count += 1
+        tags.extend((item.namespace, item.value) for item in tag_page.items)
+        if tag_page.terminal:
+            break
+        assert isinstance(tag_page.next_after, int)
+        after_ordinal = tag_page.next_after
+
+    assert tuple(file_names) == expected_file_names
+    assert tuple(entry_names) == expected_entry_names
+    assert tuple(tags) == tuple(("misc", value) for value in tag_values)
+    assert tuple(file_receipts) == tuple(
+        (
+            sha256((folder / os.fsdecode(name)).read_bytes()).digest(),
+            (folder / os.fsdecode(name)).stat().st_size,
+        )
+        for name in expected_file_names
+    )
+    assert observation.metadata.source_file_count == len(expected_file_names)
+    assert observation.metadata.page_count == 260
+    assert (file_page_count, directory_page_count, tag_page_count) == (2, 3, 2)
+    # The legacy implementation built and audited three entry indexes for every
+    # named page, while tags rebuilt once.  The immutable active index is built
+    # once and every returned page performs one fresh, exact directory audit.
+    legacy_scan_count = (
+        1 + 3 * file_page_count + 3 * directory_page_count + (tag_page_count)
+    )
+    assert legacy_scan_count == 18
+    assert (
+        target_scans
+        == (1 + file_page_count + directory_page_count + tag_page_count)
+        == 8
+    )
+    source.close()
+
+
+def test_gallery_index_keeps_only_one_payload_and_rebuilds_against_fixed_audit(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "download"
+    first = _gallery(root, "1006")
+    _gallery(root, "1007")
+    source = FilesystemSource(root)
+    source.list_gallery_locators(after_locator=None, limit=2)
+
+    first_observation = source.observe_gallery(("1006",))
+    source.observe_gallery(("1007",))
+    connection = source._discovery_index()
+
+    assert connection.execute("SELECT count(*) FROM gallery_entries").fetchone() == (3,)
+    assert connection.execute(
+        "SELECT count(*) FROM active_gallery_snapshot"
+    ).fetchone() == (1,)
+    assert connection.execute("SELECT count(*) FROM gallery_audits").fetchone() == (2,)
+    assert source.observe_gallery(("1006",)) == first_observation
+    source.observe_gallery(("1007",))
+
+    (first / "001.jpg").write_bytes(b"changed without a directory entry change")
+
+    with pytest.raises(
+        FilesystemObservationError,
+        match="changed between bounded pages",
+    ):
+        source.observe_gallery(("1006",))
+
+
+def test_gallery_page_boundary_rejects_mutation_during_fresh_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "1008")
+    source = FilesystemSource(root)
+    source.list_gallery_locators(after_locator=None, limit=1)
+    source.observe_gallery(("1008",))
+    original_scandir = os.scandir
+    mutate_on_next_gallery_scan = True
+
+    def mutating_scandir(
+        path: int | os.PathLike[str] | str,
+    ) -> Iterator[os.DirEntry[str]]:
+        nonlocal mutate_on_next_gallery_scan
+        if (
+            mutate_on_next_gallery_scan
+            and not isinstance(path, int)
+            and Path(path) == folder
+        ):
+            mutate_on_next_gallery_scan = False
+            (folder / "002.jpg").write_bytes(b"changed during boundary audit")
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", mutating_scandir)
+
+    with pytest.raises(
+        FilesystemObservationError,
+        match="changed between bounded pages",
+    ):
+        source.list_files(("1008",), after_name=None, limit=256)
+
+
 def test_public_adapter_exposes_only_keyset_pages(tmp_path: Path) -> None:
     root = tmp_path / "download"
     _gallery(root, "nested/1001")

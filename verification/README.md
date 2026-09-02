@@ -17,6 +17,10 @@ This directory contains executable specifications owned by filesystem ingest.
   exit kind reaches closed state, entered/closed runtimes reject reentry,
   closed runtimes reject work, and a partially built runtime closes its owned
   facade.
+- `lean/GalleryIndexReuse.lean` proves that exact immutable-index capture keeps
+  every keyset page and deterministic downstream result equal to legacy source
+  selection, that an exact changed boundary is rejected, and that the abstract
+  active-gallery cache contains at most one payload.
 - `lean/LibraryAuthorityReuse.lean` proves that a previously computed digest
   equals recomputation only under an explicit preserved-bytes authority
   premise, that caller digests are accepted only after independent
@@ -33,6 +37,9 @@ This directory contains executable specifications owned by filesystem ingest.
 - `tla/IngestRuntimeLifecycle.tla` model-checks partial construction failure,
   two arbitrarily ordered explicit close callers, normal/one-shot/exception/
   `SystemExit`/`KeyboardInterrupt` CLI exits, and fail-closed reentry/work.
+- `tla/GalleryIndexReuse.tla` model-checks two finite galleries across active
+  index reuse, replacement on gallery switches, mutation before a page audit,
+  and rejection when a changed gallery is rebuilt against its fixed audit.
 - `tla/LibraryIoReservation.tla` model-checks WRITING and activation
   reservations across unlocked I/O, crash/restart and response loss, exact
   terminalization, wrong caller digests, stale fence attempts, and the rule
@@ -76,6 +83,14 @@ signal delivery, core cache cleanup, destructor behavior, or production
 refinement. Deterministic concurrent-close, partial-construction fault, real
 core fail-after-close, and CLI exit-path tests provide those implementation
 checks.
+
+The gallery-index proofs use exact list equality for capture and boundary
+audits. Production uses canonical stat facts and SHA-256 plus independent exact
+file-read checks; collision resistance and the mapping from POSIX/SQLite/Python
+operations to the model are explicit assumptions, not Lean or TLC results. The
+TLA+ profile explores only two galleries with one possible mutation each. The
+runtime differential, scan-count, active-cache cardinality, source-mutation,
+and exact archive tests provide implementation evidence at those boundaries.
 
 The library-authority proofs intentionally assume that the same private inode
 authority still denotes the same bytes. They do not prove `flock` exclusion,
