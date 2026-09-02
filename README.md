@@ -180,8 +180,8 @@ than repeated per render request.
 Docker Desktop runs the service inside a Linux guest, so a container on a macOS
 host cannot query the host's Darwin performance-level sysctls. Automatic
 selection there uses only the process/container-visible Linux vCPU count and
-cannot infer which host CPUs are performance or efficiency cores. To require the
-10 performance cores of the current M4 Pro host, configure
+cannot infer which host CPUs are performance or efficiency cores. On a measured
+M4 Pro host with 10 performance cores, requiring that measured count means setting
 `"page_render_workers": 10` explicitly; the override remains subject to the
 hard cap but is not adjusted to the container's visible CPU count.
 
