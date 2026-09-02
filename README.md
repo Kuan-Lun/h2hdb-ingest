@@ -134,7 +134,6 @@ A minimal SQLite configuration with artifacts enabled is:
     "download_path": "/download",
     "library_path": "/hentai/library",
     "max_image_short_side": 768,
-    "page_render_workers": 2,
     "render_policy": {
       "page_jpeg_quality": 90,
       "thumbnail_jpeg_quality": 85,
@@ -161,10 +160,32 @@ JPEG qualities are strict integers from 0 through 95. Supported resamplers are
 `"preset": "benchmark-low-cost"` selects quality 70, unoptimized encoding, and
 the bilinear resampler for local performance experiments; it never changes the
 default, and any fields supplied beside the preset override its values.
-`page_render_workers` is a strict integer from 1 through 4. It bounds concurrent
-image decoding/encoding while CBZ members are always serialized in canonical
-page order; the default of 2 limits worst-case decoded-image memory on developer
-machines.
+`page_render_workers` may be omitted (or set to `null`) to choose a bounded
+process-cached default, or set to a strict integer from 1 through 16 to override
+that default exactly. CBZ members are always serialized in canonical page order,
+so worker selection does not change archive bytes or member order. On macOS the
+automatic policy reads `hw.perflevel0.physicalcpu` once through the fixed
+`/usr/sbin/sysctl` executable and uses only that highest-performance physical-core
+count. A native Intel process may fall back to `hw.physicalcpu` only after
+`sysctl.proc_translated` confirms it is not running through Rosetta. Translated,
+Apple Silicon, and unknown Darwin processes fall back to one worker if
+performance-core authority is missing, malformed, or unavailable. They never
+reinterpret logical or total CPU counts as performance cores. Other platforms
+use the process CPU availability, then the host CPU count, and finally one.
+Every detected value is capped at 16, and platform detection is cached rather
+than repeated per render request.
+
+The macOS source choice follows Apple's
+[processor performance-level guidance](https://developer.apple.com/documentation/kernel/1387446-sysctlbyname/determining_system_capabilities)
+and uses Apple's documented
+[`sysctl.proc_translated` Rosetta signal](https://developer.apple.com/documentation/apple-silicon/about-the-rosetta-translation-environment)
+to avoid treating an emulated `x86_64` process as native Intel hardware.
+
+Worker count is a concurrency limit, not a memory allocation bound. For example,
+a 40-megapixel RGBA decode is about 153 MiB of raw pixels per worker, so 16 such
+decodes can represent about 2.4 GiB before source, output, temporary, allocator,
+and Pillow overhead. Memory-constrained installations should set a lower explicit
+value; the implementation does not claim a fixed RSS upper bound.
 
 Configuration rejects unknown fields. A complete string value such as
 `"${H2HDB_RW_DB_PASSWORD}"` is replaced from the environment before validation;

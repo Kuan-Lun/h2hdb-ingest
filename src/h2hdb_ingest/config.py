@@ -29,7 +29,6 @@ from ._library_layout import (
 )
 from .artifact import (
     MAX_IMAGE_LONG_SIDE,
-    MAX_PAGE_RENDER_WORKERS,
     MAX_SUPPORTED_JPEG_QUALITY,
     MIN_SUPPORTED_JPEG_QUALITY,
     PAGE_JPEG_QUALITY,
@@ -37,6 +36,7 @@ from .artifact import (
     ArtifactImageResampler,
     ArtifactRenderPolicy,
 )
+from .page_workers import MAX_PAGE_RENDER_WORKERS, resolve_page_render_workers
 
 DEFAULT_MAX_ROWS = 128
 
@@ -130,13 +130,14 @@ class IngestPathsConfig(ConfigModel):
     render_policy: ArtifactRenderPolicyConfig = Field(
         default_factory=ArtifactRenderPolicyConfig
     )
-    page_render_workers: StrictInt = Field(
-        default=2,
+    page_render_workers: StrictInt | None = Field(
+        default=None,
         ge=1,
         le=MAX_PAGE_RENDER_WORKERS,
         description=(
-            "Maximum image pages rendered concurrently before deterministic "
-            "in-order CBZ serialization"
+            "Explicit concurrent image-page worker count, or null/omitted for "
+            "the process-cached bounded platform default; CBZ serialization "
+            "always remains deterministic and in order"
         ),
     )
 
@@ -146,6 +147,12 @@ class IngestPathsConfig(ConfigModel):
         return self.render_policy.to_domain(
             max_image_short_side=self.max_image_short_side
         )
+
+    @property
+    def effective_page_render_workers(self) -> int:
+        """Resolve the optional override to one bounded runtime worker count."""
+
+        return resolve_page_render_workers(self.page_render_workers)
 
     @model_validator(mode="after")
     def validate_library_root(self) -> IngestPathsConfig:

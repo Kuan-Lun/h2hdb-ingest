@@ -4,6 +4,7 @@ from __future__ import annotations
 
 __all__ = [
     "FILESYSTEM_OBSERVATION_VERSION",
+    "MAX_PAGE_RENDER_WORKERS",
     "ArtifactImageResampler",
     "ArtifactRenderPolicy",
     "ArtifactRenderPolicyConfig",
@@ -32,7 +33,9 @@ __all__ = [
     "VNextIngestService",
     "VNextIngestSynchronizationResult",
     "build_ingest_policy",
+    "default_page_render_workers",
     "load_config",
+    "resolve_page_render_workers",
 ]
 
 from .artifact import ArtifactImageResampler, ArtifactRenderPolicy
@@ -65,6 +68,11 @@ from .metrics import (
     IngestMetricSink,
     IngestMetricValue,
     TextIngestMetricSink,
+)
+from .page_workers import (
+    MAX_PAGE_RENDER_WORKERS,
+    default_page_render_workers,
+    resolve_page_render_workers,
 )
 from .policy import build_ingest_policy
 from .resident import ResidentIngestor

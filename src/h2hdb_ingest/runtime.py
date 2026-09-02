@@ -73,7 +73,7 @@ def build_runtime(
             config.paths.library_path,
             source_root=config.paths.download_path,
             render_policy=config.paths.artifact_render_policy(),
-            page_render_workers=config.paths.page_render_workers,
+            page_render_workers=config.paths.effective_page_render_workers,
             metrics_sink=metrics_sink,
         )
         artifact_adapters[library.adapter_id] = library

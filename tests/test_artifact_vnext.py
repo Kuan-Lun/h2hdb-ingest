@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
-from threading import Event, Lock, Thread
+from threading import Barrier, Event, Lock, Thread
 from typing import BinaryIO, cast
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
@@ -32,6 +32,7 @@ from h2hdb_ingest.artifact import (
     MAX_ENCODED_PAGE_BYTES,
     MAX_IMAGE_LONG_SIDE,
     MAX_PAGE_COUNT,
+    MAX_PAGE_RENDER_WORKERS,
     PAGE_JPEG_QUALITY,
     THUMBNAIL_JPEG_QUALITY,
     THUMBNAIL_MAX_SIDE,
@@ -44,6 +45,7 @@ from h2hdb_ingest.artifact import (
 )
 from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
 from h2hdb_ingest.metrics import IngestMetric
+from h2hdb_ingest.page_workers import resolve_page_render_workers
 
 
 class _PartialWriter(BytesIO):
@@ -541,7 +543,9 @@ def test_adapter_owns_deterministic_closed_world_archive_rendering(
                 assert red > blue
 
 
-def test_parallel_page_rendering_is_byte_identical_to_sequential_rendering() -> None:
+def test_parallel_and_automatic_rendering_are_byte_identical_to_sequential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     pages: list[bytes] = []
     for index in range(4):
         source = BytesIO()
@@ -569,9 +573,18 @@ def test_parallel_page_rendering_is_byte_identical_to_sequential_rendering() -> 
         ),
     )
     policy = ArtifactRenderPolicy(max_image_short_side=64)
-    outputs: dict[int, tuple[bytes, object]] = {}
+    outputs: dict[int | None, tuple[bytes, object]] = {}
+    original_resolve = resolve_page_render_workers
 
-    for workers in (1, 2, 4):
+    def resolve(configured: int | None) -> int:
+        return 10 if configured is None else original_resolve(configured)
+
+    monkeypatch.setattr(
+        "h2hdb_ingest.artifact.resolve_page_render_workers",
+        resolve,
+    )
+
+    for workers in (1, 2, 4, 10, 16, None):
         destination = BytesIO()
         evidence = artifact_module.render_archive(
             members,
@@ -582,10 +595,10 @@ def test_parallel_page_rendering_is_byte_identical_to_sequential_rendering() -> 
         )
         outputs[workers] = (destination.getvalue(), evidence)
 
-    assert outputs[1] == outputs[2] == outputs[4]
+    assert all(output == outputs[1] for output in outputs.values())
 
 
-def test_parallel_page_rendering_runs_only_the_bounded_worker_count(
+def test_automatic_page_rendering_runs_only_the_bounded_worker_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     page = BytesIO()
@@ -605,15 +618,24 @@ def test_parallel_page_rendering_runs_only_the_bounded_worker_count(
                 f"page-{index}.png".encode(),
                 content,
             )
-            for index in range(4)
+            for index in range(MAX_PAGE_RENDER_WORKERS)
         ),
     )
     original = artifact_module._render_page
-    release = Event()
+    rendezvous = Barrier(MAX_PAGE_RENDER_WORKERS)
     guard = Lock()
     active = 0
     maximum_active = 0
-    started = 0
+    resolved: list[int | None] = []
+
+    def resolve(configured: int | None) -> int:
+        resolved.append(configured)
+        return MAX_PAGE_RENDER_WORKERS
+
+    monkeypatch.setattr(
+        "h2hdb_ingest.artifact.resolve_page_render_workers",
+        resolve,
+    )
 
     def observed_render(
         source: BinaryIO,
@@ -621,15 +643,12 @@ def test_parallel_page_rendering_runs_only_the_bounded_worker_count(
         *,
         policy: ArtifactRenderPolicy,
     ) -> artifact_module.CanonicalImageEvidence:
-        nonlocal active, maximum_active, started
+        nonlocal active, maximum_active
         with guard:
             active += 1
-            started += 1
             maximum_active = max(maximum_active, active)
-            if started == 2:
-                release.set()
         try:
-            assert release.wait(timeout=5), "the second bounded worker never started"
+            rendezvous.wait(timeout=5)
             return original(source, destination, policy=policy)
         finally:
             with guard:
@@ -642,10 +661,10 @@ def test_parallel_page_rendering_runs_only_the_bounded_worker_count(
         BytesIO(),
         gid=42,
         policy=ArtifactRenderPolicy(max_image_short_side=64),
-        page_render_workers=2,
     )
 
-    assert maximum_active == 2
+    assert maximum_active == MAX_PAGE_RENDER_WORKERS
+    assert resolved == [None]
 
 
 def test_parallel_image_header_warning_filter_is_serialized_and_restored(
@@ -818,7 +837,7 @@ def test_sequential_page_batch_closes_completed_spools_after_later_failure(
         (True, TypeError),
         (1.0, TypeError),
         (0, ValueError),
-        (5, ValueError),
+        (17, ValueError),
     ],
 )
 def test_page_render_worker_count_is_strict_and_hard_bounded(
@@ -840,6 +859,29 @@ def test_page_render_worker_count_is_strict_and_hard_bounded(
             policy=ArtifactRenderPolicy(max_image_short_side=64),
             page_render_workers=cast(int, workers),
         )
+
+
+@pytest.mark.parametrize("workers", range(1, 17))
+def test_archive_api_accepts_every_explicit_worker_override(workers: int) -> None:
+    destination = BytesIO()
+
+    evidence = artifact_module.render_archive(
+        (
+            _source_member(
+                0,
+                ArtifactSourceRole.METADATA,
+                b"galleryinfo.txt",
+                b"Title: explicit worker override\n",
+            ),
+        ),
+        destination,
+        gid=42,
+        policy=ArtifactRenderPolicy(max_image_short_side=64),
+        page_render_workers=workers,
+    )
+
+    assert evidence.pages == ()
+    assert destination.getbuffer().nbytes == evidence.size_bytes
 
 
 def test_archive_writer_fails_closed_before_exposing_bounded_destination(

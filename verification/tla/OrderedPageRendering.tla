@@ -20,7 +20,7 @@ does not model a failure during the final destination write itself.
 CONSTANTS PageCount, MaxWorkers
 
 ASSUME /\ PageCount \in Nat \ {0}
-       /\ MaxWorkers = 4
+       /\ MaxWorkers = 16
 
 Pages == 1..PageCount
 
@@ -209,7 +209,7 @@ TypeOK ==
 WorkerCountHardBound ==
     /\ 1 \leq workerCount
     /\ workerCount \leq MaxWorkers
-    /\ workerCount \leq 4
+    /\ workerCount \leq 16
 
 BatchSizeHardBound ==
     /\ Cardinality(CurrentBatch) \leq workerCount

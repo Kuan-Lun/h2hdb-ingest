@@ -24,7 +24,7 @@ This directory contains executable specifications owned by filesystem ingest.
 - `tla/OrderedPageRendering.tla` model-checks finite choices of worker count,
   batch size, page-completion interleavings, ordered collection, validation and
   serialization failures, and publish-last destination safety. Its required
-  `Small` profile uses four pages and explores worker counts `1..4`.
+  `Small` profile uses four pages and explores worker counts `1..16`.
 - `tla/LibraryIoReservation.tla` model-checks WRITING and activation
   reservations across unlocked I/O, crash/restart and response loss, exact
   terminalization, wrong caller digests, stale fence attempts, and the rule
@@ -51,6 +51,15 @@ before publication; it does not claim that a failure during the final
 destination write is atomic. Exact-byte differential, measured concurrency-
 bound, validation/serialization fault, and destination-preservation tests
 remain the implementation evidence for those boundaries.
+
+The worker-policy Lean theorems prove only that natural-number auto selection is
+clamped into `1..16`, that a valid explicit override is preserved exactly, and
+that every modeled batch respects the same hard cap. TLC exhaustively explores
+that finite worker range for its four-page profile. Neither proves that Darwin
+`sysctl`, Python CPU discovery, or configuration parsing refines those inputs;
+mocked platform, validation, cache, API, and runtime tests provide that evidence.
+The cap is a scheduling/resource-count bound, not a memory or RSS proof: decoded
+image size and Pillow/intermediate allocation remain unmodeled.
 
 The library-authority proofs intentionally assume that the same private inode
 authority still denotes the same bytes. They do not prove `flock` exclusion,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from h2hdb import (
     LibraryActivationStatus,
     VNextCatalogFacade,
@@ -9,6 +10,7 @@ from h2hdb import (
     VNextIngestFacade,
 )
 
+import h2hdb_ingest.config as config_module
 from h2hdb_ingest import (
     ArtifactImageResampler,
     ArtifactRenderPolicyConfig,
@@ -108,3 +110,31 @@ def test_runtime_passes_effective_render_policy_and_one_metric_sink_to_adapter(
     assert adapter._render_policy.resampler is ArtifactImageResampler.BILINEAR
     assert adapter._page_render_workers == 4
     assert adapter._metrics_sink is service._metrics_sink
+
+
+def test_runtime_resolves_omitted_page_workers_once_before_adapter_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source_root(tmp_path)
+    configured_values: list[int | None] = []
+
+    def resolve(configured: int | None) -> int:
+        configured_values.append(configured)
+        return 10
+
+    monkeypatch.setattr(config_module, "resolve_page_render_workers", resolve)
+    config = IngestConfig(
+        paths=IngestPathsConfig(
+            download_path=source,
+            library_path=tmp_path / "library",
+        )
+    )
+
+    service = build_runtime(config).resident._service
+    assert isinstance(service, VNextIngestService)
+    adapter = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
+
+    assert isinstance(adapter, ManagedFilesystemLibraryAdapter)
+    assert adapter._page_render_workers == 10
+    assert configured_values == [None]

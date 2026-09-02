@@ -6,7 +6,7 @@ import Std
 The renderer is modeled as a deterministic pure function from one indexed page
 to its exact bytes and evidence.  A `BoundedExecution` may complete pages in any
 permutation and group them into arbitrary batches, provided every page occurs
-exactly once, worker count is in `1..4`, and every batch is no larger than that
+exactly once, worker count is in `1..16`, and every batch is no larger than that
 worker count.  `orderedCollect` deliberately ignores completion order and reads
 the exact result at increasing page index.
 
@@ -28,8 +28,42 @@ evidence.
 
 namespace H2HDBIngest.Verification.OrderedPageRendering
 
+def HardWorkerCap : Nat := 16
+
 def ValidWorkerCount (workers : Nat) : Prop :=
-  1 ≤ workers ∧ workers ≤ 4
+  1 ≤ workers ∧ workers ≤ HardWorkerCap
+
+def automaticWorkerCount (detected : Nat) : Nat :=
+  if detected < 1 then 1
+  else if HardWorkerCap < detected then HardWorkerCap
+  else detected
+
+def resolveWorkerCount (configured : Option Nat) (detected : Nat) : Nat :=
+  match configured with
+  | none => automaticWorkerCount detected
+  | some workers => workers
+
+theorem automatic_worker_count_is_valid (detected : Nat) :
+    ValidWorkerCount (automaticWorkerCount detected) := by
+  unfold automaticWorkerCount ValidWorkerCount HardWorkerCap
+  split
+  · omega
+  · split <;> omega
+
+theorem automatic_resolution_is_valid (detected : Nat) :
+    ValidWorkerCount (resolveWorkerCount none detected) := by
+  exact automatic_worker_count_is_valid detected
+
+theorem explicit_worker_override_is_exact
+    (configured detected : Nat) :
+    resolveWorkerCount (some configured) detected = configured := by
+  rfl
+
+theorem valid_explicit_worker_override_stays_valid
+    (configured detected : Nat)
+    (valid : ValidWorkerCount configured) :
+    ValidWorkerCount (resolveWorkerCount (some configured) detected) := by
+  simpa [resolveWorkerCount] using valid
 
 def nextBatchSize (workers remaining : Nat) : Nat :=
   min workers remaining
@@ -42,7 +76,7 @@ theorem next_batch_size_le_worker_count
 theorem next_batch_size_is_hard_bounded
     (workers remaining : Nat)
     (valid : ValidWorkerCount workers) :
-    nextBatchSize workers remaining ≤ 4 := by
+    nextBatchSize workers remaining ≤ HardWorkerCap := by
   exact Nat.le_trans
     (next_batch_size_le_worker_count workers remaining) valid.2
 
@@ -137,14 +171,15 @@ theorem worker_count_is_valid_and_every_batch_is_worker_bounded
   ⟨execution.workerCountValid,
     scheduled_batch_size_le_worker_count execution batch⟩
 
-theorem worker_and_every_batch_are_hard_bounded_by_four
+theorem worker_and_every_batch_are_hard_bounded
     {pageCount : Nat}
     {Page Result : Type}
     {pages : Fin pageCount → Page}
     {render : Page → Result}
     (execution : BoundedExecution pageCount Page Result pages render)
     (batch : Nat) :
-    execution.workerCount ≤ 4 ∧ scheduledBatchSize execution batch ≤ 4 := by
+    execution.workerCount ≤ HardWorkerCap ∧
+      scheduledBatchSize execution batch ≤ HardWorkerCap := by
   exact ⟨execution.workerCountValid.2,
     Nat.le_trans (scheduled_batch_size_le_worker_count execution batch)
       execution.workerCountValid.2⟩

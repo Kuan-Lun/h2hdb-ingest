@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+import h2hdb_ingest.config as config_module
 from h2hdb_ingest import (
     ArtifactImageResampler,
     ArtifactRenderPolicyConfig,
@@ -274,10 +275,24 @@ def test_default_render_policy_preserves_canonical_encoder_parameters() -> None:
         resampler=ArtifactImageResampler.LANCZOS,
     )
     assert paths.artifact_render_policy().max_image_short_side == 768
-    assert paths.page_render_workers == 2
+    assert paths.page_render_workers is None
 
 
-@pytest.mark.parametrize("value", (1, 2, 3, 4))
+def test_omitted_or_null_page_render_workers_use_automatic_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config_module, "resolve_page_render_workers", lambda value: 10)
+
+    omitted = IngestPathsConfig(download_path=Path("/download"))
+    explicit_null = IngestPathsConfig.model_validate(
+        {"download_path": "/download", "page_render_workers": None}
+    )
+
+    assert omitted.effective_page_render_workers == 10
+    assert explicit_null.effective_page_render_workers == 10
+
+
+@pytest.mark.parametrize("value", range(1, 17))
 def test_page_render_workers_accept_every_bounded_value(value: int) -> None:
     paths = IngestPathsConfig(
         download_path=Path("/download"),
@@ -285,9 +300,10 @@ def test_page_render_workers_accept_every_bounded_value(value: int) -> None:
     )
 
     assert paths.page_render_workers == value
+    assert paths.effective_page_render_workers == value
 
 
-@pytest.mark.parametrize("value", (0, 5, True, 1.0, "2", None))
+@pytest.mark.parametrize("value", (0, 17, True, 1.0, "2"))
 def test_page_render_workers_reject_unbounded_or_coerced_values(value: object) -> None:
     with pytest.raises(ValidationError):
         IngestPathsConfig.model_validate(

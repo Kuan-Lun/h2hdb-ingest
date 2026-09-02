@@ -240,18 +240,40 @@ def test_library_rejects_non_integer_page_render_workers(
         )
 
 
-@pytest.mark.parametrize("workers", (0, 5))
+@pytest.mark.parametrize("workers", (0, 17))
 def test_library_rejects_out_of_range_page_render_workers(
     tmp_path: Path,
     workers: int,
 ) -> None:
-    with pytest.raises(ValueError, match="must be from 1 through 4"):
+    with pytest.raises(ValueError, match="must be from 1 through 16"):
         ManagedFilesystemLibraryAdapter(
             tmp_path / "library",
             source_root=_source_root(tmp_path / "library"),
             render_policy=_RENDER_POLICY,
             page_render_workers=workers,
         )
+
+
+def test_library_resolves_automatic_page_render_workers_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured: list[int | None] = []
+
+    def resolve(value: int | None) -> int:
+        configured.append(value)
+        return 10
+
+    monkeypatch.setattr(library_module, "resolve_page_render_workers", resolve)
+
+    adapter = ManagedFilesystemLibraryAdapter(
+        tmp_path / "library",
+        source_root=_source_root(tmp_path / "library"),
+        render_policy=_RENDER_POLICY,
+    )
+
+    assert adapter._page_render_workers == 10
+    assert configured == [None]
 
 
 def test_library_passes_page_render_workers_to_archive_renderer(

@@ -13,7 +13,10 @@ def test_lean_model_proves_order_serialization_and_publish_last() -> None:
     prose = " ".join(model.split())
 
     for definition in {
+        "HardWorkerCap",
         "ValidWorkerCount",
+        "automaticWorkerCount",
+        "resolveWorkerCount",
         "nextBatchSize",
         "BoundedExecution",
         "orderedCollect",
@@ -22,10 +25,14 @@ def test_lean_model_proves_order_serialization_and_publish_last() -> None:
     }:
         assert f"def {definition}" in model or f"structure {definition}" in model
     for theorem in {
+        "automatic_worker_count_is_valid",
+        "automatic_resolution_is_valid",
+        "explicit_worker_override_is_exact",
+        "valid_explicit_worker_override_stays_valid",
         "arbitrary_bounded_schedule_ordered_collect_equals_sequential_map",
         "completion_schedule_contains_every_page_exactly_once",
         "worker_count_is_valid_and_every_batch_is_worker_bounded",
-        "worker_and_every_batch_are_hard_bounded_by_four",
+        "worker_and_every_batch_are_hard_bounded",
         "ordered_serialization_equals_sequential_serialization",
         "every_deterministic_serializer_observes_sequential_input",
         "every_prepublication_failure_preserves_destination",
@@ -77,12 +84,12 @@ def test_tla_model_explores_bounded_schedules_failures_and_publish_last() -> Non
     assert "failure during the final destination write itself" in prose
 
 
-def test_tla_small_profile_wires_four_worker_safety_contract() -> None:
+def test_tla_small_profile_wires_sixteen_worker_safety_contract() -> None:
     profile = SMALL_PROFILE.read_text(encoding="utf-8")
 
     assert "SPECIFICATION Spec" in profile
     assert "PageCount = 4" in profile
-    assert "MaxWorkers = 4" in profile
+    assert "MaxWorkers = 16" in profile
     assert "WorkerCountHardBound" in profile
     assert "BatchSizeHardBound" in profile
     assert "OrderedCollectIsSequentialPrefix" in profile

@@ -73,13 +73,13 @@ from .metrics import (
     IngestMetricValue,
     emit_ingest_metric,
 )
+from .page_workers import MAX_PAGE_RENDER_WORKERS, resolve_page_render_workers
 from .storage import artifact_name
 
 ARTIFACT_ADAPTER_ID = b"managed-filesystem"
 ARTIFACT_WRITER_ID = b"h2hdb-ingest-presentation-v2"
 
 MAX_PAGE_COUNT = 4096
-MAX_PAGE_RENDER_WORKERS = 4
 MAX_ENCODED_PAGE_BYTES = 32 * 1024 * 1024
 # v2 forbids ZIP64. This deliberately matches the standard library's safe
 # non-ZIP64 ceiling and is checked before a completed archive is exposed.
@@ -326,7 +326,7 @@ def render_archive(
     *,
     gid: int,
     policy: ArtifactRenderPolicy,
-    page_render_workers: int = 1,
+    page_render_workers: int | None = None,
     metrics_sink: IngestMetricSink | None = None,
 ) -> ArtifactArchiveRenderEvidence:
     """Render one closed-world non-ZIP64 CBZ before exposing destination bytes."""
@@ -338,7 +338,7 @@ def render_archive(
     if not isinstance(policy, ArtifactRenderPolicy):
         raise TypeError("artifact policy must be ArtifactRenderPolicy")
     policy.__post_init__()
-    workers = _validate_page_render_workers(page_render_workers)
+    workers = resolve_page_render_workers(page_render_workers)
     if not all(
         hasattr(destination, method) for method in ("seek", "truncate", "write")
     ):
@@ -513,16 +513,6 @@ def render_archive(
         ),
     )
     return evidence
-
-
-def _validate_page_render_workers(value: int) -> int:
-    if type(value) is not int:
-        raise TypeError("page_render_workers must be int")
-    if not 1 <= value <= MAX_PAGE_RENDER_WORKERS:
-        raise ValueError(
-            f"page_render_workers must be from 1 through {MAX_PAGE_RENDER_WORKERS}"
-        )
-    return value
 
 
 def _render_page_member(

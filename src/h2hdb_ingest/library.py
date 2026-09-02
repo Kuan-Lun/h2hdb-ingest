@@ -48,7 +48,6 @@ from ._library_layout import STATE_DIRECTORY_NAME as _STATE_DIRECTORY_NAME
 from ._library_layout import validate_precreated_library_layout
 from .artifact import (
     ARTIFACT_ADAPTER_ID,
-    MAX_PAGE_RENDER_WORKERS,
     ArtifactRenderPolicy,
     artifact_policy_fingerprint_sha256,
     render_archive,
@@ -56,6 +55,7 @@ from .artifact import (
 )
 from .maintenance import LibraryMaintenanceOutcome
 from .metrics import IngestMetricSink
+from .page_workers import resolve_page_render_workers
 from .storage import (
     STORAGE_OBJECT_CODEC,
     storage_key_gid,
@@ -185,7 +185,7 @@ class ManagedFilesystemLibraryAdapter:
         *,
         source_root: Path,
         render_policy: ArtifactRenderPolicy,
-        page_render_workers: int = 1,
+        page_render_workers: int | None = None,
         metrics_sink: IngestMetricSink | None = None,
     ) -> None:
         if not isinstance(library_path, Path):
@@ -193,12 +193,7 @@ class ManagedFilesystemLibraryAdapter:
         if not isinstance(render_policy, ArtifactRenderPolicy):
             raise TypeError("render_policy must be ArtifactRenderPolicy")
         render_policy.__post_init__()
-        if type(page_render_workers) is not int:
-            raise TypeError("page_render_workers must be int")
-        if not 1 <= page_render_workers <= MAX_PAGE_RENDER_WORKERS:
-            raise ValueError(
-                f"page_render_workers must be from 1 through {MAX_PAGE_RENDER_WORKERS}"
-            )
+        effective_page_render_workers = resolve_page_render_workers(page_render_workers)
         if metrics_sink is not None and not callable(metrics_sink):
             raise TypeError("metrics_sink must be callable")
         if not isinstance(source_root, Path):
@@ -228,7 +223,7 @@ class ManagedFilesystemLibraryAdapter:
         self._publication_lock_path = self._coordination / _PUBLICATION_LOCK_NAME
         self._marker_path = self._coordination / _ACTIVATING_MARKER_NAME
         self._render_policy = render_policy
-        self._page_render_workers = page_render_workers
+        self._page_render_workers = effective_page_render_workers
         self._metrics_sink = metrics_sink
         self.policy_fingerprint_sha256 = artifact_policy_fingerprint_sha256(
             render_policy
