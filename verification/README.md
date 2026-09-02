@@ -97,9 +97,12 @@ archive tests provide implementation evidence at those boundaries.
 Gallery-index reuse is a structural call-count and constant-factor
 optimization, not an asymptotic claim for one unbounded gallery. For `M`
 direct entries and fixed page size `B`, the required fresh full-entry audit
-after each bounded API page still has worst-case `O(M² / B)` work. The reusable
-active index removes repeated index construction and metadata parsing; a corpus
-of `N` galleries is `O(N)` only when per-gallery entry cardinality is bounded.
+after each bounded API page performs `Θ(M² / B)` filesystem `scandir`/`stat`
+entry observations. Including the audit's SQLite B-tree primary-key
+maintenance gives a conservative `O(M² log M / B)` bound, with metadata and
+tag parsing/paging costs accounted for separately. The reusable active index
+removes repeated reusable-index construction and metadata parsing; a corpus of
+`N` galleries is `O(N)` only when per-gallery entry cardinality is bounded.
 
 The library-authority proofs intentionally assume that the same private inode
 authority still denotes the same bytes. They do not prove `flock` exclusion,
