@@ -4,10 +4,16 @@ import os
 import platform
 import subprocess
 import sys
+from ctypes import c_int, sizeof
+from errno import EACCES, ENOENT
 
 import pytest
 
 import h2hdb_ingest.page_workers as page_workers
+
+
+def _reject_translation_probe() -> page_workers._DarwinTranslationStatus:
+    raise AssertionError("translation status is irrelevant after P-core authority")
 
 
 @pytest.mark.parametrize(
@@ -25,7 +31,11 @@ def test_darwin_prefers_highest_performance_physical_cores(
         return reported
 
     assert (
-        page_workers._darwin_default_page_render_workers("arm64", read_sysctl)
+        page_workers._darwin_default_page_render_workers(
+            "arm64",
+            read_sysctl,
+            _reject_translation_probe,
+        )
         == expected
     )
     assert requested == ["hw.perflevel0.physicalcpu"]
@@ -38,7 +48,14 @@ def test_apple_silicon_missing_performance_authority_falls_back_to_one() -> None
         requested.append(name)
         return 14 if name == "hw.physicalcpu" else None
 
-    assert page_workers._darwin_default_page_render_workers("arm64", read_sysctl) == 1
+    assert (
+        page_workers._darwin_default_page_render_workers(
+            "arm64",
+            read_sysctl,
+            _reject_translation_probe,
+        )
+        == 1
+    )
     assert requested == ["hw.perflevel0.physicalcpu"]
 
 
@@ -50,35 +67,76 @@ def test_intel_macos_falls_back_to_total_physical_not_logical_cores(
 
     def read_sysctl(name: str) -> int | None:
         requested.append(name)
-        if name == "sysctl.proc_translated":
-            return 0
         return 6 if name == "hw.physicalcpu" else None
 
-    assert page_workers._darwin_default_page_render_workers(machine, read_sysctl) == 6
+    assert (
+        page_workers._darwin_default_page_render_workers(
+            machine,
+            read_sysctl,
+            lambda: page_workers._DarwinTranslationStatus.NATIVE,
+        )
+        == 6
+    )
     assert requested == [
         "hw.perflevel0.physicalcpu",
-        "sysctl.proc_translated",
         "hw.physicalcpu",
     ]
 
 
-@pytest.mark.parametrize("translated", (1, None))
-def test_rosetta_or_unknown_translation_state_never_uses_total_physical_cores(
-    translated: int | None,
+def test_intel_missing_translation_oid_uses_native_physical_fallback(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     requested: list[str] = []
 
     def read_sysctl(name: str) -> int | None:
         requested.append(name)
-        if name == "sysctl.proc_translated":
-            return translated
-        return 14 if name == "hw.physicalcpu" else None
+        return 6 if name == "hw.physicalcpu" else None
 
-    assert page_workers._darwin_default_page_render_workers("x86_64", read_sysctl) == 1
+    monkeypatch.setattr(
+        page_workers,
+        "_invoke_darwin_translation_sysctl",
+        lambda: (-1, ENOENT, 0, sizeof(c_int)),
+    )
+
+    assert (
+        page_workers._darwin_default_page_render_workers(
+            "x86_64",
+            read_sysctl,
+            page_workers._read_darwin_translation_status,
+        )
+        == 6
+    )
     assert requested == [
         "hw.perflevel0.physicalcpu",
-        "sysctl.proc_translated",
+        "hw.physicalcpu",
     ]
+
+
+@pytest.mark.parametrize(
+    "translation_status",
+    (
+        page_workers._DarwinTranslationStatus.TRANSLATED,
+        page_workers._DarwinTranslationStatus.FAILURE,
+    ),
+)
+def test_rosetta_or_unknown_translation_state_never_uses_total_physical_cores(
+    translation_status: page_workers._DarwinTranslationStatus,
+) -> None:
+    requested: list[str] = []
+
+    def read_sysctl(name: str) -> int | None:
+        requested.append(name)
+        return 14 if name == "hw.physicalcpu" else None
+
+    assert (
+        page_workers._darwin_default_page_render_workers(
+            "x86_64",
+            read_sysctl,
+            lambda: translation_status,
+        )
+        == 1
+    )
+    assert requested == ["hw.perflevel0.physicalcpu"]
 
 
 def test_unknown_darwin_architecture_never_reinterprets_total_cpu_count() -> None:
@@ -89,7 +147,12 @@ def test_unknown_darwin_architecture_never_reinterprets_total_cpu_count() -> Non
         return 64 if name == "hw.physicalcpu" else None
 
     assert (
-        page_workers._darwin_default_page_render_workers("future-arm", read_sysctl) == 1
+        page_workers._darwin_default_page_render_workers(
+            "future-arm",
+            read_sysctl,
+            _reject_translation_probe,
+        )
+        == 1
     )
     assert requested == ["hw.perflevel0.physicalcpu"]
 
@@ -191,20 +254,48 @@ def test_darwin_sysctl_reader_accepts_only_bounded_decimal_output(
     assert page_workers._read_darwin_sysctl("hw.perflevel0.physicalcpu") == 10
 
 
-@pytest.mark.parametrize("reported", (0, 1))
-def test_darwin_sysctl_reader_accepts_translation_state(
+@pytest.mark.parametrize(
+    ("invocation", "expected"),
+    (
+        (
+            (0, 0, 0, sizeof(c_int)),
+            page_workers._DarwinTranslationStatus.NATIVE,
+        ),
+        (
+            (0, 0, 1, sizeof(c_int)),
+            page_workers._DarwinTranslationStatus.TRANSLATED,
+        ),
+        (
+            (-1, ENOENT, 0, sizeof(c_int)),
+            page_workers._DarwinTranslationStatus.NATIVE,
+        ),
+        (
+            (-1, EACCES, 0, sizeof(c_int)),
+            page_workers._DarwinTranslationStatus.FAILURE,
+        ),
+        (
+            (0, 0, 2, sizeof(c_int)),
+            page_workers._DarwinTranslationStatus.FAILURE,
+        ),
+        (
+            (0, 0, 0, sizeof(c_int) + 1),
+            page_workers._DarwinTranslationStatus.FAILURE,
+        ),
+        (None, page_workers._DarwinTranslationStatus.FAILURE),
+    ),
+)
+def test_darwin_translation_reader_distinguishes_missing_oid_from_failure(
     monkeypatch: pytest.MonkeyPatch,
-    reported: int,
+    invocation: tuple[int, int, int, int] | None,
+    expected: page_workers._DarwinTranslationStatus,
 ) -> None:
-    def completed(
-        _command: tuple[str, str, str],
-        **_kwargs: object,
-    ) -> subprocess.CompletedProcess[str]:
-        return subprocess.CompletedProcess((), 0, stdout=f"{reported}\n", stderr="")
+    monkeypatch.setattr(
+        page_workers,
+        "_invoke_darwin_translation_sysctl",
+        lambda: invocation,
+    )
 
-    monkeypatch.setattr(subprocess, "run", completed)
-
-    assert page_workers._read_darwin_sysctl("sysctl.proc_translated") == reported
+    assert page_workers._read_darwin_translation_status() is expected
 
 
 @pytest.mark.parametrize("stdout", ("", "0", "-1", "1.5", "ten", "1025"))

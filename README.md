@@ -167,8 +167,10 @@ so worker selection does not change archive bytes or member order. On macOS the
 automatic policy reads `hw.perflevel0.physicalcpu` once through the fixed
 `/usr/sbin/sysctl` executable and uses only that highest-performance physical-core
 count. A native Intel process may fall back to `hw.physicalcpu` only after
-`sysctl.proc_translated` confirms it is not running through Rosetta. Translated,
-Apple Silicon, and unknown Darwin processes fall back to one worker if
+`sysctl.proc_translated` confirms it is not running through Rosetta; following
+Apple's contract, a missing translation OID also means native, while any other
+invocation failure remains unknown and falls back to one. Translated, Apple
+Silicon, and unknown Darwin processes likewise fall back to one worker if
 performance-core authority is missing, malformed, or unavailable. They never
 reinterpret logical or total CPU counts as performance cores. Other platforms
 use the process CPU availability, then the host CPU count, and finally one.

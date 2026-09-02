@@ -13,6 +13,11 @@ import platform
 import subprocess
 import sys
 from collections.abc import Callable
+from ctypes import CDLL, POINTER, byref, c_char_p, c_int, c_size_t, c_void_p, sizeof
+from ctypes import get_errno as _get_errno
+from ctypes import set_errno as _set_errno
+from enum import Enum, auto
+from errno import ENOENT
 from functools import cache
 
 MAX_PAGE_RENDER_WORKERS = 16
@@ -25,6 +30,15 @@ _DARWIN_CONSERVATIVE_FALLBACK = 1
 _MAX_PLAUSIBLE_DETECTED_CPUS = 1024
 
 _DarwinSysctlReader = Callable[[str], int | None]
+
+
+class _DarwinTranslationStatus(Enum):
+    NATIVE = auto()
+    TRANSLATED = auto()
+    FAILURE = auto()
+
+
+_DarwinTranslationReader = Callable[[], _DarwinTranslationStatus]
 
 
 def _validated_detected_cpu_count(value: object) -> int | None:
@@ -43,11 +57,7 @@ def _bounded_detected_workers(value: object) -> int:
 def _read_darwin_sysctl(name: str) -> int | None:
     """Read one fixed Darwin CPU-count sysctl without invoking a shell."""
 
-    if name not in {
-        _DARWIN_PERFORMANCE_CORES,
-        _DARWIN_PHYSICAL_CORES,
-        _DARWIN_PROCESS_TRANSLATED,
-    }:
+    if name not in {_DARWIN_PERFORMANCE_CORES, _DARWIN_PHYSICAL_CORES}:
         raise ValueError("unsupported Darwin worker-count sysctl")
     try:
         completed = subprocess.run(
@@ -64,15 +74,63 @@ def _read_darwin_sysctl(name: str) -> int | None:
     raw = completed.stdout.strip()
     if not raw.isascii() or not raw.isdecimal():
         return None
-    value = int(raw)
-    if name == _DARWIN_PROCESS_TRANSLATED:
-        return value if value in {0, 1} else None
-    return _validated_detected_cpu_count(value)
+    return _validated_detected_cpu_count(int(raw))
+
+
+def _invoke_darwin_translation_sysctl() -> tuple[int, int, int, int] | None:
+    """Call Apple's fixed Rosetta sysctl and retain errno and ABI evidence."""
+
+    try:
+        library = CDLL(None, use_errno=True)
+        sysctlbyname = library.sysctlbyname
+        sysctlbyname.argtypes = [
+            c_char_p,
+            c_void_p,
+            POINTER(c_size_t),
+            c_void_p,
+            c_size_t,
+        ]
+        sysctlbyname.restype = c_int
+        value = c_int()
+        size = c_size_t(sizeof(value))
+        _set_errno(0)
+        result = int(
+            sysctlbyname(
+                _DARWIN_PROCESS_TRANSLATED.encode("ascii"),
+                byref(value),
+                byref(size),
+                None,
+                0,
+            )
+        )
+    except AttributeError, OSError, TypeError, ValueError:
+        return None
+    return result, _get_errno(), value.value, size.value
+
+
+def _read_darwin_translation_status() -> _DarwinTranslationStatus:
+    invocation = _invoke_darwin_translation_sysctl()
+    if invocation is None:
+        return _DarwinTranslationStatus.FAILURE
+    result, error_number, value, returned_size = invocation
+    if result != 0:
+        # Apple documents ENOENT as a native (non-Rosetta) process.
+        if error_number == ENOENT:
+            return _DarwinTranslationStatus.NATIVE
+        return _DarwinTranslationStatus.FAILURE
+    if returned_size != sizeof(c_int):
+        return _DarwinTranslationStatus.FAILURE
+    if value == 0:
+        return _DarwinTranslationStatus.NATIVE
+    if value == 1:
+        return _DarwinTranslationStatus.TRANSLATED
+    return _DarwinTranslationStatus.FAILURE
 
 
 def _darwin_default_page_render_workers(
     machine: str,
     read_sysctl: _DarwinSysctlReader,
+    read_translation: _DarwinTranslationReader,
 ) -> int:
     """Prefer highest-performance physical cores and fail conservatively."""
 
@@ -89,8 +147,7 @@ def _darwin_default_page_render_workers(
     # reinterpret a logical/total CPU count as missing performance-core
     # authority. An unreadable translation flag also fails conservatively.
     if machine.casefold() in {"x86_64", "amd64", "i386", "i686"}:
-        translated = read_sysctl(_DARWIN_PROCESS_TRANSLATED)
-        if type(translated) is not int or translated != 0:
+        if read_translation() is not _DarwinTranslationStatus.NATIVE:
             return _DARWIN_CONSERVATIVE_FALLBACK
         physical_cores = _validated_detected_cpu_count(
             read_sysctl(_DARWIN_PHYSICAL_CORES)
@@ -109,6 +166,7 @@ def _detect_default_page_render_workers() -> int:
         return _darwin_default_page_render_workers(
             platform.machine(),
             _read_darwin_sysctl,
+            _read_darwin_translation_status,
         )
     available = os.process_cpu_count()
     if available is None:
