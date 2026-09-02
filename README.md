@@ -177,17 +177,29 @@ use the process CPU availability, then the host CPU count, and finally one.
 Every detected value is capped at 16, and platform detection is cached rather
 than repeated per render request.
 
+Docker Desktop runs the service inside a Linux guest, so a container on a macOS
+host cannot query the host's Darwin performance-level sysctls. Automatic
+selection there uses only the process/container-visible Linux vCPU count and
+cannot infer which host CPUs are performance or efficiency cores. To require the
+10 performance cores of the current M4 Pro host, configure
+`"page_render_workers": 10` explicitly; the override remains subject to the
+hard cap but is not adjusted to the container's visible CPU count.
+
 The macOS source choice follows Apple's
 [processor performance-level guidance](https://developer.apple.com/documentation/kernel/1387446-sysctlbyname/determining_system_capabilities)
 and uses Apple's documented
 [`sysctl.proc_translated` Rosetta signal](https://developer.apple.com/documentation/apple-silicon/about-the-rosetta-translation-environment)
 to avoid treating an emulated `x86_64` process as native Intel hardware.
 
-Worker count is a concurrency limit, not a memory allocation bound. For example,
-a 40-megapixel RGBA decode is about 153 MiB of raw pixels per worker, so 16 such
-decodes can represent about 2.4 GiB before source, output, temporary, allocator,
-and Pillow overhead. Memory-constrained installations should set a lower explicit
-value; the implementation does not claim a fixed RSS upper bound.
+Worker count is a concurrency limit, not memory admission control. A single
+40-megapixel RGBA buffer is about 153 MiB, but that is not a complete per-worker
+upper bound: decoded input, copied or resized images, color conversion or alpha
+composition, JPEG encoding, and allocator overhead can coexist. A 2 GiB tmpfs
+limits temporary-file capacity; it is neither a process RSS cap nor reserved
+memory, and its pages can add to container or virtual-machine memory pressure.
+Memory-constrained installations should set an explicit value such as 2 or 4
+based on measurements; the implementation does not claim a fixed RSS upper
+bound.
 
 Configuration rejects unknown fields. A complete string value such as
 `"${H2HDB_RW_DB_PASSWORD}"` is replaced from the environment before validation;
