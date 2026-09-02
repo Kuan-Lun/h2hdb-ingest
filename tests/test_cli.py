@@ -37,6 +37,30 @@ class _Resident:
         self._events.append(("run-forever", stop))
 
 
+class _Runtime:
+    def __init__(
+        self,
+        events: list[object],
+        *,
+        resident: _Resident,
+        catalog: _Catalog | None = None,
+    ) -> None:
+        self._events = events
+        self.resident = resident
+        self.catalog = catalog
+        self.closed = False
+
+    def __enter__(self) -> _Runtime:
+        if self.closed:
+            raise AssertionError("test runtime was reopened")
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if not self.closed:
+            self.closed = True
+            self._events.append("runtime-close")
+
+
 def _cli_config(events: list[object]) -> SimpleNamespace:
     return SimpleNamespace(ensure_paths=lambda: events.append("ensure-paths"))
 
@@ -58,8 +82,9 @@ def test_once_checks_epoch_then_uses_one_periodic_session(
     monkeypatch.setattr(
         cli,
         "build_runtime",
-        lambda value: SimpleNamespace(
-            resident=resident if value is config else None,
+        lambda value: _Runtime(
+            events,
+            resident=resident if value is config else _Resident(events),
         ),
     )
 
@@ -70,6 +95,7 @@ def test_once_checks_epoch_then_uses_one_periodic_session(
         ("logging", config),
         "initialize",
         ("process", True),
+        "runtime-close",
     ]
 
 
@@ -85,7 +111,7 @@ def test_resident_mode_runs_forever_after_epoch_check(
     monkeypatch.setattr(
         cli,
         "build_runtime",
-        lambda value: SimpleNamespace(resident=resident),
+        lambda value: _Runtime(events, resident=resident),
     )
 
     cli.main(["--config", str(tmp_path / "ingest.json")])
@@ -94,6 +120,7 @@ def test_resident_mode_runs_forever_after_epoch_check(
     resident_event = events[2]
     assert isinstance(resident_event, tuple)
     assert resident_event[0] == "run-forever"
+    assert events[3] == "runtime-close"
 
 
 def test_once_reports_ordinary_claim_contention(
@@ -108,11 +135,69 @@ def test_once_reports_ordinary_claim_contention(
     monkeypatch.setattr(
         cli,
         "build_runtime",
-        lambda value: SimpleNamespace(resident=resident),
+        lambda value: _Runtime(events, resident=resident),
     )
 
     with pytest.raises(RuntimeError, match="No gallery ingest lease"):
         cli.main(["--config", str(tmp_path / "ingest.json"), "--once"])
+
+    assert events[-1] == "runtime-close"
+
+
+def test_resident_exception_closes_runtime_before_propagation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    config = _cli_config(events)
+
+    class FailingResident(_Resident):
+        def run_forever(self, *, stop: object) -> None:
+            del stop
+            self._events.append("run-failed")
+            raise RuntimeError("resident failed")
+
+    resident = FailingResident(events)
+    runtime = _Runtime(events, resident=resident)
+    monkeypatch.setattr(cli, "load_config", lambda path: config)
+    monkeypatch.setattr(cli, "configure_logging", lambda value: None)
+    monkeypatch.setattr(cli, "build_runtime", lambda value: runtime)
+
+    with pytest.raises(RuntimeError, match="resident failed"):
+        cli.main(["--config", str(tmp_path / "ingest.json")])
+
+    assert runtime.closed
+    assert events[-2:] == ["run-failed", "runtime-close"]
+
+
+@pytest.mark.parametrize(
+    "failure_type",
+    (KeyboardInterrupt, SystemExit),
+)
+def test_resident_base_exception_closes_runtime_before_propagation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    events: list[object] = []
+    config = _cli_config(events)
+
+    class InterruptedResident(_Resident):
+        def run_forever(self, *, stop: object) -> None:
+            del stop
+            self._events.append("run-interrupted")
+            raise failure_type()
+
+    runtime = _Runtime(events, resident=InterruptedResident(events))
+    monkeypatch.setattr(cli, "load_config", lambda path: config)
+    monkeypatch.setattr(cli, "configure_logging", lambda value: None)
+    monkeypatch.setattr(cli, "build_runtime", lambda value: runtime)
+
+    with pytest.raises(failure_type):
+        cli.main(["--config", str(tmp_path / "ingest.json")])
+
+    assert runtime.closed
+    assert events[-2:] == ["run-interrupted", "runtime-close"]
 
 
 def test_cli_rejects_empty_download_mount_before_opening_facades(
@@ -171,14 +256,14 @@ def test_bootstrap_requires_no_current_revision_then_publishes_nonempty_catalog(
             SimpleNamespace(revision=1, publication_count=7),
         ]
     )
-    runtime = SimpleNamespace(resident=_Resident(events), catalog=catalog)
+    runtime = _Runtime(events, resident=_Resident(events), catalog=catalog)
     monkeypatch.setattr(bootstrap, "load_config", lambda path: config)
     monkeypatch.setattr(bootstrap, "configure_logging", lambda value: None)
     monkeypatch.setattr(bootstrap, "build_runtime", lambda value: runtime)
 
     assert bootstrap.main(["--config", str(tmp_path / "ingest.json")]) == 0
 
-    assert events == ["initialize", ("process", True)]
+    assert events == ["initialize", ("process", True), "runtime-close"]
     assert "revision=1 publications=7" in capsys.readouterr().out
 
 
@@ -189,7 +274,8 @@ def test_bootstrap_refuses_an_existing_catalog_revision(
 ) -> None:
     events: list[object] = []
     config = _bootstrap_config(tmp_path)
-    runtime = SimpleNamespace(
+    runtime = _Runtime(
+        events,
         resident=_Resident(events),
         catalog=_Catalog([SimpleNamespace(revision=9, publication_count=3)]),
     )
@@ -202,6 +288,8 @@ def test_bootstrap_refuses_an_existing_catalog_revision(
 
     assert stopped.value.code == 2
     assert "current_revision=9" in capsys.readouterr().err
+    assert runtime.closed
+    assert events[-1] == "runtime-close"
 
 
 def test_bootstrap_rejects_a_source_without_gallery_metadata(

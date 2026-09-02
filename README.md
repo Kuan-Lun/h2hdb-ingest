@@ -211,6 +211,14 @@ Run the resident service:
 h2hdb-ingest --config /config/h2hdb-ingest.json
 ```
 
+Python embedders should use `with build_runtime(config) as runtime:` or call
+`runtime.close()` explicitly. Close is idempotent, releases the core ingest
+facade's process-local caches, and makes later context entry or ingest-facade
+operations fail closed. Both command-line entry points close the runtime after
+normal resident/one-shot completion and while unwinding exceptions,
+`KeyboardInterrupt`, or `SystemExit`. A failure after `build_runtime` has acquired
+the facade also closes that partial ownership before propagating the error.
+
 The equivalent module command is:
 
 ```bash

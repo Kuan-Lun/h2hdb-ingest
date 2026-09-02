@@ -12,6 +12,11 @@ This directory contains executable specifications owned by filesystem ingest.
   serialization receives the same ordered results. It also proves that worker,
   validation, and serialization failures preserve the destination when
   publication is the final step.
+- `lean/IngestRuntimeLifecycle.lean` proves the abstract runtime close is
+  idempotent, two linearized callers delegate close once, every modeled CLI
+  exit kind reaches closed state, entered/closed runtimes reject reentry,
+  closed runtimes reject work, and a partially built runtime closes its owned
+  facade.
 - `lean/LibraryAuthorityReuse.lean` proves that a previously computed digest
   equals recomputation only under an explicit preserved-bytes authority
   premise, that caller digests are accepted only after independent
@@ -25,6 +30,9 @@ This directory contains executable specifications owned by filesystem ingest.
   batch size, page-completion interleavings, ordered collection, validation and
   serialization failures, and publish-last destination safety. Its required
   `Small` profile uses four pages and explores worker counts `1..16`.
+- `tla/IngestRuntimeLifecycle.tla` model-checks partial construction failure,
+  two arbitrarily ordered explicit close callers, normal/one-shot/exception/
+  `SystemExit`/`KeyboardInterrupt` CLI exits, and fail-closed reentry/work.
 - `tla/LibraryIoReservation.tla` model-checks WRITING and activation
   reservations across unlocked I/O, crash/restart and response loss, exact
   terminalization, wrong caller digests, stale fence attempts, and the rule
@@ -60,6 +68,14 @@ that finite worker range for its four-page profile. Neither proves that Darwin
 mocked platform, validation, cache, API, and runtime tests provide that evidence.
 The cap is a scheduling/resource-count bound, not a memory or RSS proof: decoded
 image size and Pillow/intermediate allocation remain unmodeled.
+
+The runtime-lifecycle models treat facade close as an atomic linearization point
+and CLI unwinding as an abstract bracketed exit. They do not prove Python
+`Lock` scheduling or waiting, context-manager or `BaseException` mechanics,
+signal delivery, core cache cleanup, destructor behavior, or production
+refinement. Deterministic concurrent-close, partial-construction fault, real
+core fail-after-close, and CLI exit-path tests provide those implementation
+checks.
 
 The library-authority proofs intentionally assume that the same private inode
 authority still denotes the same bytes. They do not prove `flock` exclusion,

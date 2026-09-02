@@ -7,7 +7,9 @@ __all__ = ["IngestRuntime", "build_runtime", "configure_logging"]
 import logging
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from threading import Lock
+from typing import Self
 
 from h2hdb import (
     LibraryActivationCheckpoint,
@@ -35,12 +37,41 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class IngestRuntime:
-    """Public core facades and the fully composed resident process."""
+    """Own the public facades and deterministic ingest-process lifecycle."""
 
     facade: VNextIngestFacade
     database_admin: VNextDatabaseAdminFacade
     catalog: VNextCatalogFacade
     resident: ResidentIngestor
+    _lifecycle_lock: Lock = field(
+        default_factory=Lock,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _closed: bool = field(default=False, init=False, repr=False, compare=False)
+    _entered: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def close(self) -> None:
+        """Close facade-owned caches exactly once before returning."""
+
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self.facade.close()
+            object.__setattr__(self, "_closed", True)
+
+    def __enter__(self) -> Self:
+        with self._lifecycle_lock:
+            if self._closed:
+                raise ValueError("ingest runtime is closed")
+            if self._entered:
+                raise ValueError("ingest runtime context is already entered")
+            object.__setattr__(self, "_entered", True)
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
 
 def build_runtime(
@@ -53,55 +84,65 @@ def build_runtime(
     if not isinstance(config, IngestConfig):
         raise TypeError("config must be IngestConfig")
     facade = VNextIngestFacade(config.core)
-    database_admin = VNextDatabaseAdminFacade(config.core)
-    catalog = VNextCatalogFacade(config.core)
-    runtime_event_logger = event_logger or logger.info
-    metrics_sink = TextIngestMetricSink(runtime_event_logger)
+    try:
+        database_admin = VNextDatabaseAdminFacade(config.core)
+        catalog = VNextCatalogFacade(config.core)
+        runtime_event_logger = event_logger or logger.info
+        metrics_sink = TextIngestMetricSink(runtime_event_logger)
 
-    artifact_adapters: dict[bytes, ManagedFilesystemLibraryAdapter] = {}
-    finalization_adapters: dict[bytes, ManagedFilesystemLibraryAdapter] = {}
-    library_activation: VNextLibraryActivationAdapter
-    library_maintenance: LibraryMaintenanceAdapter
-    publication_guard: Callable[[], AbstractContextManager[None]]
-    if config.paths.library_path is None:
-        disabled_library = _DisabledLibraryActivationAdapter()
-        library_activation = disabled_library
-        library_maintenance = disabled_library
-        publication_guard = _disabled_publication_guard
-    else:
-        library = ManagedFilesystemLibraryAdapter(
-            config.paths.library_path,
+        artifact_adapters: dict[bytes, ManagedFilesystemLibraryAdapter] = {}
+        finalization_adapters: dict[bytes, ManagedFilesystemLibraryAdapter] = {}
+        library_activation: VNextLibraryActivationAdapter
+        library_maintenance: LibraryMaintenanceAdapter
+        publication_guard: Callable[[], AbstractContextManager[None]]
+        if config.paths.library_path is None:
+            disabled_library = _DisabledLibraryActivationAdapter()
+            library_activation = disabled_library
+            library_maintenance = disabled_library
+            publication_guard = _disabled_publication_guard
+        else:
+            library = ManagedFilesystemLibraryAdapter(
+                config.paths.library_path,
+                source_root=config.paths.download_path,
+                render_policy=config.paths.artifact_render_policy(),
+                page_render_workers=config.paths.effective_page_render_workers,
+                metrics_sink=metrics_sink,
+            )
+            artifact_adapters[library.adapter_id] = library
+            finalization_adapters[library.adapter_id] = library
+            library_activation = library
+            library_maintenance = library
+            publication_guard = library.publication_guard
+
+        service = VNextIngestService(
             source_root=config.paths.download_path,
-            render_policy=config.paths.artifact_render_policy(),
-            page_render_workers=config.paths.effective_page_render_workers,
+            policy=build_ingest_policy(config),
+            max_rows=config.resident.max_rows,
+            artifact_adapters=artifact_adapters,
+            finalization_adapters=finalization_adapters,
+            library_activation=library_activation,
+            publication_guard=publication_guard,
             metrics_sink=metrics_sink,
         )
-        artifact_adapters[library.adapter_id] = library
-        finalization_adapters[library.adapter_id] = library
-        library_activation = library
-        library_maintenance = library
-        publication_guard = library.publication_guard
-
-    service = VNextIngestService(
-        source_root=config.paths.download_path,
-        policy=build_ingest_policy(config),
-        max_rows=config.resident.max_rows,
-        artifact_adapters=artifact_adapters,
-        finalization_adapters=finalization_adapters,
-        library_activation=library_activation,
-        publication_guard=publication_guard,
-        metrics_sink=metrics_sink,
-    )
-    resident = ResidentIngestor(
-        service=service,
-        facade=facade,
-        database_admin=database_admin,
-        library_maintenance=library_maintenance,
-        config=config.resident,
-        database_type=config.core.database.sql_type,
-        event_logger=runtime_event_logger,
-    )
-    return IngestRuntime(facade, database_admin, catalog, resident)
+        resident = ResidentIngestor(
+            service=service,
+            facade=facade,
+            database_admin=database_admin,
+            library_maintenance=library_maintenance,
+            config=config.resident,
+            database_type=config.core.database.sql_type,
+            event_logger=runtime_event_logger,
+        )
+        return IngestRuntime(facade, database_admin, catalog, resident)
+    except BaseException as error:
+        try:
+            facade.close()
+        except BaseException as close_error:
+            error.add_note(
+                "The ingest facade also failed to close after runtime "
+                f"construction failed: {close_error!r}"
+            )
+        raise
 
 
 def configure_logging(config: IngestConfig) -> None:

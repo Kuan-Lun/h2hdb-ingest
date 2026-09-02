@@ -24,20 +24,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     config = load_config(arguments.config)
     config.ensure_paths()
     configure_logging(config)
-    runtime = build_runtime(config)
-    with _stop_on_termination() as stop:
-        runtime.resident.initialize()
-        if arguments.once:
-            processed = runtime.resident.process_available(
-                periodic_scan=True,
-                should_stop=stop.is_set,
-            )
-            if stop.is_set():
+    with build_runtime(config) as runtime:
+        with _stop_on_termination() as stop:
+            runtime.resident.initialize()
+            if arguments.once:
+                processed = runtime.resident.process_available(
+                    periodic_scan=True,
+                    should_stop=stop.is_set,
+                )
+                if stop.is_set():
+                    return
+                if not processed:
+                    raise RuntimeError("No gallery ingest lease is currently available")
                 return
-            if not processed:
-                raise RuntimeError("No gallery ingest lease is currently available")
-            return
-        runtime.resident.run_forever(stop=stop)
+            runtime.resident.run_forever(stop=stop)
 
 
 @contextmanager

@@ -32,43 +32,43 @@ def main(arguments: Sequence[str] | None = None) -> int:
             "publish an empty initial catalog.\n",
         )
     configure_logging(config)
-    runtime = build_runtime(config)
-    runtime.resident.initialize()
+    with build_runtime(config) as runtime:
+        runtime.resident.initialize()
 
-    def require_unpublished_catalog() -> None:
+        def require_unpublished_catalog() -> None:
+            try:
+                current = runtime.catalog.get_catalog_revision()
+            except CatalogRevisionNotFoundError as error:
+                if error.revision == 0:
+                    return
+                raise
+            raise _AlreadyPublished(str(current.revision))
+
         try:
-            current = runtime.catalog.get_catalog_revision()
-        except CatalogRevisionNotFoundError as error:
-            if error.revision == 0:
-                return
-            raise
-        raise _AlreadyPublished(str(current.revision))
+            processed = runtime.resident.process_available(
+                periodic_scan=True,
+                preflight=require_unpublished_catalog,
+            )
+        except _AlreadyPublished as error:
+            parser.exit(
+                2,
+                "Initial catalog reconciliation has already run: "
+                f"current_revision={error}.\n",
+            )
+        if not processed:
+            parser.exit(2, "No gallery ingest lease is currently available.\n")
 
-    try:
-        processed = runtime.resident.process_available(
-            periodic_scan=True,
-            preflight=require_unpublished_catalog,
+        published = runtime.catalog.get_catalog_revision()
+        if published.revision <= 0 or published.publication_count <= 0:
+            parser.exit(
+                1,
+                "Initial reconciliation did not publish a non-empty catalog.\n",
+            )
+        print(
+            "Initial catalog reconciliation completed: "
+            f"revision={published.revision} "
+            f"publications={published.publication_count}."
         )
-    except _AlreadyPublished as error:
-        parser.exit(
-            2,
-            "Initial catalog reconciliation has already run: "
-            f"current_revision={error}.\n",
-        )
-    if not processed:
-        parser.exit(2, "No gallery ingest lease is currently available.\n")
-
-    published = runtime.catalog.get_catalog_revision()
-    if published.revision <= 0 or published.publication_count <= 0:
-        parser.exit(
-            1,
-            "Initial reconciliation did not publish a non-empty catalog.\n",
-        )
-    print(
-        "Initial catalog reconciliation completed: "
-        f"revision={published.revision} "
-        f"publications={published.publication_count}."
-    )
     return 0
 
 
