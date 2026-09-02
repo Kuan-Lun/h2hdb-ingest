@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-01T21:07:40+00:00",
-  "manifest_sha256": "93f3a532b4eaa88a9b0f2961b77f5895599510619ce33d2277c147f6584198c7",
+  "checked_at": "2026-09-02T10:44:21+00:00",
+  "manifest_sha256": "d920a85494143e4fe6cb9a953525cf3b189b3685c43049e069456595a6972cc6",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.11.0",
+  "project_version": "0.11.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,9 +30,9 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.29.0,<0.30.0",
+      "declared": "h2hdb>=0.29.1,<0.30.0",
       "group": "runtime",
-      "latest": "0.28.3",
+      "latest": "0.29.0",
       "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
@@ -130,7 +130,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all build, runtime, optional, development, and Node direct dependencies for 0.11.0; the h2hdb 0.29 compatibility lane is intentional and source-integrated, while render and filesystem performance changes require no additional dependency upgrade.",
+    "note": "Reviewed every direct build, runtime, optional development, and Node dependency for 0.11.1. The in-range Pydantic 2.13.5, build 1.6.0, Hypothesis 6.167.1, packaging 26.3, and Ruff 0.16.5 candidates require no manifest change; the clean Python 3.14 environment resolves them, and repository-local gates validate the explicit tool configuration. PyPI h2hdb 0.29.0 does not satisfy the required >=0.29.1 facade.close floor because the integrated release is not yet published; latest_satisfies=false is an unresolved registry publication condition, not a compatibility pass. Cross-repository runtime validation uses final h2hdb 0.29.2 wheel SHA-256 df8ec7b89fd9442cdff2c7491e44fc8c96f31b89bc657b1a41814759e1631a1a.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
