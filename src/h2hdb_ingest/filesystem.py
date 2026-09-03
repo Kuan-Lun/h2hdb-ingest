@@ -19,8 +19,8 @@ import os
 import sqlite3
 import stat
 import tempfile
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
 from hashlib import sha256
@@ -36,6 +36,10 @@ _GALLERY_AUDIT_PREFIX = b"h2hdb-ingest-filesystem-gallery-audit-v2\0"
 _PAGE_SUFFIXES = frozenset(
     {b".avif", b".bmp", b".gif", b".jpeg", b".jpg", b".png", b".webp"}
 )
+
+
+def _noop_checkpoint() -> None:
+    pass
 
 
 class FilesystemObservationError(RuntimeError):
@@ -96,10 +100,17 @@ class FilesystemFileObservation:
     stat: FilesystemStat
     artifact_role: FilesystemArtifactSourceRole
     expected_sha256: bytes | None = None
+    _checkpoint: Callable[[], None] = field(
+        default=_noop_checkpoint,
+        repr=False,
+        compare=False,
+        kw_only=True,
+    )
 
     def content_parts(self) -> Iterator[bytes]:
         """Yield exact file bytes after a no-follow open and stat check."""
 
+        self._checkpoint()
         directory_descriptor = os.open(
             self.folder,
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
@@ -118,9 +129,14 @@ class FilesystemFileObservation:
                 )
             self._require_stat(opened, stage="before read")
             digest = sha256()
-            while part := os.read(descriptor, _READ_BYTES):
+            while True:
+                self._checkpoint()
+                part = os.read(descriptor, _READ_BYTES)
+                if not part:
+                    break
                 digest.update(part)
                 yield part
+            self._checkpoint()
             self._require_stat(os.fstat(descriptor), stage="after read")
             if self.expected_sha256 is not None and digest.digest() != (
                 self.expected_sha256
@@ -200,7 +216,16 @@ class FilesystemPage[PageItemT]:
 class FilesystemSource:
     """Discover nested galleries and reproduce exact direct-child snapshots."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        checkpoint: Callable[[], None] | None = None,
+    ) -> None:
+        if checkpoint is not None and not callable(checkpoint):
+            raise TypeError("checkpoint must be callable or None")
+        self._checkpoint = checkpoint if checkpoint is not None else _noop_checkpoint
+        self._checkpoint()
         try:
             resolved = root.resolve(strict=True)
         except OSError as error:
@@ -254,6 +279,7 @@ class FilesystemSource:
     ) -> FilesystemPage[tuple[str, ...]]:
         """Return one keyset page from this session's disk-backed snapshot."""
 
+        self._checkpoint()
         bound = _page_limit(limit)
         after = None if after_locator is None else _encode_locator(after_locator)
         connection = self._discovery_index()
@@ -278,6 +304,7 @@ class FilesystemSource:
             ).fetchall()
         items: list[tuple[str, ...]] = []
         for row in rows[:bound]:
+            self._checkpoint()
             locator = _decode_locator(bytes(row[0]))
             current = self._directory_stat(self._gallery_path(locator))
             if current != _stat_from_row(row[1:]):
@@ -291,6 +318,7 @@ class FilesystemSource:
         self,
         locator_components: tuple[str, ...],
     ) -> FilesystemGalleryObservation:
+        self._checkpoint()
         index, created = self._gallery_index(locator_components)
         if not created:
             self._require_gallery_unchanged(index)
@@ -306,6 +334,7 @@ class FilesystemSource:
         FilesystemGalleryObservation,
         FilesystemPage[FilesystemFileObservation],
     ]:
+        self._checkpoint()
         index, _created = self._gallery_index(locator_components)
         bound = _page_limit(limit)
         after = _after_name(after_name)
@@ -343,6 +372,7 @@ class FilesystemSource:
                     if bytes(row[0]) == GALLERY_INFO_NAME.encode("ascii")
                     else None
                 ),
+                _checkpoint=self._checkpoint,
             )
             for row in rows[:bound]
         )
@@ -359,6 +389,7 @@ class FilesystemSource:
         FilesystemGalleryObservation,
         FilesystemPage[FilesystemDirectoryObservation],
     ]:
+        self._checkpoint()
         index, _created = self._gallery_index(locator_components)
         bound = _page_limit(limit)
         after = _after_name(after_name)
@@ -396,6 +427,7 @@ class FilesystemSource:
         after_position: int,
         limit: int,
     ) -> tuple[FilesystemGalleryObservation, FilesystemPage[tuple[str, str]]]:
+        self._checkpoint()
         index, _created = self._gallery_index(locator_components)
         bound = _page_limit(limit)
         if isinstance(after_position, bool) or not isinstance(after_position, int):
@@ -420,6 +452,7 @@ class FilesystemSource:
 
     def _discovery_index(self) -> sqlite3.Connection:
         self._require_open()
+        self._checkpoint()
         if self._discovery_connection is not None:
             return self._discovery_connection
         temporary = tempfile.TemporaryDirectory(prefix="h2hdb-ingest-discovery-")
@@ -508,6 +541,7 @@ class FilesystemSource:
                 """)
             expected_root = self._directory_stat(self._root)
             for locator, observed in self._discover_directory(self._root):
+                self._checkpoint()
                 try:
                     connection.execute(
                         "INSERT INTO locators VALUES (?, ?, ?, ?, ?, ?)",
@@ -529,6 +563,7 @@ class FilesystemSource:
                     f"source root changed during discovery snapshot: {self._root}"
                 )
             connection.commit()
+            self._checkpoint()
         except BaseException:
             connection.close()
             temporary.cleanup()
@@ -542,6 +577,7 @@ class FilesystemSource:
         self,
         locator_components: tuple[str, ...],
     ) -> tuple[_FilesystemGalleryIndex, bool]:
+        self._checkpoint()
         connection = self._discovery_index()
         payload = _encode_locator(locator_components)
         folder = self._gallery_path(locator_components)
@@ -595,15 +631,18 @@ class FilesystemSource:
         folder: Path,
         directory_stat: FilesystemStat,
     ) -> _FilesystemGalleryIndex:
+        self._checkpoint()
         metadata_path = folder / GALLERY_INFO_NAME
         metadata_stat = self._regular_file_stat(metadata_path)
         metadata_sha256 = self._hash_path(metadata_path, metadata_stat)
+        self._checkpoint()
         try:
             parsed = parse_galleryinfo(folder)
         except Exception as error:
             raise FilesystemObservationError(
                 f"unable to parse {metadata_path}: {error}"
             ) from error
+        self._checkpoint()
         if self._regular_file_stat(metadata_path) != metadata_stat:
             raise FilesystemObservationError(
                 f"gallery metadata changed while parsing: {metadata_path}"
@@ -612,9 +651,13 @@ class FilesystemSource:
             raise FilesystemObservationError(
                 f"gallery metadata bytes changed while parsing: {metadata_path}"
             )
-        tags = tuple((str(namespace), str(value)) for namespace, value in parsed.tags)
+        tags: list[tuple[str, str]] = []
+        for namespace, tag_text in parsed.tags:
+            self._checkpoint()
+            tags.append((str(namespace), str(tag_text)))
         try:
             with connection:
+                self._checkpoint()
                 connection.execute("DELETE FROM gallery_tags")
                 connection.execute("DELETE FROM gallery_entries")
                 connection.execute("DELETE FROM active_gallery_snapshot")
@@ -627,6 +670,7 @@ class FilesystemSource:
                     entry_batch: list[tuple[object, ...]] = []
                     with os.scandir(folder) as entries:
                         for entry in entries:
+                            self._checkpoint()
                             name = os.fsencode(entry.name)
                             _strict_name_bytes(name)
                             value = entry.stat(follow_symlinks=False)
@@ -645,8 +689,10 @@ class FilesystemSource:
                             if len(entry_batch) == 128:
                                 _insert_gallery_entry_batch(connection, entry_batch)
                                 entry_batch.clear()
+                                self._checkpoint()
                     if entry_batch:
                         _insert_gallery_entry_batch(connection, entry_batch)
+                        self._checkpoint()
                 except (OSError, sqlite3.DatabaseError) as error:
                     raise FilesystemObservationError(
                         f"unable to snapshot gallery directory {folder}: {error}"
@@ -663,7 +709,11 @@ class FilesystemSource:
                     "SELECT name_bytes, device, inode, size_bytes, modified_ns, "
                     "changed_ns, file_type FROM gallery_entries ORDER BY name_bytes"
                 )
-                while page := rows.fetchmany(128):
+                while True:
+                    self._checkpoint()
+                    page = rows.fetchmany(128)
+                    if not page:
+                        break
                     for row in page:
                         name = bytes(row[0])
                         digest.update(len(name).to_bytes(4, "big"))
@@ -712,6 +762,7 @@ class FilesystemSource:
                     page_count=page_count,
                 )
                 for ordinal, (namespace, tag_value) in enumerate(tags):
+                    self._checkpoint()
                     connection.execute(
                         "INSERT INTO gallery_tags VALUES (?, ?, ?)",
                         (ordinal, namespace, tag_value),
@@ -770,6 +821,7 @@ class FilesystemSource:
                         metadata.page_count,
                     ),
                 )
+                self._checkpoint()
         except sqlite3.DatabaseError as error:
             raise FilesystemObservationError(
                 f"unable to index gallery directory {folder}: {error}"
@@ -836,6 +888,7 @@ class FilesystemSource:
         )
 
     def _require_gallery_unchanged(self, index: _FilesystemGalleryIndex) -> None:
+        self._checkpoint()
         connection = self._discovery_index()
         before = self._directory_stat(index.folder)
         if before != index.directory_stat:
@@ -847,6 +900,7 @@ class FilesystemSource:
                 connection.execute("DELETE FROM gallery_audit_entries")
                 with os.scandir(index.folder) as entries:
                     for entry in entries:
+                        self._checkpoint()
                         name = os.fsencode(entry.name)
                         _strict_name_bytes(name)
                         value = entry.stat(follow_symlinks=False)
@@ -866,11 +920,17 @@ class FilesystemSource:
                         if len(batch) == 128:
                             _insert_audit_batch(connection, batch)
                             batch.clear()
+                            self._checkpoint()
                 if batch:
                     _insert_audit_batch(connection, batch)
                     batch.clear()
-                current_audit = _entry_audit(connection)
+                    self._checkpoint()
+                current_audit = _entry_audit(
+                    connection,
+                    checkpoint=self._checkpoint,
+                )
                 connection.execute("DELETE FROM gallery_audit_entries")
+                self._checkpoint()
         except FilesystemObservationError:
             raise
         except (OSError, sqlite3.DatabaseError) as error:
@@ -901,12 +961,14 @@ class FilesystemSource:
         self,
         directory: Path,
     ) -> Iterator[tuple[tuple[str, ...], FilesystemStat]]:
+        self._checkpoint()
         expected_directory = self._directory_stat(directory)
         has_metadata = False
         children: list[Path] = []
         try:
             with os.scandir(directory) as entries:
                 for entry in entries:
+                    self._checkpoint()
                     if entry.name == GALLERY_INFO_NAME:
                         value = entry.stat(follow_symlinks=False)
                         if stat.S_ISREG(value.st_mode):
@@ -934,7 +996,9 @@ class FilesystemSource:
                 expected_directory,
             )
         for child in children:
+            self._checkpoint()
             yield from self._discover_directory(child)
+        self._checkpoint()
         if self._directory_stat(directory) != expected_directory:
             raise FilesystemObservationError(
                 f"directory changed during gallery discovery: {directory}"
@@ -947,6 +1011,7 @@ class FilesystemSource:
             )
         current = self._root
         for component in locator_components:
+            self._checkpoint()
             current /= _strict_component(component)
             try:
                 value = current.lstat()
@@ -986,8 +1051,8 @@ class FilesystemSource:
             )
         return FilesystemStat.from_os_stat(value)
 
-    @staticmethod
-    def _hash_path(path: Path, expected: FilesystemStat) -> bytes:
+    def _hash_path(self, path: Path, expected: FilesystemStat) -> bytes:
+        self._checkpoint()
         digest = sha256()
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
@@ -1001,8 +1066,13 @@ class FilesystemSource:
                 raise FilesystemObservationError(
                     f"gallery metadata changed before hashing: {path}"
                 )
-            while part := os.read(descriptor, _READ_BYTES):
+            while True:
+                self._checkpoint()
+                part = os.read(descriptor, _READ_BYTES)
+                if not part:
+                    break
                 digest.update(part)
+            self._checkpoint()
             if FilesystemStat.from_os_stat(os.fstat(descriptor)) != expected:
                 raise FilesystemObservationError(
                     f"gallery metadata changed after hashing: {path}"
@@ -1032,13 +1102,21 @@ def _insert_gallery_entry_batch(
     )
 
 
-def _entry_audit(connection: sqlite3.Connection) -> bytes:
+def _entry_audit(
+    connection: sqlite3.Connection,
+    *,
+    checkpoint: Callable[[], None] = _noop_checkpoint,
+) -> bytes:
     digest = sha256(_ENTRY_AUDIT_PREFIX)
     rows = connection.execute(
         "SELECT name_bytes, device, inode, size_bytes, modified_ns, changed_ns, "
         "file_type FROM gallery_audit_entries ORDER BY name_bytes"
     )
-    while page := rows.fetchmany(128):
+    while True:
+        checkpoint()
+        page = rows.fetchmany(128)
+        if not page:
+            break
         for row in page:
             name = bytes(row[0])
             digest.update(len(name).to_bytes(4, "big"))

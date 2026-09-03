@@ -156,7 +156,10 @@ class VNextIngestService:
                 library_activation=self._library_activation,
                 should_stop=stop_requested,
             )
-        with FilesystemSource(self._source_root) as source:
+        with FilesystemSource(
+            self._source_root,
+            checkpoint=lambda: _raise_if_stopping(stop_requested),
+        ) as source:
             source_receipt = synchronize_source(
                 session,
                 resolved,

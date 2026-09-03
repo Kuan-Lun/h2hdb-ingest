@@ -18,6 +18,8 @@ from h2hdb_ingest.filesystem import (
     FilesystemSource,
 )
 
+type _OpenPath = str | bytes | os.PathLike[str] | os.PathLike[bytes]
+
 
 def _gallery(root: Path, name: str = "nested/1001") -> Path:
     folder = root.joinpath(*name.split("/"))
@@ -42,13 +44,42 @@ def _gallery(root: Path, name: str = "nested/1001") -> Path:
     return folder
 
 
+class _CheckpointInterrupted(Exception):
+    pass
+
+
+class _StopOnceAt:
+    def __init__(self, position: int) -> None:
+        self._position = position
+        self.calls = 0
+        self.armed = False
+        self.interrupted = False
+
+    def arm(self) -> None:
+        self.calls = 0
+        self.armed = True
+
+    def __call__(self) -> None:
+        if not self.armed:
+            return
+        self.calls += 1
+        if not self.interrupted and self.calls == self._position:
+            self.interrupted = True
+            raise _CheckpointInterrupted
+
+
 def test_source_observation_is_sorted_bounded_and_replayable(tmp_path: Path) -> None:
     root = tmp_path / "download"
     folder = _gallery(root)
     (folder / "child").mkdir()
     (folder / "linked").symlink_to(folder / "001.jpg")
+    checkpoints = 0
 
-    source = FilesystemSource(root)
+    def checkpoint() -> None:
+        nonlocal checkpoints
+        checkpoints += 1
+
+    source = FilesystemSource(root, checkpoint=checkpoint)
 
     assert source.source_root_components == tuple(root.resolve().parts[1:])
     assert source.list_gallery_locators(after_locator=None, limit=1).items == (
@@ -120,6 +151,7 @@ def test_source_observation_is_sorted_bounded_and_replayable(tmp_path: Path) -> 
     )
     assert tag_page.items == (("language", "english"),)
     assert tag_page.terminal
+    assert checkpoints > 0
 
 
 def test_observation_replay_rejects_changed_source(tmp_path: Path) -> None:
@@ -204,6 +236,73 @@ def test_discovery_snapshot_is_built_once_and_closed_explicitly(
     source.close()
     with pytest.raises(RuntimeError, match="closed"):
         source.list_gallery_locators(after_locator=None, limit=1)
+
+
+def test_discovery_checkpoint_interrupts_and_cleans_partial_spill_index(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "download"
+    _gallery(root, "nested/1001")
+    stop = _StopOnceAt(4)
+    source = FilesystemSource(root, checkpoint=stop)
+    stop.arm()
+
+    with pytest.raises(_CheckpointInterrupted):
+        source.list_gallery_locators(after_locator=None, limit=1)
+
+    assert stop.interrupted
+    assert source._discovery_connection is None
+    assert source._discovery_temporary is None
+    assert source.list_gallery_locators(after_locator=None, limit=1).items == (
+        ("nested", "1001"),
+    )
+    source.close()
+
+
+def test_file_stream_checkpoint_interrupts_between_chunks_and_closes_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "1009")
+    (folder / "001.jpg").write_bytes(b"x" * (5 * 1024 * 1024))
+    stop = _StopOnceAt(3)
+    source = FilesystemSource(root, checkpoint=stop)
+    _observation, page = source.list_files(("1009",), after_name=None, limit=256)
+    streamed = next(item for item in page.items if item.name_bytes == b"001.jpg")
+    stop.arm()
+    opened: set[int] = set()
+    closed: set[int] = set()
+    original_open = os.open
+    original_close = os.close
+
+    def tracking_open(
+        path: _OpenPath,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        opened.add(descriptor)
+        return descriptor
+
+    def tracking_close(descriptor: int) -> None:
+        closed.add(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "close", tracking_close)
+    parts = streamed.content_parts()
+
+    assert len(next(parts)) == 4 * 1024 * 1024
+    with pytest.raises(_CheckpointInterrupted):
+        next(parts)
+
+    assert stop.interrupted
+    assert opened
+    assert closed == opened
+    source.close()
 
 
 def test_gallery_index_is_reused_across_pages_with_exact_reference_output(

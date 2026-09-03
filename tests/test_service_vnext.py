@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
@@ -848,8 +848,14 @@ def test_complete_service_recovers_before_source_and_guards_publication(
     )
 
     class _Source:
-        def __init__(self, root: Path) -> None:
+        def __init__(
+            self,
+            root: Path,
+            *,
+            checkpoint: Callable[[], None],
+        ) -> None:
             assert root == tmp_path
+            assert callable(checkpoint)
             events.append("source-construct")
 
         def __enter__(self) -> _Source:
@@ -994,6 +1000,109 @@ def test_complete_service_recovers_before_source_and_guards_publication(
         "source-close",
         "analysis",
         "publication",
+    ]
+
+
+def test_complete_service_stop_during_source_preparation_closes_without_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    stopping = False
+    activation = _LibraryActivation()
+    config = IngestConfig(paths=IngestPathsConfig(download_path=tmp_path))
+    policy = build_ingest_policy(config)
+    resolved = cast(VNextResolvedIngestPolicy, object())
+
+    class _Source:
+        def __init__(
+            self,
+            root: Path,
+            *,
+            checkpoint: Callable[[], None],
+        ) -> None:
+            assert root == tmp_path
+            self.checkpoint = checkpoint
+            events.append("source-construct")
+
+        def __enter__(self) -> _Source:
+            events.append("source-enter")
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            del exc
+            events.append("source-close")
+
+    class _PolicyFacade(_PublicationFacade):
+        def __init__(self) -> None:
+            super().__init__(events, recovery_stops_after=0)
+
+        def ensure_policy(
+            self,
+            receipt: VNextIngestSession,
+            natural: object,
+        ) -> VNextResolvedIngestPolicy:
+            del receipt
+            assert natural is policy
+            events.append("ensure-policy")
+            return resolved
+
+    def fake_adapter(source: object) -> object:
+        events.append("adapter")
+        return source
+
+    def fake_source(
+        session: object,
+        selected: object,
+        adapter: object,
+        **kwargs: object,
+    ) -> VNextIngestSourceReceipt:
+        nonlocal stopping
+        del session, kwargs
+        assert selected is resolved
+        assert isinstance(adapter, _Source)
+        events.append("source-prepare-start")
+        stopping = True
+        adapter.checkpoint()
+        raise AssertionError("stop checkpoint returned")
+
+    def unexpected(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        events.append("unexpected-later-phase")
+        raise AssertionError("a later ingest phase ran after stop")
+
+    monkeypatch.setattr(service_module, "FilesystemSource", _Source)
+    monkeypatch.setattr(service_module, "VNextFilesystemSourceAdapter", fake_adapter)
+    monkeypatch.setattr(service_module, "synchronize_source", fake_source)
+    monkeypatch.setattr(service_module, "synchronize_analysis", unexpected)
+    monkeypatch.setattr(service_module, "synchronize_publication", unexpected)
+    controller = IngestSessionController(
+        cast(VNextIngestFacade, _PolicyFacade()),
+        _session(),
+        lease_duration_microseconds=10_000_000,
+        database_type="sqlite",
+    )
+    service = VNextIngestService(
+        source_root=tmp_path,
+        policy=policy,
+        max_rows=128,
+        artifact_adapters={},
+        finalization_adapters={},
+        library_activation=activation,
+        publication_guard=activation.publication_guard,
+    )
+
+    with pytest.raises(_IngestStopRequested):
+        service.synchronize_once(controller, should_stop=lambda: stopping)
+
+    assert events == [
+        "ensure-policy",
+        ("recovery-empty", 0, 10_000_000),
+        "source-construct",
+        "source-enter",
+        "adapter",
+        "source-prepare-start",
+        "source-close",
     ]
 
 
