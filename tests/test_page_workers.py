@@ -3,8 +3,13 @@ from __future__ import annotations
 import dataclasses
 import os
 import platform
+import select
 import subprocess
 import sys
+import threading
+import time
+import warnings
+from collections.abc import Callable
 from ctypes import c_int, sizeof
 from errno import EACCES, ENOENT
 from itertools import product
@@ -536,7 +541,7 @@ def test_topology_probe_is_cached_once_per_process(
         probes += 1
         return _darwin(performance=10, physical=14)
 
-    _detect_cpu_topology.cache_clear()
+    page_workers._reset_cpu_topology_cache()
     monkeypatch.setattr(page_workers, "_probe_cpu_topology", probe)
     try:
         assert _detect_cpu_topology() == _darwin(performance=10, physical=14)
@@ -551,7 +556,142 @@ def test_topology_probe_is_cached_once_per_process(
             automatic.log_line()
         assert probes == 1
     finally:
-        _detect_cpu_topology.cache_clear()
+        page_workers._reset_cpu_topology_cache()
+
+
+def test_eight_concurrent_first_calls_probe_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent first calls single-flight: one probe, one shared record."""
+
+    probes = 0
+    barrier = threading.Barrier(8)
+
+    def probe() -> _CpuTopology:
+        nonlocal probes
+        probes += 1
+        time.sleep(0.05)
+        return _darwin(performance=10, physical=14)
+
+    page_workers._reset_cpu_topology_cache()
+    monkeypatch.setattr(page_workers, "_probe_cpu_topology", probe)
+    results: list[_CpuTopology | None] = [None] * 8
+
+    def call(index: int) -> None:
+        barrier.wait(timeout=5)
+        results[index] = page_workers._detect_cpu_topology()
+
+    threads = [threading.Thread(target=call, args=(index,)) for index in range(8)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        assert not any(thread.is_alive() for thread in threads)
+        assert probes == 1
+        first = results[0]
+        assert first == _darwin(performance=10, physical=14)
+        assert all(result is first for result in results)
+    finally:
+        page_workers._reset_cpu_topology_cache()
+
+
+def _fork_and_read(child: Callable[[], bytes]) -> bytes:
+    """Fork, run ``child`` in the child, and return the bytes it reports."""
+
+    read_fd, write_fd = os.pipe()
+    with warnings.catch_warnings():
+        # This process may hold pytest worker threads; the child only runs
+        # the mocked probe and exits, which is exactly what the test proves.
+        warnings.simplefilter("ignore", DeprecationWarning)
+        pid = os.fork()
+    if pid == 0:
+        status = 1
+        try:
+            os.close(read_fd)
+            os.write(write_fd, child())
+            status = 0
+        finally:
+            os._exit(status)
+    os.close(write_fd)
+    try:
+        ready, _, _ = select.select([read_fd], [], [], 10)
+        payload = os.read(read_fd, 256) if ready else b""
+    finally:
+        os.close(read_fd)
+        _, wait_status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(wait_status) == 0
+    return payload
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork only")
+def test_fork_child_probes_its_own_topology(monkeypatch: pytest.MonkeyPatch) -> None:
+    parent_pid = os.getpid()
+    parent_topology = _darwin(performance=10, physical=14)
+    child_topology = _linux(process_count=2, cpu_count=2)
+    probed_by: list[int] = []
+
+    def probe() -> _CpuTopology:
+        probed_by.append(os.getpid())
+        return parent_topology if os.getpid() == parent_pid else child_topology
+
+    page_workers._reset_cpu_topology_cache()
+    monkeypatch.setattr(page_workers, "_probe_cpu_topology", probe)
+    try:
+        assert page_workers._detect_cpu_topology() is parent_topology
+
+        def child() -> bytes:
+            observed = page_workers._detect_cpu_topology()
+            if observed == child_topology and observed != parent_topology:
+                return b"probed-own"
+            return b"inherited"
+
+        assert _fork_and_read(child) == b"probed-own"
+        # The parent's cache is untouched by the child's probe.
+        assert page_workers._detect_cpu_topology() is parent_topology
+        assert probed_by == [parent_pid]
+    finally:
+        page_workers._reset_cpu_topology_cache()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork only")
+def test_fork_during_an_in_flight_probe_leaves_the_child_unlocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A probe holding the single-flight lock on another thread at fork time
+    must not leave the child a lock it can never acquire."""
+
+    started = threading.Event()
+    release = threading.Event()
+    parent_topology = _linux(process_count=4, cpu_count=8)
+    child_topology = _linux(process_count=1, cpu_count=1)
+
+    def slow_probe() -> _CpuTopology:
+        started.set()
+        release.wait(timeout=10)
+        return parent_topology
+
+    page_workers._reset_cpu_topology_cache()
+    monkeypatch.setattr(page_workers, "_probe_cpu_topology", slow_probe)
+    prober = threading.Thread(target=page_workers._detect_cpu_topology)
+    try:
+        prober.start()
+        assert started.wait(timeout=5)
+        assert page_workers._topology_lock.locked()
+
+        def child() -> bytes:
+            page_workers._probe_cpu_topology = lambda: child_topology
+            observed = page_workers._detect_cpu_topology()
+            return b"probed-own" if observed == child_topology else b"inherited"
+
+        assert _fork_and_read(child) == b"probed-own"
+    finally:
+        release.set()
+        prober.join(timeout=10)
+        page_workers._reset_cpu_topology_cache()
+    assert not prober.is_alive()
+    # The parent is unaffected: a fresh single flight probes again normally.
+    assert page_workers._detect_cpu_topology() is parent_topology
 
 
 # --- structured log -------------------------------------------------------
@@ -696,7 +836,7 @@ def test_integer_api_projects_the_same_decision(
         _linux(process_count=3, cpu_count=8),
         _linux(process_count=None, cpu_count=None),
     ):
-        _detect_cpu_topology.cache_clear()
+        page_workers._reset_cpu_topology_cache()
         monkeypatch.setattr(page_workers, "_probe_cpu_topology", lambda t=topology: t)
         try:
             expected = _decide_page_render_workers(None, topology).selected
@@ -704,7 +844,7 @@ def test_integer_api_projects_the_same_decision(
             assert resolve_page_render_workers(None) == expected
             assert _decide_page_render_workers(None).selected == expected
         finally:
-            _detect_cpu_topology.cache_clear()
+            page_workers._reset_cpu_topology_cache()
 
 
 # --- Darwin readers -------------------------------------------------------

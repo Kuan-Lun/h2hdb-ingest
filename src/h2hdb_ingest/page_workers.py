@@ -4,8 +4,9 @@ The policy is split into three layers so that every automatic or manual worker
 decision is observable without re-probing the host or guessing reasons back
 from an integer:
 
-1. :func:`_detect_cpu_topology` probes the host exactly once per process and
-   returns an immutable :class:`_CpuTopology` fact record.
+1. :func:`_detect_cpu_topology` probes the host at most once per process
+   (single flight across threads, never inherited across ``fork``) and returns
+   an immutable :class:`_CpuTopology` fact record.
 2. :func:`_decide_page_render_workers` is a pure function from the optional
    configured override and one topology to an immutable
    :class:`_PageRenderWorkerDecision` that carries the mode, configured and
@@ -28,13 +29,13 @@ import os
 import platform
 import subprocess
 import sys
+import threading
 from ctypes import CDLL, POINTER, byref, c_char_p, c_int, c_size_t, c_void_p, sizeof
 from ctypes import get_errno as _get_errno
 from ctypes import set_errno as _set_errno
 from dataclasses import dataclass
 from enum import StrEnum
 from errno import ENOENT
-from functools import cache
 
 MAX_PAGE_RENDER_WORKERS = 16
 
@@ -106,7 +107,7 @@ def _require_optional_count(value: object, *, field: str) -> int | None:
 
 @dataclass(frozen=True, slots=True)
 class _CpuTopology:
-    """Immutable host facts recorded by exactly one probe per process.
+    """Immutable host facts from the at-most-one topology probe of a process.
 
     Darwin-only facts are ``None``/``NOT_PROBED`` on every other platform: a
     Linux container on a macOS host cannot see the host's performance and
@@ -208,7 +209,11 @@ class _PageRenderWorkerDecision:
         return self.reason in _FALLBACK_REASONS
 
     def log_fields(self) -> tuple[tuple[str, str], ...]:
-        """Return the ordered structured fields of the one-time startup log."""
+        """Return the ordered structured fields of the runtime-build log record.
+
+        The runtime logs one such record each time it builds a CBZ-enabled
+        runtime; the topology inside it is the once-per-process probe.
+        """
 
         topology = self.topology
         return (
@@ -354,11 +359,47 @@ def _probe_cpu_topology() -> _CpuTopology:
     )
 
 
-@cache
-def _detect_cpu_topology() -> _CpuTopology:
-    """Probe CPU and Darwin sysctl facts exactly once per process."""
+# The process-wide topology cache is keyed by PID and guarded by one lock so
+# that concurrent first calls probe exactly once (single flight) and a fork
+# child never reuses its parent's facts.  ``os.register_at_fork`` replaces the
+# lock in the child: a probe in flight on another parent thread at fork time
+# would otherwise leave the child a lock nobody can release.
+_topology_lock = threading.Lock()
+_topology_cache: tuple[int, _CpuTopology] | None = None
 
-    return _probe_cpu_topology()
+
+def _reset_cpu_topology_cache() -> None:
+    """Forget any probed topology and start a fresh, unlocked single flight."""
+
+    global _topology_lock, _topology_cache
+    _topology_lock = threading.Lock()
+    _topology_cache = None
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_cpu_topology_cache)
+
+
+def _detect_cpu_topology() -> _CpuTopology:
+    """Return this process's topology, probing at most once per process.
+
+    Every caller in the same process receives the same immutable record.  A
+    fork child observes a different PID, so it probes its own topology instead
+    of inheriting the parent's cached facts.
+    """
+
+    global _topology_cache
+    pid = os.getpid()
+    cached = _topology_cache
+    if cached is not None and cached[0] == pid:
+        return cached[1]
+    with _topology_lock:
+        cached = _topology_cache
+        if cached is not None and cached[0] == pid:
+            return cached[1]
+        topology = _probe_cpu_topology()
+        _topology_cache = (pid, topology)
+        return topology
 
 
 def _detected_decision(
@@ -482,8 +523,8 @@ def _decide_page_render_workers(
     """Return the immutable worker decision for one optional override.
 
     A manual override never inspects the platform to choose its value, but the
-    decision still records the process-cached topology so the startup log can
-    show what the host looks like next to the configured count.
+    decision still records the process-cached topology so the runtime-build
+    log can show what the host looks like next to the configured count.
     """
 
     if topology is not None and not isinstance(topology, _CpuTopology):

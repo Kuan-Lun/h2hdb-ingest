@@ -102,9 +102,11 @@ def build_runtime(
             library_maintenance = disabled_library
             publication_guard = _disabled_publication_guard
         else:
-            # One structured decision record per process: the renderer only
-            # receives the selected integer, and nothing below this line logs
-            # worker selection again per gallery or page.
+            # One structured decision record per CBZ-enabled runtime build
+            # (the host topology inside it is probed at most once per
+            # process): the renderer only receives the selected integer, and
+            # nothing below this line logs worker selection again per gallery
+            # or page.
             worker_decision = _decide_page_render_workers(
                 config.paths.page_render_workers
             )

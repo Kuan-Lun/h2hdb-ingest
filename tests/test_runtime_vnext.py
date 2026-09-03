@@ -243,7 +243,7 @@ def test_runtime_passes_effective_render_policy_and_one_metric_sink_to_adapter(
 
 
 def _fixed_topology(monkeypatch: pytest.MonkeyPatch, topology: _CpuTopology) -> None:
-    page_workers._detect_cpu_topology.cache_clear()
+    page_workers._reset_cpu_topology_cache()
     monkeypatch.setattr(page_workers, "_probe_cpu_topology", lambda: topology)
 
 
@@ -287,7 +287,7 @@ def test_runtime_decides_omitted_page_workers_once_and_logs_the_decision(
     try:
         service = build_runtime(config, event_logger=events.append).resident._service
     finally:
-        page_workers._detect_cpu_topology.cache_clear()
+        page_workers._reset_cpu_topology_cache()
     assert isinstance(service, VNextIngestService)
     adapter = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
 
@@ -319,7 +319,7 @@ def test_runtime_logs_a_manual_override_as_manual_next_to_the_host_facts(
     try:
         service = build_runtime(config, event_logger=events.append).resident._service
     finally:
-        page_workers._detect_cpu_topology.cache_clear()
+        page_workers._reset_cpu_topology_cache()
     assert isinstance(service, VNextIngestService)
     adapter = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
 
@@ -349,7 +349,7 @@ def test_runtime_logs_the_worker_decision_once_not_per_archive(
     try:
         runtime = build_runtime(config, event_logger=events.append)
     finally:
-        page_workers._detect_cpu_topology.cache_clear()
+        page_workers._reset_cpu_topology_cache()
     service = runtime.resident._service
     assert isinstance(service, VNextIngestService)
     adapter = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
@@ -383,13 +383,13 @@ def test_artifact_disabled_runtime_does_not_log_or_probe_worker_selection(
     def reject_probe() -> _CpuTopology:
         raise AssertionError("a runtime without a library must not probe workers")
 
-    page_workers._detect_cpu_topology.cache_clear()
+    page_workers._reset_cpu_topology_cache()
     monkeypatch.setattr(page_workers, "_probe_cpu_topology", reject_probe)
     events: list[str] = []
     config = IngestConfig(paths=IngestPathsConfig(download_path=_source_root(tmp_path)))
     try:
         build_runtime(config, event_logger=events.append)
     finally:
-        page_workers._detect_cpu_topology.cache_clear()
+        page_workers._reset_cpu_topology_cache()
 
     assert _worker_lines(events) == []
