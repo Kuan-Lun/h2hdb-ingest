@@ -174,8 +174,9 @@ Silicon, and unknown Darwin processes likewise fall back to one worker if
 performance-core authority is missing, malformed, or unavailable. They never
 reinterpret logical or total CPU counts as performance cores. Other platforms
 use the process CPU availability, then the host CPU count, and finally one.
-Every detected value is capped at 16, and platform detection is cached rather
-than repeated per render request.
+Every detected value is capped at 16, and the host topology is probed at most
+once per process (concurrent first calls share one probe, and a forked child
+probes again) rather than per render request.
 
 When a CBZ-enabled runtime is built, the service logs the worker decision
 exactly once as one structured `page_render_workers` line, for example:

@@ -18,11 +18,14 @@ def test_lean_model_proves_order_serialization_and_publish_last() -> None:
         "automaticWorkerCount",
         "resolveWorkerCount",
         "CpuTopology",
+        "WorkerSelection",
         "WorkerDecision",
         "plausible",
         "darwinAutomatic",
         "otherAutomatic",
         "automaticDecision",
+        "select",
+        "embed",
         "decide",
         "legacyDetected",
         "LogRecord",
@@ -39,6 +42,9 @@ def test_lean_model_proves_order_serialization_and_publish_last() -> None:
         "automatic_resolution_is_valid",
         "explicit_worker_override_is_exact",
         "valid_explicit_worker_override_stays_valid",
+        "decide_embeds_its_topology",
+        "decide_records_the_hard_cap",
+        "decide_projects_its_selection",
         "manual_decision_is_exact_and_marked",
         "automatic_decision_shape",
         "automatic_decision_has_no_configured_value",
@@ -54,6 +60,8 @@ def test_lean_model_proves_order_serialization_and_publish_last() -> None:
         "detected_reason_selects_capped_authority",
         "decision_selects_exactly_the_previous_policy",
         "observation_reports_the_decision_unchanged",
+        "observation_reports_every_field",
+        "observation_reports_the_decided_topology",
         "arbitrary_bounded_schedule_ordered_collect_equals_sequential_map",
         "completion_schedule_contains_every_page_exactly_once",
         "worker_count_is_valid_and_every_batch_is_worker_bounded",
@@ -67,8 +75,9 @@ def test_lean_model_proves_order_serialization_and_publish_last() -> None:
     assert "deterministic pure function" in prose
     assert "any permutation" in prose
     assert (
-        "None of this proves that `sysctl`, Python CPU discovery, configuration "
-        "parsing, or Python logging refines these definitions" in prose
+        "None of this proves that `sysctl`, Python CPU discovery, the PID-aware "
+        "single-flight topology cache, configuration parsing, or Python logging "
+        "refines these definitions" in prose
     )
     assert "do not prove Pillow determinism or thread safety" in prose
     assert "Python future/executor behavior" in prose

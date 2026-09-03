@@ -68,20 +68,27 @@ theorem valid_explicit_worker_override_stays_valid
 /-!
 ## Worker decision shape
 
-`CpuTopology` abstracts the once-per-process host probe, `WorkerDecision` the
-immutable decision value, and `decide` the pure selection from an optional
-override and one topology.  Darwin-only facts are options so a non-Darwin
-topology carries none of them.  The theorems below state what the decision
-*shape* guarantees: manual overrides are exact and marked, automatic selection
-is always in `1..16`, a Darwin decision never depends on logical CPU counts, a
-non-Darwin decision never depends on Darwin facts, every fallback reason
-selects exactly one worker, and the selected count equals the earlier
-`resolveWorkerCount` policy over the same abstract authority.  `observe` is a
-pure projection of a decision into its log record.
+`CpuTopology` abstracts the at-most-once-per-process host probe,
+`WorkerSelection` the pure selection (mode, configured and selected values, raw
+detected authority, closed reason), and `WorkerDecision` the immutable decision
+value the runtime records once per CBZ-enabled runtime build: that selection
+together with the fixed hard cap and the very topology it was selected from.
+`decide` is the pure function from an optional override and one topology to
+the decision, and `observe` is the pure projection of one decision into its
+structured log record; every log field, the topology included, is taken from
+that same decision value and nothing else.  Darwin-only facts are options so a
+non-Darwin topology carries none of them.  The theorems below state what the
+decision *shape* guarantees: manual overrides are exact and marked, automatic
+selection is always in `1..16`, a Darwin selection never depends on logical
+CPU counts, a non-Darwin selection never depends on Darwin facts, every
+fallback reason selects exactly one worker, the selected count equals the
+earlier `resolveWorkerCount` policy over the same abstract authority, and the
+decision embeds exactly the topology it was decided from.
 
-None of this proves that `sysctl`, Python CPU discovery, configuration
-parsing, or Python logging refines these definitions; mocked-topology,
-differential, cache, and runtime log tests remain that implementation evidence.
+None of this proves that `sysctl`, Python CPU discovery, the PID-aware
+single-flight topology cache, configuration parsing, or Python logging refines
+these definitions; mocked-topology, differential, cache, fork, and runtime log
+tests remain that implementation evidence.
 -/
 
 inductive WorkerMode where
@@ -127,12 +134,27 @@ def WorkerReason.isFallback : WorkerReason → Bool
   | .cpuCountUnavailableFallback => true
   | _ => false
 
-structure WorkerDecision where
+/-- The pure selection: what was chosen and why, before it is bound to the
+topology it was chosen from. -/
+structure WorkerSelection where
   mode : WorkerMode
   configured : Option Nat
   selected : Nat
   detected : Option Nat
   reason : WorkerReason
+deriving DecidableEq, Repr
+
+/-- The immutable decision value: one selection, the fixed hard cap, and the
+topology it was selected from.  The runtime records one such value per
+CBZ-enabled runtime build. -/
+structure WorkerDecision where
+  mode : WorkerMode
+  configured : Option Nat
+  selected : Nat
+  detected : Option Nat
+  hardCap : Nat
+  reason : WorkerReason
+  topology : CpuTopology
 deriving DecidableEq, Repr
 
 def MaxPlausibleCpus : Nat := 1024
@@ -143,13 +165,13 @@ def plausible (value : Option Nat) : Option Nat :=
   | none => none
   | some n => if 1 ≤ n ∧ n ≤ MaxPlausibleCpus then some n else none
 
-def detectedDecision (authority : Nat) (reason : WorkerReason) : WorkerDecision :=
+def detectedDecision (authority : Nat) (reason : WorkerReason) : WorkerSelection :=
   ⟨.auto, none, min authority HardWorkerCap, some authority, reason⟩
 
-def fallbackDecision (reason : WorkerReason) : WorkerDecision :=
+def fallbackDecision (reason : WorkerReason) : WorkerSelection :=
   ⟨.auto, none, 1, none, reason⟩
 
-def darwinAutomatic (topology : CpuTopology) : WorkerDecision :=
+def darwinAutomatic (topology : CpuTopology) : WorkerSelection :=
   match plausible topology.darwinPerformanceCores with
   | some performance => detectedDecision performance .darwinPerformanceCores
   | none =>
@@ -164,7 +186,7 @@ def darwinAutomatic (topology : CpuTopology) : WorkerDecision :=
       | .notProbed => fallbackDecision .darwinIntelTranslationUnknownFallback
     else fallbackDecision .darwinPerformanceCoresUnavailableFallback
 
-def otherAutomatic (topology : CpuTopology) : WorkerDecision :=
+def otherAutomatic (topology : CpuTopology) : WorkerSelection :=
   match topology.processCpuCount with
   | some reported =>
     match plausible (some reported) with
@@ -175,22 +197,50 @@ def otherAutomatic (topology : CpuTopology) : WorkerDecision :=
     | some total => detectedDecision total .cpuCount
     | none => fallbackDecision .cpuCountUnavailableFallback
 
-def automaticDecision (topology : CpuTopology) : WorkerDecision :=
+def automaticDecision (topology : CpuTopology) : WorkerSelection :=
   if topology.darwin then darwinAutomatic topology else otherAutomatic topology
 
-def decide (configured : Option Nat) (topology : CpuTopology) : WorkerDecision :=
+def select (configured : Option Nat) (topology : CpuTopology) : WorkerSelection :=
   match configured with
   | some workers => ⟨.manual, some workers, workers, none, .manualOverride⟩
   | none => automaticDecision topology
 
+/-- Bind one selection to the topology it was selected from. -/
+def embed (selection : WorkerSelection) (topology : CpuTopology) : WorkerDecision :=
+  ⟨selection.mode, selection.configured, selection.selected, selection.detected,
+    HardWorkerCap, selection.reason, topology⟩
+
+def decide (configured : Option Nat) (topology : CpuTopology) : WorkerDecision :=
+  embed (select configured topology) topology
+
+theorem decide_embeds_its_topology (configured : Option Nat) (topology : CpuTopology) :
+    (decide configured topology).topology = topology := by
+  rfl
+
+theorem decide_records_the_hard_cap (configured : Option Nat) (topology : CpuTopology) :
+    (decide configured topology).hardCap = HardWorkerCap := by
+  rfl
+
+theorem decide_projects_its_selection (configured : Option Nat) (topology : CpuTopology) :
+    (decide configured topology).mode = (select configured topology).mode ∧
+      (decide configured topology).configured = (select configured topology).configured ∧
+      (decide configured topology).selected = (select configured topology).selected ∧
+      (decide configured topology).detected = (select configured topology).detected ∧
+      (decide configured topology).reason = (select configured topology).reason := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+
 theorem manual_decision_is_exact_and_marked
     (workers : Nat) (topology : CpuTopology) :
     decide (some workers) topology =
-      ⟨.manual, some workers, workers, none, .manualOverride⟩ := by
+      ⟨.manual, some workers, workers, none, HardWorkerCap, .manualOverride, topology⟩ := by
+  rfl
+
+theorem select_none (topology : CpuTopology) :
+    select none topology = automaticDecision topology := by
   rfl
 
 theorem decide_none (topology : CpuTopology) :
-    decide none topology = automaticDecision topology := by
+    decide none topology = embed (automaticDecision topology) topology := by
   rfl
 
 theorem plausible_eq_some_iff (value : Option Nat) (n : Nat) :
@@ -239,7 +289,8 @@ theorem automatic_decision_shape (topology : CpuTopology) :
 theorem automatic_decision_has_no_configured_value (topology : CpuTopology) :
     (decide none topology).mode = .auto ∧
       (decide none topology).configured = none := by
-  rw [decide_none]
+  show (automaticDecision topology).mode = .auto ∧
+    (automaticDecision topology).configured = none
   rcases automatic_decision_shape topology with ⟨_, _, _, _, _, h⟩ | ⟨_, _, h⟩ <;>
     rw [h] <;> exact ⟨rfl, rfl⟩
 
@@ -255,7 +306,7 @@ theorem fallback_decision_is_valid (reason : WorkerReason) :
 
 theorem automatic_decision_is_valid (topology : CpuTopology) :
     ValidWorkerCount (decide none topology).selected := by
-  rw [decide_none]
+  show ValidWorkerCount (automaticDecision topology).selected
   rcases automatic_decision_shape topology with
     ⟨authority, reason, positive, _, _, h⟩ | ⟨reason, _, h⟩
   · rw [h]
@@ -274,29 +325,29 @@ theorem every_decision_is_valid
 theorem darwin_decision_ignores_logical_cpu_counts
     (topology : CpuTopology) (processCpuCount cpuCount : Option Nat)
     (darwin : topology.darwin = true) :
-    decide none { topology with
+    select none { topology with
       processCpuCount := processCpuCount, cpuCount := cpuCount } =
-      decide none topology := by
-  simp [decide, automaticDecision, darwinAutomatic, darwin]
+      select none topology := by
+  simp [select, automaticDecision, darwinAutomatic, darwin]
 
 theorem non_darwin_decision_ignores_darwin_facts
     (topology : CpuTopology)
     (performance physical : Option Nat) (translation : DarwinTranslation)
     (other : topology.darwin = false) :
-    decide none { topology with
+    select none { topology with
       darwinPerformanceCores := performance,
       darwinPhysicalCores := physical,
       darwinTranslation := translation } =
-      decide none topology := by
-  simp [decide, automaticDecision, otherAutomatic, other]
+      select none topology := by
+  simp [select, automaticDecision, otherAutomatic, other]
 
 theorem performance_cores_take_priority
     (topology : CpuTopology) (performance : Nat)
     (darwin : topology.darwin = true)
     (authority : plausible topology.darwinPerformanceCores = some performance) :
-    decide none topology =
+    select none topology =
       detectedDecision performance .darwinPerformanceCores := by
-  simp [decide, automaticDecision, darwinAutomatic, darwin, authority]
+  simp [select, automaticDecision, darwinAutomatic, darwin, authority]
 
 theorem translated_intel_process_falls_back_to_one
     (topology : CpuTopology)
@@ -304,8 +355,8 @@ theorem translated_intel_process_falls_back_to_one
     (missing : plausible topology.darwinPerformanceCores = none)
     (intel : topology.intelMachine = true)
     (translated : topology.darwinTranslation = .translated) :
-    decide none topology = fallbackDecision .darwinIntelTranslatedFallback := by
-  simp [decide, automaticDecision, darwinAutomatic, darwin, missing, intel,
+    select none topology = fallbackDecision .darwinIntelTranslatedFallback := by
+  simp [select, automaticDecision, darwinAutomatic, darwin, missing, intel,
     translated]
 
 theorem unknown_translation_intel_process_falls_back_to_one
@@ -315,29 +366,32 @@ theorem unknown_translation_intel_process_falls_back_to_one
     (intel : topology.intelMachine = true)
     (unknown : topology.darwinTranslation = .unknown ∨
       topology.darwinTranslation = .notProbed) :
-    decide none topology =
+    select none topology =
       fallbackDecision .darwinIntelTranslationUnknownFallback := by
   rcases unknown with h | h <;>
-    simp [decide, automaticDecision, darwinAutomatic, darwin, missing, intel, h]
+    simp [select, automaticDecision, darwinAutomatic, darwin, missing, intel, h]
 
 theorem non_intel_darwin_without_performance_authority_falls_back_to_one
     (topology : CpuTopology)
     (darwin : topology.darwin = true)
     (missing : plausible topology.darwinPerformanceCores = none)
     (other : topology.intelMachine = false) :
-    decide none topology =
+    select none topology =
       fallbackDecision .darwinPerformanceCoresUnavailableFallback := by
-  simp [decide, automaticDecision, darwinAutomatic, darwin, missing, other]
+  simp [select, automaticDecision, darwinAutomatic, darwin, missing, other]
 
 theorem fallback_reason_selects_exactly_one
     (configured : Option Nat) (topology : CpuTopology)
     (fallback : (decide configured topology).reason.isFallback = true) :
     (decide configured topology).selected = 1 ∧
       (decide configured topology).detected = none := by
+  change (select configured topology).reason.isFallback = true at fallback
+  show (select configured topology).selected = 1 ∧
+    (select configured topology).detected = none
   cases configured with
-  | some workers => simp [decide, WorkerReason.isFallback] at fallback
+  | some workers => simp [select, WorkerReason.isFallback] at fallback
   | none =>
-    rw [decide_none] at fallback ⊢
+    rw [select_none] at fallback ⊢
     rcases automatic_decision_shape topology with
       ⟨_, _, _, _, detected, h⟩ | ⟨_, _, h⟩
     · rw [h] at fallback
@@ -352,7 +406,11 @@ theorem detected_reason_selects_capped_authority
     ∃ authority, 1 ≤ authority ∧
       (decide none topology).detected = some authority ∧
       (decide none topology).selected = min authority HardWorkerCap := by
-  rw [decide_none] at detected ⊢
+  change (select none topology).reason.isFallback = false at detected
+  show ∃ authority, 1 ≤ authority ∧
+    (select none topology).detected = some authority ∧
+    (select none topology).selected = min authority HardWorkerCap
+  rw [select_none] at detected ⊢
   rcases automatic_decision_shape topology with
     ⟨authority, _, positive, _, _, h⟩ | ⟨_, fallback, h⟩
   · rw [h]
@@ -393,10 +451,12 @@ theorem decision_selects_exactly_the_previous_policy
     (configured : Option Nat) (topology : CpuTopology) :
     (decide configured topology).selected =
       resolveWorkerCount configured (legacyDetected topology) := by
+  show (select configured topology).selected =
+    resolveWorkerCount configured (legacyDetected topology)
   cases configured with
   | some workers => rfl
   | none =>
-    rw [decide_none]
+    rw [select_none]
     unfold resolveWorkerCount automaticDecision darwinAutomatic otherAutomatic
       legacyDetected
     split <;> split <;> (try split) <;> (try split) <;> (try split) <;>
@@ -404,7 +464,7 @@ theorem decision_selects_exactly_the_previous_policy
       exact plausible_authority_clamps_like_previous_policy _
         (by simp_all [plausible_eq_some_iff])
 
-/-- The structured startup log is a pure projection of one decision. -/
+/-- The structured log record: every field is projected from one decision. -/
 structure LogRecord where
   mode : WorkerMode
   configured : Option Nat
@@ -415,20 +475,33 @@ structure LogRecord where
   reason : WorkerReason
 deriving DecidableEq, Repr
 
-def observe (decision : WorkerDecision) (topology : CpuTopology) : LogRecord :=
+/-- `observe` reads nothing but the decision: the topology it reports is the
+topology embedded in that decision, never a second probe. -/
+def observe (decision : WorkerDecision) : LogRecord :=
   ⟨decision.mode, decision.configured, decision.selected, decision.detected,
-    HardWorkerCap, topology, decision.reason⟩
+    decision.hardCap, decision.topology, decision.reason⟩
 
-theorem observation_reports_the_decision_unchanged
+theorem observation_reports_the_decision_unchanged (decision : WorkerDecision) :
+    observe decision =
+      ⟨decision.mode, decision.configured, decision.selected, decision.detected,
+        decision.hardCap, decision.topology, decision.reason⟩ := by
+  rfl
+
+theorem observation_reports_every_field (decision : WorkerDecision) :
+    (observe decision).mode = decision.mode ∧
+      (observe decision).configured = decision.configured ∧
+      (observe decision).selected = decision.selected ∧
+      (observe decision).detected = decision.detected ∧
+      (observe decision).hardCap = decision.hardCap ∧
+      (observe decision).topology = decision.topology ∧
+      (observe decision).reason = decision.reason := by
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+theorem observation_reports_the_decided_topology
     (configured : Option Nat) (topology : CpuTopology) :
-    (observe (decide configured topology) topology).selected =
-        (decide configured topology).selected ∧
-      (observe (decide configured topology) topology).mode =
-        (decide configured topology).mode ∧
-      (observe (decide configured topology) topology).reason =
-        (decide configured topology).reason ∧
-      (observe (decide configured topology) topology).hardCap = HardWorkerCap := by
-  exact ⟨rfl, rfl, rfl, rfl⟩
+    (observe (decide configured topology)).topology = topology ∧
+      (observe (decide configured topology)).hardCap = HardWorkerCap := by
+  exact ⟨rfl, rfl⟩
 
 def nextBatchSize (workers remaining : Nat) : Nat :=
   min workers remaining
