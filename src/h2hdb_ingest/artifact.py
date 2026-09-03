@@ -67,6 +67,7 @@ from h2hdb import (
 from PIL import Image, ImageFile, ImageOps, UnidentifiedImageError, features
 from PIL import __version__ as PILLOW_VERSION
 
+from ._limits import MAX_METADATA_BYTES
 from .metrics import (
     IngestMetric,
     IngestMetricSink,
@@ -86,7 +87,6 @@ MAX_ENCODED_PAGE_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_SIZE_BYTES = (1 << 31) - 1
 MAX_DECODED_PIXELS = 40_000_000
 MAX_IMAGE_LONG_SIDE = 8192
-MAX_METADATA_BYTES = 1024 * 1024
 PAGE_JPEG_QUALITY = 90
 THUMBNAIL_MAX_SIDE = 320
 THUMBNAIL_JPEG_QUALITY = 85

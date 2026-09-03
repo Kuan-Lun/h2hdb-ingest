@@ -40,10 +40,11 @@ pages/0001.jpg
 
 `galleryinfo.txt` uses DEFLATE. Page members use `ZIP_STORED`, which makes their
 verified byte ranges directly readable. ZIP comments, ZIP64, extra fields,
-data descriptors, duplicate names, and any other members are rejected. The
-metadata may be at most 1 MiB after decompression; the writer and verifier allow
-the corresponding worst-case DEFLATE size. The non-ZIP64 archive limit is
-2,147,483,647 bytes.
+data descriptors, duplicate names, and any other members are rejected. Source
+`galleryinfo.txt` metadata must be 1 byte through 1 MiB even when artifact
+generation is disabled; this bounds parsing and cancellation latency. The
+writer and verifier allow the corresponding worst-case DEFLATE size. The
+non-ZIP64 archive limit is 2,147,483,647 bytes.
 
 A gallery with no eligible pages still has a valid metadata-only acquisition
 containing `galleryinfo.txt`. Its presentation page list is empty and it has no

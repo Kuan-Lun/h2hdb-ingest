@@ -26,7 +26,9 @@ from enum import IntEnum, StrEnum
 from hashlib import sha256
 from pathlib import Path
 
-from h2h_galleryinfo_parser import parse_galleryinfo
+from h2h_galleryinfo_parser import GalleryInfoParser, parse_gid
+
+from ._limits import MAX_METADATA_BYTES
 
 FILESYSTEM_OBSERVATION_VERSION = 2
 GALLERY_INFO_NAME = "galleryinfo.txt"
@@ -634,10 +636,21 @@ class FilesystemSource:
         self._checkpoint()
         metadata_path = folder / GALLERY_INFO_NAME
         metadata_stat = self._regular_file_stat(metadata_path)
-        metadata_sha256 = self._hash_path(metadata_path, metadata_stat)
+        if not 1 <= metadata_stat.size_bytes <= MAX_METADATA_BYTES:
+            raise FilesystemObservationError(
+                f"gallery metadata size is outside policy: {metadata_path}"
+            )
+        metadata_content, metadata_sha256 = self._read_metadata_path(
+            metadata_path,
+            metadata_stat,
+        )
         self._checkpoint()
         try:
-            parsed = parse_galleryinfo(folder)
+            parsed = _parse_galleryinfo_content(
+                folder,
+                metadata_content,
+                modified_ns=metadata_stat.modified_ns,
+            )
         except Exception as error:
             raise FilesystemObservationError(
                 f"unable to parse {metadata_path}: {error}"
@@ -1080,6 +1093,122 @@ class FilesystemSource:
         finally:
             os.close(descriptor)
         return digest.digest()
+
+    def _read_metadata_path(
+        self,
+        path: Path,
+        expected: FilesystemStat,
+    ) -> tuple[bytes, bytes]:
+        """Read one exact bounded metadata snapshot from a no-follow descriptor."""
+
+        self._checkpoint()
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            raise FilesystemObservationError(
+                f"unable to open gallery metadata {path}: {error}"
+            ) from error
+        try:
+            if FilesystemStat.from_os_stat(os.fstat(descriptor)) != expected:
+                raise FilesystemObservationError(
+                    f"gallery metadata changed before reading: {path}"
+                )
+            content = bytearray()
+            digest = sha256()
+            while len(content) <= MAX_METADATA_BYTES:
+                self._checkpoint()
+                part = os.read(
+                    descriptor,
+                    min(_READ_BYTES, MAX_METADATA_BYTES + 1 - len(content)),
+                )
+                if not part:
+                    break
+                content.extend(part)
+                digest.update(part)
+            self._checkpoint()
+            if len(content) != expected.size_bytes:
+                raise FilesystemObservationError(
+                    f"gallery metadata size changed while reading: {path}"
+                )
+            if FilesystemStat.from_os_stat(os.fstat(descriptor)) != expected:
+                raise FilesystemObservationError(
+                    f"gallery metadata changed after reading: {path}"
+                )
+            return bytes(content), digest.digest()
+        except OSError as error:
+            raise FilesystemObservationError(
+                f"unable to read gallery metadata {path}: {error}"
+            ) from error
+        finally:
+            os.close(descriptor)
+
+
+def _parse_galleryinfo_content(
+    gallery_folder: Path,
+    content: bytes,
+    *,
+    modified_ns: int,
+) -> GalleryInfoParser:
+    """Parse the exact bounded snapshot with h2h-galleryinfo-parser semantics."""
+
+    text = content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.strip("\n").split("\n")
+    gid = parse_gid(gallery_folder)
+    modified_time = datetime.fromtimestamp(modified_ns / 1_000_000_000)
+    title: str
+    upload_time: datetime
+    upload_account: str
+    download_time: datetime
+    tags: list[tuple[str, str]]
+    comments = False
+    comment_lines: list[str] = []
+    for line in lines:
+        if "Uploader's Comments" in line:
+            comments = True
+        elif comments:
+            if (
+                line
+                == "Downloaded from E-Hentai Galleries by the Hentai@Home Downloader <3"
+            ):
+                break
+            comment_lines.append(line.strip())
+        elif ":" in line:
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            if key == "Tags":
+                tags = []
+                for tag in value.split(","):
+                    if ":" in tag:
+                        tag_key, tag_value = tag.split(":", 1)
+                        if tag_key.strip() != "":
+                            tags.append((tag_key.strip(), tag_value.strip()))
+                        else:
+                            tags.append(("untagged", tag_value.strip()))
+                    else:
+                        tags.append(("untagged", tag.strip()))
+            elif key == "Title":
+                title = value
+            elif key == "Upload Time":
+                upload_time = datetime.strptime(value, "%Y-%m-%d %H:%M")
+            elif key == "Uploaded By":
+                upload_account = value
+            elif key == "Downloaded":
+                download_time = datetime.strptime(value, "%Y-%m-%d %H:%M")
+
+    return GalleryInfoParser(
+        gallery_folder=gallery_folder,
+        gallery_name=gallery_folder.name,
+        gid=gid,
+        modified_time=modified_time,
+        title=title,
+        upload_time=upload_time,
+        galleries_comments="\n".join(comment_lines).strip("\n"),
+        upload_account=upload_account,
+        download_time=download_time,
+        tags=tags,
+    )
 
 
 def _insert_audit_batch(

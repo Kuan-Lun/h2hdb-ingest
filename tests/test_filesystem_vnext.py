@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import os
 import stat
+import tempfile
 from collections.abc import Iterator
 from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from h2h_galleryinfo_parser import parse_galleryinfo
 from h2hdb import VNextIngestSourceAdapter
 
+import h2hdb_ingest.filesystem as filesystem_module
+from h2hdb_ingest.artifact import MAX_METADATA_BYTES
 from h2hdb_ingest.core_source import VNextFilesystemSourceAdapter
 from h2hdb_ingest.filesystem import (
     FILESYSTEM_OBSERVATION_VERSION,
@@ -240,9 +244,11 @@ def test_discovery_snapshot_is_built_once_and_closed_explicitly(
 
 def test_discovery_checkpoint_interrupts_and_cleans_partial_spill_index(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "download"
     _gallery(root, "nested/1001")
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     stop = _StopOnceAt(4)
     source = FilesystemSource(root, checkpoint=stop)
     stop.arm()
@@ -253,10 +259,104 @@ def test_discovery_checkpoint_interrupts_and_cleans_partial_spill_index(
     assert stop.interrupted
     assert source._discovery_connection is None
     assert source._discovery_temporary is None
+    assert tuple(tmp_path.glob("h2hdb-ingest-discovery-*")) == ()
     assert source.list_gallery_locators(after_locator=None, limit=1).items == (
         ("nested", "1001"),
     )
     source.close()
+
+
+@pytest.mark.parametrize("size_bytes", [0, MAX_METADATA_BYTES + 1])
+def test_gallery_metadata_size_is_bounded_before_parser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    size_bytes: int,
+) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "1008")
+    (folder / "galleryinfo.txt").write_bytes(b"x" * size_bytes)
+    parser_called = False
+
+    def unexpected_parser(
+        _folder: Path,
+        _content: bytes,
+        *,
+        modified_ns: int,
+    ) -> object:
+        del modified_ns
+        nonlocal parser_called
+        parser_called = True
+        raise AssertionError("oversized metadata reached the parser")
+
+    monkeypatch.setattr(
+        filesystem_module,
+        "_parse_galleryinfo_content",
+        unexpected_parser,
+    )
+    source = FilesystemSource(root)
+
+    with pytest.raises(FilesystemObservationError, match="size is outside policy"):
+        source.observe_gallery(("1008",))
+
+    assert not parser_called
+    source.close()
+
+
+def test_gallery_metadata_accepts_the_exact_size_limit(tmp_path: Path) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "1007")
+    metadata_path = folder / "galleryinfo.txt"
+    metadata = metadata_path.read_bytes()
+    padding_size = MAX_METADATA_BYTES - len(metadata) - 1
+    assert padding_size > 0
+    metadata_path.write_bytes(metadata + b"\n" + (b"x" * padding_size))
+    source = FilesystemSource(root)
+
+    observation = source.observe_gallery(("1007",))
+
+    assert observation.metadata.gid == 1007
+    assert observation.metadata.title == "A title"
+    assert metadata_path.stat().st_size == MAX_METADATA_BYTES
+    source.close()
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        (
+            "\nTitle: A title\nUpload Time: 2024-01-02 03:04\n"
+            "Uploaded By: uploader\nDownloaded: 2024-02-03 04:05\n"
+            "Tags: artist:first, :second, plain\nUploader's Comments\n"
+            " A comment \nDownloaded from E-Hentai Galleries by the "
+            "Hentai@Home Downloader <3\n\n"
+        ),
+        (
+            "Title: First\r\nTitle: Last\r\nUpload Time: 2024-01-02 03:04\r\n"
+            "Uploaded By: uploader\r\nDownloaded: 2024-02-03 04:05\r\n"
+            "Tags: language:english\r\nUploader's Comments\r\n"
+            "line one\r\n\r\nline two\r\nDownloaded from E-Hentai Galleries by "
+            "the Hentai@Home Downloader <3\r\nignored"
+        ),
+    ],
+)
+def test_snapshot_parser_matches_the_pinned_galleryinfo_parser(
+    tmp_path: Path,
+    metadata: str,
+) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "1010")
+    metadata_path = folder / "galleryinfo.txt"
+    content = metadata.encode("utf-8")
+    metadata_path.write_bytes(content)
+
+    expected = parse_galleryinfo(folder)
+    actual = filesystem_module._parse_galleryinfo_content(
+        folder,
+        content,
+        modified_ns=metadata_path.stat().st_mtime_ns,
+    )
+
+    assert actual == expected
 
 
 def test_file_stream_checkpoint_interrupts_between_chunks_and_closes_descriptors(
