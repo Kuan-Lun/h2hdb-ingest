@@ -9,8 +9,6 @@ __all__ = [
     "ArtifactRenderPolicy",
     "ArtifactRenderPolicyConfig",
     "ArtifactRenderPreset",
-    "CpuTopology",
-    "DarwinTranslation",
     "FilesystemArtifactSourceRole",
     "FilesystemEntryType",
     "FilesystemGalleryObservation",
@@ -28,9 +26,6 @@ __all__ = [
     "LibraryMaintenanceAdapter",
     "LibraryMaintenanceOutcome",
     "ManagedFilesystemLibraryAdapter",
-    "PageRenderWorkerDecision",
-    "PageRenderWorkerMode",
-    "PageRenderWorkerReason",
     "ResidentConfig",
     "ResidentIngestor",
     "TextIngestMetricSink",
@@ -38,9 +33,7 @@ __all__ = [
     "VNextIngestService",
     "VNextIngestSynchronizationResult",
     "build_ingest_policy",
-    "decide_page_render_workers",
     "default_page_render_workers",
-    "detect_cpu_topology",
     "load_config",
     "resolve_page_render_workers",
 ]
@@ -78,14 +71,7 @@ from .metrics import (
 )
 from .page_workers import (
     MAX_PAGE_RENDER_WORKERS,
-    CpuTopology,
-    DarwinTranslation,
-    PageRenderWorkerDecision,
-    PageRenderWorkerMode,
-    PageRenderWorkerReason,
-    decide_page_render_workers,
     default_page_render_workers,
-    detect_cpu_topology,
     resolve_page_render_workers,
 )
 from .policy import build_ingest_policy

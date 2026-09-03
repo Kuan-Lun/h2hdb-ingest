@@ -28,7 +28,7 @@ from .maintenance import (
     LibraryMaintenanceOutcome,
 )
 from .metrics import TextIngestMetricSink
-from .page_workers import decide_page_render_workers
+from .page_workers import _decide_page_render_workers
 from .policy import build_ingest_policy
 from .resident import ResidentIngestor
 from .service import VNextIngestService
@@ -105,7 +105,7 @@ def build_runtime(
             # One structured decision record per process: the renderer only
             # receives the selected integer, and nothing below this line logs
             # worker selection again per gallery or page.
-            worker_decision = decide_page_render_workers(
+            worker_decision = _decide_page_render_workers(
                 config.paths.page_render_workers
             )
             runtime_event_logger(worker_decision.log_line())

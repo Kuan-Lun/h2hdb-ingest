@@ -27,7 +27,7 @@ from h2hdb_ingest import (
 )
 from h2hdb_ingest.artifact import ARTIFACT_ADAPTER_ID
 from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
-from h2hdb_ingest.page_workers import CpuTopology, DarwinTranslation
+from h2hdb_ingest.page_workers import _CpuTopology, _DarwinTranslation
 from h2hdb_ingest.runtime import IngestRuntime, build_runtime
 from h2hdb_ingest.service import VNextIngestService
 
@@ -242,28 +242,28 @@ def test_runtime_passes_effective_render_policy_and_one_metric_sink_to_adapter(
     assert adapter._metrics_sink is service._metrics_sink
 
 
-def _fixed_topology(monkeypatch: pytest.MonkeyPatch, topology: CpuTopology) -> None:
-    page_workers.detect_cpu_topology.cache_clear()
+def _fixed_topology(monkeypatch: pytest.MonkeyPatch, topology: _CpuTopology) -> None:
+    page_workers._detect_cpu_topology.cache_clear()
     monkeypatch.setattr(page_workers, "_probe_cpu_topology", lambda: topology)
 
 
-_APPLE_SILICON = CpuTopology(
+_APPLE_SILICON = _CpuTopology(
     platform="darwin",
     machine="arm64",
     process_cpu_count=14,
     cpu_count=14,
     darwin_performance_cores=10,
     darwin_physical_cores=14,
-    darwin_translation=DarwinTranslation.NATIVE,
+    darwin_translation=_DarwinTranslation.NATIVE,
 )
-_CONTAINER = CpuTopology(
+_CONTAINER = _CpuTopology(
     platform="linux",
     machine="aarch64",
     process_cpu_count=4,
     cpu_count=14,
     darwin_performance_cores=None,
     darwin_physical_cores=None,
-    darwin_translation=DarwinTranslation.NOT_PROBED,
+    darwin_translation=_DarwinTranslation.NOT_PROBED,
 )
 
 
@@ -287,7 +287,7 @@ def test_runtime_decides_omitted_page_workers_once_and_logs_the_decision(
     try:
         service = build_runtime(config, event_logger=events.append).resident._service
     finally:
-        page_workers.detect_cpu_topology.cache_clear()
+        page_workers._detect_cpu_topology.cache_clear()
     assert isinstance(service, VNextIngestService)
     adapter = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
 
@@ -319,7 +319,7 @@ def test_runtime_logs_a_manual_override_as_manual_next_to_the_host_facts(
     try:
         service = build_runtime(config, event_logger=events.append).resident._service
     finally:
-        page_workers.detect_cpu_topology.cache_clear()
+        page_workers._detect_cpu_topology.cache_clear()
     assert isinstance(service, VNextIngestService)
     adapter = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
 
@@ -349,7 +349,7 @@ def test_runtime_logs_the_worker_decision_once_not_per_archive(
     try:
         runtime = build_runtime(config, event_logger=events.append)
     finally:
-        page_workers.detect_cpu_topology.cache_clear()
+        page_workers._detect_cpu_topology.cache_clear()
     service = runtime.resident._service
     assert isinstance(service, VNextIngestService)
     adapter = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
@@ -380,16 +380,16 @@ def test_artifact_disabled_runtime_does_not_log_or_probe_worker_selection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def reject_probe() -> CpuTopology:
+    def reject_probe() -> _CpuTopology:
         raise AssertionError("a runtime without a library must not probe workers")
 
-    page_workers.detect_cpu_topology.cache_clear()
+    page_workers._detect_cpu_topology.cache_clear()
     monkeypatch.setattr(page_workers, "_probe_cpu_topology", reject_probe)
     events: list[str] = []
     config = IngestConfig(paths=IngestPathsConfig(download_path=_source_root(tmp_path)))
     try:
         build_runtime(config, event_logger=events.append)
     finally:
-        page_workers.detect_cpu_topology.cache_clear()
+        page_workers._detect_cpu_topology.cache_clear()
 
     assert _worker_lines(events) == []

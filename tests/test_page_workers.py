@@ -15,14 +15,14 @@ import pytest
 import h2hdb_ingest.page_workers as page_workers
 from h2hdb_ingest.page_workers import (
     MAX_PAGE_RENDER_WORKERS,
-    CpuTopology,
-    DarwinTranslation,
-    PageRenderWorkerDecision,
-    PageRenderWorkerMode,
-    PageRenderWorkerReason,
-    decide_page_render_workers,
+    _CpuTopology,
+    _DarwinTranslation,
+    _decide_page_render_workers,
+    _detect_cpu_topology,
+    _PageRenderWorkerDecision,
+    _PageRenderWorkerMode,
+    _PageRenderWorkerReason,
     default_page_render_workers,
-    detect_cpu_topology,
     resolve_page_render_workers,
 )
 
@@ -32,11 +32,11 @@ def _darwin(
     machine: str = "arm64",
     performance: int | None = None,
     physical: int | None = None,
-    translation: DarwinTranslation = DarwinTranslation.NATIVE,
+    translation: _DarwinTranslation = _DarwinTranslation.NATIVE,
     process_count: int | None = 14,
     cpu_count: int | None = 14,
-) -> CpuTopology:
-    return CpuTopology(
+) -> _CpuTopology:
+    return _CpuTopology(
         platform="darwin",
         machine=machine,
         process_cpu_count=process_count,
@@ -52,19 +52,19 @@ def _linux(
     machine: str = "aarch64",
     process_count: int | None,
     cpu_count: int | None,
-) -> CpuTopology:
-    return CpuTopology(
+) -> _CpuTopology:
+    return _CpuTopology(
         platform="linux",
         machine=machine,
         process_cpu_count=process_count,
         cpu_count=cpu_count,
         darwin_performance_cores=None,
         darwin_physical_cores=None,
-        darwin_translation=DarwinTranslation.NOT_PROBED,
+        darwin_translation=_DarwinTranslation.NOT_PROBED,
     )
 
 
-def _legacy_automatic_workers(topology: CpuTopology) -> int:
+def _legacy_automatic_workers(topology: _CpuTopology) -> int:
     """Independent port of the pre-decision integer policy used as an oracle.
 
     This mirrors the previous ``_darwin_default_page_render_workers`` and
@@ -82,7 +82,7 @@ def _legacy_automatic_workers(topology: CpuTopology) -> int:
         if performance is not None:
             return min(performance, 16)
         if topology.machine.casefold() in {"x86_64", "amd64", "i386", "i686"}:
-            if topology.darwin_translation is not DarwinTranslation.NATIVE:
+            if topology.darwin_translation is not _DarwinTranslation.NATIVE:
                 return 1
             physical = plausible(topology.darwin_physical_cores)
             if physical is not None:
@@ -106,17 +106,17 @@ def test_darwin_prefers_highest_performance_physical_cores(
     reported: int,
     expected: int,
 ) -> None:
-    decision = decide_page_render_workers(
+    decision = _decide_page_render_workers(
         None,
         _darwin(performance=reported, physical=reported + 4),
     )
 
-    assert decision.mode is PageRenderWorkerMode.AUTO
+    assert decision.mode is _PageRenderWorkerMode.AUTO
     assert decision.configured is None
     assert decision.selected == expected
     assert decision.detected == reported
     assert decision.hard_cap == MAX_PAGE_RENDER_WORKERS
-    assert decision.reason is PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES
+    assert decision.reason is _PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES
     assert not decision.is_fallback
 
 
@@ -124,7 +124,7 @@ def test_darwin_prefers_highest_performance_physical_cores(
 def test_native_intel_macos_falls_back_to_total_physical_not_logical_cores(
     machine: str,
 ) -> None:
-    decision = decide_page_render_workers(
+    decision = _decide_page_render_workers(
         None,
         _darwin(
             machine=machine,
@@ -137,26 +137,26 @@ def test_native_intel_macos_falls_back_to_total_physical_not_logical_cores(
     assert decision.selected == 6
     assert decision.detected == 6
     assert decision.reason is (
-        PageRenderWorkerReason.DARWIN_INTEL_NATIVE_PHYSICAL_CORES
+        _PageRenderWorkerReason.DARWIN_INTEL_NATIVE_PHYSICAL_CORES
     )
 
 
 @pytest.mark.parametrize(
     ("process_count", "cpu_count", "expected", "reason"),
     [
-        (8, 64, 8, PageRenderWorkerReason.PROCESS_CPU_COUNT),
-        (32, 64, 16, PageRenderWorkerReason.PROCESS_CPU_COUNT),
-        (None, 6, 6, PageRenderWorkerReason.CPU_COUNT),
-        (None, 1024, 16, PageRenderWorkerReason.CPU_COUNT),
+        (8, 64, 8, _PageRenderWorkerReason.PROCESS_CPU_COUNT),
+        (32, 64, 16, _PageRenderWorkerReason.PROCESS_CPU_COUNT),
+        (None, 6, 6, _PageRenderWorkerReason.CPU_COUNT),
+        (None, 1024, 16, _PageRenderWorkerReason.CPU_COUNT),
     ],
 )
 def test_non_darwin_uses_process_availability_then_host_count(
     process_count: int | None,
     cpu_count: int | None,
     expected: int,
-    reason: PageRenderWorkerReason,
+    reason: _PageRenderWorkerReason,
 ) -> None:
-    decision = decide_page_render_workers(
+    decision = _decide_page_render_workers(
         None,
         _linux(process_count=process_count, cpu_count=cpu_count),
     )
@@ -175,7 +175,7 @@ def test_non_darwin_uses_process_availability_then_host_count(
 def test_apple_silicon_missing_or_implausible_performance_authority_is_one(
     performance: int | None,
 ) -> None:
-    decision = decide_page_render_workers(
+    decision = _decide_page_render_workers(
         None,
         _darwin(performance=performance, physical=14, process_count=14),
     )
@@ -184,25 +184,25 @@ def test_apple_silicon_missing_or_implausible_performance_authority_is_one(
     assert decision.detected is None
     assert decision.is_fallback
     assert decision.reason is (
-        PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES_UNAVAILABLE_FALLBACK
+        _PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES_UNAVAILABLE_FALLBACK
     )
 
 
 def test_unknown_darwin_architecture_never_reinterprets_total_cpu_count() -> None:
-    decision = decide_page_render_workers(
+    decision = _decide_page_render_workers(
         None,
         _darwin(machine="future-arm", physical=64, process_count=64, cpu_count=64),
     )
 
     assert decision.selected == 1
     assert decision.reason is (
-        PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES_UNAVAILABLE_FALLBACK
+        _PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES_UNAVAILABLE_FALLBACK
     )
 
 
 def test_darwin_decision_never_uses_logical_cpu_counts() -> None:
     without_authority = _darwin(process_count=64, cpu_count=64)
-    assert decide_page_render_workers(None, without_authority).selected == 1
+    assert _decide_page_render_workers(None, without_authority).selected == 1
 
     for process_count, cpu_count in product((None, 1, 64), repeat=2):
         varied = dataclasses.replace(
@@ -210,23 +210,23 @@ def test_darwin_decision_never_uses_logical_cpu_counts() -> None:
             process_cpu_count=process_count,
             cpu_count=cpu_count,
         )
-        assert decide_page_render_workers(None, varied).selected == 1
+        assert _decide_page_render_workers(None, varied).selected == 1
         with_authority = dataclasses.replace(varied, darwin_performance_cores=10)
-        assert decide_page_render_workers(None, with_authority).selected == 10
+        assert _decide_page_render_workers(None, with_authority).selected == 10
 
 
 @pytest.mark.parametrize("physical", (None, 0, 1025))
 def test_native_intel_missing_physical_authority_falls_back_to_one(
     physical: int | None,
 ) -> None:
-    decision = decide_page_render_workers(
+    decision = _decide_page_render_workers(
         None,
         _darwin(machine="x86_64", physical=physical, process_count=8),
     )
 
     assert decision.selected == 1
     assert decision.reason is (
-        PageRenderWorkerReason.DARWIN_INTEL_PHYSICAL_CORES_UNAVAILABLE_FALLBACK
+        _PageRenderWorkerReason.DARWIN_INTEL_PHYSICAL_CORES_UNAVAILABLE_FALLBACK
     )
 
 
@@ -238,60 +238,60 @@ def test_non_darwin_unavailable_or_implausible_counts_fall_back_to_one(
     process_count: int | None,
     cpu_count: int | None,
 ) -> None:
-    decision = decide_page_render_workers(
+    decision = _decide_page_render_workers(
         None,
         _linux(process_count=process_count, cpu_count=cpu_count),
     )
 
     assert decision.selected == 1
     assert decision.detected is None
-    assert decision.reason is PageRenderWorkerReason.CPU_COUNT_UNAVAILABLE_FALLBACK
+    assert decision.reason is _PageRenderWorkerReason.CPU_COUNT_UNAVAILABLE_FALLBACK
 
 
 # --- Rosetta --------------------------------------------------------------
 
 
 def test_rosetta_translated_intel_process_never_uses_total_physical_cores() -> None:
-    decision = decide_page_render_workers(
+    decision = _decide_page_render_workers(
         None,
         _darwin(
             machine="x86_64",
             physical=14,
-            translation=DarwinTranslation.TRANSLATED,
+            translation=_DarwinTranslation.TRANSLATED,
         ),
     )
 
     assert decision.selected == 1
-    assert decision.reason is PageRenderWorkerReason.DARWIN_INTEL_TRANSLATED_FALLBACK
-    assert decision.topology.darwin_translation is DarwinTranslation.TRANSLATED
+    assert decision.reason is _PageRenderWorkerReason.DARWIN_INTEL_TRANSLATED_FALLBACK
+    assert decision.topology.darwin_translation is _DarwinTranslation.TRANSLATED
 
 
 def test_unknown_translation_state_on_intel_machine_fails_conservatively() -> None:
-    decision = decide_page_render_workers(
+    decision = _decide_page_render_workers(
         None,
         _darwin(
             machine="x86_64",
             physical=14,
-            translation=DarwinTranslation.UNKNOWN,
+            translation=_DarwinTranslation.UNKNOWN,
         ),
     )
 
     assert decision.selected == 1
     assert decision.reason is (
-        PageRenderWorkerReason.DARWIN_INTEL_TRANSLATION_UNKNOWN_FALLBACK
+        _PageRenderWorkerReason.DARWIN_INTEL_TRANSLATION_UNKNOWN_FALLBACK
     )
 
 
 def test_translation_state_is_irrelevant_after_performance_core_authority() -> None:
-    for translation in DarwinTranslation:
-        if translation is DarwinTranslation.NOT_PROBED:
+    for translation in _DarwinTranslation:
+        if translation is _DarwinTranslation.NOT_PROBED:
             continue
-        decision = decide_page_render_workers(
+        decision = _decide_page_render_workers(
             None,
             _darwin(machine="x86_64", performance=8, translation=translation),
         )
         assert decision.selected == 8
-        assert decision.reason is PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES
+        assert decision.reason is _PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES
 
 
 # --- container / non-Darwin honesty --------------------------------------
@@ -299,48 +299,48 @@ def test_translation_state_is_irrelevant_after_performance_core_authority() -> N
 
 def test_linux_topology_cannot_carry_macos_host_core_facts() -> None:
     with pytest.raises(ValueError, match="only a Darwin process"):
-        CpuTopology(
+        _CpuTopology(
             platform="linux",
             machine="aarch64",
             process_cpu_count=4,
             cpu_count=14,
             darwin_performance_cores=10,
             darwin_physical_cores=None,
-            darwin_translation=DarwinTranslation.NOT_PROBED,
+            darwin_translation=_DarwinTranslation.NOT_PROBED,
         )
     with pytest.raises(ValueError, match="only a Darwin process"):
-        CpuTopology(
+        _CpuTopology(
             platform="linux",
             machine="aarch64",
             process_cpu_count=4,
             cpu_count=14,
             darwin_performance_cores=None,
             darwin_physical_cores=None,
-            darwin_translation=DarwinTranslation.NATIVE,
+            darwin_translation=_DarwinTranslation.NATIVE,
         )
     with pytest.raises(ValueError, match="must record its translation probe"):
-        CpuTopology(
+        _CpuTopology(
             platform="darwin",
             machine="arm64",
             process_cpu_count=14,
             cpu_count=14,
             darwin_performance_cores=10,
             darwin_physical_cores=14,
-            darwin_translation=DarwinTranslation.NOT_PROBED,
+            darwin_translation=_DarwinTranslation.NOT_PROBED,
         )
 
 
 def test_container_visible_vcpus_are_the_only_linux_authority() -> None:
-    decision = decide_page_render_workers(
+    decision = _decide_page_render_workers(
         None,
         _linux(process_count=4, cpu_count=14),
     )
 
     assert decision.selected == 4
-    assert decision.reason is PageRenderWorkerReason.PROCESS_CPU_COUNT
+    assert decision.reason is _PageRenderWorkerReason.PROCESS_CPU_COUNT
     assert decision.topology.darwin_performance_cores is None
     assert decision.topology.darwin_physical_cores is None
-    assert decision.topology.darwin_translation is DarwinTranslation.NOT_PROBED
+    assert decision.topology.darwin_translation is _DarwinTranslation.NOT_PROBED
     assert decision.log_fields()[9:12] == (
         ("darwin_performance_cores", "none"),
         ("darwin_physical_cores", "none"),
@@ -359,7 +359,7 @@ def test_probe_never_invokes_sysctl_outside_darwin(
     def reject_sysctl(_name: str) -> int | None:
         raise AssertionError("non-Darwin detection must not invoke sysctl")
 
-    def reject_translation() -> DarwinTranslation:
+    def reject_translation() -> _DarwinTranslation:
         raise AssertionError("non-Darwin detection must not probe Rosetta")
 
     monkeypatch.setattr(page_workers, "_read_darwin_sysctl", reject_sysctl)
@@ -386,10 +386,10 @@ def test_darwin_probe_records_every_fact_exactly_once(
         requested.append(name)
         return {"hw.perflevel0.physicalcpu": 10, "hw.physicalcpu": 14}[name]
 
-    def read_translation() -> DarwinTranslation:
+    def read_translation() -> _DarwinTranslation:
         nonlocal translation_probes
         translation_probes += 1
-        return DarwinTranslation.NATIVE
+        return _DarwinTranslation.NATIVE
 
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(platform, "machine", lambda: "arm64")
@@ -417,13 +417,13 @@ def test_darwin_probe_records_every_fact_exactly_once(
 def test_manual_override_is_exact_and_clearly_marked(configured: int) -> None:
     topology = _linux(process_count=2, cpu_count=2)
 
-    decision = decide_page_render_workers(configured, topology)
+    decision = _decide_page_render_workers(configured, topology)
 
-    assert decision.mode is PageRenderWorkerMode.MANUAL
+    assert decision.mode is _PageRenderWorkerMode.MANUAL
     assert decision.configured == configured
     assert decision.selected == configured
     assert decision.detected is None
-    assert decision.reason is PageRenderWorkerReason.MANUAL_OVERRIDE
+    assert decision.reason is _PageRenderWorkerReason.MANUAL_OVERRIDE
     assert decision.topology == topology
     assert decision.log_fields()[:3] == (
         ("mode", "manual"),
@@ -438,10 +438,10 @@ def test_explicit_worker_override_is_preserved_without_detection(
     monkeypatch: pytest.MonkeyPatch,
     configured: int,
 ) -> None:
-    def reject_detection() -> CpuTopology:
+    def reject_detection() -> _CpuTopology:
         raise AssertionError("an explicit override must not inspect the platform")
 
-    monkeypatch.setattr(page_workers, "detect_cpu_topology", reject_detection)
+    monkeypatch.setattr(page_workers, "_detect_cpu_topology", reject_detection)
 
     assert resolve_page_render_workers(configured) == configured
 
@@ -451,7 +451,7 @@ def test_worker_override_rejects_coerced_values(configured: object) -> None:
     with pytest.raises(TypeError, match="page_render_workers"):
         resolve_page_render_workers(configured)  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="page_render_workers"):
-        decide_page_render_workers(
+        _decide_page_render_workers(
             configured,  # type: ignore[arg-type]
             _linux(process_count=2, cpu_count=2),
         )
@@ -462,12 +462,12 @@ def test_worker_override_rejects_values_outside_hard_cap(configured: int) -> Non
     with pytest.raises(ValueError, match="from 1 through 16"):
         resolve_page_render_workers(configured)
     with pytest.raises(ValueError, match="from 1 through 16"):
-        decide_page_render_workers(configured, _linux(process_count=2, cpu_count=2))
+        _decide_page_render_workers(configured, _linux(process_count=2, cpu_count=2))
 
 
 def test_decision_rejects_a_foreign_topology() -> None:
     with pytest.raises(TypeError, match="topology"):
-        decide_page_render_workers(None, object())  # type: ignore[arg-type]
+        _decide_page_render_workers(None, object())  # type: ignore[arg-type]
 
 
 # --- decision value self-consistency -------------------------------------
@@ -480,7 +480,7 @@ def test_decision_rejects_a_foreign_topology() -> None:
         {"selected": 17},
         {"hard_cap": 8},
         {"configured": 4},
-        {"reason": PageRenderWorkerReason.MANUAL_OVERRIDE},
+        {"reason": _PageRenderWorkerReason.MANUAL_OVERRIDE},
         {"detected": None},
         {"selected": 4, "detected": 10},
     ],
@@ -488,7 +488,7 @@ def test_decision_rejects_a_foreign_topology() -> None:
 def test_automatic_decision_rejects_inconsistent_fields(
     fields: dict[str, Any],
 ) -> None:
-    consistent = decide_page_render_workers(None, _darwin(performance=10))
+    consistent = _decide_page_render_workers(None, _darwin(performance=10))
     with pytest.raises(ValueError):
         dataclasses.replace(consistent, **fields)
 
@@ -498,15 +498,15 @@ def test_automatic_decision_rejects_inconsistent_fields(
     [
         {"selected": 5},
         {"detected": 4},
-        {"reason": PageRenderWorkerReason.PROCESS_CPU_COUNT},
+        {"reason": _PageRenderWorkerReason.PROCESS_CPU_COUNT},
         {"selected": 2, "detected": 10},
     ],
 )
 def test_fallback_and_manual_decisions_reject_inconsistent_fields(
     fields: dict[str, Any],
 ) -> None:
-    fallback = decide_page_render_workers(None, _darwin())
-    manual = decide_page_render_workers(4, _darwin())
+    fallback = _decide_page_render_workers(None, _darwin())
+    manual = _decide_page_render_workers(4, _darwin())
     with pytest.raises(ValueError):
         dataclasses.replace(fallback, **fields)
     with pytest.raises(ValueError):
@@ -514,7 +514,7 @@ def test_fallback_and_manual_decisions_reject_inconsistent_fields(
 
 
 def test_decision_rejects_foreign_mode_reason_and_topology_types() -> None:
-    decision = decide_page_render_workers(None, _darwin(performance=10))
+    decision = _decide_page_render_workers(None, _darwin(performance=10))
     with pytest.raises(TypeError, match="mode"):
         dataclasses.replace(decision, mode="auto")  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="reason"):
@@ -531,19 +531,19 @@ def test_topology_probe_is_cached_once_per_process(
 ) -> None:
     probes = 0
 
-    def probe() -> CpuTopology:
+    def probe() -> _CpuTopology:
         nonlocal probes
         probes += 1
         return _darwin(performance=10, physical=14)
 
-    detect_cpu_topology.cache_clear()
+    _detect_cpu_topology.cache_clear()
     monkeypatch.setattr(page_workers, "_probe_cpu_topology", probe)
     try:
-        assert detect_cpu_topology() == _darwin(performance=10, physical=14)
+        assert _detect_cpu_topology() == _darwin(performance=10, physical=14)
         assert default_page_render_workers() == 10
         assert resolve_page_render_workers(None) == 10
-        automatic = decide_page_render_workers(None)
-        manual = decide_page_render_workers(3)
+        automatic = _decide_page_render_workers(None)
+        manual = _decide_page_render_workers(3)
         assert automatic.selected == 10
         assert manual.selected == 3
         assert automatic.topology is manual.topology
@@ -551,14 +551,14 @@ def test_topology_probe_is_cached_once_per_process(
             automatic.log_line()
         assert probes == 1
     finally:
-        detect_cpu_topology.cache_clear()
+        _detect_cpu_topology.cache_clear()
 
 
 # --- structured log -------------------------------------------------------
 
 
 def test_log_line_is_structured_and_carries_no_private_data() -> None:
-    decision = decide_page_render_workers(
+    decision = _decide_page_render_workers(
         None,
         _darwin(performance=10, physical=14, process_count=14, cpu_count=14),
     )
@@ -588,14 +588,14 @@ def test_log_line_is_structured_and_carries_no_private_data() -> None:
 
 
 def test_manual_and_fallback_log_lines_state_their_mode_and_reason() -> None:
-    manual = decide_page_render_workers(
+    manual = _decide_page_render_workers(
         10,
         _linux(process_count=4, cpu_count=14),
     )
-    fallback = decide_page_render_workers(
+    fallback = _decide_page_render_workers(
         None,
         _darwin(
-            machine="x86_64", physical=14, translation=DarwinTranslation.TRANSLATED
+            machine="x86_64", physical=14, translation=_DarwinTranslation.TRANSLATED
         ),
     )
 
@@ -614,7 +614,7 @@ def test_manual_and_fallback_log_lines_state_their_mode_and_reason() -> None:
 
 
 def test_log_renders_an_empty_machine_as_unknown() -> None:
-    decision = decide_page_render_workers(
+    decision = _decide_page_render_workers(
         None, _linux(machine="", process_count=2, cpu_count=2)
     )
 
@@ -624,9 +624,9 @@ def test_log_renders_an_empty_machine_as_unknown() -> None:
 # --- differential: decision equals the previous integer policy ------------
 
 
-def _topology_matrix() -> list[CpuTopology]:
+def _topology_matrix() -> list[_CpuTopology]:
     counts: tuple[int | None, ...] = (None, 0, 1, 4, 16, 17, 1024, 1025)
-    topologies: list[CpuTopology] = []
+    topologies: list[_CpuTopology] = []
     for (
         machine,
         performance,
@@ -639,9 +639,9 @@ def _topology_matrix() -> list[CpuTopology]:
         counts,
         counts,
         (
-            DarwinTranslation.NATIVE,
-            DarwinTranslation.TRANSLATED,
-            DarwinTranslation.UNKNOWN,
+            _DarwinTranslation.NATIVE,
+            _DarwinTranslation.TRANSLATED,
+            _DarwinTranslation.UNKNOWN,
         ),
         (None, 2, 64),
         (None, 2, 64),
@@ -672,14 +672,14 @@ def test_decision_selects_exactly_the_previous_integer_policy() -> None:
     assert len(matrix) > 5000
 
     for topology in matrix:
-        decision = decide_page_render_workers(None, topology)
+        decision = _decide_page_render_workers(None, topology)
         assert decision.selected == _legacy_automatic_workers(topology), topology
         assert 1 <= decision.selected <= MAX_PAGE_RENDER_WORKERS
         assert decision.is_fallback == (decision.detected is None)
         if decision.detected is not None:
             assert decision.selected == min(decision.detected, MAX_PAGE_RENDER_WORKERS)
         for configured in range(1, 17):
-            assert decide_page_render_workers(configured, topology).selected == (
+            assert _decide_page_render_workers(configured, topology).selected == (
                 configured
             )
 
@@ -690,19 +690,21 @@ def test_integer_api_projects_the_same_decision(
     for topology in (
         _darwin(performance=10, physical=14),
         _darwin(machine="x86_64", physical=6),
-        _darwin(machine="x86_64", physical=6, translation=DarwinTranslation.TRANSLATED),
+        _darwin(
+            machine="x86_64", physical=6, translation=_DarwinTranslation.TRANSLATED
+        ),
         _linux(process_count=3, cpu_count=8),
         _linux(process_count=None, cpu_count=None),
     ):
-        detect_cpu_topology.cache_clear()
+        _detect_cpu_topology.cache_clear()
         monkeypatch.setattr(page_workers, "_probe_cpu_topology", lambda t=topology: t)
         try:
-            expected = decide_page_render_workers(None, topology).selected
+            expected = _decide_page_render_workers(None, topology).selected
             assert default_page_render_workers() == expected
             assert resolve_page_render_workers(None) == expected
-            assert decide_page_render_workers(None).selected == expected
+            assert _decide_page_render_workers(None).selected == expected
         finally:
-            detect_cpu_topology.cache_clear()
+            _detect_cpu_topology.cache_clear()
 
 
 # --- Darwin readers -------------------------------------------------------
@@ -725,19 +727,19 @@ def test_darwin_sysctl_reader_accepts_only_bounded_decimal_output(
 @pytest.mark.parametrize(
     ("invocation", "expected"),
     (
-        ((0, 0, 0, sizeof(c_int)), DarwinTranslation.NATIVE),
-        ((0, 0, 1, sizeof(c_int)), DarwinTranslation.TRANSLATED),
-        ((-1, ENOENT, 0, sizeof(c_int)), DarwinTranslation.NATIVE),
-        ((-1, EACCES, 0, sizeof(c_int)), DarwinTranslation.UNKNOWN),
-        ((0, 0, 2, sizeof(c_int)), DarwinTranslation.UNKNOWN),
-        ((0, 0, 0, sizeof(c_int) + 1), DarwinTranslation.UNKNOWN),
-        (None, DarwinTranslation.UNKNOWN),
+        ((0, 0, 0, sizeof(c_int)), _DarwinTranslation.NATIVE),
+        ((0, 0, 1, sizeof(c_int)), _DarwinTranslation.TRANSLATED),
+        ((-1, ENOENT, 0, sizeof(c_int)), _DarwinTranslation.NATIVE),
+        ((-1, EACCES, 0, sizeof(c_int)), _DarwinTranslation.UNKNOWN),
+        ((0, 0, 2, sizeof(c_int)), _DarwinTranslation.UNKNOWN),
+        ((0, 0, 0, sizeof(c_int) + 1), _DarwinTranslation.UNKNOWN),
+        (None, _DarwinTranslation.UNKNOWN),
     ),
 )
 def test_darwin_translation_reader_distinguishes_missing_oid_from_failure(
     monkeypatch: pytest.MonkeyPatch,
     invocation: tuple[int, int, int, int] | None,
-    expected: DarwinTranslation,
+    expected: _DarwinTranslation,
 ) -> None:
     monkeypatch.setattr(
         page_workers,
@@ -789,10 +791,10 @@ def test_darwin_sysctl_reader_rejects_unknown_authority() -> None:
 
 
 def test_live_host_probe_is_a_valid_decision_input() -> None:
-    topology = detect_cpu_topology()
-    decision = decide_page_render_workers(None, topology)
+    topology = _detect_cpu_topology()
+    decision = _decide_page_render_workers(None, topology)
 
-    assert isinstance(topology, CpuTopology)
-    assert isinstance(decision, PageRenderWorkerDecision)
+    assert isinstance(topology, _CpuTopology)
+    assert isinstance(decision, _PageRenderWorkerDecision)
     assert decision.selected == default_page_render_workers()
     assert decision.selected == _legacy_automatic_workers(topology)

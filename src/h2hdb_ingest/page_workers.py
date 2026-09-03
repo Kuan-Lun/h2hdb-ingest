@@ -4,11 +4,11 @@ The policy is split into three layers so that every automatic or manual worker
 decision is observable without re-probing the host or guessing reasons back
 from an integer:
 
-1. :func:`detect_cpu_topology` probes the host exactly once per process and
-   returns an immutable :class:`CpuTopology` fact record.
-2. :func:`decide_page_render_workers` is a pure function from the optional
+1. :func:`_detect_cpu_topology` probes the host exactly once per process and
+   returns an immutable :class:`_CpuTopology` fact record.
+2. :func:`_decide_page_render_workers` is a pure function from the optional
    configured override and one topology to an immutable
-   :class:`PageRenderWorkerDecision` that carries the mode, configured and
+   :class:`_PageRenderWorkerDecision` that carries the mode, configured and
    selected values, the raw authority value before hard-capping, the hard cap,
    the topology facts, and the closed selection or fallback reason.
 3. :func:`resolve_page_render_workers` and :func:`default_page_render_workers`
@@ -20,14 +20,7 @@ from __future__ import annotations
 
 __all__ = [
     "MAX_PAGE_RENDER_WORKERS",
-    "CpuTopology",
-    "DarwinTranslation",
-    "PageRenderWorkerDecision",
-    "PageRenderWorkerMode",
-    "PageRenderWorkerReason",
-    "decide_page_render_workers",
     "default_page_render_workers",
-    "detect_cpu_topology",
     "resolve_page_render_workers",
 ]
 
@@ -55,7 +48,7 @@ _CONSERVATIVE_FALLBACK = 1
 _MAX_PLAUSIBLE_DETECTED_CPUS = 1024
 
 
-class DarwinTranslation(StrEnum):
+class _DarwinTranslation(StrEnum):
     """Rosetta status of the running Darwin process."""
 
     NATIVE = "native"
@@ -64,12 +57,12 @@ class DarwinTranslation(StrEnum):
     NOT_PROBED = "not-probed"
 
 
-class PageRenderWorkerMode(StrEnum):
+class _PageRenderWorkerMode(StrEnum):
     AUTO = "auto"
     MANUAL = "manual"
 
 
-class PageRenderWorkerReason(StrEnum):
+class _PageRenderWorkerReason(StrEnum):
     """Closed selection and fallback reasons; fallbacks always select one."""
 
     MANUAL_OVERRIDE = "manual-override"
@@ -92,11 +85,11 @@ class PageRenderWorkerReason(StrEnum):
 
 _FALLBACK_REASONS = frozenset(
     {
-        PageRenderWorkerReason.DARWIN_INTEL_TRANSLATED_FALLBACK,
-        PageRenderWorkerReason.DARWIN_INTEL_TRANSLATION_UNKNOWN_FALLBACK,
-        PageRenderWorkerReason.DARWIN_INTEL_PHYSICAL_CORES_UNAVAILABLE_FALLBACK,
-        PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES_UNAVAILABLE_FALLBACK,
-        PageRenderWorkerReason.CPU_COUNT_UNAVAILABLE_FALLBACK,
+        _PageRenderWorkerReason.DARWIN_INTEL_TRANSLATED_FALLBACK,
+        _PageRenderWorkerReason.DARWIN_INTEL_TRANSLATION_UNKNOWN_FALLBACK,
+        _PageRenderWorkerReason.DARWIN_INTEL_PHYSICAL_CORES_UNAVAILABLE_FALLBACK,
+        _PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES_UNAVAILABLE_FALLBACK,
+        _PageRenderWorkerReason.CPU_COUNT_UNAVAILABLE_FALLBACK,
     }
 )
 
@@ -112,7 +105,7 @@ def _require_optional_count(value: object, *, field: str) -> int | None:
 
 
 @dataclass(frozen=True, slots=True)
-class CpuTopology:
+class _CpuTopology:
     """Immutable host facts recorded by exactly one probe per process.
 
     Darwin-only facts are ``None``/``NOT_PROBED`` on every other platform: a
@@ -126,7 +119,7 @@ class CpuTopology:
     cpu_count: int | None
     darwin_performance_cores: int | None
     darwin_physical_cores: int | None
-    darwin_translation: DarwinTranslation
+    darwin_translation: _DarwinTranslation
 
     def __post_init__(self) -> None:
         if type(self.platform) is not str or not self.platform:
@@ -143,15 +136,15 @@ class CpuTopology:
             self.darwin_physical_cores,
             field="darwin_physical_cores",
         )
-        if not isinstance(self.darwin_translation, DarwinTranslation):
-            raise TypeError("darwin_translation must be DarwinTranslation")
+        if not isinstance(self.darwin_translation, _DarwinTranslation):
+            raise TypeError("darwin_translation must be _DarwinTranslation")
         if self.is_darwin:
-            if self.darwin_translation is DarwinTranslation.NOT_PROBED:
+            if self.darwin_translation is _DarwinTranslation.NOT_PROBED:
                 raise ValueError("a Darwin topology must record its translation probe")
         elif (
             self.darwin_performance_cores is not None
             or self.darwin_physical_cores is not None
-            or self.darwin_translation is not DarwinTranslation.NOT_PROBED
+            or self.darwin_translation is not _DarwinTranslation.NOT_PROBED
         ):
             raise ValueError("only a Darwin process can carry Darwin CPU facts")
 
@@ -165,42 +158,42 @@ class CpuTopology:
 
 
 @dataclass(frozen=True, slots=True)
-class PageRenderWorkerDecision:
+class _PageRenderWorkerDecision:
     """One immutable, self-consistent worker decision and its evidence.
 
     ``detected`` is the raw plausible authority value before hard-capping and
     is ``None`` for a manual override or a conservative fallback constant.
     """
 
-    mode: PageRenderWorkerMode
+    mode: _PageRenderWorkerMode
     configured: int | None
     selected: int
     detected: int | None
     hard_cap: int
-    reason: PageRenderWorkerReason
-    topology: CpuTopology
+    reason: _PageRenderWorkerReason
+    topology: _CpuTopology
 
     def __post_init__(self) -> None:
-        if not isinstance(self.mode, PageRenderWorkerMode):
-            raise TypeError("mode must be PageRenderWorkerMode")
-        if not isinstance(self.reason, PageRenderWorkerReason):
-            raise TypeError("reason must be PageRenderWorkerReason")
-        if not isinstance(self.topology, CpuTopology):
-            raise TypeError("topology must be CpuTopology")
+        if not isinstance(self.mode, _PageRenderWorkerMode):
+            raise TypeError("mode must be _PageRenderWorkerMode")
+        if not isinstance(self.reason, _PageRenderWorkerReason):
+            raise TypeError("reason must be _PageRenderWorkerReason")
+        if not isinstance(self.topology, _CpuTopology):
+            raise TypeError("topology must be _CpuTopology")
         if self.hard_cap != MAX_PAGE_RENDER_WORKERS:
             raise ValueError("hard_cap must be the fixed page-render worker cap")
         if type(self.selected) is not int or not 1 <= self.selected <= self.hard_cap:
             raise ValueError("selected workers must be from 1 through the hard cap")
         _require_optional_count(self.detected, field="detected")
-        if self.mode is PageRenderWorkerMode.MANUAL:
+        if self.mode is _PageRenderWorkerMode.MANUAL:
             if self.configured != self.selected or self.detected is not None:
                 raise ValueError("a manual decision preserves its configured value")
-            if self.reason is not PageRenderWorkerReason.MANUAL_OVERRIDE:
+            if self.reason is not _PageRenderWorkerReason.MANUAL_OVERRIDE:
                 raise ValueError("a manual decision must record the manual reason")
             return
         if self.configured is not None:
             raise ValueError("an automatic decision has no configured value")
-        if self.reason is PageRenderWorkerReason.MANUAL_OVERRIDE:
+        if self.reason is _PageRenderWorkerReason.MANUAL_OVERRIDE:
             raise ValueError("an automatic decision cannot record the manual reason")
         if self.reason in _FALLBACK_REASONS:
             if self.detected is not None or self.selected != _CONSERVATIVE_FALLBACK:
@@ -312,45 +305,45 @@ def _invoke_darwin_translation_sysctl() -> tuple[int, int, int, int] | None:
     return result, _get_errno(), value.value, size.value
 
 
-def _read_darwin_translation_status() -> DarwinTranslation:
+def _read_darwin_translation_status() -> _DarwinTranslation:
     invocation = _invoke_darwin_translation_sysctl()
     if invocation is None:
-        return DarwinTranslation.UNKNOWN
+        return _DarwinTranslation.UNKNOWN
     result, error_number, value, returned_size = invocation
     if result != 0:
         # Apple documents ENOENT as a native (non-Rosetta) process.
         if error_number == ENOENT:
-            return DarwinTranslation.NATIVE
-        return DarwinTranslation.UNKNOWN
+            return _DarwinTranslation.NATIVE
+        return _DarwinTranslation.UNKNOWN
     if returned_size != sizeof(c_int):
-        return DarwinTranslation.UNKNOWN
+        return _DarwinTranslation.UNKNOWN
     if value == 0:
-        return DarwinTranslation.NATIVE
+        return _DarwinTranslation.NATIVE
     if value == 1:
-        return DarwinTranslation.TRANSLATED
-    return DarwinTranslation.UNKNOWN
+        return _DarwinTranslation.TRANSLATED
+    return _DarwinTranslation.UNKNOWN
 
 
 def _running_platform() -> str:
     return sys.platform
 
 
-def _probe_cpu_topology() -> CpuTopology:
+def _probe_cpu_topology() -> _CpuTopology:
     running = _running_platform()
     machine = platform.machine()
     process_count = os.process_cpu_count()
     total_count = os.cpu_count()
     if running != _DARWIN_PLATFORM:
-        return CpuTopology(
+        return _CpuTopology(
             platform=running,
             machine=machine,
             process_cpu_count=process_count,
             cpu_count=total_count,
             darwin_performance_cores=None,
             darwin_physical_cores=None,
-            darwin_translation=DarwinTranslation.NOT_PROBED,
+            darwin_translation=_DarwinTranslation.NOT_PROBED,
         )
-    return CpuTopology(
+    return _CpuTopology(
         platform=running,
         machine=machine,
         process_cpu_count=process_count,
@@ -362,19 +355,19 @@ def _probe_cpu_topology() -> CpuTopology:
 
 
 @cache
-def detect_cpu_topology() -> CpuTopology:
+def _detect_cpu_topology() -> _CpuTopology:
     """Probe CPU and Darwin sysctl facts exactly once per process."""
 
     return _probe_cpu_topology()
 
 
 def _detected_decision(
-    topology: CpuTopology,
+    topology: _CpuTopology,
     detected: int,
-    reason: PageRenderWorkerReason,
-) -> PageRenderWorkerDecision:
-    return PageRenderWorkerDecision(
-        mode=PageRenderWorkerMode.AUTO,
+    reason: _PageRenderWorkerReason,
+) -> _PageRenderWorkerDecision:
+    return _PageRenderWorkerDecision(
+        mode=_PageRenderWorkerMode.AUTO,
         configured=None,
         selected=min(detected, MAX_PAGE_RENDER_WORKERS),
         detected=detected,
@@ -385,11 +378,11 @@ def _detected_decision(
 
 
 def _fallback_decision(
-    topology: CpuTopology,
-    reason: PageRenderWorkerReason,
-) -> PageRenderWorkerDecision:
-    return PageRenderWorkerDecision(
-        mode=PageRenderWorkerMode.AUTO,
+    topology: _CpuTopology,
+    reason: _PageRenderWorkerReason,
+) -> _PageRenderWorkerDecision:
+    return _PageRenderWorkerDecision(
+        mode=_PageRenderWorkerMode.AUTO,
         configured=None,
         selected=_CONSERVATIVE_FALLBACK,
         detected=None,
@@ -399,7 +392,7 @@ def _fallback_decision(
     )
 
 
-def _darwin_automatic_decision(topology: CpuTopology) -> PageRenderWorkerDecision:
+def _darwin_automatic_decision(topology: _CpuTopology) -> _PageRenderWorkerDecision:
     """Prefer highest-performance physical cores and fail conservatively."""
 
     performance_cores = _plausible_cpu_count(topology.darwin_performance_cores)
@@ -407,7 +400,7 @@ def _darwin_automatic_decision(topology: CpuTopology) -> PageRenderWorkerDecisio
         return _detected_decision(
             topology,
             performance_cores,
-            PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES,
+            _PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES,
         )
 
     # Intel Macs do not expose heterogeneous performance levels. Their total
@@ -419,33 +412,33 @@ def _darwin_automatic_decision(topology: CpuTopology) -> PageRenderWorkerDecisio
     if not topology.is_intel_machine:
         return _fallback_decision(
             topology,
-            PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES_UNAVAILABLE_FALLBACK,
+            _PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES_UNAVAILABLE_FALLBACK,
         )
     translation = topology.darwin_translation
-    if translation is DarwinTranslation.TRANSLATED:
+    if translation is _DarwinTranslation.TRANSLATED:
         return _fallback_decision(
             topology,
-            PageRenderWorkerReason.DARWIN_INTEL_TRANSLATED_FALLBACK,
+            _PageRenderWorkerReason.DARWIN_INTEL_TRANSLATED_FALLBACK,
         )
-    if translation is not DarwinTranslation.NATIVE:
+    if translation is not _DarwinTranslation.NATIVE:
         return _fallback_decision(
             topology,
-            PageRenderWorkerReason.DARWIN_INTEL_TRANSLATION_UNKNOWN_FALLBACK,
+            _PageRenderWorkerReason.DARWIN_INTEL_TRANSLATION_UNKNOWN_FALLBACK,
         )
     physical_cores = _plausible_cpu_count(topology.darwin_physical_cores)
     if physical_cores is None:
         return _fallback_decision(
             topology,
-            PageRenderWorkerReason.DARWIN_INTEL_PHYSICAL_CORES_UNAVAILABLE_FALLBACK,
+            _PageRenderWorkerReason.DARWIN_INTEL_PHYSICAL_CORES_UNAVAILABLE_FALLBACK,
         )
     return _detected_decision(
         topology,
         physical_cores,
-        PageRenderWorkerReason.DARWIN_INTEL_NATIVE_PHYSICAL_CORES,
+        _PageRenderWorkerReason.DARWIN_INTEL_NATIVE_PHYSICAL_CORES,
     )
 
 
-def _automatic_decision(topology: CpuTopology) -> PageRenderWorkerDecision:
+def _automatic_decision(topology: _CpuTopology) -> _PageRenderWorkerDecision:
     if topology.is_darwin:
         return _darwin_automatic_decision(topology)
     # Other platforms use the process CPU availability first. A reported but
@@ -456,20 +449,20 @@ def _automatic_decision(topology: CpuTopology) -> PageRenderWorkerDecision:
         if available is None:
             return _fallback_decision(
                 topology,
-                PageRenderWorkerReason.CPU_COUNT_UNAVAILABLE_FALLBACK,
+                _PageRenderWorkerReason.CPU_COUNT_UNAVAILABLE_FALLBACK,
             )
         return _detected_decision(
             topology,
             available,
-            PageRenderWorkerReason.PROCESS_CPU_COUNT,
+            _PageRenderWorkerReason.PROCESS_CPU_COUNT,
         )
     total = _plausible_cpu_count(topology.cpu_count)
     if total is None:
         return _fallback_decision(
             topology,
-            PageRenderWorkerReason.CPU_COUNT_UNAVAILABLE_FALLBACK,
+            _PageRenderWorkerReason.CPU_COUNT_UNAVAILABLE_FALLBACK,
         )
-    return _detected_decision(topology, total, PageRenderWorkerReason.CPU_COUNT)
+    return _detected_decision(topology, total, _PageRenderWorkerReason.CPU_COUNT)
 
 
 def _require_manual_workers(configured: object) -> int:
@@ -482,10 +475,10 @@ def _require_manual_workers(configured: object) -> int:
     return configured
 
 
-def decide_page_render_workers(
+def _decide_page_render_workers(
     configured: int | None = None,
-    topology: CpuTopology | None = None,
-) -> PageRenderWorkerDecision:
+    topology: _CpuTopology | None = None,
+) -> _PageRenderWorkerDecision:
     """Return the immutable worker decision for one optional override.
 
     A manual override never inspects the platform to choose its value, but the
@@ -493,28 +486,28 @@ def decide_page_render_workers(
     show what the host looks like next to the configured count.
     """
 
-    if topology is not None and not isinstance(topology, CpuTopology):
-        raise TypeError("topology must be CpuTopology or None")
+    if topology is not None and not isinstance(topology, _CpuTopology):
+        raise TypeError("topology must be _CpuTopology or None")
     if configured is not None:
         selected = _require_manual_workers(configured)
-        facts = detect_cpu_topology() if topology is None else topology
-        return PageRenderWorkerDecision(
-            mode=PageRenderWorkerMode.MANUAL,
+        facts = _detect_cpu_topology() if topology is None else topology
+        return _PageRenderWorkerDecision(
+            mode=_PageRenderWorkerMode.MANUAL,
             configured=selected,
             selected=selected,
             detected=None,
             hard_cap=MAX_PAGE_RENDER_WORKERS,
-            reason=PageRenderWorkerReason.MANUAL_OVERRIDE,
+            reason=_PageRenderWorkerReason.MANUAL_OVERRIDE,
             topology=facts,
         )
-    facts = detect_cpu_topology() if topology is None else topology
+    facts = _detect_cpu_topology() if topology is None else topology
     return _automatic_decision(facts)
 
 
 def default_page_render_workers() -> int:
     """Return the automatic worker count from the process-cached topology."""
 
-    return _automatic_decision(detect_cpu_topology()).selected
+    return _automatic_decision(_detect_cpu_topology()).selected
 
 
 def resolve_page_render_workers(configured: int | None = None) -> int:
