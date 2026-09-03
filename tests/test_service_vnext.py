@@ -459,9 +459,10 @@ class _LibraryActivation:
 
 
 class _PreparedPublication:
-    def __init__(self, events: list[object], step: int) -> None:
+    def __init__(self, events: list[object], step: int, *, recovery: bool) -> None:
         self._events = events
         self.step = step
+        self.recovery = recovery
 
     def __enter__(self) -> _PreparedPublication:
         self._events.append(("publication-enter", self.step))
@@ -473,8 +474,9 @@ class _PreparedPublication:
 
 
 class _IssuedPublication:
-    def __init__(self, step: int) -> None:
+    def __init__(self, step: int, *, recovery: bool = False) -> None:
         self.step = step
+        self.recovery = recovery
 
     @property
     def operation(self) -> str:
@@ -514,7 +516,7 @@ class _PublicationFacade:
         self._events.append(
             ("recovery-issue", self._step, session.ingest_lease_expires_at)
         )
-        return _IssuedPublication(self._step)
+        return _IssuedPublication(self._step, recovery=True)
 
     def prepare_publication_step(
         self,
@@ -533,7 +535,11 @@ class _PublicationFacade:
                 library_activation,
             )
         )
-        return _PreparedPublication(self._events, issued.step)
+        return _PreparedPublication(
+            self._events,
+            issued.step,
+            recovery=issued.recovery,
+        )
 
     def commit_publication_step(
         self,
@@ -549,7 +555,9 @@ class _PublicationFacade:
         )
         terminal = self._step == 1
         phase = (
-            VNextIngestPhase.FINALIZATION if terminal else VNextIngestPhase.PUBLICATION
+            VNextIngestPhase.FINALIZATION
+            if terminal or prepared.recovery
+            else VNextIngestPhase.PUBLICATION
         )
         self._step += 1
         return VNextIngestAdvanceResult(phase, 1, terminal, False)
@@ -625,6 +633,42 @@ def test_pending_publication_recovery_uses_the_same_bounded_adapter_protocol() -
         "publication-commit",
         "publication-close",
     ]
+
+
+def test_pending_publication_recovery_rejects_a_nonfinalization_step() -> None:
+    events: list[object] = []
+
+    class _WrongPhaseFacade(_PublicationFacade):
+        def commit_publication_step(
+            self,
+            session: VNextIngestSession,
+            prepared: _PreparedPublication,
+        ) -> VNextIngestAdvanceResult:
+            del session
+            self._events.append(("wrong-phase-commit", prepared.step))
+            return VNextIngestAdvanceResult(
+                VNextIngestPhase.PUBLICATION,
+                1,
+                False,
+                False,
+            )
+
+    controller = IngestSessionController(
+        cast(VNextIngestFacade, _WrongPhaseFacade(events)),
+        _session(),
+        lease_duration_microseconds=10_000_000,
+        database_type="sqlite",
+    )
+
+    with pytest.raises(RuntimeError, match="outside finalization"):
+        service_module.synchronize_pending_publication(
+            controller,
+            artifact_adapters={},
+            finalization_adapters={},
+            library_activation=_LibraryActivation(),
+        )
+
+    assert events[-2:] == [("wrong-phase-commit", 0), ("publication-close", 0)]
 
 
 def test_empty_catalog_has_no_pending_publication_recovery_work() -> None:

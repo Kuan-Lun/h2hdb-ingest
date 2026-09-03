@@ -456,13 +456,20 @@ def test_restart_recovers_durable_publication_before_applying_new_policy(
     with pytest.raises(OSError, match="after durable database commit"):
         service.synchronize_once(session)
     assert crashed
+    staged_old_archives = tuple(
+        (library_root / ".h2hdb-state" / "staging").glob("*.cbz")
+    )
+    assert len(staged_old_archives) == 1
+    with ZipFile(staged_old_archives[0]) as archive:
+        old_policy_page = archive.read("pages/0000.jpg")
     session.complete()
     first.close()
 
     # The old snapshot stays unchanged.  Changing only the byte-affecting
     # policy must still produce a successor after the pending old-policy
     # commit has been activated and finalized in this same synchronization.
-    restarted = build_runtime(config(page_jpeg_quality=55))
+    requested_config = config(page_jpeg_quality=55)
+    restarted = build_runtime(requested_config)
     restarted.resident.initialize()
     assert restarted.resident.process_available(periodic_scan=True)
 
@@ -471,7 +478,30 @@ def test_restart_recovers_durable_publication_before_applying_new_policy(
     assert revision.revision == 2
     assert page.revision == revision
     assert page.total == len(page.publications) == 1
-    assert page.publications[0].gid == 2101
+    publication = page.publications[0]
+    assert publication.gid == 2101
+    assert len(publication.artifacts) == 1
+    current_path = library_root.joinpath(
+        "current",
+        *publication.artifacts[0].storage_object.key.segments,
+    )
+    current_bytes = current_path.read_bytes()
+    assert sha256(current_bytes).hexdigest() == (
+        publication.artifacts[0].storage_object.sha256
+    )
+    with ZipFile(BytesIO(current_bytes)) as archive:
+        current_page = archive.read("pages/0000.jpg")
+    expected_page = BytesIO()
+    with Image.open(source / "2101" / "001.png") as source_page:
+        source_page.save(
+            expected_page,
+            format="JPEG",
+            quality=55,
+            optimize=True,
+            progressive=False,
+        )
+    assert current_page == expected_page.getvalue()
+    assert current_page != old_policy_page
     assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
     restarted.close()
 

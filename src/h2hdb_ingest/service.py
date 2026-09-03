@@ -237,13 +237,13 @@ def synchronize_pending_publication(
                 )
             )
         _require_publication_result(result)
+        if result.phase is not VNextIngestPhase.FINALIZATION:
+            raise RuntimeError(
+                "publication recovery advancement is outside finalization"
+            )
         progressed = True
         _raise_if_stopping(should_stop)
         if result.terminal:
-            if result.phase is not VNextIngestPhase.FINALIZATION:
-                raise RuntimeError(
-                    "terminal publication recovery advancement is not finalized"
-                )
             return result
 
 
