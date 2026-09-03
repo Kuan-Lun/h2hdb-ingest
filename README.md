@@ -292,6 +292,21 @@ operator inspection.
 leave `ACTIVATING`, private staged bytes, or quarantine bytes; restart resumes
 the same receipt before readers are allowed through the shared fence.
 
+Every claimed synchronization resolves its configured policy first, then,
+before constructing or reading the filesystem source, finishes the sole
+durable `DB_COMMITTED` publication (if any) and revalidates that the published
+head's library activation is `COMPLETE`. Recovery uses the staged bytes and
+durable receipt from the interrupted turn; it does not require the old source
+files to remain present and does not bind the new ingest generation to that old
+snapshot. The same synchronization then observes the current source and runs
+it through the complete requested policy tuple, including source-manifest,
+analysis, artifact/render, display-title, operational, and artifact-required
+choices. A successful synchronization therefore means that policy is fully
+published and finalized; there is no hidden deferred-policy success or operator
+retry step. A stop or adapter error before that point propagates without
+reporting synchronization success, and the next claim resumes from the durable
+boundary.
+
 ## Common startup failures
 
 - **`download_path is empty`**: check that the download volume is mounted.

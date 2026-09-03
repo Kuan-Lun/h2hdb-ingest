@@ -6,6 +6,7 @@ __all__ = [
     "VNextIngestService",
     "VNextIngestSynchronizationResult",
     "synchronize_analysis",
+    "synchronize_pending_publication",
     "synchronize_publication",
     "synchronize_source",
 ]
@@ -147,6 +148,14 @@ class VNextIngestService:
         resolved = session.call(
             lambda facade, receipt: facade.ensure_policy(receipt, self._policy)
         )
+        with self._publication_guard():
+            synchronize_pending_publication(
+                session,
+                artifact_adapters=self._artifact_adapters,
+                finalization_adapters=self._finalization_adapters,
+                library_activation=self._library_activation,
+                should_stop=stop_requested,
+            )
         with FilesystemSource(self._source_root) as source:
             source_receipt = synchronize_source(
                 session,
@@ -176,6 +185,66 @@ class VNextIngestService:
             analysis,
             publication,
         )
+
+
+def synchronize_pending_publication(
+    session: IngestSessionController,
+    *,
+    artifact_adapters: Mapping[bytes, ArtifactStorageAdapter],
+    finalization_adapters: Mapping[bytes, ArtifactReleaseAdapter],
+    library_activation: VNextLibraryActivationAdapter,
+    should_stop: Callable[[], bool] = _never_stop,
+) -> VNextIngestAdvanceResult | None:
+    """Finish durable publication work before reading a new filesystem snapshot.
+
+    ``None`` means the catalog has never published.  A non-``None`` result is
+    terminal only after both the database head and the external library agree
+    on the recovered publication.  This internal recovery does not consume the
+    live ingest generation's source-build mapping.
+    """
+
+    if not isinstance(session, IngestSessionController):
+        raise TypeError("session must be IngestSessionController")
+    if not isinstance(library_activation, VNextLibraryActivationAdapter):
+        raise TypeError(
+            "library_activation must implement VNextLibraryActivationAdapter"
+        )
+    progressed = False
+    while True:
+        _raise_if_stopping(should_stop)
+        issued = session.call(
+            lambda facade, receipt: facade.try_issue_publication_recovery_step(receipt)
+        )
+        if issued is None:
+            if progressed:
+                raise RuntimeError(
+                    "publication recovery authority disappeared after progress"
+                )
+            return None
+        prepared = session.outside_session(
+            lambda facade: facade.prepare_publication_step(
+                issued,  # noqa: B023
+                artifact_adapters=artifact_adapters,
+                finalization_adapters=finalization_adapters,
+                library_activation=library_activation,
+            )
+        )
+        with prepared:
+            result = session.call(
+                lambda facade, receipt: facade.commit_publication_step(
+                    receipt,
+                    prepared,  # noqa: B023
+                )
+            )
+        _require_publication_result(result)
+        progressed = True
+        _raise_if_stopping(should_stop)
+        if result.terminal:
+            if result.phase is not VNextIngestPhase.FINALIZATION:
+                raise RuntimeError(
+                    "terminal publication recovery advancement is not finalized"
+                )
+            return result
 
 
 def synchronize_analysis(

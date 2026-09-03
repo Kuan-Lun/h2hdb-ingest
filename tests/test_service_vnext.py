@@ -482,9 +482,15 @@ class _IssuedPublication:
 
 
 class _PublicationFacade:
-    def __init__(self, events: list[object]) -> None:
+    def __init__(
+        self,
+        events: list[object],
+        *,
+        recovery_stops_after: int | None = None,
+    ) -> None:
         self._events = events
         self._step = 0
+        self._recovery_stops_after = recovery_stops_after
 
     def issue_publication_step(
         self,
@@ -493,6 +499,20 @@ class _PublicationFacade:
     ) -> _IssuedPublication:
         self._events.append(
             ("publication-issue", self._step, session.ingest_lease_expires_at, policy)
+        )
+        return _IssuedPublication(self._step)
+
+    def try_issue_publication_recovery_step(
+        self,
+        session: VNextIngestSession,
+    ) -> _IssuedPublication | None:
+        if self._recovery_stops_after == self._step:
+            self._events.append(
+                ("recovery-empty", self._step, session.ingest_lease_expires_at)
+            )
+            return None
+        self._events.append(
+            ("recovery-issue", self._step, session.ingest_lease_expires_at)
         )
         return _IssuedPublication(self._step)
 
@@ -573,6 +593,117 @@ def test_publication_orchestration_closes_each_prepared_step() -> None:
     ]
 
 
+def test_pending_publication_recovery_uses_the_same_bounded_adapter_protocol() -> None:
+    events: list[object] = []
+    facade = _PublicationFacade(events)
+    controller = IngestSessionController(
+        cast(VNextIngestFacade, facade),
+        _session(),
+        lease_duration_microseconds=10_000_000,
+        database_type="sqlite",
+    )
+
+    result = service_module.synchronize_pending_publication(
+        controller,
+        artifact_adapters={},
+        finalization_adapters={},
+        library_activation=_LibraryActivation(),
+    )
+
+    assert result is not None
+    assert result.phase is VNextIngestPhase.FINALIZATION
+    assert result.terminal
+    assert [event[0] for event in events if isinstance(event, tuple)] == [
+        "recovery-issue",
+        "publication-prepare",
+        "publication-enter",
+        "publication-commit",
+        "publication-close",
+        "recovery-issue",
+        "publication-prepare",
+        "publication-enter",
+        "publication-commit",
+        "publication-close",
+    ]
+
+
+def test_empty_catalog_has_no_pending_publication_recovery_work() -> None:
+    events: list[object] = []
+    facade = _PublicationFacade(events, recovery_stops_after=0)
+    controller = IngestSessionController(
+        cast(VNextIngestFacade, facade),
+        _session(),
+        lease_duration_microseconds=10_000_000,
+        database_type="sqlite",
+    )
+
+    result = service_module.synchronize_pending_publication(
+        controller,
+        artifact_adapters={},
+        finalization_adapters={},
+        library_activation=_LibraryActivation(),
+    )
+
+    assert result is None
+    assert events == [("recovery-empty", 0, 10_000_000)]
+
+
+def test_pending_recovery_fails_closed_if_authority_disappears_after_progress() -> None:
+    events: list[object] = []
+    facade = _PublicationFacade(events, recovery_stops_after=1)
+    controller = IngestSessionController(
+        cast(VNextIngestFacade, facade),
+        _session(),
+        lease_duration_microseconds=10_000_000,
+        database_type="sqlite",
+    )
+
+    with pytest.raises(RuntimeError, match="authority disappeared after progress"):
+        service_module.synchronize_pending_publication(
+            controller,
+            artifact_adapters={},
+            finalization_adapters={},
+            library_activation=_LibraryActivation(),
+        )
+
+    assert [event[0] for event in events if isinstance(event, tuple)] == [
+        "recovery-issue",
+        "publication-prepare",
+        "publication-enter",
+        "publication-commit",
+        "publication-close",
+        "recovery-empty",
+    ]
+
+
+def test_pending_recovery_stop_does_not_report_a_partial_turn_as_success() -> None:
+    events: list[object] = []
+    facade = _PublicationFacade(events)
+    controller = IngestSessionController(
+        cast(VNextIngestFacade, facade),
+        _session(),
+        lease_duration_microseconds=10_000_000,
+        database_type="sqlite",
+    )
+
+    with pytest.raises(_IngestStopRequested):
+        service_module.synchronize_pending_publication(
+            controller,
+            artifact_adapters={},
+            finalization_adapters={},
+            library_activation=_LibraryActivation(),
+            should_stop=lambda: facade._step == 1,
+        )
+
+    assert [event[0] for event in events if isinstance(event, tuple)] == [
+        "recovery-issue",
+        "publication-prepare",
+        "publication-enter",
+        "publication-commit",
+        "publication-close",
+    ]
+
+
 def test_publication_metrics_aggregate_each_issued_operation_and_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -646,7 +777,7 @@ def test_publication_stop_is_observed_after_one_committed_bounded_step() -> None
     ]
 
 
-def test_complete_service_holds_one_outer_guard_through_publication(
+def test_complete_service_recovers_before_source_and_guards_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -675,6 +806,7 @@ def test_complete_service_holds_one_outer_guard_through_publication(
     class _Source:
         def __init__(self, root: Path) -> None:
             assert root == tmp_path
+            events.append("source-construct")
 
         def __enter__(self) -> _Source:
             events.append("source-enter")
@@ -684,7 +816,10 @@ def test_complete_service_holds_one_outer_guard_through_publication(
             del exc
             events.append("source-close")
 
-    class _PolicyFacade:
+    class _PolicyFacade(_PublicationFacade):
+        def __init__(self) -> None:
+            super().__init__(events)
+
         def ensure_policy(
             self,
             receipt: VNextIngestSession,
@@ -693,6 +828,37 @@ def test_complete_service_holds_one_outer_guard_through_publication(
             assert natural is policy
             events.append(("ensure-policy", receipt.ingest_generation))
             return resolved
+
+        def try_issue_publication_recovery_step(
+            self,
+            receipt: VNextIngestSession,
+        ) -> _IssuedPublication | None:
+            assert activation.guarded
+            return super().try_issue_publication_recovery_step(receipt)
+
+        def prepare_publication_step(
+            self,
+            issued: _IssuedPublication,
+            *,
+            artifact_adapters: Mapping[bytes, ArtifactStorageAdapter],
+            finalization_adapters: Mapping[bytes, ArtifactReleaseAdapter],
+            library_activation: VNextLibraryActivationAdapter,
+        ) -> _PreparedPublication:
+            assert activation.guarded
+            return super().prepare_publication_step(
+                issued,
+                artifact_adapters=artifact_adapters,
+                finalization_adapters=finalization_adapters,
+                library_activation=library_activation,
+            )
+
+        def commit_publication_step(
+            self,
+            receipt: VNextIngestSession,
+            prepared: _PreparedPublication,
+        ) -> VNextIngestAdvanceResult:
+            assert activation.guarded
+            return super().commit_publication_step(receipt, prepared)
 
     def fake_source(
         session: object,
@@ -767,10 +933,99 @@ def test_complete_service_holds_one_outer_guard_through_publication(
     assert outcome.publication is publication
     assert events == [
         ("ensure-policy", 2),
+        ("recovery-issue", 0, 10_000_000),
+        ("publication-prepare", 0, {}, {}, activation),
+        ("publication-enter", 0),
+        ("publication-commit", 0, 10_000_000),
+        ("publication-close", 0),
+        ("recovery-issue", 1, 10_000_000),
+        ("publication-prepare", 1, {}, {}, activation),
+        ("publication-enter", 1),
+        ("publication-commit", 1, 10_000_000),
+        ("publication-close", 1),
+        "source-construct",
         "source-enter",
         "adapter",
         "source",
         "source-close",
         "analysis",
         "publication",
+    ]
+
+
+def test_service_does_not_construct_source_after_recovery_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    activation = _LibraryActivation()
+    config = IngestConfig(paths=IngestPathsConfig(download_path=tmp_path))
+    policy = build_ingest_policy(config)
+
+    class _PolicyFacade(_PublicationFacade):
+        def __init__(self) -> None:
+            super().__init__([])
+
+        def ensure_policy(
+            self,
+            receipt: VNextIngestSession,
+            natural: object,
+        ) -> VNextResolvedIngestPolicy:
+            del receipt
+            assert natural is policy
+            events.append("ensure-policy")
+            return cast(VNextResolvedIngestPolicy, object())
+
+        def try_issue_publication_recovery_step(
+            self,
+            receipt: VNextIngestSession,
+        ) -> _IssuedPublication | None:
+            assert activation.guarded
+            events.append("recovery-issued")
+            return _IssuedPublication(receipt.ingest_generation)
+
+        def prepare_publication_step(
+            self,
+            issued: _IssuedPublication,
+            *,
+            artifact_adapters: Mapping[bytes, ArtifactStorageAdapter],
+            finalization_adapters: Mapping[bytes, ArtifactReleaseAdapter],
+            library_activation: VNextLibraryActivationAdapter,
+        ) -> _PreparedPublication:
+            del issued, artifact_adapters, finalization_adapters
+            assert library_activation is activation
+            assert activation.guarded
+            events.append("recovery-adapter-failed")
+            raise OSError("library recovery failed")
+
+    class _UnexpectedSource:
+        def __init__(self, root: Path) -> None:
+            del root
+            events.append("source-constructed")
+            raise AssertionError("source was constructed after recovery failed")
+
+    monkeypatch.setattr(service_module, "FilesystemSource", _UnexpectedSource)
+    controller = IngestSessionController(
+        cast(VNextIngestFacade, _PolicyFacade()),
+        _session(),
+        lease_duration_microseconds=10_000_000,
+        database_type="sqlite",
+    )
+    service = VNextIngestService(
+        source_root=tmp_path,
+        policy=policy,
+        max_rows=128,
+        artifact_adapters={},
+        finalization_adapters={},
+        library_activation=activation,
+        publication_guard=activation.publication_guard,
+    )
+
+    with pytest.raises(OSError, match="library recovery failed"):
+        service.synchronize_once(controller)
+
+    assert events == [
+        "ensure-policy",
+        "recovery-issued",
+        "recovery-adapter-failed",
     ]

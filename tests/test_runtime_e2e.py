@@ -19,12 +19,14 @@ from h2hdb import (
 from PIL import Image
 
 from h2hdb_ingest import (
+    ArtifactRenderPolicyConfig,
     IngestConfig,
     IngestPathsConfig,
     IngestSessionController,
     LibraryMaintenanceOutcome,
     ResidentConfig,
     ResidentIngestor,
+    VNextIngestService,
 )
 from h2hdb_ingest.runtime import build_runtime
 
@@ -385,6 +387,93 @@ def test_fresh_artifact_runtime_publishes_one_current_cbz(
     assert not list((state / "staging").glob("*.cbz"))
     assert not list((state / "quarantine").glob("*.cbz"))
     assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
+
+
+def test_restart_recovers_durable_publication_before_applying_new_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "download"
+    _gallery(source, 2101, "artist")
+    image = Image.new("RGB", (24, 24))
+    image.putdata(
+        [
+            ((index * 17) % 256, (index * 29) % 256, (index * 43) % 256)
+            for index in range(24 * 24)
+        ]
+    )
+    image.save(source / "2101" / "001.png")
+    (source / "2101" / "001.jpg").unlink()
+    library_root = tmp_path / "library"
+    _provision_library_root(library_root)
+    database = str(tmp_path / "catalog.sqlite3")
+
+    def config(*, page_jpeg_quality: int) -> IngestConfig:
+        return IngestConfig(
+            core=CoreConfig(
+                database=DatabaseConfig(sql_type="sqlite", database=database)
+            ),
+            paths=IngestPathsConfig(
+                download_path=source,
+                library_path=library_root,
+                page_render_workers=1,
+                render_policy=ArtifactRenderPolicyConfig(
+                    page_jpeg_quality=page_jpeg_quality,
+                ),
+            ),
+            resident=ResidentConfig(
+                lease_seconds=30,
+                heartbeat_seconds=5,
+            ),
+        )
+
+    first = build_runtime(config(page_jpeg_quality=90))
+    first.database_admin.initialize()
+    claimed = first.facade.try_claim_ingest(True, 30_000_000)
+    assert claimed is not None
+    session = IngestSessionController(
+        first.facade,
+        claimed,
+        lease_duration_microseconds=30_000_000,
+        database_type="sqlite",
+    )
+    service = cast(VNextIngestService, first.resident._service)
+    activation = service._library_activation
+    original_begin = activation.begin
+    crashed = False
+
+    def fail_first_activation(
+        revision: int,
+        receipt_id: bytes,
+    ) -> object:
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise OSError("injected crash after durable database commit")
+        return original_begin(revision, receipt_id)
+
+    monkeypatch.setattr(activation, "begin", fail_first_activation)
+    with pytest.raises(OSError, match="after durable database commit"):
+        service.synchronize_once(session)
+    assert crashed
+    session.complete()
+    first.close()
+
+    # The old snapshot stays unchanged.  Changing only the byte-affecting
+    # policy must still produce a successor after the pending old-policy
+    # commit has been activated and finalized in this same synchronization.
+    restarted = build_runtime(config(page_jpeg_quality=55))
+    restarted.resident.initialize()
+    assert restarted.resident.process_available(periodic_scan=True)
+
+    revision = restarted.catalog.get_catalog_revision()
+    page = restarted.catalog.discover_publications()
+    assert revision.revision == 2
+    assert page.revision == revision
+    assert page.total == len(page.publications) == 1
+    assert page.publications[0].gid == 2101
+    assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
+    restarted.close()
 
 
 def test_deleted_gallery_reconciles_catalog_library_and_historical_cleanup(
