@@ -4,6 +4,7 @@ import dataclasses
 import os
 import platform
 import select
+import signal
 import subprocess
 import sys
 import threading
@@ -596,8 +597,39 @@ def test_eight_concurrent_first_calls_probe_exactly_once(
         page_workers._reset_cpu_topology_cache()
 
 
-def _fork_and_read(child: Callable[[], bytes]) -> bytes:
-    """Fork, run ``child`` in the child, and return the bytes it reports."""
+FORK_CHILD_DEADLINE_SECONDS = 10.0
+
+
+def _reap_forked_child(pid: int, *, deadline_seconds: float) -> int | None:
+    """Reap ``pid`` within the deadline; kill and reap it otherwise.
+
+    Returns the child's exit code, or ``None`` when the child had to be
+    killed.  Either way the child is reaped, so a hung child never leaves a
+    zombie and never blocks the test process forever."""
+
+    deadline = time.monotonic() + deadline_seconds
+    while True:
+        waited, wait_status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return os.waitstatus_to_exitcode(wait_status)
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    return None
+
+
+def _fork_and_read(
+    child: Callable[[], bytes],
+    *,
+    deadline_seconds: float = FORK_CHILD_DEADLINE_SECONDS,
+) -> bytes:
+    """Fork, run ``child`` in the child, and return the bytes it reports.
+
+    A child that neither reports nor exits within the deadline (for example
+    one deadlocked on a lock inherited across fork) is killed, reaped, and
+    reported as a test failure instead of hanging the test run."""
 
     read_fd, write_fd = os.pipe()
     with warnings.catch_warnings():
@@ -614,14 +646,51 @@ def _fork_and_read(child: Callable[[], bytes]) -> bytes:
         finally:
             os._exit(status)
     os.close(write_fd)
+    payload = b""
     try:
-        ready, _, _ = select.select([read_fd], [], [], 10)
-        payload = os.read(read_fd, 256) if ready else b""
+        ready, _, _ = select.select([read_fd], [], [], deadline_seconds)
+        if ready:
+            payload = os.read(read_fd, 256)
     finally:
         os.close(read_fd)
-        _, wait_status = os.waitpid(pid, 0)
-    assert os.waitstatus_to_exitcode(wait_status) == 0
+    exit_code = _reap_forked_child(pid, deadline_seconds=deadline_seconds)
+    if exit_code is None:
+        pytest.fail(
+            f"forked child {pid} neither reported nor exited within "
+            f"{deadline_seconds}s and was killed; payload={payload!r}"
+        )
+    assert exit_code == 0, f"forked child exited with {exit_code}"
     return payload
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork only")
+def test_hung_fork_child_is_killed_reaped_and_reported_as_a_failure() -> None:
+    """The fork helper must never wait forever: a child that blocks is
+    killed at the deadline, reaped (no zombie), and turned into a failure."""
+
+    def hang() -> bytes:
+        while True:
+            time.sleep(60)
+
+    started = time.monotonic()
+    with pytest.raises(pytest.fail.Exception, match="was killed"):
+        _fork_and_read(hang, deadline_seconds=0.5)
+    assert time.monotonic() - started < 5.0
+    # Reaping is verified directly: a killed child is gone, not a zombie.
+    read_fd, write_fd = os.pipe()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        pid = os.fork()
+    if pid == 0:
+        try:
+            hang()
+        finally:
+            os._exit(1)
+    os.close(read_fd)
+    os.close(write_fd)
+    assert _reap_forked_child(pid, deadline_seconds=0.2) is None
+    with pytest.raises(ChildProcessError):
+        os.waitpid(pid, os.WNOHANG)
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="POSIX fork only")
@@ -692,6 +761,43 @@ def test_fork_during_an_in_flight_probe_leaves_the_child_unlocked(
     assert not prober.is_alive()
     # The parent is unaffected: a fresh single flight probes again normally.
     assert page_workers._detect_cpu_topology() is parent_topology
+
+
+# --- withdrawn public surface ---------------------------------------------
+
+
+WITHDRAWN_WORKER_DECISION_NAMES = (
+    "CpuTopology",
+    "DarwinTranslation",
+    "PageRenderWorkerDecision",
+    "PageRenderWorkerMode",
+    "PageRenderWorkerReason",
+    "decide_page_render_workers",
+    "detect_cpu_topology",
+)
+
+
+def test_withdrawn_worker_decision_names_are_absent_from_every_public_surface() -> None:
+    """The worker-decision types and functions are implementation details:
+    none of the withdrawn names exists at the package root or in the module's
+    export list, no alias survives, and the public surface is exactly the
+    integer API."""
+
+    import h2hdb_ingest
+
+    for name in WITHDRAWN_WORKER_DECISION_NAMES:
+        assert name not in h2hdb_ingest.__all__
+        assert not hasattr(h2hdb_ingest, name)
+        assert name not in page_workers.__all__
+        assert not hasattr(page_workers, name)
+    assert page_workers.__all__ == [
+        "MAX_PAGE_RENDER_WORKERS",
+        "default_page_render_workers",
+        "resolve_page_render_workers",
+    ]
+    assert len(set(h2hdb_ingest.__all__)) == len(h2hdb_ingest.__all__)
+    for name in h2hdb_ingest.__all__:
+        getattr(h2hdb_ingest, name)
 
 
 # --- structured log -------------------------------------------------------
