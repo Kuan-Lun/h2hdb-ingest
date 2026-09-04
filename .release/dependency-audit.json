@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-04T09:09:58+00:00",
-  "manifest_sha256": "c4c6026b604e81915c8fd35026cc4ed361fcec683210ac9dc7d7a70751eec8e4",
+  "checked_at": "2026-09-04T12:08:36+00:00",
+  "manifest_sha256": "bc52e30e87884858fb1fad0788654318d2e1f63906677c5978eda0ff44314e67",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.13.0",
+  "project_version": "0.14.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,7 +30,7 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.30.1,<0.31.0",
+      "declared": "h2hdb>=0.31.0,<0.32.0",
       "group": "runtime",
       "latest": "0.29.0",
       "latest_satisfies": false,
@@ -111,6 +111,15 @@
       "url": "https://pypi.org/project/pytest/"
     },
     {
+      "declared": "pytest-xdist>=3.8.0,<4.0.0",
+      "group": "optional:dev",
+      "latest": "3.8.0",
+      "latest_satisfies": true,
+      "name": "pytest-xdist",
+      "python_3_14": true,
+      "url": "https://pypi.org/project/pytest-xdist/"
+    },
+    {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
       "latest": "0.16.6",
@@ -130,7 +139,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed every direct build, runtime, optional development, and Node dependency for h2hdb-ingest 0.13.0. The h2hdb lower bound is intentionally raised to >=0.30.1,<0.31.0 because Resident now passes the maintenance release-adapter registry; registry 0.29.0 is older than this unpublished cross-repository contract. The exact locally built h2hdb 0.30.1 wheel SHA-256 6095f22eeae70603f3893d6463f998673e5e741daddcd466184fcf1be65ee414 was imported from an isolated target and passed 36 focused ingest tests. Every other registry latest satisfies its range. Ruff 0.16.6 release notes were reviewed and explicit lint plus formatter checks pass, so no additional bound changes are required.",
+    "note": "Reviewed every direct build, runtime, optional development, and Node dependency for h2hdb-ingest 0.14.0. The h2hdb compatibility lane is intentionally raised to >=0.31.0,<0.32.0 because CBZ-enabled startup requires the new immutable storage binding API and schema. Registry h2hdb remains older than this local coordinated candidate; the exact h2hdb 0.31.0 task tree passed SQLite, MariaDB 10.11.11, schema, Lean, and strict coverage checks and is supplied explicitly for ingest validation. pytest-xdist 3.8.0 is added only to make the bounded five-minute development gate parallel; all other registry latest versions were checked against their declared ranges.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
