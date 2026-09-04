@@ -25,6 +25,8 @@ __all__ = [
     "IngestSessionController",
     "LibraryMaintenanceAdapter",
     "LibraryMaintenanceOutcome",
+    "LibraryStorageIdentity",
+    "LibraryStorageIdentityProvider",
     "ManagedFilesystemLibraryAdapter",
     "ResidentConfig",
     "ResidentIngestor",
@@ -58,6 +60,7 @@ from .filesystem import (
     FilesystemSource,
 )
 from .library import ManagedFilesystemLibraryAdapter
+from .library_identity import LibraryStorageIdentity, LibraryStorageIdentityProvider
 from .maintenance import (
     LibraryMaintenanceAdapter,
     LibraryMaintenanceOutcome,

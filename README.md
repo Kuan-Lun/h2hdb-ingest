@@ -59,7 +59,7 @@ Startup rejects these known legacy states without deleting them:
 
 - `current/hash-v1`;
 - `.h2hdb-state/coordination`;
-- a version-1 activation journal.
+- a version-1 or version-2 activation journal.
 
 Rebuild artifacts into a fresh library root. This prevents old and new paths
 from silently coexisting under one reader mount.
@@ -78,6 +78,16 @@ library/
 ```
 
 Do not pre-create `.h2hdb-state`; ingest creates and owns it. After operation,
+the private version-3 journal contains one immutable UUIDv4 for this library
+root. Startup stores the same UUID in h2hdb before any cleanup or ingest work;
+an exact restart is idempotent, while pairing the database with another root
+fails closed. A resident also rechecks the local UUID once at the start of each
+processing cycle, so replacing a mount while the process is running cannot
+reach maintenance, claim, or CBZ work. There is no journal v2 migration or
+automatic database rebind; use a fresh database and rebuild when intentionally
+replacing the storage instance.
+
+After operation,
 the complete layout is:
 
 ```text
@@ -326,7 +336,7 @@ activation reconciliation.
 - **`must be a pre-existing real directory`**: create the required library
   directories before starting the container; symlinks are not accepted.
 - **`unsupported legacy ... fresh library root`**: keep the old tree as a
-  backup and configure an empty v2 root for a full artifact rebuild.
+  backup and configure an empty v3 journal root for a full artifact rebuild.
 - **`library ... changed identity`**: another process modified a managed path;
   stop all writers and inspect the mount before retrying.
 - **database is not READY**: initialize or repair the schema with the H2HDB

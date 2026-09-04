@@ -208,11 +208,13 @@ def test_cbz_runtime_shares_one_adapter_for_protection_and_release(
 
         assert isinstance(service, VNextIngestService)
         storage = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
+        assert isinstance(storage, ManagedFilesystemLibraryAdapter)
         assert id(service._finalization_adapters[ARTIFACT_ADAPTER_ID]) == id(storage)
         assert id(
             runtime.resident._artifact_release_adapters[ARTIFACT_ADAPTER_ID]
         ) == id(storage)
         assert isinstance(service._library_activation, ManagedFilesystemLibraryAdapter)
+        assert runtime.resident._library_storage_identity is storage
         assert (
             service._publication_guard == service._library_activation.publication_guard
         )

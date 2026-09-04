@@ -29,6 +29,7 @@ from h2hdb import (
 import h2hdb_ingest.library as library_module
 from h2hdb_ingest.artifact import ArtifactRenderPolicy
 from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
+from h2hdb_ingest.library_identity import LibraryStorageIdentity
 from h2hdb_ingest.maintenance import (
     LibraryMaintenanceOutcome,
     _LibraryStagingSlotConflictError,
@@ -227,6 +228,114 @@ def test_layout_requires_a_preexisting_real_library_root(tmp_path: Path) -> None
             pass
 
     assert not root.exists()
+
+
+def test_storage_identity_is_created_once_and_replayed_after_reopen(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    _provision_library_root(root)
+
+    created = _adapter(root).ensure_storage_identity()
+    reopened = _adapter(root).ensure_storage_identity()
+
+    assert isinstance(created, LibraryStorageIdentity)
+    assert reopened == created
+    assert len(created.storage_instance_uuid) == 16
+    assert created.storage_instance_uuid[6] >> 4 == 4
+    assert created.storage_instance_uuid[8] & 0xC0 == 0x80
+    database = root / ".h2hdb-state" / "journal" / "library-activation.sqlite3"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT format_version FROM library_state WHERE singleton = 1"
+        ).fetchone() == (3,)
+        assert connection.execute(
+            "SELECT singleton, storage_instance_uuid FROM library_storage_identity"
+        ).fetchall() == [(1, created.storage_instance_uuid)]
+
+
+def test_storage_identity_replays_a_lost_fresh_commit_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "library"
+    _provision_library_root(root)
+    original_create = library_module._create_fresh_journal
+    interrupted = False
+
+    def commit_then_interrupt(
+        connection: sqlite3.Connection,
+        storage_instance_uuid: bytes,
+    ) -> None:
+        nonlocal interrupted
+        original_create(connection, storage_instance_uuid)
+        if not interrupted:
+            interrupted = True
+            raise RuntimeError("fresh-journal-commit-response-lost")
+
+    monkeypatch.setattr(
+        library_module,
+        "_create_fresh_journal",
+        commit_then_interrupt,
+    )
+    with pytest.raises(RuntimeError, match="commit-response-lost"):
+        _adapter(root).ensure_storage_identity()
+
+    monkeypatch.setattr(library_module, "_create_fresh_journal", original_create)
+    identity = _adapter(root).ensure_storage_identity()
+
+    assert interrupted
+    assert len(identity.storage_instance_uuid) == 16
+
+
+def test_v2_journal_requires_a_fresh_library_root(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    _provision_library_root(root)
+    journal = root / ".h2hdb-state" / "journal"
+    journal.mkdir(parents=True)
+    database = journal / "library-activation.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            "CREATE TABLE library_state ("
+            "singleton INTEGER PRIMARY KEY, format_version INTEGER NOT NULL);"
+            "INSERT INTO library_state VALUES (1, 2);"
+        )
+
+    with pytest.raises(RuntimeError, match="fresh library root is required"):
+        _adapter(root).ensure_storage_identity()
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT format_version FROM library_state WHERE singleton = 1"
+        ).fetchone() == (2,)
+
+
+@pytest.mark.parametrize("corruption", ("missing", "nil", "wrong-version"))
+def test_storage_identity_corruption_fails_closed(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    adapter.ensure_storage_identity()
+    database = root / ".h2hdb-state" / "journal" / "library-activation.sqlite3"
+    with sqlite3.connect(database) as connection:
+        if corruption == "missing":
+            connection.execute("DELETE FROM library_storage_identity")
+        elif corruption == "nil":
+            connection.execute(
+                "UPDATE library_storage_identity SET storage_instance_uuid = ?",
+                (bytes(16),),
+            )
+        else:
+            connection.execute(
+                "UPDATE library_storage_identity SET storage_instance_uuid = ?",
+                (bytes.fromhex("00000000000050008000000000000001"),),
+            )
+        connection.commit()
+
+    with pytest.raises(RuntimeError, match="storage identity"):
+        _adapter(root).ensure_storage_identity()
 
 
 @pytest.mark.parametrize("workers", (True, 1.0, "2"))
@@ -4002,7 +4111,7 @@ def test_release_rejects_stage_suffix_swapped_in_journal(tmp_path: Path) -> None
     assert staged.read_bytes() == payload
 
 
-def test_journal_rejects_extra_v2_schema_surface(tmp_path: Path) -> None:
+def test_journal_rejects_extra_v3_schema_surface(tmp_path: Path) -> None:
     root = tmp_path / "library"
     adapter = _adapter(root)
     adapter._ensure_layout()
@@ -4015,7 +4124,7 @@ def test_journal_rejects_extra_v2_schema_surface(tmp_path: Path) -> None:
         _adapter(root)._ensure_layout()
 
 
-def test_journal_rejects_missing_v2_schema_without_repairing_it(
+def test_journal_rejects_missing_v3_schema_without_repairing_it(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "library"

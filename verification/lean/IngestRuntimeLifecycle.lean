@@ -9,6 +9,11 @@ later closes are idempotent. Every modeled CLI body outcome is bracketed by the
 same close operation. An entered or closed runtime rejects reentry, and a
 closed runtime rejects later work.
 
+For a CBZ-enabled runtime, startup must also pass the ordered database check,
+local durable UUID read, and immutable core binding before either maintenance
+or writer work is allowed. Every later cycle rechecks that same local UUID; a
+startup mismatch or later root replacement remains blocked under retry.
+
 These theorems are mathematical statements about the functions below. They do
 not prove Python lock or context-manager behavior, exception unwinding, signal
 delivery, core cache cleanup, object lifetime, or that `build_runtime` and the
@@ -84,6 +89,84 @@ theorem closed_runtime_rejects_reentry : enter .closed = .rejected := by
 
 theorem closed_runtime_rejects_later_work : invoke .closed = .rejected := by
   rfl
+
+inductive StorageStartupState where
+  | unchecked
+  | checked
+  | identified
+  | bound
+  | mismatch
+deriving DecidableEq, Repr
+
+def checkDatabase : StorageStartupState → StorageStartupState
+  | .unchecked => .checked
+  | state => state
+
+def readLocalIdentity : StorageStartupState → StorageStartupState
+  | .checked => .identified
+  | state => state
+
+def bindStorage (sameIdentity : Bool) : StorageStartupState → StorageStartupState
+  | .identified => if sameIdentity then .bound else .mismatch
+  | .mismatch => .mismatch
+  | state => state
+
+def verifyCycleIdentity (sameIdentity : Bool) :
+    StorageStartupState → StorageStartupState
+  | .bound => if sameIdentity then .bound else .mismatch
+  | .mismatch => .mismatch
+  | state => state
+
+inductive WriterResult where
+  | allowed
+  | rejected
+deriving DecidableEq, Repr
+
+def runMaintenance : StorageStartupState → WriterResult
+  | .bound => .allowed
+  | _ => .rejected
+
+def runWriterWork : StorageStartupState → WriterResult
+  | .bound => .allowed
+  | _ => .rejected
+
+theorem writer_work_rejected_until_storage_is_bound
+    (state : StorageStartupState)
+    (unbound : state ≠ .bound) :
+    runWriterWork state = .rejected := by
+  cases state <;> simp_all [runWriterWork]
+
+theorem maintenance_rejected_until_storage_is_bound
+    (state : StorageStartupState)
+    (unbound : state ≠ .bound) :
+    runMaintenance state = .rejected := by
+  cases state <;> simp_all [runMaintenance]
+
+theorem ordered_matching_startup_enables_maintenance_and_work :
+    let state := bindStorage true (readLocalIdentity (checkDatabase .unchecked))
+    runMaintenance state = .allowed ∧ runWriterWork state = .allowed := by
+  decide
+
+theorem binding_mismatch_remains_blocked :
+    let state := bindStorage false (readLocalIdentity (checkDatabase .unchecked))
+    bindStorage true state = .mismatch ∧
+      runMaintenance state = .rejected ∧
+      runWriterWork state = .rejected := by
+  decide
+
+theorem matching_cycle_identity_preserves_work_authority :
+    let state := bindStorage true (readLocalIdentity (checkDatabase .unchecked))
+    verifyCycleIdentity true state = .bound ∧
+      runMaintenance (verifyCycleIdentity true state) = .allowed ∧
+      runWriterWork (verifyCycleIdentity true state) = .allowed := by
+  decide
+
+theorem replaced_root_is_rejected_before_maintenance_and_work :
+    let state := bindStorage true (readLocalIdentity (checkDatabase .unchecked))
+    verifyCycleIdentity false state = .mismatch ∧
+      runMaintenance (verifyCycleIdentity false state) = .rejected ∧
+      runWriterWork (verifyCycleIdentity false state) = .rejected := by
+  decide
 
 inductive FacadeOwnership where
   | absent

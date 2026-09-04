@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from threading import Event
 from typing import cast
 
 import pytest
 from h2hdb import (
+    ArtifactReleaseAdapter,
     GalleryStagingCapacityError,
     SchemaEpochReport,
     VNextCurrentOnlyMaintenanceOutcome,
@@ -17,7 +18,8 @@ from h2hdb import (
 )
 
 import h2hdb_ingest.resident as resident_module
-from h2hdb_ingest import ResidentConfig
+from h2hdb_ingest import LibraryStorageIdentity, ResidentConfig
+from h2hdb_ingest.library_identity import LibraryStorageIdentityProvider
 from h2hdb_ingest.maintenance import (
     LibraryMaintenanceOutcome,
     _LibraryStagingSlotConflictError,
@@ -98,6 +100,20 @@ class _Admin:
     def check(self) -> SchemaEpochReport:
         self._events.append("check")
         return cast(SchemaEpochReport, object())
+
+    def bind_storage_instance(self, storage_instance_uuid: bytes) -> object:
+        self._events.append(("bind", storage_instance_uuid))
+        return object()
+
+
+class _StorageIdentity:
+    def __init__(self, events: list[object], value: bytes) -> None:
+        self._events = events
+        self._identity = LibraryStorageIdentity(value)
+
+    def ensure_storage_identity(self) -> LibraryStorageIdentity:
+        self._events.append("identity")
+        return self._identity
 
 
 class _LibraryMaintenance:
@@ -214,7 +230,9 @@ def _resident(
         VNextCurrentOnlyMaintenanceOutcome.DONE,
     ),
     library_maintenance: _LibraryMaintenance | None = None,
+    library_storage_identity: LibraryStorageIdentityProvider | None = None,
     service: IngestSynchronizer | None = None,
+    artifact_release_adapters: Mapping[bytes, ArtifactReleaseAdapter] | None = None,
 ) -> ResidentIngestor:
     facade = _Facade(
         events,
@@ -225,6 +243,7 @@ def _resident(
         service=service or _Service(events),
         facade=cast(VNextIngestFacade, facade),
         database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
+        library_storage_identity=library_storage_identity,
         library_maintenance=(library_maintenance or _LibraryMaintenance()),
         config=ResidentConfig(
             periodic_scan_seconds=60,
@@ -233,7 +252,9 @@ def _resident(
             heartbeat_seconds=5,
         ),
         database_type="sqlite",
-        artifact_release_adapters={},
+        artifact_release_adapters=(
+            {} if artifact_release_adapters is None else artifact_release_adapters
+        ),
         event_logger=lambda message: events.append(("log", message)),
     )
 
@@ -262,6 +283,108 @@ def test_startup_only_checks_existing_epoch_and_processes_one_session(
         "log",
         "vNext ingest session completed: generation=2 replayed=False",
     )
+
+
+def test_cbz_startup_binds_local_identity_before_any_maintenance() -> None:
+    events: list[object] = []
+    storage_uuid = bytes.fromhex("00000000000040008000000000000001")
+
+    class _OrderedMaintenance(_LibraryMaintenance):
+        def maintain_cleanup(self) -> LibraryMaintenanceOutcome:
+            events.append("library-maintenance")
+            return super().maintain_cleanup()
+
+    resident = _resident(
+        events,
+        library_maintenance=_OrderedMaintenance(),
+        library_storage_identity=_StorageIdentity(events, storage_uuid),
+    )
+
+    resident.initialize()
+
+    assert events == [
+        "check",
+        "identity",
+        ("bind", storage_uuid),
+        "library-maintenance",
+        ("current-only", 10_000_000),
+    ]
+
+
+def test_artifact_enabled_resident_requires_storage_identity() -> None:
+    events: list[object] = []
+
+    with pytest.raises(
+        ValueError,
+        match="artifact-enabled resident requires a library storage identity",
+    ):
+        _resident(
+            events,
+            artifact_release_adapters={
+                b"adapter": cast(ArtifactReleaseAdapter, object())
+            },
+        )
+
+
+def test_changed_storage_identity_stops_before_maintenance_or_claim() -> None:
+    events: list[object] = []
+    first_uuid = bytes.fromhex("00000000000040008000000000000001")
+    replacement_uuid = bytes.fromhex("00000000000040008000000000000002")
+    identities = iter(
+        (
+            LibraryStorageIdentity(first_uuid),
+            LibraryStorageIdentity(replacement_uuid),
+        )
+    )
+
+    class _ChangingStorageIdentity:
+        def ensure_storage_identity(self) -> LibraryStorageIdentity:
+            events.append("identity")
+            return next(identities)
+
+    maintenance = _LibraryMaintenance()
+    resident = _resident(
+        events,
+        library_maintenance=maintenance,
+        library_storage_identity=_ChangingStorageIdentity(),
+    )
+    resident.initialize()
+    initialized_events = list(events)
+
+    with pytest.raises(RuntimeError, match="changed after binding"):
+        resident.process_available(periodic_scan=True)
+
+    assert maintenance.calls == 1
+    assert events == [*initialized_events, "identity"]
+    with pytest.raises(RuntimeError, match="must initialize"):
+        resident.process_available(periodic_scan=True)
+    assert events == [*initialized_events, "identity"]
+
+
+def test_storage_binding_mismatch_prevents_maintenance_and_claim() -> None:
+    events: list[object] = []
+    storage_uuid = bytes.fromhex("00000000000040008000000000000001")
+    maintenance = _LibraryMaintenance()
+
+    class _MismatchAdmin(_Admin):
+        def bind_storage_instance(self, storage_instance_uuid: bytes) -> object:
+            super().bind_storage_instance(storage_instance_uuid)
+            raise RuntimeError("different storage instance")
+
+    resident = _resident(
+        events,
+        library_maintenance=maintenance,
+        library_storage_identity=_StorageIdentity(events, storage_uuid),
+    )
+    resident._database_admin = cast(VNextDatabaseAdminFacade, _MismatchAdmin(events))
+
+    with pytest.raises(RuntimeError, match="different storage instance"):
+        resident.initialize()
+    with pytest.raises(RuntimeError, match="must initialize"):
+        resident.process_available(periodic_scan=True)
+
+    assert maintenance.calls == 0
+    assert events == ["check", "identity", ("bind", storage_uuid)]
 
 
 def test_startup_propagates_library_layout_failure() -> None:
@@ -570,6 +693,7 @@ def test_staging_capacity_preserves_completion_failure_as_note(
         service=_StagingCapacityService(events),
         facade=cast(VNextIngestFacade, facade),
         database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
+        library_storage_identity=None,
         library_maintenance=_LibraryMaintenance(),
         config=ResidentConfig(
             periodic_scan_seconds=60,
@@ -647,6 +771,7 @@ def test_maintenance_failure_does_not_undo_completed_ingest(
         service=_Service(events),
         facade=cast(VNextIngestFacade, _FailAfterCompletionFacade()),
         database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
+        library_storage_identity=None,
         library_maintenance=_LibraryMaintenance(),
         config=ResidentConfig(
             periodic_scan_seconds=60,

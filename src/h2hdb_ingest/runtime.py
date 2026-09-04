@@ -23,6 +23,7 @@ from h2hdb import (
 
 from .config import IngestConfig
 from .library import ManagedFilesystemLibraryAdapter
+from .library_identity import LibraryStorageIdentityProvider
 from .maintenance import (
     LibraryMaintenanceAdapter,
     LibraryMaintenanceOutcome,
@@ -94,11 +95,13 @@ def build_runtime(
         artifact_adapters: dict[bytes, ManagedFilesystemLibraryAdapter] = {}
         finalization_adapters: dict[bytes, ManagedFilesystemLibraryAdapter] = {}
         library_activation: VNextLibraryActivationAdapter
+        library_storage_identity: LibraryStorageIdentityProvider | None
         library_maintenance: LibraryMaintenanceAdapter
         publication_guard: Callable[[], AbstractContextManager[None]]
         if config.paths.library_path is None:
             disabled_library = _DisabledLibraryActivationAdapter()
             library_activation = disabled_library
+            library_storage_identity = None
             library_maintenance = disabled_library
             publication_guard = _disabled_publication_guard
         else:
@@ -121,6 +124,7 @@ def build_runtime(
             artifact_adapters[library.adapter_id] = library
             finalization_adapters[library.adapter_id] = library
             library_activation = library
+            library_storage_identity = library
             library_maintenance = library
             publication_guard = library.publication_guard
 
@@ -138,6 +142,7 @@ def build_runtime(
             service=service,
             facade=facade,
             database_admin=database_admin,
+            library_storage_identity=library_storage_identity,
             library_maintenance=library_maintenance,
             config=config.resident,
             database_type=config.core.database.sql_type,

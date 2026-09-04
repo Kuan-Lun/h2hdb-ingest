@@ -139,6 +139,7 @@ def test_capacity_backpressure_releases_real_core_session_for_retry(
         service=service,
         facade=runtime.facade,
         database_admin=runtime.database_admin,
+        library_storage_identity=None,
         library_maintenance=_DoneLibraryMaintenance(),
         config=config.resident,
         database_type=config.core.database.sql_type,
@@ -320,6 +321,7 @@ def test_fresh_artifact_runtime_publishes_one_current_cbz(
     runtime = build_runtime(config)
 
     runtime.database_admin.initialize()
+    runtime.resident.initialize()
     assert runtime.resident.process_available(periodic_scan=True)
     page = runtime.catalog.discover_publications()
     current = tuple(current_root.rglob("*.cbz"))
@@ -439,6 +441,7 @@ def test_restart_recovers_durable_publication_before_applying_new_policy(
 
     first = build_runtime(config(page_jpeg_quality=90))
     first.database_admin.initialize()
+    first.resident.initialize()
     claimed = first.facade.try_claim_ingest(True, 30_000_000)
     assert claimed is not None
     session = IngestSessionController(
@@ -717,6 +720,7 @@ def test_deleted_gallery_reconciles_catalog_library_and_historical_cleanup(
     )
     runtime = build_runtime(config)
     runtime.database_admin.initialize()
+    runtime.resident.initialize()
 
     assert runtime.resident.process_available(periodic_scan=True)
     first_revision = runtime.catalog.get_catalog_revision()
@@ -791,6 +795,7 @@ def test_many_replacements_keep_one_stable_current_file_per_gid(
     )
     runtime = build_runtime(config)
     runtime.database_admin.initialize()
+    runtime.resident.initialize()
 
     assert runtime.resident.process_available(periodic_scan=True)
     first = runtime.catalog.discover_publications()

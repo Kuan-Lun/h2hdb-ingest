@@ -37,6 +37,7 @@ dev = [
     "mypy>=2.3.1",
     "packaging>=26.0",
     "pytest>=9.1.1",
+    "pytest-xdist>=3.8.0,<4.0.0",
     "ruff>=0.16.4",
     "testcontainers>=4.15.0",
 ]
@@ -70,7 +71,13 @@ warn_unused_configs = true
 warn_unreachable = true
 
 [tool.pytest.ini_options]
+addopts = "-m 'not deep' --numprocesses=auto --max-worker-restart=0 --dist=loadgroup"
+required_plugins = ["pytest-xdist>=3.8.0,<4.0.0"]
 testpaths = ["tests"]
+markers = [
+    "deep: manual crash, scale, or live-service evidence excluded from normal pytest",
+    "mariadb: requires the explicitly enabled MariaDB 10.11.11 testcontainer",
+]
 
 [tool.h2h.version]
 release-paths = ["LICENSE", "src/**"]

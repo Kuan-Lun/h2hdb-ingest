@@ -18,6 +18,7 @@ def test_lean_model_proves_bracketed_idempotent_runtime_close() -> None:
         "bracketedCliExit",
         "enter",
         "invoke",
+        "verifyCycleIdentity",
         "cleanupConstructionFailure",
     }:
         assert f"def {definition}" in model
@@ -30,11 +31,18 @@ def test_lean_model_proves_bracketed_idempotent_runtime_close() -> None:
         "closed_runtime_rejects_later_work",
         "partial_construction_failure_closes_owned_facade",
         "construction_cleanup_is_idempotent",
+        "writer_work_rejected_until_storage_is_bound",
+        "maintenance_rejected_until_storage_is_bound",
+        "ordered_matching_startup_enables_maintenance_and_work",
+        "binding_mismatch_remains_blocked",
+        "matching_cycle_identity_preserves_work_authority",
+        "replaced_root_is_rejected_before_maintenance_and_work",
     }:
         assert f"theorem {theorem}" in model
 
     assert "do not prove Python lock or context-manager behavior" in prose
     assert "core cache cleanup" in prose
+    assert "later root replacement remains blocked" in prose
     assert "production code refines this model" not in prose
 
 

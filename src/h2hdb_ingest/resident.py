@@ -22,6 +22,7 @@ from h2hdb import (
 )
 
 from .config import ResidentConfig
+from .library_identity import LibraryStorageIdentity, LibraryStorageIdentityProvider
 from .maintenance import (
     LibraryMaintenanceAdapter,
     LibraryMaintenanceOutcome,
@@ -57,6 +58,7 @@ class ResidentIngestor:
         service: IngestSynchronizer,
         facade: VNextIngestFacade,
         database_admin: VNextDatabaseAdminFacade,
+        library_storage_identity: LibraryStorageIdentityProvider | None,
         library_maintenance: LibraryMaintenanceAdapter,
         config: ResidentConfig,
         database_type: str,
@@ -66,6 +68,14 @@ class ResidentIngestor:
         self._service = service
         self._facade = facade
         self._database_admin = database_admin
+        if library_storage_identity is not None and not isinstance(
+            library_storage_identity,
+            LibraryStorageIdentityProvider,
+        ):
+            raise TypeError(
+                "library_storage_identity must implement the storage identity protocol"
+            )
+        self._library_storage_identity = library_storage_identity
         if not isinstance(
             library_maintenance,
             LibraryMaintenanceAdapter,
@@ -77,16 +87,31 @@ class ResidentIngestor:
         if not isinstance(artifact_release_adapters, Mapping):
             raise TypeError("artifact_release_adapters must be a mapping")
         self._artifact_release_adapters = dict(artifact_release_adapters)
+        if self._artifact_release_adapters and library_storage_identity is None:
+            raise ValueError(
+                "artifact-enabled resident requires a library storage identity"
+            )
         self._config = config
         self._database_type = database_type.casefold()
         self._event_logger = event_logger or logger.info
+        self._bound_storage_identity: LibraryStorageIdentity | None = None
+        self._storage_instance_ready = library_storage_identity is None
 
     def initialize(self) -> SchemaEpochReport:
         """Validate an existing READY epoch without creating or migrating it."""
 
+        self._bound_storage_identity = None
+        self._storage_instance_ready = self._library_storage_identity is None
         report = self._database_admin.check()
+        if self._library_storage_identity is not None:
+            identity = self._library_storage_identity.ensure_storage_identity()
+            self._database_admin.bind_storage_instance(
+                identity.storage_instance_uuid,
+            )
+            self._bound_storage_identity = identity
         self._run_library_maintenance()
         self._try_current_only_maintenance()
+        self._storage_instance_ready = True
         return report
 
     def process_available(
@@ -97,6 +122,12 @@ class ResidentIngestor:
         should_stop: Callable[[], bool] | None = None,
     ) -> bool:
         """Process one ingest or maintenance progress unit if available."""
+
+        if not self._storage_instance_ready:
+            raise RuntimeError(
+                "CBZ-enabled resident must initialize its storage instance before "
+                "processing"
+            )
 
         return (
             self._process_cycle(
@@ -116,6 +147,7 @@ class ResidentIngestor:
     ) -> _ResidentCycleOutcome:
         if should_stop is not None and should_stop():
             return _ResidentCycleOutcome.IDLE
+        self._require_current_storage_identity()
         lease_duration = self._config.lease_seconds * 1_000_000
         # A previous bounded sweep may have lost its response, contended on the
         # EXCLUSIVE gate, or remained blocked by a live predecessor.  Retrying
@@ -243,6 +275,25 @@ class ResidentIngestor:
         )
         return _ResidentCycleOutcome.INGESTED
 
+    def _require_current_storage_identity(self) -> None:
+        """Fail before work if the configured library root changed identity."""
+
+        provider = self._library_storage_identity
+        if provider is None:
+            return
+        expected = self._bound_storage_identity
+        if expected is None:
+            self._storage_instance_ready = False
+            raise RuntimeError("library storage instance has not been bound")
+        try:
+            observed = provider.ensure_storage_identity()
+        except Exception:
+            self._storage_instance_ready = False
+            raise
+        if observed != expected:
+            self._storage_instance_ready = False
+            raise RuntimeError("library storage instance changed after binding")
+
     def _try_library_maintenance(
         self,
     ) -> LibraryMaintenanceOutcome | None:
@@ -283,6 +334,11 @@ class ResidentIngestor:
             return None
 
     def run_forever(self, *, stop: Event | None = None) -> None:
+        if not self._storage_instance_ready:
+            raise RuntimeError(
+                "CBZ-enabled resident must initialize its storage instance before "
+                "polling"
+            )
         stop_event = stop or Event()
         next_periodic = monotonic()
         while not stop_event.is_set():

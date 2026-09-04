@@ -116,8 +116,12 @@
 - `scripts/format.sh`：明確執行會修改檔案的 formatter 或 fixer。
 - `scripts/check-fast.sh`：離線、唯讀的 Ruff、format check、mypy 與
   markdownlint；每次非 merge commit 執行。
-- `scripts/check-full.sh`：fast gate、完整測試、build、wheel smoke 及本
-  repository 的特殊檢查；整合候選只跑一次。
+- `scripts/run-pytest.py merge`：以 auto-xdist 執行 `not deep`，包含 collection、
+  execution、teardown 與 process-group cleanup 的總時間上限為 300 秒；不得啟動
+  live MariaDB 或 private corpus。`scripts/check-pytest-deep.sh` 是明確手動、
+  不限時的 deep 入口。
+- `scripts/check-full.sh`：fast gate、上述 bounded pytest merge profile、build、
+  wheel smoke 及本 repository 的特殊檢查；整合候選只跑一次。
 - dependency audit 可連網，但 hooks 只驗證本機 receipt，不在 commit
   過程連網。
 - GitHub Actions 只呼叫相同 scripts，並保留 trusted publishing、平台特有
@@ -212,8 +216,8 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
 - Legacy `.h2hdb-state/coordination` entry 無論為 directory、symlink 或
   其他類型都必須在修改 private state 前 fail closed；不得 migrate、fallback
   或接納舊 coordination layout。
-- Legacy `current/hash-v1`與 activation journal format v1必須明確 fail closed並
-  要求 fresh rebuild；不得自動刪除、migrate或和v2 tree混合啟動。
+- Legacy `current/hash-v1`與 activation journal format v1/v2必須明確 fail
+  closed並要求 fresh rebuild；不得自動刪除、migrate或和v3 journal混合啟動。
 - `library_path` parent、`.h2hdb-state/` 與 `.h2hdb-coordination/` 是
   ingest-owned single-writer namespace；其他程序即使使用相同 UID 也不得
   mutate。Komga只能 read-only mount `current/acquisitions/`；OPDS read-only mount
@@ -286,7 +290,7 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
   一般 commit 與 merge gate 不得啟動 MariaDB 或其他 live service。唯一的
   Docker 例外是 host Java 不可用時，以 lockfile digest-pinned、network-off
   container 執行 TLC。
-- `scripts/check-full.sh` 執行完整離線 pytest、Lean verification、
+- `scripts/check-full.sh` 執行 bounded 離線 pytest、Lean verification、
   checksum-pinned TLC Small profile、sdist/wheel build 與 installed-wheel
   CLI/import smoke。
 - `verification/` 是 executable design model，不代表 runtime 自動符合。

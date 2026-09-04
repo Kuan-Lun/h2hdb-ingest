@@ -23,6 +23,7 @@ from itertools import pairwise
 from pathlib import Path
 from threading import RLock, get_ident
 from typing import BinaryIO, cast
+from uuid import uuid4
 
 from h2hdb import (
     ArtifactArchiveRenderEvidence,
@@ -53,6 +54,7 @@ from .artifact import (
     render_archive,
     render_presentation,
 )
+from .library_identity import LibraryStorageIdentity
 from .maintenance import LibraryMaintenanceOutcome, _LibraryStagingSlotConflictError
 from .metrics import IngestMetricSink
 from .page_workers import resolve_page_render_workers
@@ -244,6 +246,13 @@ class ManagedFilesystemLibraryAdapter:
         """The only current subtree that a Komga deployment must mount."""
 
         return self._current / "acquisitions"
+
+    def ensure_storage_identity(self) -> LibraryStorageIdentity:
+        """Create or replay this library root's immutable durable UUID."""
+
+        self._ensure_layout()
+        with self._exclusive_state() as connection:
+            return _read_storage_identity(connection)
 
     @staticmethod
     def storage_key(
@@ -3387,19 +3396,20 @@ class ManagedFilesystemLibraryAdapter:
                         "unsupported library activation journal; a fresh library "
                         "root is required"
                     ) from error
-                if existing_version != (2,):
+                if existing_version != (3,):
                     raise RuntimeError(
                         "unsupported library activation journal format; a fresh "
                         "library root is required"
                     )
                 _require_exact_journal_schema(connection)
             else:
-                connection.executescript(_SCHEMA)
+                _create_fresh_journal(connection, uuid4().bytes)
                 _require_exact_journal_schema(connection)
             if connection.execute(
                 "SELECT format_version FROM library_state WHERE singleton = 1"
-            ).fetchone() != (2,):
+            ).fetchone() != (3,):
                 raise RuntimeError("unsupported library activation journal format")
+            _read_storage_identity(connection)
             connection.commit()
             _ensure_managed_file(
                 self._database_path,
@@ -3417,7 +3427,7 @@ def _storage_key(value: StorageObjectKey) -> StorageObjectKey:
 
 
 def _require_exact_journal_schema(connection: sqlite3.Connection) -> None:
-    """Reject every journal table/index shape outside the v2 closed world."""
+    """Reject every journal table/index shape outside the v3 closed world."""
 
     def signature(database: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
         return tuple(
@@ -3429,7 +3439,10 @@ def _require_exact_journal_schema(connection: sqlite3.Connection) -> None:
 
     reference = sqlite3.connect(":memory:")
     try:
-        reference.executescript(_SCHEMA)
+        _create_fresh_journal(
+            reference,
+            bytes.fromhex("00000000000040008000000000000001"),
+        )
         expected = signature(reference)
     finally:
         reference.close()
@@ -3438,6 +3451,37 @@ def _require_exact_journal_schema(connection: sqlite3.Connection) -> None:
             "unsupported library activation journal shape; a fresh library "
             "root is required"
         )
+
+
+def _create_fresh_journal(
+    connection: sqlite3.Connection,
+    storage_instance_uuid: bytes,
+) -> None:
+    """Create the complete v3 journal and identity in one transaction."""
+
+    identity = LibraryStorageIdentity(storage_instance_uuid)
+    script = (
+        "BEGIN IMMEDIATE;\n" + _SCHEMA + "\nINSERT INTO library_storage_identity "
+        "(singleton, storage_instance_uuid) VALUES "
+        f"(1, X'{identity.storage_instance_uuid.hex()}');\n"
+        "COMMIT;\n"
+    )
+    connection.executescript(script)
+
+
+def _read_storage_identity(
+    connection: sqlite3.Connection,
+) -> LibraryStorageIdentity:
+    rows = connection.execute(
+        "SELECT singleton, storage_instance_uuid "
+        "FROM library_storage_identity ORDER BY singleton LIMIT 2"
+    ).fetchall()
+    if len(rows) != 1 or len(rows[0]) != 2 or rows[0][0] != 1:
+        raise RuntimeError("library storage identity is missing or corrupt")
+    try:
+        return LibraryStorageIdentity(rows[0][1])
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("library storage identity UUID is corrupt") from error
 
 
 def _require_source_component(value: object) -> str:
@@ -4664,7 +4708,7 @@ def _quarantine_leaf(storage_path: str, digest: bytes) -> str:
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS library_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    format_version INTEGER NOT NULL CHECK (format_version = 2),
+    format_version INTEGER NOT NULL CHECK (format_version = 3),
     current_revision INTEGER NULL,
     current_receipt_id BLOB NULL,
     pending_revision INTEGER NULL,
@@ -4677,7 +4721,11 @@ CREATE TABLE IF NOT EXISTS library_state (
     )
 );
 INSERT OR IGNORE INTO library_state
-    (singleton, format_version, phase) VALUES (1, 2, 'IDLE');
+    (singleton, format_version, phase) VALUES (1, 3, 'IDLE');
+CREATE TABLE IF NOT EXISTS library_storage_identity (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    storage_instance_uuid BLOB NOT NULL CHECK (length(storage_instance_uuid) = 16)
+);
 CREATE TABLE IF NOT EXISTS protection_tokens (
     token BLOB PRIMARY KEY CHECK (length(token) = 32),
     storage_codec TEXT NOT NULL,

@@ -229,9 +229,11 @@ def test_failed_merge_gate_aborts_the_primary_worktree_and_retains_task(
     assert "branch refs/heads/perf/task\n" in worktrees
 
 
-def test_full_gate_unsets_live_test_opt_ins() -> None:
+def test_full_gate_delegates_to_runner_that_unsets_live_test_opt_ins() -> None:
     source_root = Path(__file__).resolve().parents[1]
     check_full = (source_root / "scripts" / "check-full.sh").read_text(encoding="utf-8")
+    runner = (source_root / "scripts" / "run-pytest.py").read_text(encoding="utf-8")
 
-    assert "unset H2HDB_INGEST_TEST_PRIVATE_CORPUS" in check_full
-    assert "unset H2HDB_TEST_MARIADB" in check_full
+    assert ".venv/bin/python scripts/run-pytest.py merge" in check_full
+    assert 'environment.pop("H2HDB_INGEST_TEST_PRIVATE_CORPUS", None)' in runner
+    assert 'environment.pop("H2HDB_TEST_MARIADB", None)' in runner
