@@ -13,6 +13,7 @@ from hashlib import sha256
 from io import BytesIO
 from itertools import pairwise
 from pathlib import Path
+from shutil import copytree
 from threading import Event, Thread
 from typing import cast
 
@@ -27,9 +28,13 @@ from h2hdb import (
 )
 
 import h2hdb_ingest.library as library_module
+from h2hdb_ingest._library_layout import validate_precreated_library_layout
 from h2hdb_ingest.artifact import ArtifactRenderPolicy
 from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
-from h2hdb_ingest.library_identity import LibraryStorageIdentity
+from h2hdb_ingest.library_identity import (
+    LibraryStorageIdentity,
+    LibraryStorageIdentityMismatchError,
+)
 from h2hdb_ingest.maintenance import (
     LibraryMaintenanceOutcome,
     _LibraryStagingSlotConflictError,
@@ -252,6 +257,122 @@ def test_storage_identity_is_created_once_and_replayed_after_reopen(
         assert connection.execute(
             "SELECT singleton, storage_instance_uuid FROM library_storage_identity"
         ).fetchall() == [(1, created.storage_instance_uuid)]
+
+
+def test_pinned_storage_identity_rejects_replaced_root_before_writing(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    replacement = tmp_path / "replacement"
+    detached = tmp_path / "detached-library"
+    _provision_library_root(root)
+    _provision_library_root(replacement)
+    adapter = _adapter(root)
+    identity = adapter.ensure_storage_identity()
+    payload = b"must-not-reach-the-replacement-root"
+    item = _item(7002, payload)
+
+    root.rename(detached)
+    replacement.rename(root)
+
+    with pytest.raises(
+        LibraryStorageIdentityMismatchError,
+        match="root changed after its storage identity was pinned",
+    ):
+        _protect(adapter, item, payload, 2)
+
+    assert not (root / ".h2hdb-state").exists()
+    assert not tuple(root.rglob("*.cbz"))
+    assert _adapter(detached).ensure_storage_identity() == identity
+
+
+def test_pinned_root_rejects_a_same_uuid_clone_in_the_same_process(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    replacement = tmp_path / "same-uuid-clone"
+    detached = tmp_path / "detached-library"
+    adapter = _adapter(root)
+    identity = adapter.ensure_storage_identity()
+    copytree(root, replacement)
+
+    root.rename(detached)
+    replacement.rename(root)
+
+    with pytest.raises(
+        LibraryStorageIdentityMismatchError,
+        match="root changed after its storage identity was pinned",
+    ):
+        adapter.ensure_storage_identity()
+
+    assert _adapter(root).ensure_storage_identity() == identity
+    assert _adapter(detached).ensure_storage_identity() == identity
+
+
+def test_first_use_rejects_root_swap_before_creating_managed_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "library"
+    replacement = tmp_path / "replacement"
+    detached = tmp_path / "detached-library"
+    _provision_library_root(root)
+    _provision_library_root(replacement)
+    adapter = ManagedFilesystemLibraryAdapter(
+        root,
+        source_root=_source_root(root),
+        render_policy=_RENDER_POLICY,
+    )
+    real_validate = validate_precreated_library_layout
+    swapped = False
+
+    def validate_then_swap(path: Path, *, durable: bool) -> None:
+        nonlocal swapped
+        real_validate(path, durable=durable)
+        if durable and not swapped:
+            root.rename(detached)
+            replacement.rename(root)
+            swapped = True
+
+    monkeypatch.setattr(
+        library_module,
+        "validate_precreated_library_layout",
+        validate_then_swap,
+    )
+
+    with pytest.raises(
+        LibraryStorageIdentityMismatchError,
+        match="root changed while preparing its layout",
+    ):
+        adapter.ensure_storage_identity()
+
+    assert swapped
+    assert not (root / ".h2hdb-state").exists()
+    assert not (detached / ".h2hdb-state").exists()
+
+
+def test_pinned_storage_identity_rejects_changed_journal_uuid(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    identity = adapter.ensure_storage_identity()
+    replacement_uuid = bytes.fromhex("00000000000040008000000000000002")
+    assert replacement_uuid != identity.storage_instance_uuid
+    database = root / ".h2hdb-state" / "journal" / "library-activation.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE library_storage_identity SET storage_instance_uuid = ? "
+            "WHERE singleton = 1",
+            (replacement_uuid,),
+        )
+        connection.commit()
+
+    with pytest.raises(
+        LibraryStorageIdentityMismatchError,
+        match="storage UUID changed after it was pinned",
+    ):
+        adapter.ensure_storage_identity()
 
 
 def test_storage_identity_replays_a_lost_fresh_commit_response(

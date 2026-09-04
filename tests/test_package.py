@@ -12,6 +12,7 @@ def test_package_exports_only_vnext_consumer_boundaries() -> None:
     assert callable(package.ManagedFilesystemLibraryAdapter)
     assert callable(package.ResidentIngestor)
     assert callable(package.VNextIngestService)
+    assert issubclass(package.LibraryStorageIdentityMismatchError, RuntimeError)
     assert not hasattr(package, "H2HDB")
     assert not hasattr(package, "StagedIngestService")
     assert not hasattr(package, "LegacyIngestService")

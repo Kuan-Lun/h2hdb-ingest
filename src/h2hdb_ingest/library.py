@@ -54,7 +54,10 @@ from .artifact import (
     render_archive,
     render_presentation,
 )
-from .library_identity import LibraryStorageIdentity
+from .library_identity import (
+    LibraryStorageIdentity,
+    LibraryStorageIdentityMismatchError,
+)
 from .maintenance import LibraryMaintenanceOutcome, _LibraryStagingSlotConflictError
 from .metrics import IngestMetricSink
 from .page_workers import resolve_page_render_workers
@@ -232,6 +235,9 @@ class ManagedFilesystemLibraryAdapter:
         )
         self._process_lock = RLock()
         self._state_process_lock = RLock()
+        self._storage_identity_lock = RLock()
+        self._pinned_storage_identity: LibraryStorageIdentity | None = None
+        self._pinned_root_identity: tuple[int, int] | None = None
         self._guard_owner: int | None = None
         self._publication_descriptor: int | None = None
 
@@ -3163,57 +3169,158 @@ class ManagedFilesystemLibraryAdapter:
             )
 
     def _ensure_layout(self) -> None:
-        validate_precreated_library_layout(self._root, durable=True)
-        _ensure_managed_directory(
-            self._state,
-            _PRIVATE_DIRECTORY_CREATION_MODE,
-            label="library state",
-        )
-        for path in (self._staging, self._quarantine, self._journal, self._locks):
+        with self._storage_identity_lock:
+            self._require_pinned_storage_identity()
+            validate_precreated_library_layout(self._root, durable=False)
+            root_before = self._storage_root_identity()
+            validate_precreated_library_layout(self._root, durable=True)
+            self._require_storage_root_identity(
+                root_before,
+                message="library root changed while preparing its layout",
+            )
             _ensure_managed_directory(
-                path,
+                self._state,
                 _PRIVATE_DIRECTORY_CREATION_MODE,
-                label=f"private library {path.name}",
+                label="library state",
             )
-        validate_precreated_library_layout(self._root, durable=True)
-        _require_directory(
-            self._state,
-            label="library state",
-        )
-        for path in (self._staging, self._quarantine, self._journal, self._locks):
+            for path in (self._staging, self._quarantine, self._journal, self._locks):
+                _ensure_managed_directory(
+                    path,
+                    _PRIVATE_DIRECTORY_CREATION_MODE,
+                    label=f"private library {path.name}",
+                )
+            validate_precreated_library_layout(self._root, durable=True)
             _require_directory(
-                path,
-                label=f"private library {path.name}",
+                self._state,
+                label="library state",
             )
-        devices = {
-            self._current.stat().st_dev,
-            self._staging.stat().st_dev,
-            self._quarantine.stat().st_dev,
-        }
-        if len(devices) != 1:
-            raise RuntimeError(
-                "current, staging, and quarantine must share a filesystem"
+            for path in (self._staging, self._quarantine, self._journal, self._locks):
+                _require_directory(
+                    path,
+                    label=f"private library {path.name}",
+                )
+            devices = {
+                self._current.stat().st_dev,
+                self._staging.stat().st_dev,
+                self._quarantine.stat().st_dev,
+            }
+            if len(devices) != 1:
+                raise RuntimeError(
+                    "current, staging, and quarantine must share a filesystem"
+                )
+            _ensure_managed_file(
+                self._state_lock_path,
+                _PRIVATE_FILE_CREATION_MODE,
+                label="library state lock",
             )
-        _ensure_managed_file(
-            self._state_lock_path,
-            _PRIVATE_FILE_CREATION_MODE,
-            label="library state lock",
+            _ensure_managed_file(
+                self._publication_lock_path,
+                _PUBLIC_FILE_CREATION_MODE,
+                label="library publication lock",
+            )
+            _ensure_managed_file(
+                self._database_path,
+                _PRIVATE_FILE_CREATION_MODE,
+                label="library activation database",
+            )
+            with self._connection() as connection:
+                identity = _read_storage_identity(connection)
+            root_after = self._storage_root_identity()
+            if root_after != root_before:
+                raise LibraryStorageIdentityMismatchError(
+                    "library root changed while pinning its storage identity"
+                )
+            self._pin_or_require_storage_identity(identity, root_after)
+            self._require_pinned_storage_identity()
+
+    def _storage_root_identity(self) -> tuple[int, int]:
+        flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         )
-        _ensure_managed_file(
-            self._publication_lock_path,
-            _PUBLIC_FILE_CREATION_MODE,
-            label="library publication lock",
-        )
-        _ensure_managed_file(
-            self._database_path,
-            _PRIVATE_FILE_CREATION_MODE,
-            label="library activation database",
-        )
-        with self._connection():
-            pass
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(self._root, flags)
+            opened = os.fstat(descriptor)
+            visible = self._root.lstat()
+        except OSError as error:
+            raise RuntimeError("library root is not safely openable") from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_ISLNK(visible.st_mode)
+            or (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino)
+        ):
+            raise RuntimeError("library root changed while its identity was observed")
+        return opened.st_dev, opened.st_ino
+
+    def _require_storage_root_identity(
+        self,
+        expected: tuple[int, int],
+        *,
+        message: str,
+    ) -> None:
+        try:
+            observed = self._storage_root_identity()
+        except RuntimeError as error:
+            raise LibraryStorageIdentityMismatchError(message) from error
+        if observed != expected:
+            raise LibraryStorageIdentityMismatchError(message)
+
+    def _pin_or_require_storage_identity(
+        self,
+        identity: LibraryStorageIdentity,
+        root_identity: tuple[int, int],
+    ) -> None:
+        with self._storage_identity_lock:
+            expected_identity = self._pinned_storage_identity
+            expected_root = self._pinned_root_identity
+            if expected_identity is None and expected_root is None:
+                self._pinned_storage_identity = identity
+                self._pinned_root_identity = root_identity
+                return
+            if expected_identity is None or expected_root is None:
+                raise RuntimeError("library storage identity pin is inconsistent")
+            if identity != expected_identity:
+                raise LibraryStorageIdentityMismatchError(
+                    "library storage UUID changed after it was pinned"
+                )
+            if root_identity != expected_root:
+                raise LibraryStorageIdentityMismatchError(
+                    "library root changed after its storage identity was pinned"
+                )
+
+    def _require_pinned_storage_uuid(
+        self,
+        observed: LibraryStorageIdentity,
+    ) -> None:
+        with self._storage_identity_lock:
+            expected = self._pinned_storage_identity
+        if expected is not None and observed != expected:
+            raise LibraryStorageIdentityMismatchError(
+                "library storage UUID changed after it was pinned"
+            )
+
+    def _require_pinned_storage_identity(self) -> None:
+        with self._storage_identity_lock:
+            expected = self._pinned_root_identity
+        if expected is None:
+            return
+        try:
+            observed = self._storage_root_identity()
+        except RuntimeError as error:
+            raise LibraryStorageIdentityMismatchError(
+                "pinned library root became unavailable"
+            ) from error
+        if observed != expected:
+            raise LibraryStorageIdentityMismatchError(
+                "library root changed after its storage identity was pinned"
+            )
 
     @contextmanager
     def _exclusive_state(self) -> Iterator[sqlite3.Connection]:
+        self._require_pinned_storage_identity()
         with self._state_process_lock:
             descriptor = os.open(
                 self._state_lock_path,
@@ -3235,6 +3342,7 @@ class ManagedFilesystemLibraryAdapter:
                     os.close(descriptor)
 
     def _acquire_publication_lock(self) -> None:
+        self._require_pinned_storage_identity()
         with self._process_lock:
             if self._guard_owner != get_ident():
                 raise RuntimeError("library activation requires publication_guard")
@@ -3277,6 +3385,7 @@ class ManagedFilesystemLibraryAdapter:
     def _publication_io_guard(self, *, exclusive: bool) -> Iterator[None]:
         """Fence storage mutation against activation without holding state.lock."""
 
+        self._require_pinned_storage_identity()
         descriptor: int | None = None
         uses_existing_exclusive = False
         with self._process_lock:
@@ -3318,6 +3427,7 @@ class ManagedFilesystemLibraryAdapter:
     def _protection_io_guard(self, token: bytes) -> Iterator[None]:
         """Serialize one bounded token stripe without blocking unrelated protects."""
 
+        self._require_pinned_storage_identity()
         stripe = sha256(token).hexdigest()[:2]
         lock_path = self._locks / f"{_PROTECTION_LOCK_PREFIX}{stripe}.lock"
         _ensure_managed_file(
@@ -3357,6 +3467,7 @@ class ManagedFilesystemLibraryAdapter:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
+        self._require_pinned_storage_identity()
         if self._database_path.exists() or self._database_path.is_symlink():
             value = self._database_path.lstat()
             if not stat.S_ISREG(value.st_mode):
@@ -3409,7 +3520,8 @@ class ManagedFilesystemLibraryAdapter:
                 "SELECT format_version FROM library_state WHERE singleton = 1"
             ).fetchone() != (3,):
                 raise RuntimeError("unsupported library activation journal format")
-            _read_storage_identity(connection)
+            identity = _read_storage_identity(connection)
+            self._require_pinned_storage_uuid(identity)
             connection.commit()
             _ensure_managed_file(
                 self._database_path,
@@ -3417,6 +3529,7 @@ class ManagedFilesystemLibraryAdapter:
                 label="library activation database",
                 create=False,
             )
+            self._require_pinned_storage_identity()
             yield connection
         finally:
             connection.close()

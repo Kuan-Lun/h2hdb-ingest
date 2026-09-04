@@ -19,6 +19,8 @@ def test_lean_model_proves_bracketed_idempotent_runtime_close() -> None:
         "enter",
         "invoke",
         "verifyCycleIdentity",
+        "verifyPinnedStorage",
+        "runGuardedWrite",
         "cleanupConstructionFailure",
     }:
         assert f"def {definition}" in model
@@ -37,12 +39,17 @@ def test_lean_model_proves_bracketed_idempotent_runtime_close() -> None:
         "binding_mismatch_remains_blocked",
         "matching_cycle_identity_preserves_work_authority",
         "replaced_root_is_rejected_before_maintenance_and_work",
+        "exact_pinned_storage_pair_preserves_write_authority",
+        "same_uuid_different_root_is_rejected",
+        "same_root_different_uuid_is_rejected",
+        "pinned_storage_mismatch_remains_blocked_under_retry",
     }:
         assert f"theorem {theorem}" in model
 
     assert "do not prove Python lock or context-manager behavior" in prose
     assert "core cache cleanup" in prose
-    assert "later root replacement remains blocked" in prose
+    assert "changing either member fails closed" in prose
+    assert "root replacement between one successful guard" in prose
     assert "production code refines this model" not in prose
 
 

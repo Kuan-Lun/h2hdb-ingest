@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
-__all__ = ["LibraryStorageIdentity", "LibraryStorageIdentityProvider"]
+__all__ = [
+    "LibraryStorageIdentity",
+    "LibraryStorageIdentityMismatchError",
+    "LibraryStorageIdentityProvider",
+]
 
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
+
+
+class LibraryStorageIdentityMismatchError(RuntimeError):
+    """Raised when a pinned adapter observes another library root or UUID."""
 
 
 @dataclass(frozen=True, slots=True)

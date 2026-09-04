@@ -26,6 +26,7 @@ __all__ = [
     "LibraryMaintenanceAdapter",
     "LibraryMaintenanceOutcome",
     "LibraryStorageIdentity",
+    "LibraryStorageIdentityMismatchError",
     "LibraryStorageIdentityProvider",
     "ManagedFilesystemLibraryAdapter",
     "ResidentConfig",
@@ -60,7 +61,11 @@ from .filesystem import (
     FilesystemSource,
 )
 from .library import ManagedFilesystemLibraryAdapter
-from .library_identity import LibraryStorageIdentity, LibraryStorageIdentityProvider
+from .library_identity import (
+    LibraryStorageIdentity,
+    LibraryStorageIdentityMismatchError,
+    LibraryStorageIdentityProvider,
+)
 from .maintenance import (
     LibraryMaintenanceAdapter,
     LibraryMaintenanceOutcome,

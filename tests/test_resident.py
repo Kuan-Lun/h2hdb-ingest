@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from threading import Event
 from typing import cast
 
@@ -18,7 +19,13 @@ from h2hdb import (
 )
 
 import h2hdb_ingest.resident as resident_module
-from h2hdb_ingest import LibraryStorageIdentity, ResidentConfig
+from h2hdb_ingest import (
+    ArtifactRenderPolicy,
+    LibraryStorageIdentity,
+    LibraryStorageIdentityMismatchError,
+    ManagedFilesystemLibraryAdapter,
+    ResidentConfig,
+)
 from h2hdb_ingest.library_identity import LibraryStorageIdentityProvider
 from h2hdb_ingest.maintenance import (
     LibraryMaintenanceOutcome,
@@ -359,6 +366,157 @@ def test_changed_storage_identity_stops_before_maintenance_or_claim() -> None:
     with pytest.raises(RuntimeError, match="must initialize"):
         resident.process_available(periodic_scan=True)
     assert events == [*initialized_events, "identity"]
+
+
+def test_root_swap_after_cycle_check_is_fatal_before_maintenance_or_claim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    source = tmp_path / "download"
+    source.mkdir()
+    root = tmp_path / "library"
+    replacement = tmp_path / "replacement"
+    detached = tmp_path / "detached-library"
+    for candidate in (root, replacement):
+        current = candidate / "current"
+        (current / "acquisitions").mkdir(parents=True)
+        (current / "artwork").mkdir()
+        (candidate / ".h2hdb-coordination").mkdir()
+    adapter = ManagedFilesystemLibraryAdapter(
+        root,
+        source_root=source,
+        render_policy=ArtifactRenderPolicy(),
+        page_render_workers=1,
+    )
+    real_ensure = adapter.ensure_storage_identity
+    calls = 0
+
+    def ensure_then_swap() -> LibraryStorageIdentity:
+        nonlocal calls
+        identity = real_ensure()
+        calls += 1
+        if calls == 2:
+            root.rename(detached)
+            replacement.rename(root)
+        return identity
+
+    monkeypatch.setattr(adapter, "ensure_storage_identity", ensure_then_swap)
+    facade = _Facade(events, available=False)
+    resident = ResidentIngestor(
+        service=_Service(events),
+        facade=cast(VNextIngestFacade, facade),
+        database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
+        library_storage_identity=adapter,
+        library_maintenance=adapter,
+        config=ResidentConfig(
+            periodic_scan_seconds=60,
+            poll_seconds=1,
+            lease_seconds=10,
+            heartbeat_seconds=5,
+        ),
+        database_type="sqlite",
+        artifact_release_adapters={adapter.adapter_id: adapter},
+        event_logger=lambda message: events.append(("log", message)),
+    )
+    resident.initialize()
+    initialized_events = list(events)
+
+    with pytest.raises(
+        LibraryStorageIdentityMismatchError,
+        match="root changed after its storage identity was pinned",
+    ):
+        resident.process_available(periodic_scan=True)
+
+    assert calls == 2
+    assert events == initialized_events
+    assert not (root / ".h2hdb-state").exists()
+    assert not tuple(root.rglob("*.cbz"))
+    with pytest.raises(RuntimeError, match="must initialize"):
+        resident.process_available(periodic_scan=True)
+    assert events == initialized_events
+
+
+def test_storage_mismatch_from_current_only_maintenance_is_not_best_effort() -> None:
+    events: list[object] = []
+    storage_uuid = bytes.fromhex("00000000000040008000000000000001")
+
+    class _MismatchDuringMaintenanceFacade(_Facade):
+        def __init__(self) -> None:
+            super().__init__(events)
+            self._attempt = 0
+
+        def drain_current_only_maintenance(
+            self,
+            lease_duration_microseconds: int,
+            *,
+            artifact_release_adapters: object,
+        ) -> VNextCurrentOnlyMaintenanceOutcome:
+            self._attempt += 1
+            if self._attempt == 2:
+                raise LibraryStorageIdentityMismatchError("replacement root")
+            return super().drain_current_only_maintenance(
+                lease_duration_microseconds,
+                artifact_release_adapters=artifact_release_adapters,
+            )
+
+    facade = _MismatchDuringMaintenanceFacade()
+    resident = ResidentIngestor(
+        service=_Service(events),
+        facade=cast(VNextIngestFacade, facade),
+        database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
+        library_storage_identity=_StorageIdentity(events, storage_uuid),
+        library_maintenance=_LibraryMaintenance(),
+        config=ResidentConfig(
+            periodic_scan_seconds=60,
+            poll_seconds=1,
+            lease_seconds=10,
+            heartbeat_seconds=5,
+        ),
+        database_type="sqlite",
+        artifact_release_adapters={},
+        event_logger=lambda message: events.append(("log", message)),
+    )
+    resident.initialize()
+
+    with pytest.raises(LibraryStorageIdentityMismatchError, match="replacement root"):
+        resident.process_available(periodic_scan=True)
+
+    assert not any(event[0] == "claim" for event in events if isinstance(event, tuple))
+    with pytest.raises(RuntimeError, match="must initialize"):
+        resident.process_available(periodic_scan=True)
+
+
+def test_storage_identity_is_rechecked_after_maintenance_before_claim() -> None:
+    events: list[object] = []
+    first_uuid = bytes.fromhex("00000000000040008000000000000001")
+    replacement_uuid = bytes.fromhex("00000000000040008000000000000002")
+    identities = iter(
+        (
+            LibraryStorageIdentity(first_uuid),
+            LibraryStorageIdentity(first_uuid),
+            LibraryStorageIdentity(replacement_uuid),
+        )
+    )
+
+    class _ReplacementAfterMaintenance:
+        def ensure_storage_identity(self) -> LibraryStorageIdentity:
+            events.append("identity")
+            return next(identities)
+
+    resident = _resident(
+        events,
+        library_storage_identity=_ReplacementAfterMaintenance(),
+    )
+    resident.initialize()
+
+    with pytest.raises(
+        LibraryStorageIdentityMismatchError,
+        match="changed after binding",
+    ):
+        resident.process_available(periodic_scan=True)
+
+    assert not any(event[0] == "claim" for event in events if isinstance(event, tuple))
 
 
 def test_storage_binding_mismatch_prevents_maintenance_and_claim() -> None:

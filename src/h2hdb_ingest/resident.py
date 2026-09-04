@@ -22,7 +22,11 @@ from h2hdb import (
 )
 
 from .config import ResidentConfig
-from .library_identity import LibraryStorageIdentity, LibraryStorageIdentityProvider
+from .library_identity import (
+    LibraryStorageIdentity,
+    LibraryStorageIdentityMismatchError,
+    LibraryStorageIdentityProvider,
+)
 from .maintenance import (
     LibraryMaintenanceAdapter,
     LibraryMaintenanceOutcome,
@@ -162,6 +166,9 @@ class ResidentIngestor:
             return _ResidentCycleOutcome.IDLE
         if database_maintenance is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED:
             return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
+        self._require_current_storage_identity()
+        if should_stop is not None and should_stop():
+            return _ResidentCycleOutcome.IDLE
         claimed = self._facade.try_claim_ingest(periodic_scan, lease_duration)
         if claimed is None:
             return _ResidentCycleOutcome.IDLE
@@ -292,7 +299,9 @@ class ResidentIngestor:
             raise
         if observed != expected:
             self._storage_instance_ready = False
-            raise RuntimeError("library storage instance changed after binding")
+            raise LibraryStorageIdentityMismatchError(
+                "library storage instance changed after binding"
+            )
 
     def _try_library_maintenance(
         self,
@@ -301,6 +310,9 @@ class ResidentIngestor:
 
         try:
             return self._run_library_maintenance()
+        except LibraryStorageIdentityMismatchError:
+            self._storage_instance_ready = False
+            raise
         except Exception:
             logger.exception("library maintenance attempt failed")
             return None
@@ -325,6 +337,9 @@ class ResidentIngestor:
                 duration,
                 artifact_release_adapters=self._artifact_release_adapters,
             )
+        except LibraryStorageIdentityMismatchError:
+            self._storage_instance_ready = False
+            raise
         except Exception:
             # The ingest receipt is already durable when this is called after
             # completion.  Maintenance is response-loss safe and the resident

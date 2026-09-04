@@ -11,12 +11,15 @@ closed runtime rejects later work.
 
 For a CBZ-enabled runtime, startup must also pass the ordered database check,
 local durable UUID read, and immutable core binding before either maintenance
-or writer work is allowed. Every later cycle rechecks that same local UUID; a
-startup mismatch or later root replacement remains blocked under retry.
+or writer work is allowed. The filesystem adapter pins both that logical UUID
+and the observed root identity. Every later operation boundary must match the
+exact pair; changing either member fails closed and remains blocked under
+retry.
 
 These theorems are mathematical statements about the functions below. They do
 not prove Python lock or context-manager behavior, exception unwinding, signal
-delivery, core cache cleanup, object lifetime, or that `build_runtime` and the
+delivery, core cache cleanup, object lifetime, a root replacement between one
+successful guard and its next POSIX syscall, or that `build_runtime` and the
 two CLI implementations refine the model. Runtime, concurrency, construction-
 fault, and CLI tests remain required evidence for those boundaries.
 -/
@@ -166,6 +169,59 @@ theorem replaced_root_is_rejected_before_maintenance_and_work :
     verifyCycleIdentity false state = .mismatch ∧
       runMaintenance (verifyCycleIdentity false state) = .rejected ∧
       runWriterWork (verifyCycleIdentity false state) = .rejected := by
+  decide
+
+structure StorageObservation where
+  storageUuid : Nat
+  rootIdentity : Nat
+deriving DecidableEq, Repr
+
+inductive StorageGuardState where
+  | pinned (expected : StorageObservation)
+  | mismatch
+deriving DecidableEq, Repr
+
+def verifyPinnedStorage (observed : StorageObservation) :
+    StorageGuardState → StorageGuardState
+  | .pinned expected =>
+      if observed = expected then .pinned expected else .mismatch
+  | .mismatch => .mismatch
+
+def runGuardedWrite : StorageGuardState → WriterResult
+  | .pinned _ => .allowed
+  | .mismatch => .rejected
+
+theorem exact_pinned_storage_pair_preserves_write_authority
+    (expected : StorageObservation) :
+    runGuardedWrite (verifyPinnedStorage expected (.pinned expected)) =
+      .allowed := by
+  simp [verifyPinnedStorage, runGuardedWrite]
+
+theorem same_uuid_different_root_is_rejected :
+    let expected : StorageObservation := ⟨1, 10⟩
+    let replacement : StorageObservation := ⟨1, 20⟩
+    verifyPinnedStorage replacement (.pinned expected) = .mismatch ∧
+      runGuardedWrite (verifyPinnedStorage replacement (.pinned expected)) =
+        .rejected := by
+  decide
+
+theorem same_root_different_uuid_is_rejected :
+    let expected : StorageObservation := ⟨1, 10⟩
+    let corrupted : StorageObservation := ⟨2, 10⟩
+    verifyPinnedStorage corrupted (.pinned expected) = .mismatch ∧
+      runGuardedWrite (verifyPinnedStorage corrupted (.pinned expected)) =
+        .rejected := by
+  decide
+
+theorem pinned_storage_mismatch_remains_blocked_under_retry :
+    let expected : StorageObservation := ⟨1, 10⟩
+    let replacement : StorageObservation := ⟨1, 20⟩
+    verifyPinnedStorage expected
+        (verifyPinnedStorage replacement (.pinned expected)) = .mismatch ∧
+      runGuardedWrite
+          (verifyPinnedStorage expected
+            (verifyPinnedStorage replacement (.pinned expected))) =
+        .rejected := by
   decide
 
 inductive FacadeOwnership where
