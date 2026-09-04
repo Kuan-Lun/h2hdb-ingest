@@ -141,6 +141,7 @@ def build_runtime(
             library_maintenance=library_maintenance,
             config=config.resident,
             database_type=config.core.database.sql_type,
+            artifact_release_adapters=finalization_adapters,
             event_logger=runtime_event_logger,
         )
         return IngestRuntime(facade, database_admin, catalog, resident)

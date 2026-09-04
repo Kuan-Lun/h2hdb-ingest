@@ -29,7 +29,10 @@ from h2hdb import (
 import h2hdb_ingest.library as library_module
 from h2hdb_ingest.artifact import ArtifactRenderPolicy
 from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
-from h2hdb_ingest.maintenance import LibraryMaintenanceOutcome
+from h2hdb_ingest.maintenance import (
+    LibraryMaintenanceOutcome,
+    _LibraryStagingSlotConflictError,
+)
 from h2hdb_ingest.storage import acquisition_storage_key, thumbnail_storage_key
 
 _MODIFIED_AT = datetime(2026, 1, 1, tzinfo=UTC)
@@ -2381,6 +2384,38 @@ def test_pending_partial_staging_release_tombstones_and_fences_delayed_protect(
         token,
     ).stored
     assert not list((root / ".h2hdb-state" / "staging").iterdir())
+
+
+def test_staging_slot_conflict_preserves_owner_until_release(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    adapter = _adapter(root)
+    item = _item(177, b"payload")
+    first_token = _protect(adapter, item, b"payload", 177)
+    staging = root / ".h2hdb-state" / "staging"
+    before = {
+        path.name: path.read_bytes() for path in staging.iterdir() if path.is_file()
+    }
+
+    with pytest.raises(_LibraryStagingSlotConflictError, match="another protection"):
+        adapter.protect(
+            BytesIO(b"payload"),
+            item.storage_key,
+            item.artifact_sha256,
+            item.size_bytes,
+            item.storage_object.modified_at,
+            b"z" * 32,
+        )
+
+    assert {
+        path.name: path.read_bytes() for path in staging.iterdir() if path.is_file()
+    } == before
+    assert adapter.release(
+        item.storage_key,
+        item.artifact_sha256,
+        item.size_bytes,
+        first_token,
+    ).released
+    assert _protect(adapter, item, b"payload", ord("z")) == b"z" * 32
 
 
 @pytest.mark.parametrize("boundary", ("before-unlink", "unlink-return-lost"))

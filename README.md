@@ -308,6 +308,18 @@ retry step. A stop or adapter error before that point propagates without
 reporting synchronization success, and the next claim resumes from the durable
 boundary.
 
+If a process stops before the database commit but after protecting artifact
+bytes, a later policy takeover can leave an unpublished predecessor in private
+staging. The resident passes the same filesystem adapter to core maintenance,
+which terminally tombstones and removes those exact predecessor resources in
+single-resource attempts. If a successor first encounters the same staging
+destination, that collision is bounded backpressure: the resident completes
+the current session, performs the release under the exclusive maintenance
+gate, and resumes the durable successor on the next poll. Reader-visible
+`current/` bytes are not part of orphan release. Resources removed or replaced
+by a successfully published successor are still deleted by the normal exact
+activation reconciliation.
+
 ## Common startup failures
 
 - **`download_path is empty`**: check that the download volume is mounted.

@@ -5,7 +5,9 @@ from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from shutil import rmtree
+from time import time_ns
 from typing import cast
+from unittest.mock import patch
 from zipfile import ZipFile
 
 import pytest
@@ -15,9 +17,16 @@ from h2hdb import (
     DatabaseConfig,
     GalleryStagingCapacityError,
     VNextCurrentOnlyMaintenanceOutcome,
+    VNextIngestAdvanceResult,
+    VNextIngestFacade,
+    VNextIngestSession,
+    VNextIssuedPublicationStep,
+    VNextPreparedPublicationStep,
+    VNextResolvedIngestPolicy,
 )
 from PIL import Image
 
+import h2hdb_ingest.runtime as runtime_module
 from h2hdb_ingest import (
     ArtifactRenderPolicyConfig,
     IngestConfig,
@@ -133,6 +142,7 @@ def test_capacity_backpressure_releases_real_core_session_for_retry(
         library_maintenance=_DoneLibraryMaintenance(),
         config=config.resident,
         database_type=config.core.database.sql_type,
+        artifact_release_adapters={},
     )
 
     assert not resident.process_available(periodic_scan=True)
@@ -504,6 +514,184 @@ def test_restart_recovers_durable_publication_before_applying_new_policy(
     assert current_page != old_policy_page
     assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
     restarted.close()
+
+
+class _SimulatedProcessLoss(RuntimeError):
+    pass
+
+
+def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "download"
+    _gallery(source, 1901, "artist")
+    Image.new("RGB", (8, 12), "red").save(source / "1901" / "001.jpg")
+    library_root = tmp_path / "library"
+    _provision_library_root(library_root)
+    current_root = library_root / "current"
+    staging = library_root / ".h2hdb-state" / "staging"
+    core = CoreConfig(
+        database=DatabaseConfig(
+            sql_type="sqlite",
+            database=str(tmp_path / "catalog.sqlite3"),
+        )
+    )
+    clock_offset = [0]
+
+    def build_facade(config: CoreConfig) -> VNextIngestFacade:
+        return VNextIngestFacade(
+            config,
+            clock=lambda: time_ns() // 1_000 + clock_offset[0],
+        )
+
+    monkeypatch.setattr(runtime_module, "VNextIngestFacade", build_facade)
+    base_config = IngestConfig(
+        core=core,
+        paths=IngestPathsConfig(
+            download_path=source,
+            library_path=library_root,
+        ),
+        resident=ResidentConfig(lease_seconds=30, heartbeat_seconds=5),
+    )
+
+    def current_files() -> dict[Path, bytes]:
+        return {
+            path.relative_to(current_root): path.read_bytes()
+            for path in current_root.rglob("*")
+            if path.is_file()
+        }
+
+    initial = build_runtime(base_config)
+    try:
+        initial.database_admin.initialize()
+        initial.resident.initialize()
+        for _attempt in range(16):
+            assert initial.resident.process_available(periodic_scan=True)
+            try:
+                initial_revision = initial.catalog.get_catalog_revision()
+            except CatalogRevisionNotFoundError:
+                continue
+            if initial_revision.publication_count == 1:
+                break
+        else:
+            raise AssertionError("initial current publication did not converge")
+        initial_current = current_files()
+        assert initial_current
+    finally:
+        initial.close()
+
+    Image.new("RGB", (8, 12), "blue").save(source / "1901" / "001.jpg")
+    abandoned_config = base_config.model_copy(
+        update={
+            "paths": base_config.paths.model_copy(
+                update={
+                    "render_policy": ArtifactRenderPolicyConfig(page_jpeg_quality=85)
+                }
+            )
+        }
+    )
+    abandoned = build_runtime(abandoned_config)
+    abandoned.resident.initialize()
+    original_issue = VNextIngestFacade.issue_publication_step
+    original_commit = VNextIngestFacade.commit_publication_step
+    issued_operation = [""]
+    protection_committed = [False]
+
+    def record_issued_operation(
+        facade: VNextIngestFacade,
+        session: VNextIngestSession,
+        policy: VNextResolvedIngestPolicy,
+    ) -> VNextIssuedPublicationStep:
+        if protection_committed[0]:
+            raise _SimulatedProcessLoss
+        issued = original_issue(facade, session, policy)
+        issued_operation[0] = issued.operation
+        return issued
+
+    def record_protection_commit(
+        facade: VNextIngestFacade,
+        session: VNextIngestSession,
+        prepared: VNextPreparedPublicationStep,
+    ) -> VNextIngestAdvanceResult:
+        result = original_commit(facade, session, prepared)
+        if issued_operation[0] == "PREPARE_ARTIFACT" and any(
+            path.is_file() for path in staging.rglob("*")
+        ):
+            protection_committed[0] = True
+        return result
+
+    try:
+        with (
+            patch.object(
+                VNextIngestFacade,
+                "issue_publication_step",
+                record_issued_operation,
+            ),
+            patch.object(
+                VNextIngestFacade,
+                "commit_publication_step",
+                record_protection_commit,
+            ),
+            pytest.raises(_SimulatedProcessLoss),
+        ):
+            for _attempt in range(16):
+                abandoned.resident.process_available(periodic_scan=True)
+    finally:
+        abandoned.close()
+    assert any(path.is_file() for path in staging.rglob("*"))
+    assert current_files() == initial_current
+
+    clock_offset[0] = 100_000_000
+    successor_config = abandoned_config.model_copy(
+        update={
+            "paths": abandoned_config.paths.model_copy(
+                update={
+                    "render_policy": ArtifactRenderPolicyConfig(page_jpeg_quality=75)
+                }
+            )
+        }
+    )
+    restarted = build_runtime(successor_config)
+    try:
+        restarted.resident.initialize()
+
+        # Bounded preliminary maintenance may need several polls before the
+        # successor encounters the predecessor's slot and releases it under
+        # EXCLUSIVE maintenance.  Until that release completes, the already
+        # published current must remain byte-exact.
+        for _attempt in range(32):
+            assert restarted.resident.process_available(periodic_scan=True)
+            assert restarted.catalog.get_catalog_revision() == initial_revision
+            assert current_files() == initial_current
+            if not any(path.is_file() for path in staging.rglob("*")):
+                break
+        else:
+            raise AssertionError("abandoned artifact staging was not released")
+
+        for _attempt in range(32):
+            assert restarted.resident.process_available(periodic_scan=True)
+            revision = restarted.catalog.get_catalog_revision()
+            if revision.revision > initial_revision.revision:
+                break
+        else:
+            raise AssertionError("policy takeover did not publish after orphan cleanup")
+        current_before_cleanup = current_files()
+        assert current_before_cleanup
+        assert current_before_cleanup != initial_current
+
+        for _attempt in range(32):
+            if not restarted.resident.process_available(periodic_scan=False):
+                break
+        else:
+            raise AssertionError("resident maintenance did not converge")
+
+        assert not any(path.is_file() for path in staging.rglob("*"))
+        assert current_files() == current_before_cleanup
+        assert restarted.catalog.get_catalog_revision().publication_count == 1
+        assert restarted.database_admin.check().state == "READY"
+    finally:
+        restarted.close()
 
 
 def test_deleted_gallery_reconciles_catalog_library_and_historical_cleanup(

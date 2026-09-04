@@ -53,7 +53,7 @@ from .artifact import (
     render_archive,
     render_presentation,
 )
-from .maintenance import LibraryMaintenanceOutcome
+from .maintenance import LibraryMaintenanceOutcome, _LibraryStagingSlotConflictError
 from .metrics import IngestMetricSink
 from .page_workers import resolve_page_render_workers
 from .storage import (
@@ -513,6 +513,20 @@ class ManagedFilesystemLibraryAdapter:
                         size=size_bytes,
                     )
             else:
+                conflicting = connection.execute(
+                    "SELECT token FROM protection_tokens WHERE storage_path = ? "
+                    "AND state IN ('WRITING', 'STAGED') LIMIT 1",
+                    (_key_text(key),),
+                ).fetchone()
+                if conflicting is not None:
+                    if len(conflicting) != 1:
+                        raise RuntimeError(
+                            "artifact staging conflict has an invalid shape"
+                        )
+                    _token(bytes(conflicting[0]))
+                    raise _LibraryStagingSlotConflictError(
+                        "another protection token owns the artifact staging target"
+                    )
                 connection.execute("BEGIN IMMEDIATE")
                 try:
                     connection.execute(

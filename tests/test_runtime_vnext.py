@@ -179,15 +179,16 @@ def test_artifact_disabled_runtime_uses_a_terminal_noop_library(
 ) -> None:
     config = IngestConfig(paths=IngestPathsConfig(download_path=_source_root(tmp_path)))
 
-    service = build_runtime(config).resident._service
+    with build_runtime(config) as runtime:
+        service = runtime.resident._service
 
-    assert isinstance(service, VNextIngestService)
-    assert service._artifact_adapters == {}
-    assert service._finalization_adapters == {}
-    checkpoint = service._library_activation.begin(3, b"r" * 16)
-    assert checkpoint.revision == 3
-    assert checkpoint.receipt_id == b"r" * 16
-    assert checkpoint.status is LibraryActivationStatus.COMPLETE
+        assert isinstance(service, VNextIngestService)
+        assert service._artifact_adapters == {}
+        assert service._finalization_adapters == {}
+        checkpoint = service._library_activation.begin(3, b"r" * 16)
+        assert checkpoint.revision == 3
+        assert checkpoint.receipt_id == b"r" * 16
+        assert checkpoint.status is LibraryActivationStatus.COMPLETE
 
 
 def test_cbz_runtime_shares_one_adapter_for_protection_and_release(
@@ -202,13 +203,19 @@ def test_cbz_runtime_shares_one_adapter_for_protection_and_release(
         )
     )
 
-    service = build_runtime(config).resident._service
+    with build_runtime(config) as runtime:
+        service = runtime.resident._service
 
-    assert isinstance(service, VNextIngestService)
-    storage = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
-    assert id(service._finalization_adapters[ARTIFACT_ADAPTER_ID]) == id(storage)
-    assert isinstance(service._library_activation, ManagedFilesystemLibraryAdapter)
-    assert service._publication_guard == service._library_activation.publication_guard
+        assert isinstance(service, VNextIngestService)
+        storage = service._artifact_adapters[ARTIFACT_ADAPTER_ID]
+        assert id(service._finalization_adapters[ARTIFACT_ADAPTER_ID]) == id(storage)
+        assert id(
+            runtime.resident._artifact_release_adapters[ARTIFACT_ADAPTER_ID]
+        ) == id(storage)
+        assert isinstance(service._library_activation, ManagedFilesystemLibraryAdapter)
+        assert (
+            service._publication_guard == service._library_activation.publication_guard
+        )
 
 
 def test_runtime_passes_effective_render_policy_and_one_metric_sink_to_adapter(

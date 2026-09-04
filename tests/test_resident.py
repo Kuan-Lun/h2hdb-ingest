@@ -18,7 +18,10 @@ from h2hdb import (
 
 import h2hdb_ingest.resident as resident_module
 from h2hdb_ingest import ResidentConfig
-from h2hdb_ingest.maintenance import LibraryMaintenanceOutcome
+from h2hdb_ingest.maintenance import (
+    LibraryMaintenanceOutcome,
+    _LibraryStagingSlotConflictError,
+)
 from h2hdb_ingest.resident import IngestSynchronizer, ResidentIngestor
 from h2hdb_ingest.session import IngestSessionController
 
@@ -77,7 +80,10 @@ class _Facade:
     def drain_current_only_maintenance(
         self,
         lease_duration_microseconds: int,
+        *,
+        artifact_release_adapters: object,
     ) -> VNextCurrentOnlyMaintenanceOutcome:
+        del artifact_release_adapters
         self._events.append(("current-only", lease_duration_microseconds))
         return next(
             self._maintenance_results,
@@ -166,6 +172,21 @@ class _StagingCapacityService:
         raise GalleryStagingCapacityError(1_500_000)
 
 
+class _StagingSlotConflictService:
+    def __init__(self, events: list[object]) -> None:
+        self._events = events
+
+    def synchronize_once(
+        self,
+        session: IngestSessionController,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> object:
+        del session, should_stop
+        self._events.append("synchronize")
+        raise _LibraryStagingSlotConflictError("stale staging owner")
+
+
 class _Heartbeat:
     def __init__(
         self,
@@ -212,6 +233,7 @@ def _resident(
             heartbeat_seconds=5,
         ),
         database_type="sqlite",
+        artifact_release_adapters={},
         event_logger=lambda message: events.append(("log", message)),
     )
 
@@ -479,6 +501,56 @@ def test_staging_capacity_reports_library_cleanup_progress(
     ]
 
 
+def test_staging_slot_conflict_waits_for_contended_cleanup_instead_of_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    resident = _resident(
+        events,
+        service=_StagingSlotConflictService(events),
+        maintenance_results=(
+            VNextCurrentOnlyMaintenanceOutcome.DONE,
+            VNextCurrentOnlyMaintenanceOutcome.CONTENDED,
+        ),
+    )
+
+    assert not resident.process_available(periodic_scan=True)
+    assert events == [
+        ("current-only", 10_000_000),
+        ("claim", True, 10_000_000),
+        "synchronize",
+        ("complete", 2),
+        ("current-only", 10_000_000),
+    ]
+
+
+def test_staging_slot_conflict_fails_when_core_has_no_matching_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    resident = _resident(
+        events,
+        service=_StagingSlotConflictService(events),
+        maintenance_results=(
+            VNextCurrentOnlyMaintenanceOutcome.DONE,
+            VNextCurrentOnlyMaintenanceOutcome.DONE,
+        ),
+    )
+
+    with pytest.raises(_LibraryStagingSlotConflictError, match="stale staging owner"):
+        resident.process_available(periodic_scan=True)
+
+    assert events == [
+        ("current-only", 10_000_000),
+        ("claim", True, 10_000_000),
+        "synchronize",
+        ("complete", 2),
+        ("current-only", 10_000_000),
+    ]
+
+
 def test_staging_capacity_preserves_completion_failure_as_note(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -506,6 +578,7 @@ def test_staging_capacity_preserves_completion_failure_as_note(
             heartbeat_seconds=5,
         ),
         database_type="sqlite",
+        artifact_release_adapters={},
         event_logger=lambda message: events.append(("log", message)),
     )
 
@@ -556,12 +629,18 @@ def test_maintenance_failure_does_not_undo_completed_ingest(
             self._attempt = 0
 
         def drain_current_only_maintenance(
-            self, lease_duration_microseconds: int
+            self,
+            lease_duration_microseconds: int,
+            *,
+            artifact_release_adapters: object,
         ) -> VNextCurrentOnlyMaintenanceOutcome:
             self._attempt += 1
             if self._attempt == 2:
                 raise RuntimeError("maintenance unavailable")
-            return super().drain_current_only_maintenance(lease_duration_microseconds)
+            return super().drain_current_only_maintenance(
+                lease_duration_microseconds,
+                artifact_release_adapters=artifact_release_adapters,
+            )
 
     monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
     resident = ResidentIngestor(
@@ -576,6 +655,7 @@ def test_maintenance_failure_does_not_undo_completed_ingest(
             heartbeat_seconds=5,
         ),
         database_type="sqlite",
+        artifact_release_adapters={},
         event_logger=lambda message: events.append(("log", message)),
     )
 

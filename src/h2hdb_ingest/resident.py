@@ -5,13 +5,14 @@ from __future__ import annotations
 __all__ = ["IngestSynchronizer", "ResidentIngestor"]
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from enum import StrEnum
 from threading import Event
 from time import monotonic
 from typing import Protocol
 
 from h2hdb import (
+    ArtifactReleaseAdapter,
     GalleryStagingCapacityError,
     SchemaEpochReport,
     VNextCurrentOnlyMaintenanceOutcome,
@@ -24,6 +25,7 @@ from .config import ResidentConfig
 from .maintenance import (
     LibraryMaintenanceAdapter,
     LibraryMaintenanceOutcome,
+    _LibraryStagingSlotConflictError,
 )
 from .service import _IngestStopRequested
 from .session import IngestLeaseHeartbeat, IngestSessionController
@@ -58,6 +60,7 @@ class ResidentIngestor:
         library_maintenance: LibraryMaintenanceAdapter,
         config: ResidentConfig,
         database_type: str,
+        artifact_release_adapters: Mapping[bytes, ArtifactReleaseAdapter],
         event_logger: Callable[[str], None] | None = None,
     ) -> None:
         self._service = service
@@ -71,6 +74,9 @@ class ResidentIngestor:
                 "library_maintenance must implement the bounded maintenance protocol"
             )
         self._library_maintenance = library_maintenance
+        if not isinstance(artifact_release_adapters, Mapping):
+            raise TypeError("artifact_release_adapters must be a mapping")
+        self._artifact_release_adapters = dict(artifact_release_adapters)
         self._config = config
         self._database_type = database_type.casefold()
         self._event_logger = event_logger or logger.info
@@ -168,6 +174,29 @@ class ResidentIngestor:
                 "vNext ingest stopped at a durable bounded-step boundary"
             )
             return _ResidentCycleOutcome.IDLE
+        except _LibraryStagingSlotConflictError as error:
+            # A crashed predecessor can retain the same destination until the
+            # new policy makes that candidate inactive.  Release this
+            # session's SHARED gate, reconcile the predecessor under
+            # EXCLUSIVE, and let the next poll resume the durable new work.
+            try:
+                session.complete()
+            except BaseException as completion_error:
+                error.add_note(
+                    "The ingest session could not be completed after a stale "
+                    f"artifact staging conflict: {completion_error!r}"
+                )
+                raise error from completion_error
+            library_maintenance = self._try_library_maintenance()
+            database_maintenance = self._try_current_only_maintenance(lease_duration)
+            if (
+                library_maintenance is LibraryMaintenanceOutcome.PROGRESSED
+                or database_maintenance is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED
+            ):
+                return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
+            if database_maintenance is VNextCurrentOnlyMaintenanceOutcome.DONE:
+                raise error
+            return _ResidentCycleOutcome.IDLE
         except GalleryStagingCapacityError as error:
             # Capacity is bounded backpressure, not a failed resident process.
             # The rejected request committed no rows, while completing the
@@ -241,7 +270,10 @@ class ResidentIngestor:
         if duration is None:
             duration = self._config.lease_seconds * 1_000_000
         try:
-            return self._facade.drain_current_only_maintenance(duration)
+            return self._facade.drain_current_only_maintenance(
+                duration,
+                artifact_release_adapters=self._artifact_release_adapters,
+            )
         except Exception:
             # The ingest receipt is already durable when this is called after
             # completion.  Maintenance is response-loss safe and the resident

@@ -11,6 +11,10 @@ from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
 
+class _LibraryStagingSlotConflictError(RuntimeError):
+    """Another protection token temporarily owns the same staging target."""
+
+
 class LibraryMaintenanceOutcome(StrEnum):
     """Result of one bounded private-library cleanup action."""
 
