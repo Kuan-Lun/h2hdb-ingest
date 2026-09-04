@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-03T23:11:26+00:00",
-  "manifest_sha256": "0fcb2eb5823f0cde02d54d8be6b64ba6993b0991e95b4f80a50f18818be1a3af",
+  "checked_at": "2026-09-04T09:09:58+00:00",
+  "manifest_sha256": "c4c6026b604e81915c8fd35026cc4ed361fcec683210ac9dc7d7a70751eec8e4",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.12.0",
+  "project_version": "0.13.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,7 +30,7 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.30.0,<0.31.0",
+      "declared": "h2hdb>=0.30.1,<0.31.0",
       "group": "runtime",
       "latest": "0.29.0",
       "latest_satisfies": false,
@@ -130,7 +130,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed every direct build, runtime, optional development, and Node dependency for h2hdb-ingest 0.12.0. The h2hdb compatibility lane is intentionally >=0.30.0,<0.31.0 because core merge 94ad7b8e697bb269d47fbe043b33b7de317333b7 changes the generated schema and recovery contract; 0.29.x databases are rejected and must be rebuilt from empty. Cross-repository verification uses final h2hdb 0.30.0 wheel SHA-256 5710c90cd5198dfb7e4c742d758af5ec684e61e19b949c6a09447485745bc722 from installed site-packages. Registry candidates were reviewed and the repository gates exercise the resolved Python 3.14 environment.",
+    "note": "Reviewed every direct build, runtime, optional development, and Node dependency for h2hdb-ingest 0.13.0. The h2hdb lower bound is intentionally raised to >=0.30.1,<0.31.0 because Resident now passes the maintenance release-adapter registry; registry 0.29.0 is older than this unpublished cross-repository contract. The exact locally built h2hdb 0.30.1 wheel SHA-256 6095f22eeae70603f3893d6463f998673e5e741daddcd466184fcf1be65ee414 was imported from an isolated target and passed 36 focused ingest tests. Every other registry latest satisfies its range. Ruff 0.16.6 release notes were reviewed and explicit lint plus formatter checks pass, so no additional bound changes are required.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
