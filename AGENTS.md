@@ -117,15 +117,18 @@
 - `scripts/check-fast.sh`：離線、唯讀的 Ruff、format check、mypy 與
   markdownlint；每次非 merge commit 執行。
 - `scripts/run-pytest.py merge`：以 auto-xdist 執行 `not deep`，包含 collection、
-  execution、teardown 與 process-group cleanup 的總時間上限為 300 秒；不得啟動
-  live MariaDB 或 private corpus。`scripts/check-pytest-deep.sh` 是明確手動、
-  不限時的 deep 入口。
+  execution、teardown 與 owned process-tree cleanup 的 absolute 總時間上限為
+  300 秒；不得啟動 live MariaDB 或 private corpus。POSIX 使用新 session/process
+  group；Windows 必須在 start gate 開啟前把 supervisor 放入 kill-on-close Job
+  Object，`taskkill /T` 只可作為 Job termination 失敗的 bounded fallback。
+  `scripts/check-pytest-deep.sh` 是明確手動、不限時的 deep 入口。
 - `scripts/check-full.sh`：fast gate、上述 bounded pytest merge profile、build、
   wheel smoke 及本 repository 的特殊檢查；整合候選只跑一次。
 - dependency audit 可連網，但 hooks 只驗證本機 receipt，不在 commit
   過程連網。
 - GitHub Actions 只呼叫相同 scripts，並保留 trusted publishing、平台特有
-  或本機無法可靠重現的檢查。
+  或本機無法可靠重現的檢查。Windows Job Object、console break、強制 parent
+  exit 與真實 descendant cleanup 由獨立 `windows-latest` target 驗證。
 - 不使用 Claude、Codex 或其他 provider-specific Stop hooks 重複檢查。
 
 ## 測試與例外

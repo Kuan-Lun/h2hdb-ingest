@@ -17,6 +17,24 @@ permissions:
   contents: read
 
 jobs:
+  windows-pytest-process-supervision:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install isolated pytest runtime
+        run: python -m pip install pytest==9.1.1
+
+      - name: Verify Windows Job Object process-tree ownership
+        run: >-
+          python -m pytest -o addopts= -o required_plugins=
+          -q tests/test_pytest_budget_runner_windows.py
+
   incremental-reference-properties:
     runs-on: ubuntu-latest
     steps:
