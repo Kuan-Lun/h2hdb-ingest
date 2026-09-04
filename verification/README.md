@@ -16,7 +16,9 @@ This directory contains executable specifications owned by filesystem ingest.
   idempotent, two linearized callers delegate close once, every modeled CLI
   exit kind reaches closed state, entered/closed runtimes reject reentry,
   closed runtimes reject work, and a partially built runtime closes its owned
-  facade.
+  facade. Its storage section separately proves that write authority requires
+  the exact pinned UUID/root-identity pair, that changing either member is
+  rejected, and that a mismatch remains blocked under retry.
 - `lean/GalleryIndexReuse.lean` proves that exact immutable-index capture keeps
   every keyset page and deterministic downstream result equal to legacy source
   selection, that an exact changed boundary is rejected, and that the abstract
@@ -48,6 +50,11 @@ This directory contains executable specifications owned by filesystem ingest.
   activation entry. Its single-object `PROTECT` gate corresponds to one
   bounded runtime token-lock stripe; unrelated stripes remain concurrent and
   are outside this model.
+- `tla/PytestProcessSupervision.tla` model-checks the repository test runner's
+  start gate, ownership-before-start ordering, normal exit with a surviving
+  descendant, timeout and interruption cleanup, termination and `taskkill`
+  failure, the fixed cleanup deadline, and the rule that another phase starts
+  only after an empty-tree receipt.
 
 The incremental Lean proof assumes collision-free canonical hash identities,
 deterministic policy/artifact functions, an exact evidence delta, exact shard
@@ -109,7 +116,24 @@ and CLI unwinding as an abstract bracketed exit. They do not prove Python
 signal delivery, core cache cleanup, destructor behavior, or production
 refinement. Deterministic concurrent-close, partial-construction fault, real
 core fail-after-close, and CLI exit-path tests provide those implementation
-checks.
+checks. The storage observation is likewise an operation-boundary abstraction:
+it does not prove that pathname identity cannot change between one successful
+guard and its next POSIX syscall. Real directory replacement, journal-UUID
+corruption, maintenance/claim-boundary, and fatal-propagation tests connect the
+modeled exact-pair decision to those named implementation seams.
+
+The pytest-supervision model treats Job termination, kill-on-close, POSIX group
+termination, and an empty-tree query as abstract transitions. It does not prove
+Win32 or POSIX kernel behavior, Python signal delivery, `taskkill`, or venv
+launcher behavior. Deterministic fake-clock/API tests refine exit and deadline
+decisions; the dedicated `windows-latest` process-tree matrix supplies the real
+Windows Job Object, console-break, forced-exit, descendant, and venv evidence.
+An exact `0`, timeout, or interrupt receipt requires a synchronous empty-tree
+query. The model's infrastructure-failure `125` path may instead rely on the
+documented Windows kill-on-last-Job-handle contract at runner process exit; it
+does not describe that fallback as an observed empty-tree receipt. A failed
+`CloseHandle` call likewise permits only `125`, after which operating-system
+process teardown remains the final handle owner.
 
 The gallery-index proofs use exact list equality for capture and boundary
 audits. Production uses canonical stat facts and SHA-256 plus independent exact

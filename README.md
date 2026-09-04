@@ -81,12 +81,16 @@ Do not pre-create `.h2hdb-state`; ingest creates and owns it. After operation,
 the private version-3 journal contains one immutable UUIDv4 for this library
 root. Startup stores the same UUID in h2hdb before any cleanup or ingest work;
 an exact restart is idempotent, while pairing the database with another root
-fails closed. A resident also rechecks the local UUID once at the start of each
-processing cycle. A replacement observed at that boundary fails before the
-cycle performs maintenance, claims, or CBZ work; this is not a continuously
-held mount-identity lock. There is no journal v2 migration or automatic
-database rebind; use a fresh database and rebuild when intentionally replacing
-the storage instance.
+fails closed. Within one process, the filesystem adapter pins both that UUID
+and the root directory's device/inode identity. It rechecks the pair at managed
+operation boundaries, and the resident checks again after maintenance before
+claiming work. A replacement observed at one of those boundaries is a fatal
+`LibraryStorageIdentityMismatchError`; when the replacement is already present
+at the guard, the adapter does not create a private layout there. This is not a
+continuously held mount lock and does not claim to stop an external actor
+swapping the path between one passed guard and its immediately following POSIX
+syscall. There is no journal v2 migration or automatic database rebind; use a
+fresh database and rebuild when intentionally replacing the storage instance.
 
 After operation,
 the complete layout is:
@@ -352,6 +356,14 @@ The project requires Python 3.14 and uses a repository-local environment:
 ./scripts/check-fast.sh
 ./scripts/check-full.sh
 ```
+
+The merge pytest runner owns the complete test process tree under one absolute
+300-second deadline. POSIX uses a new process group. Windows uses a start-gated,
+kill-on-close Job Object so a normally exiting pytest parent cannot leave an
+unobserved worker behind; a surviving child fails the gate even after cleanup.
+The repository's `windows-latest` target separately exercises real Job Object,
+console-break, forced-parent-exit, timeout, and venv-launch behavior without
+running the application or a live database.
 
 An explicit integration dependency can be supplied without relying on a
 sibling checkout:
