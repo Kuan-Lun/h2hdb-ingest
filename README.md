@@ -82,10 +82,11 @@ the private version-3 journal contains one immutable UUIDv4 for this library
 root. Startup stores the same UUID in h2hdb before any cleanup or ingest work;
 an exact restart is idempotent, while pairing the database with another root
 fails closed. A resident also rechecks the local UUID once at the start of each
-processing cycle, so replacing a mount while the process is running cannot
-reach maintenance, claim, or CBZ work. There is no journal v2 migration or
-automatic database rebind; use a fresh database and rebuild when intentionally
-replacing the storage instance.
+processing cycle. A replacement observed at that boundary fails before the
+cycle performs maintenance, claims, or CBZ work; this is not a continuously
+held mount-identity lock. There is no journal v2 migration or automatic
+database rebind; use a fresh database and rebuild when intentionally replacing
+the storage instance.
 
 After operation,
 the complete layout is:
