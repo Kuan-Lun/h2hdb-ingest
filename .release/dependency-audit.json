@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-04T12:08:36+00:00",
+  "checked_at": "2026-09-04T16:06:24+00:00",
   "manifest_sha256": "bc52e30e87884858fb1fad0788654318d2e1f63906677c5978eda0ff44314e67",
   "node": [
     {
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.14.0",
+  "project_version": "0.14.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -139,7 +139,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed every direct build, runtime, optional development, and Node dependency for h2hdb-ingest 0.14.0. The h2hdb compatibility lane is intentionally raised to >=0.31.0,<0.32.0 because CBZ-enabled startup requires the new immutable storage binding API and schema. Registry h2hdb remains older than this local coordinated candidate; the exact h2hdb 0.31.0 task tree passed SQLite, MariaDB 10.11.11, schema, Lean, and strict coverage checks and is supplied explicitly for ingest validation. pytest-xdist 3.8.0 is added only to make the bounded five-minute development gate parallel; all other registry latest versions were checked against their declared ranges.",
+    "note": "Reviewed every direct build, runtime, optional development, and Node dependency for h2hdb-ingest 0.14.1. Dependency declarations, manifest hash, and all registry latest candidates are unchanged from the reviewed 0.14.0 receipt. The installed validation environment already uses those latest satisfying candidates (including pydantic 2.13.5, build 1.6.0, hypothesis 6.167.1, packaging 26.3, and ruff 0.16.6), which the exact-tree gates exercise. The h2hdb lane deliberately remains >=0.31.0,<0.32.0; registry 0.29.0 is older and does not satisfy it, so coordinated validation uses the exact local h2hdb 0.31.0 primary tree. No dependency update is required by this storage fail-closed and test-supervision task.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
