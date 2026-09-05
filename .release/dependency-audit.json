@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-04T16:06:24+00:00",
-  "manifest_sha256": "bc52e30e87884858fb1fad0788654318d2e1f63906677c5978eda0ff44314e67",
+  "checked_at": "2026-09-05T07:22:21+00:00",
+  "manifest_sha256": "77c35e60d41989933659117a474fdab626fa6860b656e0f60c5667b39bda997f",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.14.1",
+  "project_version": "0.15.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,9 +30,9 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.31.0,<0.32.0",
+      "declared": "h2hdb>=0.32.0,<0.33.0",
       "group": "runtime",
-      "latest": "0.29.0",
+      "latest": "0.31.0",
       "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
@@ -139,7 +139,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed every direct build, runtime, optional development, and Node dependency for h2hdb-ingest 0.14.1. Dependency declarations, manifest hash, and all registry latest candidates are unchanged from the reviewed 0.14.0 receipt. The installed validation environment already uses those latest satisfying candidates (including pydantic 2.13.5, build 1.6.0, hypothesis 6.167.1, packaging 26.3, and ruff 0.16.6), which the exact-tree gates exercise. The h2hdb lane deliberately remains >=0.31.0,<0.32.0; registry 0.29.0 is older and does not satisfy it, so coordinated validation uses the exact local h2hdb 0.31.0 primary tree. No dependency update is required by this storage fail-closed and test-supervision task.",
+    "note": "Reviewed all direct build, runtime, optional development and Node candidates for 0.15.0. Non-core latest registry candidates are unchanged from the 0.14.1 receipt, satisfy declared bounds and match the installed validation environment. Registry h2hdb advanced from 0.29.0 to 0.31.0; the local 0.31.0 history and current 0.32.0 schema/title-index change were reviewed. Registry 0.31.0 is below the deliberately coordinated >=0.32.0,<0.33.0 lane: validation explicitly installs the locally built h2hdb-0.32.0 wheel from this task, rather than resolving an incompatible older schema. Producer SQLite end-to-end tests cover title, GID, tags, timestamps and page authority; exact-tree merge checks independently validate the final candidate. No non-core dependency update is needed.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
