@@ -52,6 +52,15 @@ cover extent or thumbnail resource.
 
 ## Important upgrade notice
 
+This release requires the H2HDB `0.32` compatibility lane and schema epoch 3,
+schema version 3. Catalogs published through ingest include core's
+title-specific search authority alongside the existing title, tag, GID,
+upload/download time, and artifact page-count metadata.
+
+Schema-version-2 databases are rejected. Initialize a new empty database with
+the H2HDB administrator command, then rebuild the catalog from the source
+download tree. There is no in-place schema migration or older-core fallback.
+
 Presentation storage v2 is intentionally not compatible with the old library
 layout. There is no in-place migration or compatibility fallback.
 
@@ -344,8 +353,9 @@ activation reconciliation.
   backup and configure an empty v3 journal root for a full artifact rebuild.
 - **`library ... changed identity`**: another process modified a managed path;
   stop all writers and inspect the mount before retrying.
-- **database is not READY**: initialize or repair the schema with the H2HDB
-  administrator command, not with ingest.
+- **database is not READY**: use the H2HDB administrator command to initialize
+  a new empty database or resume its matching interrupted initialization.
+  An older or drifted schema requires a fresh database and catalog rebuild.
 
 ## Development
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
@@ -12,7 +13,11 @@ from zipfile import ZipFile
 
 import pytest
 from h2hdb import (
+    CatalogDiscoveryQuery,
+    CatalogPageCountRange,
     CatalogRevisionNotFoundError,
+    CatalogSubjectFilter,
+    CatalogTimestampRange,
     CoreConfig,
     DatabaseConfig,
     GalleryStagingCapacityError,
@@ -174,9 +179,37 @@ def test_fresh_epoch_runs_source_analysis_and_publication(
     revision = runtime.catalog.get_catalog_revision()
 
     assert initialized.epoch == checked.epoch
+    assert initialized.schema_version == checked.schema_version == 3
     assert processed
     assert revision.revision == 1
     assert revision.publication_count == 1
+    searchable = runtime.catalog.discover_publications(
+        revision=revision,
+        query=CatalogDiscoveryQuery(
+            title="Runtime integration",
+            gid=1001,
+            subjects=(
+                CatalogSubjectFilter(namespace="artist", value="first"),
+                CatalogSubjectFilter(namespace="language", value="english"),
+            ),
+            uploaded=CatalogTimestampRange(
+                start=datetime(2024, 1, 2, tzinfo=UTC),
+                end=datetime(2024, 1, 3, tzinfo=UTC),
+            ),
+            downloaded=CatalogTimestampRange(
+                start=datetime(2024, 2, 3, tzinfo=UTC),
+                end=datetime(2024, 2, 4, tzinfo=UTC),
+            ),
+        ),
+    )
+    assert [publication.gid for publication in searchable.publications] == [1001]
+    assert (
+        runtime.catalog.discover_publications(
+            revision=revision,
+            query=CatalogDiscoveryQuery(title="uploader"),
+        ).publications
+        == ()
+    )
 
     # A periodic scan after process restart must replay the exact SEALED source
     # snapshot without attempting to reopen its discovery checkpoint.
@@ -331,6 +364,19 @@ def test_fresh_artifact_runtime_publishes_one_current_cbz(
     publication = page.publications[0]
     assert len(publication.artifacts) == 1
     assert publication.page_count == 1
+    assert runtime.catalog.discover_publications(
+        query=CatalogDiscoveryQuery(
+            gid=2001, pages=CatalogPageCountRange(minimum=1, maximum=1)
+        )
+    ).publications == (publication,)
+    assert (
+        runtime.catalog.discover_publications(
+            query=CatalogDiscoveryQuery(
+                gid=2001, pages=CatalogPageCountRange(maximum=0)
+            )
+        ).publications
+        == ()
+    )
     assert publication.cover is not None
     assert publication.thumbnail is not None
     assert len(current) == 1
