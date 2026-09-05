@@ -28,7 +28,7 @@ jobs:
           python-version: "3.14"
 
       - name: Install isolated pytest runtime
-        run: python -m pip install pytest==9.1.1
+        run: python scripts/install-ci-dependencies.py pytest
 
       - name: Verify Windows Job Object process-tree ownership
         run: >-
@@ -44,8 +44,8 @@ jobs:
         with:
           python-version: "3.14.6"
 
-      - name: Install exact generated-test runtime
-        run: python -m pip install pytest==9.1.1 hypothesis==6.165.10
+      - name: Install generated-test runtime from pyproject.toml
+        run: python scripts/install-ci-dependencies.py --pytest-plugins pytest hypothesis
 
       - name: Compare incremental and full evaluators over generated traces
         run: python -m pytest -q tests/test_vnext_incremental_state_machine.py
@@ -123,8 +123,8 @@ jobs:
         with:
           python-version: "3.14.6"
 
-      - name: Install exact generated-test runtime
-        run: python -m pip install pytest==9.1.1 hypothesis==6.165.10
+      - name: Install generated-test runtime from pyproject.toml
+        run: python scripts/install-ci-dependencies.py --pytest-plugins pytest hypothesis
 
       - name: Explore larger incremental state-machine traces
         env:
