@@ -50,10 +50,9 @@ from ._library_layout import STATE_DIRECTORY_NAME as _STATE_DIRECTORY_NAME
 from ._library_layout import validate_precreated_library_layout
 from .artifact import (
     ARTIFACT_ADAPTER_ID,
+    ArtifactPreparationRenderer,
     ArtifactRenderPolicy,
     artifact_policy_fingerprint_sha256,
-    render_archive,
-    render_presentation,
 )
 from .library_identity import (
     LibraryStorageIdentity,
@@ -231,6 +230,11 @@ class ManagedFilesystemLibraryAdapter:
         self._render_policy = render_policy
         self._page_render_workers = effective_page_render_workers
         self._metrics_sink = metrics_sink
+        self._artifact_renderer = ArtifactPreparationRenderer(
+            policy=render_policy,
+            page_render_workers=effective_page_render_workers,
+            metrics_sink=metrics_sink,
+        )
         self.policy_fingerprint_sha256 = artifact_policy_fingerprint_sha256(
             render_policy
         )
@@ -434,13 +438,10 @@ class ManagedFilesystemLibraryAdapter:
     ) -> ArtifactArchiveRenderEvidence:
         """Own the complete canonical CBZ serialization contract."""
 
-        return render_archive(
+        return self._artifact_renderer.render_archive(
             members,
             destination,
             gid=gid,
-            policy=self._render_policy,
-            page_render_workers=self._page_render_workers,
-            metrics_sink=self._metrics_sink,
         )
 
     def protect(
@@ -816,12 +817,10 @@ class ManagedFilesystemLibraryAdapter:
     ) -> ArtifactPresentationRenderEvidence:
         """Write thumbnail bytes and return untrusted neutral presentation facts."""
 
-        return render_presentation(
+        return self._artifact_renderer.render_presentation(
             archive,
             thumbnail_destination,
             rendered_pages=rendered_pages,
-            policy=self._render_policy,
-            metrics_sink=self._metrics_sink,
         )
 
     def release(

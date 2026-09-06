@@ -18,6 +18,7 @@ __all__ = [
     "THUMBNAIL_JPEG_QUALITY",
     "THUMBNAIL_MAX_SIDE",
     "ArtifactImageResampler",
+    "ArtifactPreparationRenderer",
     "ArtifactRenderPolicy",
     "CanonicalImageEvidence",
     "PreparedPageEvidence",
@@ -321,6 +322,92 @@ def _validate_jpeg_quality(value: int, *, label: str) -> None:
         )
 
 
+class ArtifactPreparationRenderer:
+    """Own at most one archive inspection for adjacent preparation operations.
+
+    Only the completed private writer stage can seed this optimization. No
+    caller digest or durable receipt is accepted as inspection authority. The
+    next presentation hashes the actual stream again before reusing facts; a
+    restart, eviction, or changed byte stream requires full ZIP/JPEG validation.
+    The slot contains immutable metadata for at most MAX_PAGE_COUNT pages and
+    never retains pixels, open streams, futures, or archive bytes.
+    """
+
+    def __init__(
+        self,
+        *,
+        policy: ArtifactRenderPolicy,
+        page_render_workers: int | None = None,
+        metrics_sink: IngestMetricSink | None = None,
+    ) -> None:
+        self._policy = policy
+        self._workers = page_render_workers
+        self._metrics_sink = metrics_sink
+        self._inspection: PreparedPresentationEvidence | None = None
+        self._inspection_lock = Lock()
+
+    def render_archive(
+        self,
+        members: tuple[ArtifactSourceMember, ...],
+        destination: BinaryIO,
+        *,
+        gid: int,
+    ) -> ArtifactArchiveRenderEvidence:
+        """Fully inspect a private completed stage before remembering facts."""
+        return _render_archive(
+            members,
+            destination,
+            gid=gid,
+            policy=self._policy,
+            page_render_workers=self._workers,
+            metrics_sink=self._metrics_sink,
+            preparation=self,
+        )
+
+    def render_presentation(
+        self,
+        archive: BinaryIO,
+        thumbnail_destination: BinaryIO,
+        *,
+        rendered_pages: tuple[ArtifactRenderedPage, ...],
+    ) -> ArtifactPresentationRenderEvidence:
+        """Rehash exact input bytes before reusing this process's inspection."""
+        return _render_presentation(
+            archive,
+            thumbnail_destination,
+            rendered_pages=rendered_pages,
+            policy=self._policy,
+            metrics_sink=self._metrics_sink,
+            preparation=self,
+        )
+
+    def _remember(self, inspected: PreparedPresentationEvidence) -> None:
+        with self._inspection_lock:
+            self._inspection = inspected
+
+    def _inspect_actual_bytes(
+        self,
+        archive: BinaryIO,
+        names: tuple[str, ...],
+    ) -> PreparedPresentationEvidence:
+        # Take ownership of the single-use slot before I/O. Concurrent renders
+        # may replace it and lose a speedup, but cannot bypass byte validation.
+        with self._inspection_lock:
+            inspected, self._inspection = self._inspection, None
+        if inspected is not None:
+            archive.seek(0, 2)
+            size = archive.tell()
+            if size == inspected.archive_size_bytes and names == tuple(
+                page.member_name for page in inspected.pages
+            ):
+                archive.seek(0)
+                digest = _stream_digest(archive, size)
+                archive.seek(0)
+                if digest == inspected.archive_sha256:
+                    return inspected
+        return inspect_presentation_archive(archive, names)
+
+
 def render_archive(
     members: tuple[ArtifactSourceMember, ...],
     destination: BinaryIO,
@@ -329,6 +416,29 @@ def render_archive(
     policy: ArtifactRenderPolicy,
     page_render_workers: int | None = None,
     metrics_sink: IngestMetricSink | None = None,
+) -> ArtifactArchiveRenderEvidence:
+    """Render and fully inspect one canonical CBZ without retaining evidence."""
+
+    return _render_archive(
+        members,
+        destination,
+        gid=gid,
+        policy=policy,
+        page_render_workers=page_render_workers,
+        metrics_sink=metrics_sink,
+        preparation=None,
+    )
+
+
+def _render_archive(
+    members: tuple[ArtifactSourceMember, ...],
+    destination: BinaryIO,
+    *,
+    gid: int,
+    policy: ArtifactRenderPolicy,
+    page_render_workers: int | None = None,
+    metrics_sink: IngestMetricSink | None = None,
+    preparation: ArtifactPreparationRenderer | None,
 ) -> ArtifactArchiveRenderEvidence:
     """Render one closed-world non-ZIP64 CBZ before exposing destination bytes."""
 
@@ -483,6 +593,8 @@ def render_archive(
             flush()
         destination.seek(0)
         archive_copy_ns = monotonic_ns() - archive_copy_started_ns
+        if preparation is not None:
+            preparation._remember(inspected)
     evidence = ArtifactArchiveRenderEvidence(
         artifact_sha256=artifact_sha256,
         size_bytes=size_bytes,
@@ -862,6 +974,27 @@ def render_presentation(
     policy: ArtifactRenderPolicy,
     metrics_sink: IngestMetricSink | None = None,
 ) -> ArtifactPresentationRenderEvidence:
+    """Fully inspect acquisition bytes and render a standalone thumbnail."""
+
+    return _render_presentation(
+        archive,
+        thumbnail_destination,
+        rendered_pages=rendered_pages,
+        policy=policy,
+        metrics_sink=metrics_sink,
+        preparation=None,
+    )
+
+
+def _render_presentation(
+    archive: BinaryIO,
+    thumbnail_destination: BinaryIO,
+    *,
+    rendered_pages: tuple[ArtifactRenderedPage, ...],
+    policy: ArtifactRenderPolicy,
+    metrics_sink: IngestMetricSink | None = None,
+    preparation: ArtifactPreparationRenderer | None,
+) -> ArtifactPresentationRenderEvidence:
     """Derive neutral page facts and write one standalone thumbnail.
 
     The destination belongs to core and is intentionally treated as write-only.
@@ -894,9 +1027,11 @@ def render_presentation(
         )
 
     archive_inspect_started_ns = monotonic_ns()
-    inspected = inspect_presentation_archive(
-        archive,
-        tuple(page.locator for page in rendered_pages),
+    names = tuple(page.locator for page in rendered_pages)
+    inspected = (
+        inspect_presentation_archive(archive, names)
+        if preparation is None
+        else preparation._inspect_actual_bytes(archive, names)
     )
     archive_inspect_ns = monotonic_ns() - archive_inspect_started_ns
     presentation_started_ns = monotonic_ns()
@@ -1516,16 +1651,41 @@ def _verify_canonical_jpeg(content: bytes) -> CanonicalImageEvidence:
         raise PresentationImageError("canonical JPEG exceeds the encoded-size policy")
     if not content.startswith(b"\xff\xd8") or not content.endswith(b"\xff\xd9"):
         raise PresentationImageError("presentation page bytes are not JPEG")
-    image = _load_safe_image(BytesIO(content))
     try:
-        return CanonicalImageEvidence(
-            sha256=sha256(content).digest(),
-            size_bytes=len(content),
-            width=image.width,
-            height=image.height,
-        )
-    finally:
-        image.close()
+        with ExitStack() as opened_context:
+            with _IMAGE_HEADER_WARNING_LOCK:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", Image.DecompressionBombWarning)
+                    opened = opened_context.enter_context(Image.open(BytesIO(content)))
+                    if opened.format != "JPEG":
+                        raise PresentationImageError(
+                            "presentation page bytes are not JPEG"
+                        )
+                    _validate_dimensions(
+                        opened.width,
+                        opened.height,
+                        max_long_side=MAX_IMAGE_LONG_SIDE,
+                    )
+            # Verification must decode every pixel, but never transpose or copy
+            # them: canonical rendering already applied orientation and removed
+            # EXIF. Preserve the inspector's oriented-dimension semantics for
+            # externally supplied JPEGs using metadata alone.
+            opened.load()
+            width, height = opened.size
+            if opened.getexif().get(0x0112) in {5, 6, 7, 8}:
+                width, height = height, width
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as error:
+        raise PresentationImageError(
+            "image exceeds the decoded pixel policy"
+        ) from error
+    except (OSError, SyntaxError, UnidentifiedImageError) as error:
+        raise PresentationImageError("image is truncated or invalid") from error
+    return CanonicalImageEvidence(
+        sha256=sha256(content).digest(),
+        size_bytes=len(content),
+        width=width,
+        height=height,
+    )
 
 
 def _render_thumbnail(
@@ -1540,6 +1700,8 @@ def _render_thumbnail(
         offset=cover.byte_offset,
         size=cover.image.size_bytes,
     )
+    if sha256(content).digest() != cover.image.sha256:
+        raise PresentationImageError("cover changed after archive inspection")
     image = _load_safe_image(BytesIO(content))
     try:
         image.thumbnail(

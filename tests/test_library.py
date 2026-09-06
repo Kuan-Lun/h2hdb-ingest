@@ -27,6 +27,7 @@ from h2hdb import (
     VNextLibraryActivationItem,
 )
 
+import h2hdb_ingest.artifact as artifact_module
 import h2hdb_ingest.library as library_module
 from h2hdb_ingest._library_layout import validate_precreated_library_layout
 from h2hdb_ingest.artifact import ArtifactRenderPolicy
@@ -526,7 +527,7 @@ def test_library_passes_page_render_workers_to_archive_renderer(
         observed.append(cast(int, kwargs["page_render_workers"]))
         return object()
 
-    monkeypatch.setattr(library_module, "render_archive", fake_render)
+    monkeypatch.setattr(artifact_module, "_render_archive", fake_render)
     adapter.render_archive((), BytesIO(), gid=1)
 
     assert observed == [4]
