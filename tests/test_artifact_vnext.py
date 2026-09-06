@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 import struct
 import warnings
@@ -22,6 +23,7 @@ from h2hdb import (
     CatalogResourceKind,
     LibraryActivationStatus,
     VNextLibraryActivationItem,
+    VNextSourceChangedError,
 )
 from PIL import Image
 
@@ -460,26 +462,87 @@ def test_open_source_rejects_symlinks_and_root_replacement(tmp_path: Path) -> No
     )
     root_components = tuple(source_root.resolve().parts[1:])
 
-    with pytest.raises(RuntimeError, match="not safely openable"):
+    with pytest.raises(RuntimeError, match="not safely openable") as rejected_leaf:
         adapter.open_source(
             source_root_components=root_components,
             gallery_locator_components=("gallery",),
             source_name=b"link.jpg",
         )
-    with pytest.raises(RuntimeError, match="safe directory chain"):
+    assert not isinstance(rejected_leaf.value, VNextSourceChangedError)
+    with pytest.raises(
+        RuntimeError, match="safe directory chain"
+    ) as rejected_directory:
         adapter.open_source(
             source_root_components=root_components,
             gallery_locator_components=("linked-gallery",),
             source_name=b"page.jpg",
         )
+    assert not isinstance(rejected_directory.value, VNextSourceChangedError)
 
     source_root.rename(tmp_path / "moved-download")
     source_root.mkdir()
-    with pytest.raises(RuntimeError, match="changed identity"):
+    with pytest.raises(RuntimeError, match="changed identity") as rejected_root:
         adapter.open_source(
             source_root_components=root_components,
             gallery_locator_components=(),
             source_name=b"missing.jpg",
+        )
+    assert not isinstance(rejected_root.value, VNextSourceChangedError)
+
+
+@pytest.mark.parametrize("missing", ["gallery", "page.jpg"])
+def test_open_source_reports_missing_source_as_retryable(
+    tmp_path: Path, missing: str
+) -> None:
+    source_root = tmp_path / "download"
+    source_root.mkdir()
+    if missing == "page.jpg":
+        (source_root / "gallery").mkdir()
+    adapter = _adapter(tmp_path, max_image_short_side=20)
+    with pytest.raises(VNextSourceChangedError, match="disappeared"):
+        adapter.open_source(
+            source_root_components=tuple(source_root.resolve().parts[1:]),
+            gallery_locator_components=("gallery",),
+            source_name=b"page.jpg",
+        )
+
+
+@pytest.mark.parametrize("replacement", ["gallery", "page.jpg"])
+def test_open_source_reports_regular_inode_replacement_as_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    source_root = tmp_path / "download"
+    gallery = source_root / "gallery"
+    gallery.mkdir(parents=True)
+    (gallery / "page.jpg").write_bytes(b"original")
+    adapter = _adapter(tmp_path, max_image_short_side=20)
+    original_open = os.open
+
+    def replacing_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if (replacement == "gallery" and path == "gallery") or (
+            replacement == "page.jpg" and path == b"page.jpg"
+        ):
+            changed_path = gallery if replacement == "gallery" else gallery / "page.jpg"
+            changed_path.rename(source_root / "retired")
+            if replacement == "gallery":
+                gallery.mkdir()
+            else:
+                changed_path.write_bytes(b"replacement")
+        return descriptor
+
+    monkeypatch.setattr(os, "open", replacing_open)
+    with pytest.raises(VNextSourceChangedError, match=r"changed.*identity"):
+        adapter.open_source(
+            source_root_components=tuple(source_root.resolve().parts[1:]),
+            gallery_locator_components=("gallery",),
+            source_name=b"page.jpg",
         )
 
 
@@ -991,7 +1054,7 @@ def test_archive_writer_validates_source_authority_roles_and_page_caps(
         expected_size_bytes=page.expected_size_bytes,
         source=BytesIO(image.getvalue()),
     )
-    with pytest.raises(PresentationImageError, match="SHA-256 disagrees"):
+    with pytest.raises(VNextSourceChangedError, match="SHA-256 disagrees"):
         adapter.render_archive((metadata, changed_digest), BytesIO(), gid=42)
 
     bad_position = _source_member(

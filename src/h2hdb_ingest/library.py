@@ -39,6 +39,7 @@ from h2hdb import (
     StorageObjectKey,
     VNextLibraryActivationCursor,
     VNextLibraryActivationItem,
+    VNextSourceChangedError,
 )
 
 from ._library_layout import (
@@ -327,46 +328,79 @@ class ManagedFilesystemLibraryAdapter:
                         dir_fd=current_descriptor,
                     )
                 except OSError as error:
+                    if error.errno in {errno.ENOENT, errno.ESTALE}:
+                        raise VNextSourceChangedError(
+                            "gallery locator disappeared before artifact preparation"
+                        ) from error
                     raise RuntimeError(
                         "gallery locator is not a safe directory chain"
                     ) from error
                 opened = os.fstat(child_descriptor)
-                visible = os.stat(
-                    component,
-                    dir_fd=current_descriptor,
-                    follow_symlinks=False,
-                )
+                try:
+                    visible = os.stat(
+                        component,
+                        dir_fd=current_descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError as error:
+                    os.close(child_descriptor)
+                    if error.errno in {errno.ENOENT, errno.ESTALE}:
+                        raise VNextSourceChangedError(
+                            "gallery locator disappeared during artifact preparation"
+                        ) from error
+                    raise
                 if (
                     not stat.S_ISDIR(opened.st_mode)
+                    or not stat.S_ISDIR(visible.st_mode)
                     or stat.S_ISLNK(visible.st_mode)
-                    or (opened.st_dev, opened.st_ino)
-                    != (visible.st_dev, visible.st_ino)
                 ):
                     os.close(child_descriptor)
-                    raise RuntimeError("gallery locator changed directory identity")
+                    raise RuntimeError("gallery locator is not a safe directory chain")
+                if (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino):
+                    os.close(child_descriptor)
+                    raise VNextSourceChangedError(
+                        "gallery locator changed directory identity"
+                    )
                 descriptors.append(child_descriptor)
                 current_descriptor = child_descriptor
             try:
                 leaf_descriptor = os.open(
                     source_name,
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_NONBLOCK", 0),
                     dir_fd=current_descriptor,
                 )
             except OSError as error:
+                if error.errno in {errno.ENOENT, errno.ESTALE}:
+                    raise VNextSourceChangedError(
+                        "source leaf disappeared before artifact preparation"
+                    ) from error
                 raise RuntimeError("source leaf is not safely openable") from error
             opened_leaf = os.fstat(leaf_descriptor)
-            visible_leaf = os.stat(
-                source_name,
-                dir_fd=current_descriptor,
-                follow_symlinks=False,
-            )
+            try:
+                visible_leaf = os.stat(
+                    source_name,
+                    dir_fd=current_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                if error.errno in {errno.ENOENT, errno.ESTALE}:
+                    raise VNextSourceChangedError(
+                        "source leaf disappeared during artifact preparation"
+                    ) from error
+                raise
             if (
                 not stat.S_ISREG(opened_leaf.st_mode)
+                or not stat.S_ISREG(visible_leaf.st_mode)
                 or stat.S_ISLNK(visible_leaf.st_mode)
-                or (opened_leaf.st_dev, opened_leaf.st_ino)
-                != (visible_leaf.st_dev, visible_leaf.st_ino)
             ):
-                raise RuntimeError("source leaf changed identity")
+                raise RuntimeError("source leaf is not safely openable")
+            if (opened_leaf.st_dev, opened_leaf.st_ino) != (
+                visible_leaf.st_dev,
+                visible_leaf.st_ino,
+            ):
+                raise VNextSourceChangedError("source leaf changed identity")
             self._require_source_root_identity(root_descriptor)
             result = os.fdopen(leaf_descriptor, "rb", closefd=True)
             leaf_descriptor = None

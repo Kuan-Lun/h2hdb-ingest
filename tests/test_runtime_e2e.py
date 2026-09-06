@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from shutil import rmtree
 from time import time_ns
-from typing import cast
+from typing import BinaryIO, cast
 from unittest.mock import patch
 from zipfile import ZipFile
 
@@ -38,14 +39,20 @@ from h2hdb_ingest import (
     IngestPathsConfig,
     IngestSessionController,
     LibraryMaintenanceOutcome,
+    ManagedFilesystemLibraryAdapter,
     ResidentConfig,
     ResidentIngestor,
     VNextIngestService,
 )
-from h2hdb_ingest.runtime import build_runtime
+from h2hdb_ingest.filesystem import (
+    FilesystemFileObservation,
+    FilesystemObservationError,
+)
+from h2hdb_ingest.runtime import IngestRuntime, build_runtime
+from h2hdb_ingest.source_monitor import FilesystemCompletionMarkerProbe
 
 
-@pytest.fixture(params=("sqlite", "mariadb"))
+@pytest.fixture(params=("sqlite", pytest.param("mariadb", marks=pytest.mark.mariadb)))
 def runtime_core_config(
     request: pytest.FixtureRequest,
     tmp_path: Path,
@@ -69,6 +76,7 @@ def _gallery(
 ) -> None:
     folder = root / str(gid)
     folder.mkdir(parents=True)
+    (folder / "001.jpg").write_bytes(page_bytes)
     (folder / "galleryinfo.txt").write_text(
         "\n".join(
             (
@@ -84,7 +92,39 @@ def _gallery(
         ),
         encoding="utf-8",
     )
-    (folder / "001.jpg").write_bytes(page_bytes)
+
+
+def _rewrite_completion_marker(folder: Path) -> None:
+    marker = folder / "galleryinfo.txt"
+    previous = marker.stat()
+    marker.write_bytes(marker.read_bytes())
+    os.utime(marker, ns=(previous.st_atime_ns, previous.st_mtime_ns + 1_000_000))
+
+
+def _synchronize_after_cleanup(runtime: IngestRuntime) -> None:
+    for _attempt in range(32):
+        outcome = runtime.facade.drain_current_only_maintenance(30_000_000)
+        if outcome is VNextCurrentOnlyMaintenanceOutcome.DONE:
+            break
+        assert outcome is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED
+    else:
+        pytest.fail("small metadata fixture did not finish bounded maintenance")
+    assert runtime.resident.process_available(periodic_scan=True)
+
+
+def _count_source_image_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    reads: list[str] = []
+    original = FilesystemFileObservation.content_parts
+
+    def observed(value: FilesystemFileObservation) -> Iterator[bytes]:
+        if value.name_bytes == b"001.jpg":
+            reads.append(value.folder.name)
+        yield from original(value)
+
+    monkeypatch.setattr(FilesystemFileObservation, "content_parts", observed)
+    return reads
 
 
 def _provision_library_root(root: Path) -> None:
@@ -141,6 +181,7 @@ def test_capacity_backpressure_releases_real_core_session_for_retry(
     runtime.database_admin.initialize()
     service = _CapacityThenSuccessService()
     resident = ResidentIngestor(
+        source_probe=FilesystemCompletionMarkerProbe(source),
         service=service,
         facade=runtime.facade,
         database_admin=runtime.database_admin,
@@ -273,6 +314,7 @@ def test_same_locator_content_a_b_a_creates_three_revisions_then_replays(
     assert first_revision.revision == 1
 
     (source / "1001" / "001.jpg").write_bytes(b"content-B")
+    _rewrite_completion_marker(source / "1001")
     assert runtime.resident.process_available(periodic_scan=True)
     second_revision = runtime.catalog.get_catalog_revision()
     second_content = current_content()
@@ -309,6 +351,7 @@ def test_same_locator_content_a_b_a_creates_three_revisions_then_replays(
             limit=128,
         )
     (source / "1001" / "001.jpg").write_bytes(b"content-A")
+    _rewrite_completion_marker(source / "1001")
     assert runtime.resident.process_available(periodic_scan=True)
     third_revision = runtime.catalog.get_catalog_revision()
     third_content = current_content()
@@ -324,6 +367,252 @@ def test_same_locator_content_a_b_a_creates_three_revisions_then_replays(
     assert next(
         item for item in replayed.publications if item.gid == 1001
     ).content_sha256 == (first_content)
+
+
+def test_completion_marker_cache_skips_unchanged_image_bytes_across_restart(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "download"
+    _gallery(source, 1001, "first", page_bytes=b"first gallery")
+    _gallery(source, 1002, "second", page_bytes=b"second gallery")
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(download_path=source),
+    )
+    reads = _count_source_image_reads(monkeypatch)
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        _synchronize_after_cleanup(runtime)
+        original_revision = runtime.catalog.get_catalog_revision()
+        assert set(reads) == {"1001", "1002"}
+        reads.clear()
+        _synchronize_after_cleanup(runtime)
+        assert reads == []
+        assert runtime.catalog.get_catalog_revision() == original_revision
+    with build_runtime(config) as restarted:
+        restarted.resident.initialize()
+        _synchronize_after_cleanup(restarted)
+        assert reads == []
+        assert restarted.catalog.get_catalog_revision() == original_revision
+        assert restarted.database_admin.check().state == "READY"
+
+
+@pytest.mark.parametrize("marker_change", ["stat", "content"])
+def test_completion_marker_change_reloads_only_the_affected_gallery(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    marker_change: str,
+) -> None:
+    source = tmp_path / "download"
+    _gallery(source, 1001, "first", page_bytes=b"first gallery")
+    _gallery(source, 1002, "second", page_bytes=b"second gallery")
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(download_path=source),
+    )
+    reads = _count_source_image_reads(monkeypatch)
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        _synchronize_after_cleanup(runtime)
+        original_revision = runtime.catalog.get_catalog_revision()
+        original_publications = runtime.catalog.discover_publications(
+            revision=original_revision
+        ).publications
+        original_content = next(
+            item.content_sha256 for item in original_publications if item.gid == 1001
+        )
+        folder = source / "1001"
+        marker = folder / "galleryinfo.txt"
+        original_metadata = marker.read_bytes()
+        original_stat = marker.stat()
+        (folder / "001.jpg").write_bytes(b"changed first gallery")
+        if marker_change == "stat":
+            _rewrite_completion_marker(folder)
+            assert marker.read_bytes() == original_metadata
+            assert marker.stat().st_mtime_ns != original_stat.st_mtime_ns
+        else:
+            marker.write_bytes(
+                original_metadata.replace(b"integration", b"replacement")
+            )
+            os.utime(marker, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            assert marker.stat().st_mtime_ns == original_stat.st_mtime_ns
+            assert marker.read_bytes() != original_metadata
+        reads.clear()
+        _synchronize_after_cleanup(runtime)
+        assert set(reads) == {"1001"}
+        current = runtime.catalog.get_catalog_revision()
+        assert current.revision == original_revision.revision + 1
+        publications = runtime.catalog.discover_publications(
+            revision=current
+        ).publications
+        assert (
+            next(item.content_sha256 for item in publications if item.gid == 1001)
+            != original_content
+        )
+        reads.clear()
+        _synchronize_after_cleanup(runtime)
+        assert reads == []
+        assert runtime.catalog.get_catalog_revision() == current
+        assert runtime.database_admin.check().state == "READY"
+
+
+def test_marker_cache_respects_deletion_and_rejects_incomplete_metadata(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "download"
+    _gallery(source, 1001, "first", page_bytes=b"first gallery")
+    _gallery(source, 1002, "second", page_bytes=b"second gallery")
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(download_path=source),
+    )
+    reads = _count_source_image_reads(monkeypatch)
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        _synchronize_after_cleanup(runtime)
+        rmtree(source / "1002")
+        reads.clear()
+        _synchronize_after_cleanup(runtime)
+        assert reads == []
+        current = runtime.catalog.get_catalog_revision()
+        assert current.revision == 2
+        assert current.publication_count == 1
+        assert [
+            item.gid
+            for item in runtime.catalog.discover_publications(
+                revision=current
+            ).publications
+        ] == [1001]
+        # A truncated/invalid final marker cannot reuse its older valid cache
+        # entry and cannot publish a snapshot treating the gallery as absent.
+        (source / "1001" / "galleryinfo.txt").write_bytes(b"\xff")
+        with pytest.raises(FilesystemObservationError):
+            _synchronize_after_cleanup(runtime)
+        assert runtime.catalog.get_catalog_revision() == current
+        assert runtime.catalog.discover_publications(revision=current).total == 1
+
+
+@pytest.mark.parametrize("incomplete", [b"", b"Title: Still writing"])
+def test_incomplete_completion_marker_retries_without_publishing_partial_source(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+    incomplete: bytes,
+) -> None:
+    source = tmp_path / "download"
+    _gallery(source, 1001, "first", page_bytes=b"first gallery")
+    marker = source / "1001" / "galleryinfo.txt"
+    complete = marker.read_bytes()
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(download_path=source),
+    )
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        _synchronize_after_cleanup(runtime)
+        original = runtime.catalog.get_catalog_revision()
+        marker.write_bytes(incomplete)
+        assert not runtime.resident.process_available(periodic_scan=True)
+        assert runtime.catalog.get_catalog_revision() == original
+        (source / "1001" / "001.jpg").write_bytes(b"completed replacement gallery")
+        marker.write_bytes(complete)
+        _synchronize_after_cleanup(runtime)
+        assert runtime.catalog.get_catalog_revision().revision == original.revision + 1
+        assert runtime.database_admin.check().state == "READY"
+
+
+def test_artifact_source_mutation_retries_with_current_publication_and_cleanup_intact(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "download"
+    _gallery(source, 1001, "first")
+    page_path = source / "1001" / "001.jpg"
+    Image.new("RGB", (8, 12), "red").save(page_path)
+    _rewrite_completion_marker(source / "1001")
+    library = tmp_path / "library"
+    _provision_library_root(library)
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(
+            download_path=source, library_path=library, page_render_workers=1
+        ),
+    )
+    armed = False
+    changed = False
+    original_open = ManagedFilesystemLibraryAdapter.open_source
+
+    def changing_open(
+        adapter: ManagedFilesystemLibraryAdapter,
+        *,
+        source_root_components: tuple[str, ...],
+        gallery_locator_components: tuple[str, ...],
+        source_name: bytes,
+    ) -> BinaryIO:
+        nonlocal armed, changed
+        if armed and source_name == b"001.jpg":
+            armed = False
+            Image.new("RGB", (8, 12), "green").save(page_path)
+            _rewrite_completion_marker(source / "1001")
+            changed = True
+        return original_open(
+            adapter,
+            source_root_components=source_root_components,
+            gallery_locator_components=gallery_locator_components,
+            source_name=source_name,
+        )
+
+    monkeypatch.setattr(ManagedFilesystemLibraryAdapter, "open_source", changing_open)
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
+        assert runtime.resident.process_available(periodic_scan=True)
+        baseline = runtime.catalog.get_catalog_revision()
+        original_archive = next((library / "current").rglob("*.cbz")).read_bytes()
+        Image.new("RGB", (8, 12), "blue").save(page_path)
+        _rewrite_completion_marker(source / "1001")
+        armed = True
+        for _attempt in range(32):
+            progressed = runtime.resident.process_available(periodic_scan=True)
+            if changed:
+                assert not progressed
+                break
+            assert progressed
+        else:
+            pytest.fail("artifact preparation never observed the changed source")
+        assert runtime.catalog.get_catalog_revision() == baseline
+        assert (
+            next((library / "current").rglob("*.cbz")).read_bytes() == original_archive
+        )
+        for _attempt in range(32):
+            assert runtime.resident.process_available(periodic_scan=True)
+            if runtime.catalog.get_catalog_revision() != baseline:
+                break
+        else:
+            pytest.fail(
+                "changed artifact source did not recover through a new snapshot"
+            )
+        archives = tuple((library / "current").rglob("*.cbz"))
+        assert len(archives) == 1
+        with ZipFile(archives[0]) as archive:
+            with Image.open(BytesIO(archive.read("pages/0000.jpg"))) as image:
+                red, green, blue = cast(tuple[int, int, int], image.getpixel((0, 0)))
+                assert green > red + blue
+        for _attempt in range(32):
+            if not runtime.resident.process_available(periodic_scan=False):
+                break
+        else:
+            pytest.fail("recovered artifact did not finish bounded cleanup")
+        assert runtime.database_admin.check().state == "READY"
+        state = library / ".h2hdb-state"
+        assert not list((state / "staging").glob("*.cbz"))
+        assert not list((state / "quarantine").glob("*.cbz"))
+        assert not (library / ".h2hdb-coordination" / "ACTIVATING").exists()
 
 
 def test_fresh_artifact_runtime_publishes_one_current_cbz(
@@ -423,6 +712,7 @@ def test_fresh_artifact_runtime_publishes_one_current_cbz(
         assert max(thumbnail.size) <= 320
 
     Image.new("RGB", (8, 12), "blue").save(source / "2001" / "001.jpg")
+    _rewrite_completion_marker(source / "2001")
     assert runtime.resident.process_available(periodic_scan=True)
     second_page = runtime.catalog.discover_publications()
     second_current = tuple(current_root.rglob("*.cbz"))
@@ -631,6 +921,7 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
         initial.close()
 
     Image.new("RGB", (8, 12), "blue").save(source / "1901" / "001.jpg")
+    _rewrite_completion_marker(source / "1901")
     abandoned_config = base_config.model_copy(
         update={
             "paths": base_config.paths.model_copy(
@@ -861,6 +1152,7 @@ def test_many_replacements_keep_one_stable_current_file_per_gid(
         Image.new("RGB", (8, 12), (offset * 11, 255, 0)).save(
             source / str(gid) / "001.jpg"
         )
+        _rewrite_completion_marker(source / str(gid))
     for _attempt in range(8):
         runtime.resident.process_available(periodic_scan=True)
         if runtime.catalog.get_catalog_revision().revision == 2:

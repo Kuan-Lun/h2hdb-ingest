@@ -63,6 +63,7 @@ from h2hdb import (
     ArtifactSourceRole,
     ArtifactThumbnailPresentationEvidence,
     ByteExtent,
+    VNextSourceChangedError,
 )
 from PIL import Image, ImageFile, ImageOps, UnidentifiedImageError, features
 from PIL import __version__ as PILLOW_VERSION
@@ -645,17 +646,19 @@ def _verify_source_stream(
     remaining = member.expected_size_bytes
     while remaining:
         part = member.source.read(min(_COPY_BUFFER_BYTES, remaining))
-        if type(part) is not bytes or not part:
-            raise PresentationImageError("artifact source ended before its exact size")
+        if type(part) is not bytes:
+            raise PresentationImageError("artifact source did not yield bytes")
+        if not part:
+            raise VNextSourceChangedError("artifact source ended before its exact size")
         digest.update(part)
         remaining -= len(part)
     trailing = member.source.read(1)
     if type(trailing) is not bytes:
         raise PresentationImageError("artifact source did not yield bytes")
     if trailing:
-        raise PresentationImageError("artifact source exceeds its exact size")
+        raise VNextSourceChangedError("artifact source exceeds its exact size")
     if digest.digest() != member.expected_sha256:
-        raise PresentationImageError("artifact source SHA-256 disagrees")
+        raise VNextSourceChangedError("artifact source SHA-256 disagrees")
     member.source.seek(0)
 
 

@@ -18,10 +18,12 @@ from h2hdb import (
     VNextCurrentOnlyMaintenanceOutcome,
     VNextDatabaseAdminFacade,
     VNextIngestFacade,
+    VNextSourceChangedError,
     VNextSourceManifestMismatchError,
 )
 
 from .config import ResidentConfig
+from .filesystem import FilesystemSourceChangedError
 from .library_identity import (
     LibraryStorageIdentity,
     LibraryStorageIdentityMismatchError,
@@ -34,6 +36,8 @@ from .maintenance import (
 )
 from .service import _IngestStopRequested
 from .session import IngestLeaseHeartbeat, IngestSessionController
+from .source_monitor import CompletionMarkerProbe, SourceChangeMonitor
+from .source_schedule import SourceScanSchedule, SourceScanTicket
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +45,7 @@ logger = logging.getLogger(__name__)
 class _ResidentCycleOutcome(StrEnum):
     INGESTED = "INGESTED"
     MAINTENANCE_PROGRESSED = "MAINTENANCE_PROGRESSED"
+    SOURCE_CHANGED = "SOURCE_CHANGED"
     IDLE = "IDLE"
 
 
@@ -60,6 +65,7 @@ class ResidentIngestor:
         self,
         *,
         service: IngestSynchronizer,
+        source_probe: CompletionMarkerProbe,
         facade: VNextIngestFacade,
         database_admin: VNextDatabaseAdminFacade,
         library_storage_identity: LibraryStorageIdentityProvider | None,
@@ -70,6 +76,7 @@ class ResidentIngestor:
         event_logger: Callable[[str], None] | None = None,
     ) -> None:
         self._service = service
+        self._source_probe = source_probe
         self._facade = facade
         self._database_admin = database_admin
         if library_storage_identity is not None and not isinstance(
@@ -133,13 +140,13 @@ class ResidentIngestor:
                 "processing"
             )
 
-        return (
-            self._process_cycle(
-                periodic_scan=periodic_scan,
-                preflight=preflight,
-                should_stop=should_stop,
-            )
-            is not _ResidentCycleOutcome.IDLE
+        return self._process_cycle(
+            periodic_scan=periodic_scan,
+            preflight=preflight,
+            should_stop=should_stop,
+        ) in (
+            _ResidentCycleOutcome.INGESTED,
+            _ResidentCycleOutcome.MAINTENANCE_PROGRESSED,
         )
 
     def _process_cycle(
@@ -148,6 +155,7 @@ class ResidentIngestor:
         periodic_scan: bool,
         preflight: Callable[[], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
+        on_scan_started: Callable[[], None] | None = None,
     ) -> _ResidentCycleOutcome:
         if should_stop is not None and should_stop():
             return _ResidentCycleOutcome.IDLE
@@ -170,6 +178,14 @@ class ResidentIngestor:
         if should_stop is not None and should_stop():
             return _ResidentCycleOutcome.IDLE
         claimed = self._facade.try_claim_ingest(periodic_scan, lease_duration)
+        if (
+            claimed is None
+            and periodic_scan
+            and (should_stop is None or not should_stop())
+        ):
+            # A due source scan requires a quiescent downloader. A pending
+            # durable handoff must still be claimable while it blocks that path.
+            claimed = self._facade.try_claim_ingest(False, lease_duration)
         if claimed is None:
             return _ResidentCycleOutcome.IDLE
         session = IngestSessionController(
@@ -192,6 +208,8 @@ class ResidentIngestor:
                         f"failed: {completion_error!r}"
                     )
                 raise
+        if on_scan_started is not None:
+            on_scan_started()
         try:
             with IngestLeaseHeartbeat(
                 session,
@@ -257,6 +275,22 @@ class ResidentIngestor:
             ):
                 return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
             return _ResidentCycleOutcome.IDLE
+        except (VNextSourceChangedError, FilesystemSourceChangedError) as error:
+            # A changed completion marker invalidates this attempt, not the
+            # resident process. Heartbeat has stopped before releasing its
+            # exact session and allowing bounded cleanup to make progress.
+            try:
+                session.complete()
+                self._try_library_maintenance()
+                self._try_current_only_maintenance(lease_duration)
+            except BaseException as completion_error:
+                error.add_note(
+                    "The ingest session could not be completed after source "
+                    f"mutation: {completion_error!r}"
+                )
+                raise error from completion_error
+            self._event_logger("source changed during synchronization; retry pending")
+            return _ResidentCycleOutcome.SOURCE_CHANGED
         except VNextSourceManifestMismatchError as error:
             # The mismatch has already abandoned the exact build.  Completing
             # after heartbeat shutdown makes it immediately eligible for
@@ -355,22 +389,54 @@ class ResidentIngestor:
                 "polling"
             )
         stop_event = stop or Event()
-        next_periodic = monotonic()
-        while not stop_event.is_set():
-            periodic = monotonic() >= next_periodic
-            outcome = self._process_cycle(
-                periodic_scan=periodic,
-                should_stop=stop_event.is_set,
-            )
-            if outcome is _ResidentCycleOutcome.INGESTED:
-                next_periodic = monotonic() + self._config.periodic_scan_seconds
-                continue
-            if outcome is _ResidentCycleOutcome.MAINTENANCE_PROGRESSED:
-                continue
-            remaining = max(0.0, next_periodic - monotonic())
-            stop_event.wait(
-                min(
-                    self._config.poll_seconds,
-                    remaining or self._config.poll_seconds,
+        schedule = SourceScanSchedule(
+            quiet_seconds=self._config.source_quiet_seconds,
+            max_wait_seconds=self._config.source_max_wait_seconds,
+            now=monotonic(),
+        )
+        with SourceChangeMonitor(
+            probe=self._source_probe,
+            schedule=schedule,
+            interval_seconds=self._config.source_probe_interval_seconds,
+            clock=monotonic,
+        ) as monitor:
+
+            def should_stop() -> bool:
+                monitor.raise_if_failed()
+                return stop_event.is_set()
+
+            while not should_stop():
+                deadline = schedule.next_scan_at()
+                source_due = deadline is not None and monotonic() >= deadline
+                ticket: SourceScanTicket | None = None
+
+                def scan_started() -> None:
+                    nonlocal ticket
+                    ticket = schedule.start_scan(now=monotonic())
+
+                outcome = self._process_cycle(
+                    periodic_scan=source_due,
+                    should_stop=should_stop,
+                    on_scan_started=scan_started,
                 )
-            )
+                if ticket is not None:
+                    schedule.finish_scan(
+                        ticket,
+                        now=monotonic(),
+                        succeeded=outcome is _ResidentCycleOutcome.INGESTED,
+                    )
+                if outcome in (
+                    _ResidentCycleOutcome.INGESTED,
+                    _ResidentCycleOutcome.MAINTENANCE_PROGRESSED,
+                ):
+                    continue
+                deadline = schedule.next_scan_at()
+                remaining = (
+                    0.0 if deadline is None else max(0.0, deadline - monotonic())
+                )
+                stop_event.wait(
+                    min(
+                        self._config.poll_seconds,
+                        remaining or self._config.poll_seconds,
+                    )
+                )

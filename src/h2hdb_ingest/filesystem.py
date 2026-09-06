@@ -5,6 +5,7 @@ from __future__ import annotations
 __all__ = [
     "FILESYSTEM_OBSERVATION_VERSION",
     "FilesystemArtifactSourceRole",
+    "FilesystemCompletionMarker",
     "FilesystemEntryType",
     "FilesystemFileObservation",
     "FilesystemGalleryMetadata",
@@ -12,9 +13,11 @@ __all__ = [
     "FilesystemObservationError",
     "FilesystemPage",
     "FilesystemSource",
+    "FilesystemSourceChangedError",
     "FilesystemStat",
 ]
 
+import errno
 import os
 import sqlite3
 import stat
@@ -30,7 +33,7 @@ from h2h_galleryinfo_parser import GalleryInfoParser, parse_gid
 
 from ._limits import MAX_METADATA_BYTES
 
-FILESYSTEM_OBSERVATION_VERSION = 2
+FILESYSTEM_OBSERVATION_VERSION = 3
 GALLERY_INFO_NAME = "galleryinfo.txt"
 _READ_BYTES = 4 * 1024 * 1024
 _ENTRY_AUDIT_PREFIX = b"h2hdb-ingest-filesystem-entry-audit-v2\0"
@@ -46,6 +49,10 @@ def _noop_checkpoint() -> None:
 
 class FilesystemObservationError(RuntimeError):
     """The source tree is unsafe, malformed, unavailable, or changed."""
+
+
+class FilesystemSourceChangedError(FilesystemObservationError):
+    """A source mutation invalidated this observation; a fresh probe may retry."""
 
 
 class FilesystemEntryType(IntEnum):
@@ -102,6 +109,9 @@ class FilesystemFileObservation:
     stat: FilesystemStat
     artifact_role: FilesystemArtifactSourceRole
     expected_sha256: bytes | None = None
+    _snapshot: bytes | None = field(
+        default=None, repr=False, compare=False, kw_only=True
+    )
     _checkpoint: Callable[[], None] = field(
         default=_noop_checkpoint,
         repr=False,
@@ -113,12 +123,19 @@ class FilesystemFileObservation:
         """Yield exact file bytes after a no-follow open and stat check."""
 
         self._checkpoint()
-        directory_descriptor = os.open(
-            self.folder,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
+        if self._snapshot is not None:
+            # Completion markers already own an exact bounded no-follow read.
+            # The core still derives its content receipt from these bytes.
+            yield self._snapshot
+            self._checkpoint()
+            return
+        directory_descriptor: int | None = None
         descriptor: int | None = None
         try:
+            directory_descriptor = os.open(
+                self.folder,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
             descriptor = os.open(
                 self.name_bytes,
                 os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
@@ -143,17 +160,18 @@ class FilesystemFileObservation:
             if self.expected_sha256 is not None and digest.digest() != (
                 self.expected_sha256
             ):
-                raise FilesystemObservationError(
+                raise FilesystemSourceChangedError(
                     f"source metadata bytes changed after parsing: {self.path}"
                 )
         except OSError as error:
-            raise FilesystemObservationError(
-                f"unable to read source file {self.path}: {error}"
+            raise _source_io_error(
+                f"unable to read source file {self.path}: {error}", error
             ) from error
         finally:
             if descriptor is not None:
                 os.close(descriptor)
-            os.close(directory_descriptor)
+            if directory_descriptor is not None:
+                os.close(directory_descriptor)
 
     @property
     def path(self) -> Path:
@@ -161,9 +179,18 @@ class FilesystemFileObservation:
 
     def _require_stat(self, value: os.stat_result, *, stage: str) -> None:
         if FilesystemStat.from_os_stat(value) != self.stat:
-            raise FilesystemObservationError(
+            raise FilesystemSourceChangedError(
                 f"source file changed {stage}: {self.path}"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class FilesystemCompletionMarker:
+    """Metadata-only scheduling hint, never a core content receipt."""
+
+    stat: FilesystemStat
+    file_sha256: bytes
+    observation_version: int = FILESYSTEM_OBSERVATION_VERSION
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,7 +243,7 @@ class FilesystemPage[PageItemT]:
 
 
 class FilesystemSource:
-    """Discover nested galleries and reproduce exact direct-child snapshots."""
+    """Discover collection trees with completed galleries as terminal leaves."""
 
     def __init__(
         self,
@@ -289,7 +316,7 @@ class FilesystemSource:
         if expected_root is None:  # pragma: no cover - established with the index
             raise RuntimeError("filesystem discovery index lacks its root audit")
         if self._directory_stat(self._root) != expected_root:
-            raise FilesystemObservationError(
+            raise FilesystemSourceChangedError(
                 f"source root changed after discovery snapshot: {self._root}"
             )
         columns = "payload, device, inode, size_bytes, modified_ns, changed_ns"
@@ -310,11 +337,141 @@ class FilesystemSource:
             locator = _decode_locator(bytes(row[0]))
             current = self._directory_stat(self._gallery_path(locator))
             if current != _stat_from_row(row[1:]):
-                raise FilesystemObservationError(
+                raise FilesystemSourceChangedError(
                     f"gallery locator changed after discovery snapshot: {locator!r}"
                 )
             items.append(locator)
         return FilesystemPage(tuple(items), len(rows) <= bound)
+
+    def iter_completion_markers(
+        self,
+    ) -> Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]:
+        """Hash one metadata file at a time from this source's spill index.
+
+        Each watcher probe owns a fresh source context in its own thread. The
+        SQLite connection and discovery snapshot are never shared with ingest.
+        """
+
+        after: tuple[str, ...] | None = None
+        while True:
+            page = self.list_gallery_locators(after_locator=after, limit=128)
+            for locator in page.items:
+                observed = self.observe_completion_marker(locator)
+                digest = observed.expected_sha256
+                if digest is None:  # pragma: no cover - exact snapshot below
+                    raise RuntimeError("completion marker lacks its content digest")
+                yield locator, FilesystemCompletionMarker(observed.stat, digest)
+            if page.terminal:
+                return
+            after = page.items[-1]
+
+    def observe_completion_marker(
+        self,
+        locator_components: tuple[str, ...],
+    ) -> FilesystemFileObservation:
+        """Read galleryinfo bytes without listing or opening image files.
+
+        Every invocation hashes the bytes, regardless of stat equality. All
+        ancestors are opened relative to no-follow directory descriptors, then
+        rechecked against their names before the bounded snapshot is returned.
+        A marker disappearing during a probe is a transient source mutation.
+        Empty and partial metadata remain valid change hints while H@H writes;
+        semantic validation belongs to the full gallery observation.
+        """
+
+        self._require_open()
+        self._checkpoint()
+        if type(locator_components) is not tuple or not locator_components:
+            raise FilesystemObservationError(
+                "gallery locator must be a nonempty exact tuple"
+            )
+        components = tuple(_strict_component(part) for part in locator_components)
+        folder = self._root.joinpath(*components)
+        path = folder / GALLERY_INFO_NAME
+        directories: list[int] = []
+        descriptor: int | None = None
+        directory_flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            directories.append(os.open(self._root, directory_flags))
+            for component in components:
+                self._checkpoint()
+                directories.append(
+                    os.open(component, directory_flags, dir_fd=directories[-1])
+                )
+            value = os.stat(
+                GALLERY_INFO_NAME, dir_fd=directories[-1], follow_symlinks=False
+            )
+            if not stat.S_ISREG(value.st_mode):
+                raise FilesystemObservationError(
+                    f"gallery metadata is not a regular file: {path}"
+                )
+            expected = FilesystemStat.from_os_stat(value)
+            if not 0 <= expected.size_bytes <= MAX_METADATA_BYTES:
+                raise FilesystemObservationError(
+                    f"gallery metadata size is outside policy: {path}"
+                )
+            descriptor = os.open(
+                GALLERY_INFO_NAME,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=directories[-1],
+            )
+            content, digest = self._read_metadata_descriptor(descriptor, path, expected)
+            self._checkpoint()
+            if (
+                FilesystemStat.from_os_stat(os.fstat(descriptor)) != expected
+                or FilesystemStat.from_os_stat(
+                    os.stat(
+                        GALLERY_INFO_NAME,
+                        dir_fd=directories[-1],
+                        follow_symlinks=False,
+                    )
+                )
+                != expected
+            ):
+                raise FilesystemSourceChangedError(
+                    f"gallery metadata changed during completion probe: {path}"
+                )
+            for index, directory in enumerate(directories):
+                self._checkpoint()
+                named = (
+                    self._root.lstat()
+                    if index == 0
+                    else os.stat(
+                        components[index - 1],
+                        dir_fd=directories[index - 1],
+                        follow_symlinks=False,
+                    )
+                )
+                opened = os.fstat(directory)
+                if not stat.S_ISDIR(named.st_mode) or (
+                    named.st_dev,
+                    named.st_ino,
+                ) != (opened.st_dev, opened.st_ino):
+                    raise FilesystemSourceChangedError(
+                        f"gallery locator changed during completion probe: {folder}"
+                    )
+            return FilesystemFileObservation(
+                folder=folder,
+                name_bytes=GALLERY_INFO_NAME.encode("ascii"),
+                stat=expected,
+                artifact_role=FilesystemArtifactSourceRole.METADATA,
+                expected_sha256=digest,
+                _snapshot=content,
+                _checkpoint=self._checkpoint,
+            )
+        except OSError as error:
+            raise _source_io_error(
+                f"unable to probe gallery metadata {path}: {error}", error
+            ) from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            for directory in reversed(directories):
+                os.close(directory)
 
     def observe_gallery(
         self,
@@ -471,6 +628,18 @@ class FilesystemSource:
                     modified_ns INTEGER NOT NULL,
                     changed_ns INTEGER NOT NULL
                 );
+                CREATE TABLE discovery_directories (
+                    ordinal INTEGER PRIMARY KEY,
+                    path TEXT NOT NULL UNIQUE,
+                    device BLOB NOT NULL CHECK (length(device) = 8),
+                    inode BLOB NOT NULL CHECK (length(inode) = 8),
+                    size_bytes INTEGER NOT NULL,
+                    modified_ns INTEGER NOT NULL,
+                    changed_ns INTEGER NOT NULL,
+                    visited INTEGER NOT NULL CHECK (visited IN (0, 1))
+                );
+                CREATE INDEX pending_discovery_directories
+                    ON discovery_directories (visited, ordinal);
                 CREATE TABLE gallery_audits (
                     payload BLOB PRIMARY KEY REFERENCES locators(payload),
                     metadata_audit_sha256 BLOB NOT NULL
@@ -542,7 +711,7 @@ class FilesystemSource:
                 );
                 """)
             expected_root = self._directory_stat(self._root)
-            for locator, observed in self._discover_directory(self._root):
+            for locator, observed in self._discover_directory(self._root, connection):
                 self._checkpoint()
                 try:
                     connection.execute(
@@ -561,7 +730,7 @@ class FilesystemSource:
                         f"duplicate gallery locator: {locator!r}"
                     ) from error
             if self._directory_stat(self._root) != expected_root:
-                raise FilesystemObservationError(
+                raise FilesystemSourceChangedError(
                     f"source root changed during discovery snapshot: {self._root}"
                 )
             connection.commit()
@@ -594,7 +763,7 @@ class FilesystemSource:
                 f"gallery is outside the discovery snapshot: {locator_components!r}"
             )
         if _stat_from_row(discovered) != directory_stat:
-            raise FilesystemObservationError(
+            raise FilesystemSourceChangedError(
                 f"gallery changed after discovery snapshot: {locator_components!r}"
             )
         persisted = connection.execute(
@@ -636,6 +805,10 @@ class FilesystemSource:
         self._checkpoint()
         metadata_path = folder / GALLERY_INFO_NAME
         metadata_stat = self._regular_file_stat(metadata_path)
+        if metadata_stat.size_bytes == 0:
+            raise FilesystemSourceChangedError(
+                f"gallery metadata is not complete: {metadata_path}"
+            )
         if not 1 <= metadata_stat.size_bytes <= MAX_METADATA_BYTES:
             raise FilesystemObservationError(
                 f"gallery metadata size is outside policy: {metadata_path}"
@@ -652,18 +825,16 @@ class FilesystemSource:
                 modified_ns=metadata_stat.modified_ns,
             )
         except Exception as error:
+            self._require_metadata_unchanged(
+                metadata_path, metadata_stat, metadata_sha256
+            )
+            if isinstance(error, FilesystemSourceChangedError):
+                raise
             raise FilesystemObservationError(
                 f"unable to parse {metadata_path}: {error}"
             ) from error
         self._checkpoint()
-        if self._regular_file_stat(metadata_path) != metadata_stat:
-            raise FilesystemObservationError(
-                f"gallery metadata changed while parsing: {metadata_path}"
-            )
-        if self._hash_path(metadata_path, metadata_stat) != metadata_sha256:
-            raise FilesystemObservationError(
-                f"gallery metadata bytes changed while parsing: {metadata_path}"
-            )
+        self._require_metadata_unchanged(metadata_path, metadata_stat, metadata_sha256)
         tags: list[tuple[str, str]] = []
         for namespace, tag_text in parsed.tags:
             self._checkpoint()
@@ -676,7 +847,7 @@ class FilesystemSource:
                 connection.execute("DELETE FROM active_gallery_snapshot")
                 before = self._directory_stat(folder)
                 if before != directory_stat:
-                    raise FilesystemObservationError(
+                    raise FilesystemSourceChangedError(
                         f"gallery directory changed before observation: {folder}"
                     )
                 try:
@@ -706,12 +877,17 @@ class FilesystemSource:
                     if entry_batch:
                         _insert_gallery_entry_batch(connection, entry_batch)
                         self._checkpoint()
-                except (OSError, sqlite3.DatabaseError) as error:
+                except OSError as error:
+                    raise _source_io_error(
+                        f"unable to snapshot gallery directory {folder}: {error}",
+                        error,
+                    ) from error
+                except sqlite3.DatabaseError as error:
                     raise FilesystemObservationError(
                         f"unable to snapshot gallery directory {folder}: {error}"
                     ) from error
                 if self._directory_stat(folder) != directory_stat:
-                    raise FilesystemObservationError(
+                    raise FilesystemSourceChangedError(
                         f"gallery directory changed during observation: {folder}"
                     )
                 digest = sha256(_ENTRY_AUDIT_PREFIX)
@@ -759,7 +935,7 @@ class FilesystemSource:
                     or int(metadata_row[5]) != FilesystemEntryType.REGULAR
                     or _stat_from_row(metadata_row[:5]) != metadata_stat
                 ):
-                    raise FilesystemObservationError(
+                    raise FilesystemSourceChangedError(
                         f"gallery metadata changed while indexing: {metadata_path}"
                     )
                 metadata = FilesystemGalleryMetadata(
@@ -946,7 +1122,12 @@ class FilesystemSource:
                 self._checkpoint()
         except FilesystemObservationError:
             raise
-        except (OSError, sqlite3.DatabaseError) as error:
+        except OSError as error:
+            raise _source_io_error(
+                f"unable to revalidate gallery directory {index.folder}: {error}",
+                error,
+            ) from error
+        except sqlite3.DatabaseError as error:
             raise FilesystemObservationError(
                 f"unable to revalidate gallery directory {index.folder}: {error}"
             ) from error
@@ -973,49 +1154,97 @@ class FilesystemSource:
     def _discover_directory(
         self,
         directory: Path,
+        connection: sqlite3.Connection,
     ) -> Iterator[tuple[tuple[str, ...], FilesystemStat]]:
+        """Spill collection traversal; a completion marker makes a gallery a leaf."""
+
         self._checkpoint()
-        expected_directory = self._directory_stat(directory)
-        has_metadata = False
-        children: list[Path] = []
-        try:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    self._checkpoint()
-                    if entry.name == GALLERY_INFO_NAME:
-                        value = entry.stat(follow_symlinks=False)
-                        if stat.S_ISREG(value.st_mode):
-                            has_metadata = True
-                        elif stat.S_ISLNK(value.st_mode):
-                            raise FilesystemObservationError(
-                                f"gallery metadata must not be a symlink: {entry.path}"
-                            )
-                    if entry.is_dir(follow_symlinks=False):
-                        children.append(Path(entry.path))
-        except FilesystemObservationError:
-            raise
-        except OSError as error:
-            raise FilesystemObservationError(
-                f"unable to discover galleries below {directory}: {error}"
-            ) from error
-        relative = directory.relative_to(self._root)
-        if has_metadata:
-            if not relative.parts:
-                raise FilesystemObservationError(
-                    "source root itself cannot be a gallery locator"
-                )
-            yield (
-                tuple(_strict_component(part) for part in relative.parts),
-                expected_directory,
-            )
-        for child in children:
+        _insert_discovery_directory(
+            connection, directory, self._directory_stat(directory)
+        )
+        while True:
+            row = connection.execute(
+                "SELECT ordinal, path, device, inode, size_bytes, modified_ns, "
+                "changed_ns FROM discovery_directories "
+                "WHERE visited = 0 ORDER BY ordinal LIMIT 1"
+            ).fetchone()
+            if row is None:
+                break
             self._checkpoint()
-            yield from self._discover_directory(child)
-        self._checkpoint()
-        if self._directory_stat(directory) != expected_directory:
-            raise FilesystemObservationError(
-                f"directory changed during gallery discovery: {directory}"
+            directory = Path(row[1])
+            expected_directory = _stat_from_row(row[2:])
+            if self._directory_stat(directory) != expected_directory:
+                raise FilesystemSourceChangedError(
+                    f"directory changed during gallery discovery: {directory}"
+                )
+            metadata_path = directory / GALLERY_INFO_NAME
+            try:
+                metadata = metadata_path.lstat()
+            except FileNotFoundError:
+                metadata = None
+            except OSError as error:
+                raise _source_io_error(
+                    f"unable to inspect gallery metadata {metadata_path}: {error}",
+                    error,
+                ) from error
+            if metadata is not None:
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise FilesystemObservationError(
+                        f"gallery metadata must not be a symlink: {metadata_path}"
+                    )
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise FilesystemObservationError(
+                        f"gallery metadata is not a regular file: {metadata_path}"
+                    )
+                relative = directory.relative_to(self._root)
+                if not relative.parts:
+                    raise FilesystemObservationError(
+                        "source root itself cannot be a gallery locator"
+                    )
+                yield (
+                    tuple(_strict_component(part) for part in relative.parts),
+                    expected_directory,
+                )
+            else:
+                try:
+                    with os.scandir(directory) as entries:
+                        for entry in entries:
+                            self._checkpoint()
+                            if entry.is_dir(follow_symlinks=False):
+                                _strict_component(entry.name)
+                                _insert_discovery_directory(
+                                    connection,
+                                    Path(entry.path),
+                                    FilesystemStat.from_os_stat(
+                                        entry.stat(follow_symlinks=False)
+                                    ),
+                                )
+                except OSError as error:
+                    raise _source_io_error(
+                        f"unable to discover galleries below {directory}: {error}",
+                        error,
+                    ) from error
+            if self._directory_stat(directory) != expected_directory:
+                raise FilesystemSourceChangedError(
+                    f"directory changed during gallery discovery: {directory}"
+                )
+            connection.execute(
+                "UPDATE discovery_directories SET visited = 1 WHERE ordinal = ?",
+                (row[0],),
             )
+        # Revalidate collection ancestry without retaining a Python tree or
+        # leaving a recursively open scandir descriptor for every tree level.
+        rows = connection.execute(
+            "SELECT path, device, inode, size_bytes, modified_ns, changed_ns "
+            "FROM discovery_directories ORDER BY ordinal"
+        )
+        for row in rows:
+            self._checkpoint()
+            if self._directory_stat(Path(row[0])) != _stat_from_row(row[1:]):
+                raise FilesystemSourceChangedError(
+                    f"directory changed during gallery discovery: {row[0]}"
+                )
+        connection.execute("DELETE FROM discovery_directories")
 
     def _gallery_path(self, locator_components: tuple[str, ...]) -> Path:
         if type(locator_components) is not tuple or not locator_components:
@@ -1029,8 +1258,8 @@ class FilesystemSource:
             try:
                 value = current.lstat()
             except OSError as error:
-                raise FilesystemObservationError(
-                    f"gallery locator is unavailable: {current}: {error}"
+                raise _source_io_error(
+                    f"gallery locator is unavailable: {current}: {error}", error
                 ) from error
             if not stat.S_ISDIR(value.st_mode):
                 raise FilesystemObservationError(
@@ -1043,8 +1272,8 @@ class FilesystemSource:
         try:
             value = path.lstat()
         except OSError as error:
-            raise FilesystemObservationError(
-                f"unable to inspect gallery directory {path}: {error}"
+            raise _source_io_error(
+                f"unable to inspect gallery directory {path}: {error}", error
             ) from error
         if not stat.S_ISDIR(value.st_mode):
             raise FilesystemObservationError(f"gallery path is not a directory: {path}")
@@ -1055,8 +1284,8 @@ class FilesystemSource:
         try:
             value = path.lstat()
         except OSError as error:
-            raise FilesystemObservationError(
-                f"unable to inspect gallery metadata {path}: {error}"
+            raise _source_io_error(
+                f"unable to inspect gallery metadata {path}: {error}", error
             ) from error
         if not stat.S_ISREG(value.st_mode):
             raise FilesystemObservationError(
@@ -1065,34 +1294,7 @@ class FilesystemSource:
         return FilesystemStat.from_os_stat(value)
 
     def _hash_path(self, path: Path, expected: FilesystemStat) -> bytes:
-        self._checkpoint()
-        digest = sha256()
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(path, flags)
-        except OSError as error:
-            raise FilesystemObservationError(
-                f"unable to open gallery metadata {path}: {error}"
-            ) from error
-        try:
-            if FilesystemStat.from_os_stat(os.fstat(descriptor)) != expected:
-                raise FilesystemObservationError(
-                    f"gallery metadata changed before hashing: {path}"
-                )
-            while True:
-                self._checkpoint()
-                part = os.read(descriptor, _READ_BYTES)
-                if not part:
-                    break
-                digest.update(part)
-            self._checkpoint()
-            if FilesystemStat.from_os_stat(os.fstat(descriptor)) != expected:
-                raise FilesystemObservationError(
-                    f"gallery metadata changed after hashing: {path}"
-                )
-        finally:
-            os.close(descriptor)
-        return digest.digest()
+        return self._read_metadata_path(path, expected)[1]
 
     def _read_metadata_path(
         self,
@@ -1102,16 +1304,50 @@ class FilesystemSource:
         """Read one exact bounded metadata snapshot from a no-follow descriptor."""
 
         self._checkpoint()
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        flags = (
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        )
         try:
             descriptor = os.open(path, flags)
         except OSError as error:
-            raise FilesystemObservationError(
-                f"unable to open gallery metadata {path}: {error}"
+            raise _source_io_error(
+                f"unable to open gallery metadata {path}: {error}", error
             ) from error
         try:
-            if FilesystemStat.from_os_stat(os.fstat(descriptor)) != expected:
+            return self._read_metadata_descriptor(descriptor, path, expected)
+        finally:
+            os.close(descriptor)
+
+    def _require_metadata_unchanged(
+        self,
+        path: Path,
+        expected_stat: FilesystemStat,
+        expected_sha256: bytes,
+    ) -> None:
+        self._checkpoint()
+        if self._regular_file_stat(path) != expected_stat:
+            raise FilesystemSourceChangedError(
+                f"gallery metadata changed while parsing: {path}"
+            )
+        if self._hash_path(path, expected_stat) != expected_sha256:
+            raise FilesystemSourceChangedError(
+                f"gallery metadata bytes changed while parsing: {path}"
+            )
+
+    def _read_metadata_descriptor(
+        self,
+        descriptor: int,
+        path: Path,
+        expected: FilesystemStat,
+    ) -> tuple[bytes, bytes]:
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
                 raise FilesystemObservationError(
+                    f"gallery metadata is not a regular file: {path}"
+                )
+            if FilesystemStat.from_os_stat(opened) != expected:
+                raise FilesystemSourceChangedError(
                     f"gallery metadata changed before reading: {path}"
                 )
             content = bytearray()
@@ -1128,20 +1364,18 @@ class FilesystemSource:
                 digest.update(part)
             self._checkpoint()
             if len(content) != expected.size_bytes:
-                raise FilesystemObservationError(
+                raise FilesystemSourceChangedError(
                     f"gallery metadata size changed while reading: {path}"
                 )
             if FilesystemStat.from_os_stat(os.fstat(descriptor)) != expected:
-                raise FilesystemObservationError(
+                raise FilesystemSourceChangedError(
                     f"gallery metadata changed after reading: {path}"
                 )
             return bytes(content), digest.digest()
         except OSError as error:
-            raise FilesystemObservationError(
-                f"unable to read gallery metadata {path}: {error}"
+            raise _source_io_error(
+                f"unable to read gallery metadata {path}: {error}", error
             ) from error
-        finally:
-            os.close(descriptor)
 
 
 def _parse_galleryinfo_content(
@@ -1156,11 +1390,11 @@ def _parse_galleryinfo_content(
     lines = text.strip("\n").split("\n")
     gid = parse_gid(gallery_folder)
     modified_time = datetime.fromtimestamp(modified_ns / 1_000_000_000)
-    title: str
-    upload_time: datetime
-    upload_account: str
-    download_time: datetime
-    tags: list[tuple[str, str]]
+    title: str | None = None
+    upload_time: datetime | None = None
+    upload_account: str | None = None
+    download_time: datetime | None = None
+    tags: list[tuple[str, str]] | None = None
     comments = False
     comment_lines: list[str] = []
     for line in lines:
@@ -1197,6 +1431,17 @@ def _parse_galleryinfo_content(
             elif key == "Downloaded":
                 download_time = datetime.strptime(value, "%Y-%m-%d %H:%M")
 
+    if (
+        title is None
+        or upload_time is None
+        or upload_account is None
+        or download_time is None
+        or tags is None
+    ):
+        raise FilesystemSourceChangedError(
+            f"gallery metadata is missing required fields: {gallery_folder}"
+        )
+
     return GalleryInfoParser(
         gallery_folder=gallery_folder,
         gallery_name=gallery_folder.name,
@@ -1208,6 +1453,26 @@ def _parse_galleryinfo_content(
         upload_account=upload_account,
         download_time=download_time,
         tags=tags,
+    )
+
+
+def _insert_discovery_directory(
+    connection: sqlite3.Connection,
+    directory: Path,
+    observed: FilesystemStat,
+) -> None:
+    connection.execute(
+        "INSERT INTO discovery_directories "
+        "(path, device, inode, size_bytes, modified_ns, changed_ns, visited) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0)",
+        (
+            str(directory),
+            observed.device.to_bytes(8, "big"),
+            observed.inode.to_bytes(8, "big"),
+            observed.size_bytes,
+            observed.modified_ns,
+            observed.changed_ns,
+        ),
     )
 
 
@@ -1299,8 +1564,14 @@ def _exact_text(value: object) -> str:
     return value
 
 
-def _gallery_changed(folder: Path) -> FilesystemObservationError:
-    return FilesystemObservationError(
+def _source_io_error(message: str, error: OSError) -> FilesystemObservationError:
+    if error.errno in {errno.ENOENT, errno.ESTALE}:
+        return FilesystemSourceChangedError(message)
+    return FilesystemObservationError(message)
+
+
+def _gallery_changed(folder: Path) -> FilesystemSourceChangedError:
+    return FilesystemSourceChangedError(
         f"gallery changed between bounded pages: {folder}"
     )
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from threading import Event
 from typing import cast
@@ -15,6 +15,7 @@ from h2hdb import (
     VNextIngestCompletionReceipt,
     VNextIngestFacade,
     VNextIngestSession,
+    VNextSourceChangedError,
     VNextSourceManifestMismatchError,
 )
 
@@ -26,6 +27,10 @@ from h2hdb_ingest import (
     ManagedFilesystemLibraryAdapter,
     ResidentConfig,
 )
+from h2hdb_ingest.filesystem import (
+    FilesystemCompletionMarker,
+    FilesystemSourceChangedError,
+)
 from h2hdb_ingest.library_identity import LibraryStorageIdentityProvider
 from h2hdb_ingest.maintenance import (
     LibraryMaintenanceOutcome,
@@ -33,6 +38,14 @@ from h2hdb_ingest.maintenance import (
 )
 from h2hdb_ingest.resident import IngestSynchronizer, ResidentIngestor
 from h2hdb_ingest.session import IngestSessionController
+from h2hdb_ingest.source_schedule import SourceScanSchedule
+
+
+def _empty_source_probe(
+    checkpoint: Callable[[], None],
+) -> Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]:
+    checkpoint()
+    return iter(())
 
 
 def _session() -> VNextIngestSession:
@@ -240,20 +253,23 @@ def _resident(
     library_storage_identity: LibraryStorageIdentityProvider | None = None,
     service: IngestSynchronizer | None = None,
     artifact_release_adapters: Mapping[bytes, ArtifactReleaseAdapter] | None = None,
+    facade: _Facade | None = None,
 ) -> ResidentIngestor:
-    facade = _Facade(
+    facade = facade or _Facade(
         events,
         available=available,
         maintenance_results=maintenance_results,
     )
     return ResidentIngestor(
+        source_probe=_empty_source_probe,
         service=service or _Service(events),
         facade=cast(VNextIngestFacade, facade),
         database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
         library_storage_identity=library_storage_identity,
         library_maintenance=(library_maintenance or _LibraryMaintenance()),
         config=ResidentConfig(
-            periodic_scan_seconds=60,
+            source_quiet_seconds=5,
+            source_max_wait_seconds=60,
             poll_seconds=1,
             lease_seconds=10,
             heartbeat_seconds=5,
@@ -404,13 +420,15 @@ def test_root_swap_after_cycle_check_is_fatal_before_maintenance_or_claim(
     monkeypatch.setattr(adapter, "ensure_storage_identity", ensure_then_swap)
     facade = _Facade(events, available=False)
     resident = ResidentIngestor(
+        source_probe=_empty_source_probe,
         service=_Service(events),
         facade=cast(VNextIngestFacade, facade),
         database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
         library_storage_identity=adapter,
         library_maintenance=adapter,
         config=ResidentConfig(
-            periodic_scan_seconds=60,
+            source_quiet_seconds=5,
+            source_max_wait_seconds=60,
             poll_seconds=1,
             lease_seconds=10,
             heartbeat_seconds=5,
@@ -462,13 +480,15 @@ def test_storage_mismatch_from_current_only_maintenance_is_not_best_effort() -> 
 
     facade = _MismatchDuringMaintenanceFacade()
     resident = ResidentIngestor(
+        source_probe=_empty_source_probe,
         service=_Service(events),
         facade=cast(VNextIngestFacade, facade),
         database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
         library_storage_identity=_StorageIdentity(events, storage_uuid),
         library_maintenance=_LibraryMaintenance(),
         config=ResidentConfig(
-            periodic_scan_seconds=60,
+            source_quiet_seconds=5,
+            source_max_wait_seconds=60,
             poll_seconds=1,
             lease_seconds=10,
             heartbeat_seconds=5,
@@ -848,13 +868,15 @@ def test_staging_capacity_preserves_completion_failure_as_note(
     monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
     facade = _CompletionFailureFacade(events)
     resident = ResidentIngestor(
+        source_probe=_empty_source_probe,
         service=_StagingCapacityService(events),
         facade=cast(VNextIngestFacade, facade),
         database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
         library_storage_identity=None,
         library_maintenance=_LibraryMaintenance(),
         config=ResidentConfig(
-            periodic_scan_seconds=60,
+            source_quiet_seconds=5,
+            source_max_wait_seconds=60,
             poll_seconds=1,
             lease_seconds=10,
             heartbeat_seconds=5,
@@ -926,13 +948,15 @@ def test_maintenance_failure_does_not_undo_completed_ingest(
 
     monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
     resident = ResidentIngestor(
+        source_probe=_empty_source_probe,
         service=_Service(events),
         facade=cast(VNextIngestFacade, _FailAfterCompletionFacade()),
         database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
         library_storage_identity=None,
         library_maintenance=_LibraryMaintenance(),
         config=ResidentConfig(
-            periodic_scan_seconds=60,
+            source_quiet_seconds=5,
+            source_max_wait_seconds=60,
             poll_seconds=1,
             lease_seconds=10,
             heartbeat_seconds=5,
@@ -950,7 +974,7 @@ def test_maintenance_failure_does_not_undo_completed_ingest(
     )
 
 
-def test_run_forever_retries_progress_immediately_without_resetting_periodic(
+def test_run_forever_retries_progress_immediately_without_resetting_source_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[object] = []
@@ -983,6 +1007,7 @@ def test_run_forever_retries_progress_immediately_without_resetting_periodic(
         ("current-only", 10_000_000),
         ("current-only", 10_000_000),
         ("claim", True, 10_000_000),
+        ("claim", False, 10_000_000),
         ("wait", 1.0),
     ]
 
@@ -1056,5 +1081,199 @@ def test_run_forever_immediately_drains_library_progress_then_waits(
     assert events == [
         ("current-only", 10_000_000),
         ("claim", True, 10_000_000),
+        ("claim", False, 10_000_000),
         ("wait", 1.0),
     ]
+
+
+def test_due_source_scan_still_consumes_pending_downloader_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+
+    class _HandoffFacade(_Facade):
+        def try_claim_ingest(
+            self, periodic: bool, lease_duration_microseconds: int
+        ) -> VNextIngestSession | None:
+            claimed = super().try_claim_ingest(periodic, lease_duration_microseconds)
+            return None if periodic else claimed
+
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    resident = _resident(events, facade=_HandoffFacade(events))
+    assert resident.process_available(periodic_scan=True)
+    assert events[:4] == [
+        ("current-only", 10_000_000),
+        ("claim", True, 10_000_000),
+        ("claim", False, 10_000_000),
+        "synchronize",
+    ]
+    assert ("complete", 2) in events
+
+
+def test_stop_between_due_claim_and_handoff_fallback_prevents_new_claim() -> None:
+    events: list[object] = []
+    stopped = Event()
+
+    class _StoppingFacade(_Facade):
+        def try_claim_ingest(
+            self, periodic: bool, lease_duration_microseconds: int
+        ) -> VNextIngestSession | None:
+            super().try_claim_ingest(periodic, lease_duration_microseconds)
+            stopped.set()
+            return None
+
+    resident = _resident(events, facade=_StoppingFacade(events))
+    assert not resident.process_available(
+        periodic_scan=True, should_stop=stopped.is_set
+    )
+    assert events == [
+        ("current-only", 10_000_000),
+        ("claim", True, 10_000_000),
+    ]
+
+
+@pytest.mark.parametrize(
+    "source_error", [VNextSourceChangedError, FilesystemSourceChangedError]
+)
+def test_transient_source_mutation_completes_after_heartbeat_shutdown(
+    monkeypatch: pytest.MonkeyPatch, source_error: type[RuntimeError]
+) -> None:
+    events: list[object] = []
+
+    class _ChangingService(_Service):
+        def synchronize_once(
+            self,
+            session: IngestSessionController,
+            *,
+            should_stop: Callable[[], bool] | None = None,
+        ) -> object:
+            del session, should_stop
+            events.append("synchronize")
+            raise source_error("marker changed")
+
+    class _OrderedHeartbeat(_Heartbeat):
+        def __exit__(self, *args: object) -> None:
+            del args
+            events.append("heartbeat-stop")
+
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _OrderedHeartbeat)
+    resident = _resident(events, service=_ChangingService(events))
+    assert not resident.process_available(periodic_scan=True)
+    assert events == [
+        ("current-only", 10_000_000),
+        ("claim", True, 10_000_000),
+        "synchronize",
+        "heartbeat-stop",
+        ("complete", 2),
+        ("current-only", 10_000_000),
+        ("log", "source changed during synchronization; retry pending"),
+    ]
+
+
+def test_run_forever_retries_mutation_after_quiet_period_without_process_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    now = [100.0]
+    scans: list[float] = []
+
+    class _Stop:
+        def is_set(self) -> bool:
+            return len(scans) == 2
+
+        def wait(self, timeout: float) -> bool:
+            now[0] += timeout
+            assert now[0] <= 106, "transient source retry missed its quiet deadline"
+            return self.is_set()
+
+    class _DueOnlyFacade(_Facade):
+        def try_claim_ingest(
+            self, periodic: bool, lease_duration_microseconds: int
+        ) -> VNextIngestSession | None:
+            claimed = super().try_claim_ingest(periodic, lease_duration_microseconds)
+            return claimed if periodic else None
+
+    class _ChangingOnceService(_Service):
+        def synchronize_once(
+            self,
+            session: IngestSessionController,
+            *,
+            should_stop: Callable[[], bool] | None = None,
+        ) -> object:
+            del session, should_stop
+            scans.append(now[0])
+            if len(scans) == 1:
+                raise VNextSourceChangedError("marker changed")
+            return "recovered"
+
+    monkeypatch.setattr(resident_module, "monotonic", lambda: now[0])
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    resident = _resident(
+        events,
+        facade=_DueOnlyFacade(events),
+        service=_ChangingOnceService(events),
+    )
+    resident.run_forever(stop=cast(Event, _Stop()))
+    assert scans == [100.0, 105.0]
+    assert events.count(("complete", 2)) == 2
+
+
+def test_run_forever_preserves_scan_time_change_and_then_stays_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    now = [100.0]
+    scans: list[float] = []
+    schedules: list[SourceScanSchedule] = []
+
+    def make_schedule(
+        *, quiet_seconds: float, max_wait_seconds: float, now: float
+    ) -> SourceScanSchedule:
+        schedule = SourceScanSchedule(
+            quiet_seconds=quiet_seconds, max_wait_seconds=max_wait_seconds, now=now
+        )
+        schedules.append(schedule)
+        return schedule
+
+    class _Stop:
+        def is_set(self) -> bool:
+            return now[0] >= 500
+
+        def wait(self, timeout: float) -> bool:
+            del timeout
+            now[0] += 100
+            return self.is_set()
+
+    class _DueOnlyFacade(_Facade):
+        def try_claim_ingest(
+            self, periodic: bool, lease_duration_microseconds: int
+        ) -> VNextIngestSession | None:
+            claimed = super().try_claim_ingest(periodic, lease_duration_microseconds)
+            return claimed if periodic else None
+
+    class _ChangingService(_Service):
+        def synchronize_once(
+            self,
+            session: IngestSessionController,
+            *,
+            should_stop: Callable[[], bool] | None = None,
+        ) -> object:
+            del session, should_stop
+            scans.append(now[0])
+            if len(scans) == 1:
+                schedules[0].note_change(now=110)
+                now[0] = 200
+            return "synced"
+
+    monkeypatch.setattr(resident_module, "monotonic", lambda: now[0])
+    monkeypatch.setattr(resident_module, "SourceScanSchedule", make_schedule)
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    resident = _resident(
+        events,
+        facade=_DueOnlyFacade(events),
+        service=_ChangingService(events),
+    )
+    resident.run_forever(stop=cast(Event, _Stop()))
+    assert scans == [100.0, 200.0]
+    assert events.count(("claim", True, 10_000_000)) == 2
+    assert schedules[0].next_scan_at() is None

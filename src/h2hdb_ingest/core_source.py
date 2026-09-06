@@ -14,15 +14,17 @@ from h2hdb import (
     TagObservation,
     VNextIngestGalleryObservation,
     VNextIngestPage,
+    VNextSourceCompletionMarker,
 )
 
 from .filesystem import (
+    FILESYSTEM_OBSERVATION_VERSION,
     FilesystemDirectoryObservation,
     FilesystemFileObservation,
     FilesystemGalleryMetadata,
     FilesystemGalleryObservation,
-    FilesystemObservationError,
     FilesystemSource,
+    FilesystemSourceChangedError,
 )
 
 
@@ -60,6 +62,16 @@ class VNextFilesystemSourceAdapter:
         return VNextIngestGalleryObservation(
             locator_components=locator_components,
             metadata=_metadata(observed.metadata),
+        )
+
+    def observe_completion_marker(
+        self,
+        locator_components: tuple[str, ...],
+    ) -> VNextSourceCompletionMarker:
+        observed = self._source.observe_completion_marker(locator_components)
+        return VNextSourceCompletionMarker(
+            file=_file(observed),
+            observation_version=FILESYSTEM_OBSERVATION_VERSION,
         )
 
     def list_file_observations(
@@ -133,7 +145,7 @@ class VNextFilesystemSourceAdapter:
         if not isinstance(observation, VNextIngestGalleryObservation):
             raise TypeError("observation must be VNextIngestGalleryObservation")
         if _metadata(reopened.metadata) != observation.metadata:
-            raise FilesystemObservationError(
+            raise FilesystemSourceChangedError(
                 "gallery metadata changed between bounded source pages"
             )
 

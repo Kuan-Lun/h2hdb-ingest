@@ -33,6 +33,7 @@ from .page_workers import _decide_page_render_workers
 from .policy import build_ingest_policy
 from .resident import ResidentIngestor
 from .service import VNextIngestService
+from .source_monitor import FilesystemCompletionMarkerProbe
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,7 @@ def build_runtime(
         )
         resident = ResidentIngestor(
             service=service,
+            source_probe=FilesystemCompletionMarkerProbe(config.paths.download_path),
             facade=facade,
             database_admin=database_admin,
             library_storage_identity=library_storage_identity,

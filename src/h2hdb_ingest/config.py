@@ -172,7 +172,9 @@ class IngestPathsConfig(ConfigModel):
 
 
 class ResidentConfig(ConfigModel):
-    periodic_scan_seconds: float = Field(default=1800, gt=0)
+    source_quiet_seconds: float = Field(default=300, gt=0, allow_inf_nan=False)
+    source_max_wait_seconds: float = Field(default=1800, gt=0, allow_inf_nan=False)
+    source_probe_interval_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)
     poll_seconds: float = Field(default=5, gt=0)
     lease_seconds: int = Field(default=300, ge=2)
     heartbeat_seconds: float = Field(default=60, gt=0)
@@ -182,6 +184,10 @@ class ResidentConfig(ConfigModel):
     def validate_heartbeat(self) -> ResidentConfig:
         if self.heartbeat_seconds >= self.lease_seconds:
             raise ValueError("heartbeat_seconds must be shorter than lease_seconds")
+        if self.source_quiet_seconds > self.source_max_wait_seconds:
+            raise ValueError(
+                "source_quiet_seconds must not exceed source_max_wait_seconds"
+            )
         return self
 
 

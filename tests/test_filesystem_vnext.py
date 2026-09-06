@@ -181,8 +181,8 @@ def test_artifact_roles_and_page_count_are_adapter_owned(tmp_path: Path) -> None
     source = FilesystemSource(root)
     observation, page = source.list_files(("1004",), after_name=None, limit=256)
 
-    assert FILESYSTEM_OBSERVATION_VERSION == 2
-    assert observation.metadata.scan_observation_version == 2
+    assert FILESYSTEM_OBSERVATION_VERSION == 3
+    assert observation.metadata.scan_observation_version == 3
     assert observation.metadata.source_file_count == 5
     assert observation.metadata.page_count == 3
     assert {item.name_bytes: item.artifact_role for item in page.items} == {
@@ -266,15 +266,13 @@ def test_discovery_checkpoint_interrupts_and_cleans_partial_spill_index(
     source.close()
 
 
-@pytest.mark.parametrize("size_bytes", [0, MAX_METADATA_BYTES + 1])
 def test_gallery_metadata_size_is_bounded_before_parser(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    size_bytes: int,
 ) -> None:
     root = tmp_path / "download"
     folder = _gallery(root, "1008")
-    (folder / "galleryinfo.txt").write_bytes(b"x" * size_bytes)
+    (folder / "galleryinfo.txt").write_bytes(b"x" * (MAX_METADATA_BYTES + 1))
     parser_called = False
 
     def unexpected_parser(

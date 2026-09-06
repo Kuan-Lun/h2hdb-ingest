@@ -52,12 +52,11 @@ cover extent or thumbnail resource.
 
 ## Important upgrade notice
 
-This release requires the H2HDB `0.32` compatibility lane and schema epoch 3,
-schema version 3. Catalogs published through ingest include core's
-title-specific search authority alongside the existing title, tag, GID,
-upload/download time, and artifact page-count metadata.
+This release requires the H2HDB `0.33` compatibility lane and schema epoch 3,
+schema version 4. Verified completion markers are stored with immutable source
+observations so unchanged galleries can reuse those observations across restarts.
 
-Schema-version-2 databases are rejected. Initialize a new empty database with
+Schema-version-3 and older databases are rejected. Initialize a new empty database with
 the H2HDB administrator command, then rebuild the catalog from the source
 download tree. There is no in-place schema migration or older-core fallback.
 
@@ -167,7 +166,9 @@ A minimal SQLite configuration with artifacts enabled is:
     }
   },
   "resident": {
-    "periodic_scan_seconds": 1800,
+    "source_quiet_seconds": 300,
+    "source_max_wait_seconds": 1800,
+    "source_probe_interval_seconds": 30,
     "poll_seconds": 5,
     "lease_seconds": 300,
     "heartbeat_seconds": 60,
@@ -179,6 +180,35 @@ A minimal SQLite configuration with artifacts enabled is:
 Set `library_path` to `null` to publish catalog metadata without producing
 artifacts. `download_path` must already be a nonempty directory. The download
 and library roots must be distinct and must not contain one another.
+
+The resident reconciles the source immediately on startup. After that, a source
+change schedules synchronization after `source_quiet_seconds` without another
+observed change, or after `source_max_wait_seconds` from the first observed
+change, whichever comes first. Monitoring continues during synchronization.
+Changes observed during that work remain pending: the next maximum wait starts
+at completion, while an already elapsed quiet period allows an immediate retry.
+An unchanged source does not trigger periodic full synchronization. The former
+`periodic_scan_seconds` option is rejected.
+
+Each monitor pass discovers gallery folders and reads and hashes only their
+`galleryinfo.txt` completion markers. It compares content, size, device, inode,
+mtime and ctime, so rewriting identical metadata with a changed stat still
+signals completion. Writers must finish gallery changes before writing the
+completion marker. Completed galleries are terminal discovery leaves; nested
+collection directories are supported, but galleries below another completed
+gallery are not discovered. The monitor does not enumerate a completed
+gallery's image entries. Its comparison index spills to disposable local disk
+and uses no core database connection.
+
+`source_probe_interval_seconds` is the pause between completed metadata passes;
+filesystem latency also contributes to detection delay. The quiet and maximum
+waits use observed changes, not an unavailable writer timestamp. Transient
+source changes during observation retain a retry after the quiet period.
+Empty markers and metadata missing required fields are treated as incomplete
+writes, including on startup: they are never published and retry after the
+quiet period. Marker probes only hash bytes; full observation still rejects
+invalid UTF-8, invalid dates, unsafe paths, and metadata larger than 1 MiB.
+Downloader handoffs and bounded cleanup remain eligible between source scans.
 
 JPEG qualities are strict integers from 0 through 95. Supported resamplers are
 `nearest`, `box`, `bilinear`, `hamming`, `bicubic`, and `lanczos`. An explicit
