@@ -220,7 +220,7 @@ def test_fresh_epoch_runs_source_analysis_and_publication(
     revision = runtime.catalog.get_catalog_revision()
 
     assert initialized.epoch == checked.epoch
-    assert initialized.schema_version == checked.schema_version == 3
+    assert initialized.schema_version == checked.schema_version == 4
     assert processed
     assert revision.revision == 1
     assert revision.publication_count == 1
