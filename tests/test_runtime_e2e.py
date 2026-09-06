@@ -18,6 +18,7 @@ from h2hdb import (
     CatalogPageCountRange,
     CatalogRevisionNotFoundError,
     CatalogSubjectFilter,
+    CatalogTagFilter,
     CatalogTimestampRange,
     CoreConfig,
     DatabaseConfig,
@@ -220,7 +221,7 @@ def test_fresh_epoch_runs_source_analysis_and_publication(
     revision = runtime.catalog.get_catalog_revision()
 
     assert initialized.epoch == checked.epoch
-    assert initialized.schema_version == checked.schema_version == 4
+    assert initialized.schema_version == checked.schema_version == 5
     assert processed
     assert revision.revision == 1
     assert revision.publication_count == 1
@@ -244,6 +245,18 @@ def test_fresh_epoch_runs_source_analysis_and_publication(
         ),
     )
     assert [publication.gid for publication in searchable.publications] == [1001]
+    tag_bundle = runtime.catalog.list_tag_values_with_publications(
+        namespace="artist", revision=revision
+    )
+    assert [tag.value for tag in tag_bundle.page.values] == ["first"]
+    assert tag_bundle.publications == searchable.publications
+    assert (
+        runtime.catalog.list_tag_publications(
+            subject=CatalogTagFilter(namespace="artist", value="first"),
+            revision=revision,
+        ).publications
+        == searchable.publications
+    )
     assert (
         runtime.catalog.discover_publications(
             revision=revision,

@@ -52,11 +52,11 @@ cover extent or thumbnail resource.
 
 ## Important upgrade notice
 
-This release requires the H2HDB `0.33` compatibility lane and schema epoch 3,
-schema version 4. Verified completion markers are stored with immutable source
+This release requires the H2HDB `0.35` compatibility lane and schema epoch 3,
+schema version 5. Verified completion markers are stored with immutable source
 observations so unchanged galleries can reuse those observations across restarts.
 
-Schema-version-3 and older databases are rejected. Initialize a new empty database with
+Schema-version-4 and older databases are rejected. Initialize a new empty database with
 the H2HDB administrator command, then rebuild the catalog from the source
 download tree. There is no in-place schema migration or older-core fallback.
 
