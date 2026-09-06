@@ -56,12 +56,28 @@ class IngestRuntime:
     _entered: bool = field(default=False, init=False, repr=False, compare=False)
 
     def close(self) -> None:
-        """Close facade-owned caches exactly once before returning."""
+        """Drain caches and release every facade's database pool."""
 
         with self._lifecycle_lock:
             if self._closed:
                 return
-            self.facade.close()
+            errors: list[BaseException] = []
+            for close in (
+                self.facade.close,
+                self.catalog.close,
+                self.database_admin.close,
+            ):
+                try:
+                    close()
+                except BaseException as error:
+                    errors.append(error)
+            if errors:
+                first_error = errors[0]
+                for additional_error in errors[1:]:
+                    first_error.add_note(
+                        f"Another facade failed to close: {additional_error!r}"
+                    )
+                raise first_error
             object.__setattr__(self, "_closed", True)
 
     def __enter__(self) -> Self:
@@ -87,9 +103,12 @@ def build_runtime(
     if not isinstance(config, IngestConfig):
         raise TypeError("config must be IngestConfig")
     facade = VNextIngestFacade(config.core)
+    owned_closers = [facade.close]
     try:
         database_admin = VNextDatabaseAdminFacade(config.core)
+        owned_closers.append(database_admin.close)
         catalog = VNextCatalogFacade(config.core)
+        owned_closers.append(catalog.close)
         runtime_event_logger = event_logger or logger.info
         metrics_sink = TextIngestMetricSink(runtime_event_logger)
 
@@ -153,13 +172,14 @@ def build_runtime(
         )
         return IngestRuntime(facade, database_admin, catalog, resident)
     except BaseException as error:
-        try:
-            facade.close()
-        except BaseException as close_error:
-            error.add_note(
-                "The ingest facade also failed to close after runtime "
-                f"construction failed: {close_error!r}"
-            )
+        for close in reversed(owned_closers):
+            try:
+                close()
+            except BaseException as close_error:
+                error.add_note(
+                    "A facade also failed to close after runtime "
+                    f"construction failed: {close_error!r}"
+                )
         raise
 
 

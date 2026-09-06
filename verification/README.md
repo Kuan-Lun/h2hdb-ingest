@@ -28,6 +28,14 @@ This directory contains executable specifications owned by filesystem ingest.
   premise, that caller digests are accepted only after independent
   recomputation, and that released/replaced journal facts reject stale exact
   fences.
+- `lean/ArchiveInspectionReuse.lean` proves that a single-use inspection slot
+  agrees with full inspection when the actual rehashed bytes match, under an
+  explicit collision-free-at-the-inspected-bytes assumption. It also proves
+  one-slot retention, consume-before-I/O, empty restart, and failed-copy
+  nonpublication. Runtime refinement covers full JPEG decode without pixel
+  copies, byte-for-byte output equivalence, archive/cover tampering, and actual
+  SIGTERM/SIGKILL during and after destination copy. Neither SHA-256 security
+  nor Python/Pillow/OS behavior is proved by the mathematical model.
 - `tla/CbzLibraryActivation.tla` model-checks crash recovery between
   reader-invisible
   core publication, bounded local library activation, and reader-head
@@ -121,6 +129,35 @@ it does not prove that pathname identity cannot change between one successful
 guard and its next POSIX syscall. Real directory replacement, journal-UUID
 corruption, maintenance/claim-boundary, and fatal-propagation tests connect the
 modeled exact-pair decision to those named implementation seams.
+
+`tests/test_runtime_process_lifecycle.py` supplies real spawned-process recovery
+evidence at two committed public boundaries: a sealed source build and a
+nonempty `BUILD_CATALOG` projection batch, both before any reader-visible
+publication. The parent sends SIGTERM through the production
+`_stop_on_termination` handler and verifies graceful bounded-step exit, or sends
+SIGKILL without cleanup. A fresh process reconstructs the runtime from durable
+authority and completes source, analysis, artifact preparation, publication and
+activation. It runs the full administration `check`, verifies every published
+page extent and SHA-256, archive CRC, decoded JPEG and thumbnail, and compares
+the result with an independent uninterrupted SQLite runtime using the same
+synthetic source. Each child also reports the core import location, which must
+match its parent; installed-wheel validation therefore exercises that wheel in
+the fresh process too.
+
+The fixture has one gallery with two JPEG pages and covers both signals and
+both boundaries on SQLite and opt-in MariaDB 10.11.11. A public facade test clock
+advances by 120 seconds on restart so the predecessor's 30-second lease has
+expired without changing production expiry rules or waiting in real time.
+This is process-termination evidence at the named boundaries, not arbitrary
+power-loss, storage-device durability, or exhaustive pipeline interruption
+evidence. MariaDB cases are marked `deep` and stay outside the automatic merge
+profile.
+
+```bash
+.venv/bin/pytest -q -n 0 tests/test_runtime_process_lifecycle.py -k sqlite
+H2HDB_TEST_MARIADB=1 .venv/bin/pytest -q -n 0 \
+  tests/test_runtime_process_lifecycle.py -m mariadb
+```
 
 The pytest-supervision model treats Job termination, kill-on-close, POSIX group
 termination, and an empty-tree query as abstract transitions. It does not prove

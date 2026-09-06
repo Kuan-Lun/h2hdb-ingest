@@ -58,14 +58,27 @@ def test_runtime_context_close_is_idempotent_and_fails_closed(
 ) -> None:
     config = IngestConfig(paths=IngestPathsConfig(download_path=_source_root(tmp_path)))
     close_calls = 0
+    other_close_calls: list[str] = []
     original_close = VNextIngestFacade.close
+    original_admin_close = VNextDatabaseAdminFacade.close
+    original_catalog_close = VNextCatalogFacade.close
 
     def observed_close(facade: VNextIngestFacade) -> None:
         nonlocal close_calls
         close_calls += 1
         original_close(facade)
 
+    def observed_admin_close(facade: VNextDatabaseAdminFacade) -> None:
+        other_close_calls.append("admin")
+        original_admin_close(facade)
+
+    def observed_catalog_close(facade: VNextCatalogFacade) -> None:
+        other_close_calls.append("catalog")
+        original_catalog_close(facade)
+
     monkeypatch.setattr(VNextIngestFacade, "close", observed_close)
+    monkeypatch.setattr(VNextDatabaseAdminFacade, "close", observed_admin_close)
+    monkeypatch.setattr(VNextCatalogFacade, "close", observed_catalog_close)
 
     runtime = build_runtime(config)
     with runtime as entered:
@@ -77,6 +90,7 @@ def test_runtime_context_close_is_idempotent_and_fails_closed(
     runtime.close()
 
     assert close_calls == 1
+    assert other_close_calls == ["catalog", "admin"]
     with pytest.raises(ValueError, match="ingest runtime is closed"):
         runtime.__enter__()
     with pytest.raises(ValueError, match="ingest facade is closed"):
@@ -111,6 +125,74 @@ def test_runtime_build_failure_closes_the_already_owned_facade(
         build_runtime(config)
 
     assert tracked.close_calls == 1
+
+
+def test_runtime_build_failure_closes_every_constructed_facade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = IngestConfig(paths=IngestPathsConfig(download_path=_source_root(tmp_path)))
+    closed: list[str] = []
+
+    class TrackedFacade:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            closed.append(self.name)
+
+    monkeypatch.setattr(
+        runtime_module,
+        "VNextIngestFacade",
+        lambda _config: cast(VNextIngestFacade, TrackedFacade("ingest")),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "VNextDatabaseAdminFacade",
+        lambda _config: cast(VNextDatabaseAdminFacade, TrackedFacade("admin")),
+    )
+
+    def fail_catalog(_config: object) -> VNextCatalogFacade:
+        raise RuntimeError("catalog composition failed")
+
+    monkeypatch.setattr(runtime_module, "VNextCatalogFacade", fail_catalog)
+
+    with pytest.raises(RuntimeError, match="catalog composition failed"):
+        build_runtime(config)
+    assert closed == ["admin", "ingest"]
+
+
+def test_runtime_close_failure_still_releases_other_facades_and_can_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = build_runtime(
+        IngestConfig(paths=IngestPathsConfig(download_path=_source_root(tmp_path)))
+    )
+    closed: list[str] = []
+    original_close = VNextIngestFacade.close
+
+    def fail_once(facade: VNextIngestFacade) -> None:
+        if not closed:
+            closed.append("ingest-failed")
+            raise OSError("cache close failed")
+        original_close(facade)
+        closed.append("ingest")
+
+    monkeypatch.setattr(VNextIngestFacade, "close", fail_once)
+    monkeypatch.setattr(
+        VNextCatalogFacade, "close", lambda _self: closed.append("catalog")
+    )
+    monkeypatch.setattr(
+        VNextDatabaseAdminFacade, "close", lambda _self: closed.append("admin")
+    )
+
+    with pytest.raises(OSError, match="cache close failed"):
+        runtime.close()
+    assert closed == ["ingest-failed", "catalog", "admin"]
+    runtime.close()
+    runtime.close()
+    assert closed == ["ingest-failed", "catalog", "admin", "ingest", "catalog", "admin"]
 
 
 def test_concurrent_runtime_close_waits_for_one_exact_facade_close(
