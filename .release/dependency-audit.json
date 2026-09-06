@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-06T16:16:17+00:00",
-  "manifest_sha256": "1718658713e36d6e33b1fef1bb867ab32488d4fb72d4edb16429a2169d46557d",
+  "checked_at": "2026-09-06T20:15:43+00:00",
+  "manifest_sha256": "68f1592ce0ff28d50333eaaa5eb8e283e7a4c627c1790004ad69491c803e0517",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.17.0",
+  "project_version": "0.17.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,10 +30,10 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.35.0,<0.36.0",
+      "declared": "h2hdb>=0.35.1,<0.36.0",
       "group": "runtime",
       "latest": "0.35.0",
-      "latest_satisfies": true,
+      "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
       "url": "https://pypi.org/project/h2hdb/"
@@ -139,7 +139,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed every direct build, runtime, development and Node dependency against the previous receipt and current registry latest, including versions outside existing bounds. All non-core latest versions are unchanged, accepted by the declared bounds and installed in the rebuilt Python 3.14 environment. Reviewed the h2hdb 0.33.0 through 0.35.0 public API and schema changes: existing ingest facade calls remain valid, while the supported database advances from schema 4 to epoch 3/schema 5 and the core dependency moves exclusively to the 0.35 compatibility lane. Fifteen real-filesystem SQLite runtime integration cases and the complete fast gate passed; fresh-epoch coverage now verifies published tag directory bundles and tag publication queries. The separately invoked live MariaDB resident lifecycle suite and official full merge gate remain mandatory release validation, recorded independently from this dependency review.",
+    "note": "Reviewed every direct build, runtime, optional development and Node registry candidate against the preceding receipt and the installed Python 3.14 environment. External candidates and upper bounds are unchanged. The h2hdb lower bound is now 0.35.1 because deterministic runtime teardown calls its newly added public admin/catalog close methods; registry latest 0.35.0 is below this requirement, so this explicitly coordinated cross-repository task validates an explicit local 0.35.1 wheel before release instead of using a fallback. JPEG re-encoding and output/storage contracts are unchanged. Focused artifact corruption, byte-equivalence, process-signal replay and runtime teardown tests passed; complete wheel and live MariaDB integration validation is recorded separately from this receipt.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
