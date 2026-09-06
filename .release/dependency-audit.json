@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-06T07:34:23+00:00",
-  "manifest_sha256": "b63ef0e56729d67dfc68ebdb0ed0057e3d0bf2677d848a2543870531c4cbf640",
+  "checked_at": "2026-09-06T16:16:17+00:00",
+  "manifest_sha256": "1718658713e36d6e33b1fef1bb867ab32488d4fb72d4edb16429a2169d46557d",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.16.0",
+  "project_version": "0.17.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,10 +30,10 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.33.0,<0.34.0",
+      "declared": "h2hdb>=0.35.0,<0.36.0",
       "group": "runtime",
-      "latest": "0.32.1",
-      "latest_satisfies": false,
+      "latest": "0.35.0",
+      "latest_satisfies": true,
       "name": "h2hdb",
       "python_3_14": true,
       "url": "https://pypi.org/project/h2hdb/"
@@ -139,7 +139,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed the registry candidates against the preceding receipt and the local h2hdb release history. All non-core Python and Node latest versions are unchanged and installed in the rebuilt Python 3.14 environment. The registry h2hdb 0.32.1 is intentionally excluded: schema 4 and the required completion-marker source protocol use the explicit locally built h2hdb 0.33.0 wheel. This dependency is constrained to the new 0.33 compatibility lane. Seven real-filesystem SQLite integration cases passed, including restart reuse, stat/content changes, deletion, partial metadata and artifact-source mutation recovery. The exact merge gate and separately invoked live MariaDB runtime suite validate the release candidate.",
+    "note": "Reviewed every direct build, runtime, development and Node dependency against the previous receipt and current registry latest, including versions outside existing bounds. All non-core latest versions are unchanged, accepted by the declared bounds and installed in the rebuilt Python 3.14 environment. Reviewed the h2hdb 0.33.0 through 0.35.0 public API and schema changes: existing ingest facade calls remain valid, while the supported database advances from schema 4 to epoch 3/schema 5 and the core dependency moves exclusively to the 0.35 compatibility lane. Fifteen real-filesystem SQLite runtime integration cases and the complete fast gate passed; fresh-epoch coverage now verifies published tag directory bundles and tag publication queries. The separately invoked live MariaDB resident lifecycle suite and official full merge gate remain mandatory release validation, recorded independently from this dependency review.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
