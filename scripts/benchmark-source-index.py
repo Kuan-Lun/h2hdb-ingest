@@ -334,7 +334,8 @@ def _run_source_only(gallery_count: int) -> dict[str, object]:
             "source_seconds": source_seconds,
             "total_seconds": perf_counter() - started,
             "gallery_scans_including_discovery": gallery_entry_scans,
-            "observation_gallery_scans": gallery_entry_scans - gallery_count,
+            # Completion-marker discovery never enumerates a gallery leaf.
+            "observation_gallery_scans": gallery_entry_scans,
             "source_file_count": observed_files,
             "source_semantic_manifest_sha256": manifest,
             "ru_maxrss_raw": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
@@ -495,7 +496,8 @@ def _run_pipeline(
                 "final_full_audit_seconds": audit_seconds,
                 "total_seconds": perf_counter() - started,
                 "gallery_scans_including_discovery": gallery_entry_scans,
-                "observation_gallery_scans": gallery_entry_scans - gallery_count,
+                # Completion-marker discovery never enumerates a gallery leaf.
+                "observation_gallery_scans": gallery_entry_scans,
                 "output_file_count": output_file_count,
                 "output_byte_count": output_byte_count,
                 "acquisition_count": acquisition_count,

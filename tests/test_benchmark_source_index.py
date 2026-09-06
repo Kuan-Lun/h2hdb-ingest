@@ -113,7 +113,7 @@ def test_resource_monitor_does_not_pollute_source_scan_count() -> None:
 
     result = run_pipeline(1, progress_seconds=0.05)
 
-    assert result["gallery_scans_including_discovery"] == 5
+    assert result["gallery_scans_including_discovery"] == 4
     assert result["observation_gallery_scans"] == 4
     assert result["acquisition_count"] == 1
     assert result["artwork_count"] == 1
