@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-08T16:25:30+00:00",
-  "manifest_sha256": "357fa5880f20542563f188354999f855abf3cb7d716aa038bd2cc3c015f577ed",
+  "checked_at": "2026-09-08T20:46:05+00:00",
+  "manifest_sha256": "82e2cc2132098c6aebe35614af08ecf785bbb6ba0730d7ffb0c032e9a681b6ce",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.18.1",
+  "project_version": "0.18.2",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,10 +30,10 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.35.3,<0.36.0",
+      "declared": "h2hdb>=0.35.4,<0.36.0",
       "group": "runtime",
       "latest": "0.35.3",
-      "latest_satisfies": true,
+      "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
       "url": "https://pypi.org/project/h2hdb/"
@@ -77,7 +77,7 @@
     {
       "declared": "hypothesis>=6.165.10,<7.0.0",
       "group": "optional:dev",
-      "latest": "6.167.1",
+      "latest": "6.168.0",
       "latest_satisfies": true,
       "name": "hypothesis",
       "python_3_14": true,
@@ -139,7 +139,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all direct build, runtime, optional development and Node dependencies against latest stable non-yanked registry candidates on Python 3.14. External candidates and declared compatibility bounds are unchanged and the installed environment matches every latest stable candidate. The only registry change is that h2hdb 0.35.3 is now published and satisfies the existing requirement; this task validates the explicit local 0.35.3 wheel and its additive cumulative-source API with unchanged schema. Hourly progress reporting uses standard-library threading and adds no dependency or new third-party API requirement. Focused progress, real SQLite and parallel CBZ tests (42 cases), existing configuration and orchestration regressions (265 cases), Ruff and strict mypy pass. The complete bounded release gate and manual MariaDB results are recorded separately; this receipt does not claim full deep matrices.",
+    "note": "Reviewed all direct build, runtime, development and Node registry candidates. Hypothesis 6.168.0 official changelog expands datetime boundary generation and fixes internal cache corruption; it is installed and passes this task validation. Other external candidates match the prior reviewed cohort. The newly required h2hdb 0.35.4 is the companion local release with the verified source ordering lock fix and additive preparation observer; registry 0.35.3 is below the new minimum and must not satisfy this dependency. Explicit local source/wheel integration passes 1001-folder batch-10 publication, real 10-CBZ publication, progress concurrency tests and six live MariaDB 10.11.11 integration/recovery cases. No external upper-bound exception is needed. Complete bounded merge checks run separately; no full deep-matrix claim.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
