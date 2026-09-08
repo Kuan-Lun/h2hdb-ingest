@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-08T20:46:05+00:00",
-  "manifest_sha256": "82e2cc2132098c6aebe35614af08ecf785bbb6ba0730d7ffb0c032e9a681b6ce",
+  "checked_at": "2026-09-08T23:38:39+00:00",
+  "manifest_sha256": "318afc530a2cd49236ffeeb47812e60b15219282c5fee306d6a55897d8599ea2",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.18.2",
+  "project_version": "0.19.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,9 +30,9 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.35.4,<0.36.0",
+      "declared": "h2hdb>=0.36.0,<0.37.0",
       "group": "runtime",
-      "latest": "0.35.3",
+      "latest": "0.35.5",
       "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
@@ -55,6 +55,24 @@
       "name": "pydantic",
       "python_3_14": true,
       "url": "https://pypi.org/project/pydantic/"
+    },
+    {
+      "declared": "pyvips[binary]>=3.2.0,<4",
+      "group": "runtime",
+      "latest": "3.2.0",
+      "latest_satisfies": true,
+      "name": "pyvips",
+      "python_3_14": true,
+      "url": "https://pypi.org/project/pyvips/"
+    },
+    {
+      "declared": "pyvips-binary>=8.18.6,<9",
+      "group": "runtime",
+      "latest": "8.18.6",
+      "latest_satisfies": true,
+      "name": "pyvips-binary",
+      "python_3_14": true,
+      "url": "https://pypi.org/project/pyvips-binary/"
     },
     {
       "declared": "build>=1.5.0",
@@ -139,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all direct build, runtime, development and Node registry candidates. Hypothesis 6.168.0 official changelog expands datetime boundary generation and fixes internal cache corruption; it is installed and passes this task validation. Other external candidates match the prior reviewed cohort. The newly required h2hdb 0.35.4 is the companion local release with the verified source ordering lock fix and additive preparation observer; registry 0.35.3 is below the new minimum and must not satisfy this dependency. Explicit local source/wheel integration passes 1001-folder batch-10 publication, real 10-CBZ publication, progress concurrency tests and six live MariaDB 10.11.11 integration/recovery cases. No external upper-bound exception is needed. Complete bounded merge checks run separately; no full deep-matrix claim.",
+    "note": "Reviewed all direct build/runtime/development and Node registry candidates and official release notes, including versions outside current bounds. Existing third-party latest candidates remain within their tested bounds and support Python 3.14. Local Python 3.14.1 / Node 26.7.0 environments use current Pydantic 2.13.5, build 1.6.0, Hypothesis 6.168.0, Ruff 0.16.6, packaging 26.3 and markdownlint-cli2 0.23.2; reviewed validator/GC/union, build constraints-hash, datetime/cache, lint and requirement/marker fixes without relaxing checks. Added pyvips>=3.2.0,<4 because concurrency_set is new in 3.2; pyvips-binary>=8.18.6,<9 matches audited libvips 8.18.6. Tested SourceCustom bounded reads, strict fail_on loader options, error-buffer concurrency isolation, PNG/JPEG truncation, EXIF/alpha/GIF frame zero, final configured resampling and true 100 MP JPEG/PNG output; unknown native/resource errors retain their type. Native and binding major upper bounds exclude unaudited API/codec changes. Ingest now requires h2hdb>=0.36.0,<0.37.0 for schema6/policy-bound source qualification. Registry latest core is still 0.35.5, below this intentional new minimum; installed the locally built core 0.36.0 candidate wheel and validated real mixed-image SQLite/MariaDB publication, restart, repair, removal and policy-change behavior. This receipt does not claim core0.36.0 is already on PyPI or that the independent exact-tree release gate/deep matrices ran. References: https://github.com/libvips/pyvips/blob/master/CHANGELOG.rst ; https://github.com/libvips/libvips/releases/tag/v8.18.6 ; https://github.com/kleisauke/pyvips-binary/releases/tag/v8.18.6 ; https://github.com/pydantic/pydantic/releases/tag/v2.13.5 ; https://github.com/pypa/build/releases/tag/1.6.0 ; https://hypothesis.readthedocs.io/en/latest/changelog.html#v6-168-0 ; https://github.com/astral-sh/ruff/releases/tag/0.16.6 ; https://github.com/pypa/packaging/blob/main/CHANGELOG.rst ; https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/main/CHANGELOG.md .",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
