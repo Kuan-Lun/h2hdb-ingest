@@ -70,7 +70,7 @@ def _running(
     clock = _Clock()
     wake = _ObservedEvent()
     monkeypatch.setattr(progress_module, "Event", lambda: wake)
-    progress = IngestProgress(emit, clock=clock)
+    progress = IngestProgress(lambda _: None, clock=clock, emit_debug=emit)
     progress.start()
     wake.await_wait(1)
     try:
@@ -88,7 +88,7 @@ def _snapshot(progress: IngestProgress) -> ProgressSnapshot:
 def test_announced_phases_emit_immediately_and_keep_work_counters() -> None:
     messages: list[str] = []
     clock = _Clock()
-    progress = IngestProgress(messages.append, clock=clock)
+    progress = IngestProgress(lambda _: None, clock=clock, emit_debug=messages.append)
     work = progress.begin("source")
     assert progress.current() is work
     work.advance("galleries", 2)
@@ -121,7 +121,7 @@ def test_announced_phases_emit_immediately_and_keep_work_counters() -> None:
 
 def test_silent_candidate_and_failed_work_have_explicit_outcomes() -> None:
     messages: list[str] = []
-    progress = IngestProgress(messages.append)
+    progress = IngestProgress(lambda _: None, emit_debug=messages.append)
     work = progress.begin("maintenance_probe", announce=False)
     work.finish(announce=False)
     assert not messages
@@ -175,7 +175,7 @@ def test_concurrent_worker_counters_are_exact_and_snapshots_are_immutable() -> N
 
 def test_late_worker_is_fenced_after_finish_and_replacement() -> None:
     messages: list[str] = []
-    progress = IngestProgress(messages.append)
+    progress = IngestProgress(lambda _: None, emit_debug=messages.append)
     old = progress.begin("old")
     with pytest.raises(RuntimeError, match="already active"):
         progress.begin("concurrent")
@@ -390,3 +390,291 @@ def test_counter_keys_are_bounded_without_limiting_existing_counters() -> None:
         work.advance("one_too_many")
     assert len(_snapshot(progress).counters) == 64
     assert dict(_snapshot(progress).counters)["counter_0"] == 2
+
+
+def test_info_explains_current_work_and_debug_retains_internal_details() -> None:
+    info: list[str] = []
+    debug: list[str] = []
+    clock = _Clock()
+    progress = IngestProgress(info.append, clock=clock, emit_debug=debug.append)
+    work = progress.begin("source", announce=False)
+    work.set_counter("batch_new_gallery_limit", 10)
+    work.set_counter("cbz_enabled", 1)
+    work.advance("galleries_discovered", 131256)
+    work.operation(
+        "source_discovery_transfer", completed=4096, total=131256, unit="galleries"
+    )
+    clock.advance(3600)
+    progress._report_due()
+    assert info == [
+        "Ingest progress: Copying the gallery inventory into the batch plan; "
+        "4,096 / 131,256 galleries completed; "
+        "since work started (1h 0m 0s): +131,256 gallery folders discovered; "
+        "last measured advance 1h 0m 0s ago; "
+        "current operation elapsed 1h 0m 0s; work elapsed 1h 0m 0s; "
+        "batch limit 10 new galleries; CBZs rendered this work 0; "
+        "catalog publication pending"
+    ]
+    assert len(debug) == 1
+    assert "event=periodic generation=1 phase=source" in debug[0]
+    assert "operation_completed=4096 operation_total=131256" in debug[0]
+    assert "counter.galleries_discovered=131256" in debug[0]
+    for internal in ("generation=", "counter.", "operation=", "phase=", "event="):
+        assert internal not in info[0]
+    clock.advance(1800)
+    work.operation(
+        "source_discovery_transfer", completed=8192, total=131256, unit="galleries"
+    )
+    clock.advance(1800)
+    progress._report_due()
+    assert "since previous report (1h 0m 0s): +4,096 galleries completed" in info[-1]
+    assert "current operation elapsed 2h 0m 0s" in info[-1]
+    assert "last measured advance 30m 0s ago" in info[-1]
+    clock.advance(3600)
+    progress._report_due()
+    assert "since previous report (1h 0m 0s): +0 galleries completed" in info[-1]
+    assert "last measured advance 1h 30m 0s ago" in info[-1]
+
+
+def test_unknown_and_empty_totals_are_distinct_and_operation_timer_is_separate() -> (
+    None
+):
+    info: list[str] = []
+    clock = _Clock()
+    progress = IngestProgress(info.append, clock=clock)
+    work = progress.begin("source", announce=False)
+    work.operation("source_discovery", completed=20, unit="galleries")
+    clock.advance(3600)
+    progress._report_due()
+    assert "20 galleries completed (total unknown)" in info[-1]
+    work.operation("source_batch_selection", completed=0, total=0, unit="galleries")
+    clock.advance(3600)
+    progress._report_due()
+    assert "0 / 0 galleries completed" in info[-1]
+    assert "current operation elapsed 1h 0m 0s; work elapsed 2h 0m 0s" in info[-1]
+    assert "current operation started since previous report" in info[-1]
+    work.operation("source_batch_order")
+    clock.advance(3600)
+    progress._report_due()
+    assert "completion count unavailable for this operation" in info[-1]
+    assert "no completed-item counts available" in info[-1]
+
+
+def test_info_distinguishes_rendered_cbz_from_published_catalog_and_metadata_only() -> (
+    None
+):
+    info: list[str] = []
+    progress = IngestProgress(info.append)
+    work = progress.begin("source")
+    assert "CBZ" not in info[-1]
+    work.set_counter("batch_selected_galleries", 1010)
+    work.advance("archives_rendered", 10)
+    work.phase("publication")
+    assert "galleries in this batch 1,010 (existing and new)" in info[-1]
+    assert "CBZs rendered this work 10" in info[-1]
+    assert "catalog publication pending" in info[-1]
+    work.advance("publication_batches_finalized")
+    work.finish()
+    assert info[-1].startswith("Ingest work completed:")
+    assert "CBZs rendered this work 10; catalog batches published 1" in info[-1]
+    assert "catalog publication pending" not in info[-1]
+
+
+def test_info_reports_counter_deltas_when_operations_change() -> None:
+    info: list[str] = []
+    clock = _Clock()
+    progress = IngestProgress(info.append, clock=clock)
+    work = progress.begin("publication")
+    work.advance("pages_rendered", 4)
+    work.advance("pages_written", 2)
+    work.operation("archive_inspect")
+    clock.advance(3600)
+    progress._report_due()
+    assert (
+        "since previous report (1h 0m 0s): +4 pages rendered, +2 pages written into CBZs"
+        in info[-1]
+    )
+    work.advance("pages_written", 2)
+    work.advance("archives_rendered")
+    work.operation("archive_copy")
+    clock.advance(3600)
+    progress._report_due()
+    assert (
+        "since previous report (1h 0m 0s): +2 pages written into CBZs, +1 CBZs rendered"
+        in info[-1]
+    )
+    assert "+4 pages rendered" not in info[-1]
+
+
+def test_activity_restores_parent_operation_counts_and_elapsed_after_nested_error() -> (
+    None
+):
+    clock = _Clock()
+    progress = IngestProgress(lambda _: None, clock=clock)
+    work = progress.begin("source", announce=False)
+    work.operation("source_prepare", completed=2, total=10, unit="galleries")
+    original = _snapshot(progress).operation_generation
+    clock.advance(30)
+    with work.activity("source_discovery"):
+        work.advance("galleries_discovered", 100)
+        with pytest.raises(OSError, match="source disappeared"):
+            with work.activity("source_discovery_transfer", completed=0, total=100):
+                clock.advance(20)
+                work.operation("source_discovery_order", completed=100, total=100)
+                raise OSError("source disappeared")
+        snapshot = _snapshot(progress)
+        assert snapshot.operation == "source_discovery"
+        assert snapshot.operation_completed == 100
+        assert snapshot.operation_elapsed_seconds == 20
+    snapshot = _snapshot(progress)
+    assert snapshot.operation == "source_prepare"
+    assert snapshot.operation_generation == original
+    assert snapshot.operation_completed == 2
+    assert snapshot.operation_total == 10
+    assert snapshot.operation_elapsed_seconds == 50
+    with work.activity("source_file_read"):
+        pass
+    assert _snapshot(progress).operation == "source_prepare"
+
+
+def test_activity_restores_no_operation_without_leaving_a_stale_label() -> None:
+    progress = IngestProgress(lambda _: None)
+    work = progress.begin("source", announce=False)
+    with work.activity("source_discovery"):
+        work.operation("source_discovery_order")
+    snapshot = _snapshot(progress)
+    assert snapshot.operation is None
+    assert snapshot.operation_completed is None
+    assert snapshot.operation_elapsed_seconds == 0
+
+
+def test_activity_restoration_is_fenced_by_phase_and_work_generations() -> None:
+    progress = IngestProgress(lambda _: None)
+    work = progress.begin("source", announce=False)
+    work.operation("source_prepare")
+    with work.activity("source_discovery"):
+        work.phase("analysis", announce=False)
+        work.operation("analysis_prepare")
+    assert _snapshot(progress).operation == "analysis_prepare"
+    with work.activity("analysis_prepare_step"):
+        work.finish(announce=False)
+        replacement = progress.begin("source", announce=False)
+        replacement.operation("source_prepare")
+    assert _snapshot(progress).operation == "source_prepare"
+    assert progress.current() is replacement
+    with work.activity("stale_scope", completed=999):
+        pass
+    assert _snapshot(progress).operation == "source_prepare"
+    assert _snapshot(progress).operation_completed is None
+
+
+def test_new_operation_scope_gets_new_timer_even_when_name_is_unchanged() -> None:
+    clock = _Clock()
+    progress = IngestProgress(lambda _: None, clock=clock)
+    work = progress.begin("source", announce=False)
+    work.operation("source_discovery", completed=2)
+    clock.advance(30)
+    with work.activity("source_discovery", completed=0):
+        assert _snapshot(progress).operation_elapsed_seconds == 0
+        assert _snapshot(progress).operation_completed == 0
+    assert _snapshot(progress).operation_elapsed_seconds == 30
+    assert _snapshot(progress).operation_completed == 2
+
+
+@pytest.mark.parametrize(
+    ("completed", "total", "unit", "error"),
+    [
+        (-1, None, None, "non-negative ints"),
+        (True, None, None, "non-negative ints"),
+        (0, -1, None, "non-negative ints"),
+        (0, 2.5, None, "non-negative ints"),
+        (2, 1, None, "cannot exceed total"),
+        (None, None, "line\nbreak", "non-empty tokens"),
+    ],
+)
+def test_invalid_measurements_fail_before_changing_work(
+    completed: int | None, total: int | None, unit: str | None, error: str
+) -> None:
+    progress = IngestProgress(lambda _: None)
+    work = progress.begin("source", announce=False)
+    with pytest.raises(ValueError, match=error):
+        work.operation("source_discovery", completed=completed, total=total, unit=unit)
+    assert _snapshot(progress).operation is None
+
+
+@pytest.mark.parametrize("failed_sink", ["info", "debug"])
+def test_log_levels_have_independent_failure_handling(failed_sink: str) -> None:
+    info: list[str] = []
+    debug: list[str] = []
+
+    def info_sink(message: str) -> None:
+        info.append(message)
+        if failed_sink == "info":
+            raise OSError("INFO sink failed")
+
+    def debug_sink(message: str) -> None:
+        debug.append(message)
+        if failed_sink == "debug":
+            raise OSError("DEBUG sink failed")
+
+    progress = IngestProgress(info_sink, emit_debug=debug_sink)
+    work = progress.begin("source")
+    work.finish("failed")
+    assert len(info) == len(debug) == 2
+    assert info[-1].startswith("Ingest work failed:")
+    assert "status=failed" in debug[-1]
+
+
+def test_default_diagnostics_use_debug_level(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("DEBUG", logger="h2hdb_ingest.progress")
+    info: list[str] = []
+    progress = IngestProgress(info.append)
+    progress.begin("source")
+    assert len(info) == 1
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelname == "DEBUG"
+    assert "event=phase_started" in caplog.records[0].message
+
+
+def test_known_total_does_not_invent_a_completed_count() -> None:
+    info: list[str] = []
+    clock = _Clock()
+    progress = IngestProgress(info.append, clock=clock)
+    work = progress.begin("source", announce=False)
+    work.operation("source_batch_order", total=10, unit="galleries")
+    clock.advance(3600)
+    progress._report_due()
+    assert (
+        "completion count unavailable for this operation (total 10 galleries)"
+        in info[-1]
+    )
+    assert "0 / 10" not in info[-1]
+
+
+def test_inferred_counts_only_include_work_done_during_the_current_operation() -> None:
+    progress = IngestProgress(lambda _: None)
+    work = progress.begin("publication", announce=False)
+    work.advance("pages_rendered", 200)
+    with work.activity("archive_render_pages"):
+        assert _snapshot(progress).operation_completed == 0
+        work.advance("pages_rendered", 2)
+        work.operation("archive_render_pages")
+        assert _snapshot(progress).operation_completed == 2
+    with work.activity("archive_render_pages"):
+        work.advance("pages_rendered", 3)
+        assert _snapshot(progress).operation_completed == 3
+    assert dict(_snapshot(progress).counters)["pages_rendered"] == 205
+
+
+def test_unchanged_zero_completion_and_total_changes_are_not_measured_advance() -> None:
+    clock = _Clock()
+    progress = IngestProgress(lambda _: None, clock=clock)
+    work = progress.begin("source", announce=False)
+    work.operation("source_batch_selection")
+    clock.advance(30)
+    work.operation("source_batch_selection", completed=0, total=100)
+    assert _snapshot(progress).last_progress_age_seconds == 30
+    work.operation("source_batch_selection", completed=0, total=101)
+    assert _snapshot(progress).last_progress_age_seconds == 30
+    work.operation("source_batch_selection", completed=1, total=101)
+    assert _snapshot(progress).last_progress_age_seconds == 0

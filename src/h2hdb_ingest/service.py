@@ -29,6 +29,8 @@ from h2hdb import (
     VNextIngestSourceReceipt,
     VNextLibraryActivationAdapter,
     VNextResolvedIngestPolicy,
+    VNextSourcePreparationOperation,
+    VNextSourcePreparationProgress,
 )
 
 from .core_source import VNextFilesystemSourceAdapter
@@ -176,6 +178,10 @@ class VNextIngestService:
         stop_requested = should_stop or _never_stop
         work = None if self._progress is None else self._progress.current()
         if work is not None:
+            work.set_counter(
+                "batch_new_gallery_limit", self._publication_batch_galleries
+            )
+            work.set_counter("cbz_enabled", int(self._policy.artifacts_required))
             work.phase("policy")
         _raise_if_stopping(stop_requested)
         resolved = session.call(
@@ -496,12 +502,31 @@ def synchronize_source(
         raise TypeError("session must be IngestSessionController")
     if progress is not None:
         progress.operation("source_prepare")
+
+    def observe(update: VNextSourcePreparationProgress) -> None:
+        if progress is None:
+            return
+        progress.operation(
+            f"source_{update.operation.value}",
+            completed=update.completed,
+            total=update.total,
+            unit="galleries",
+        )
+        if (
+            update.operation is VNextSourcePreparationOperation.SOURCE_FREEZE
+            and update.total is not None
+        ):
+            progress.set_counter("batch_selected_galleries", update.total)
+
     prepared = session.outside_session(
         lambda facade: facade.prepare_source(
             adapter,
             max_new_galleries=max_new_galleries,
+            progress=observe if progress is not None else None,
         )
     )
+    if progress is not None:
+        progress.set_counter("deferred_galleries", prepared.deferred_gallery_count)
     with prepared:
         while True:
             _raise_if_stopping(should_stop)

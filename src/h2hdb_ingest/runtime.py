@@ -118,6 +118,7 @@ def build_runtime(
         progress = IngestProgress(
             runtime_event_logger,
             interval_seconds=config.resident.progress_log_interval_seconds,
+            emit_debug=logger.debug,
         )
         owned_closers.append(progress.close)
 

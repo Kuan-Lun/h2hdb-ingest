@@ -211,12 +211,31 @@ or spam decisions, so later batches can replace or remove earlier CBZs and
 catalog entries. The known source collection grows progressively, but the number
 of published books need not increase on every batch.
 
-While work is active, `ingest_progress` INFO records report the current phase,
-operation, elapsed time, time since the last counter change, and measured work
-counters. `resident.progress_log_interval_seconds` defaults to 3,600 seconds
-and must be finite and positive. A dedicated thread reads an in-memory snapshot;
-it never polls the catalog, inspects files, or acquires the ingest session lock.
-Phase transitions and work completion are reported immediately. The interval
+While work is active, INFO summaries name the current work in plain English,
+show completed items and the total when known, and report changes since the
+previous summary. The current operation's elapsed time is separate from the
+whole work's elapsed time. Unknown totals and unavailable completion counts are
+explicit; a quiet counter does not by itself establish that work is stuck.
+For example, an hourly summary can say:
+
+```text
+Ingest progress: Copying the gallery inventory into the batch plan; 4,096 / 131,256 galleries completed; since previous report (1h 0m 0s): +4,096 galleries completed; last measured advance 30m 0s ago; current operation elapsed 2h 0m 0s; work elapsed 2h 1m 19s; batch limit 10 new galleries; CBZs rendered this work 0; catalog publication pending
+```
+
+The batch limit applies to newly included galleries. A complete inventory still
+precedes selection; the inventory total can therefore greatly exceed that limit.
+The selected batch includes previously known galleries as well as new ones.
+CBZs rendered during this work and catalog batches published are separate results:
+rendering a CBZ does not mean readers can already acquire it. Metadata-only work
+does not show a CBZ count.
+
+`resident.progress_log_interval_seconds` defaults to 3,600 seconds and must be
+finite and positive. A dedicated thread reads an in-memory snapshot; it never
+polls the catalog, inspects files, or acquires the ingest session lock. Phase
+transitions and work completion are reported immediately. Operation changes only
+update the next summary; they do not emit a log for every gallery or page. Nested
+preparation restores its enclosing operation when it returns or fails, so the
+summary does not keep reporting a completed discovery operation. The interval
 only controls periodic progress summaries; existing artifact and publication
 metrics retain their completion records.
 
@@ -226,17 +245,18 @@ polls. Startup validation and blocked preparation or library-lock calls remain
 observable while the reporting thread can run. Summaries describe observations,
 not a wall-clock timeout or a promise that a blocked operation will finish.
 
-Counters belong to one process-local work generation and are not recovery
-authority. Page workers increment `pages_rendered` only after successful render
-and source verification; ordered ZIP writes update `pages_written` separately.
-`archives_rendered` does not mean the archive has been published.
-`publication_batches_finalized` advances only after successful finalization.
-Source receipt counts describe the sealed cumulative source; `*_operation_rows`
-count acknowledged non-replayed database operation rows, not distinct galleries.
-Retries can perform additional work; restarts create fresh observation counters.
-Late worker updates cannot change a newer work generation. `phase_ended` reports
-a transition; only the final work status describes whether that work completed,
-failed or is being retried.
+The detailed `ingest_progress event=... generation=... counter...` records are
+emitted at DEBUG. Counters belong to one process-local work generation and are
+not recovery authority. Page workers increment `pages_rendered` only after
+successful render and source verification; ordered ZIP writes update
+`pages_written` separately. `archives_rendered` does not mean the archive has
+been published. `publication_batches_finalized` advances only after successful
+finalization. Source receipt counts describe the sealed cumulative source;
+`*_operation_rows` count acknowledged non-replayed database operation rows, not
+distinct galleries. Retries can perform additional work; restarts create fresh
+observation counters. Late worker updates cannot change a newer work generation.
+An ended stage describes a transition; only the final work status describes
+whether that work completed, failed or is being retried.
 
 The resident reconciles the source immediately on startup. After that, a source
 change schedules synchronization after `source_quiet_seconds` without another

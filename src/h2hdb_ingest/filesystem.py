@@ -23,6 +23,7 @@ import sqlite3
 import stat
 import tempfile
 from collections.abc import Callable, Iterator
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import IntEnum, StrEnum
@@ -127,8 +128,6 @@ class FilesystemFileObservation:
         """Yield exact file bytes after a no-follow open and stat check."""
 
         self._checkpoint()
-        if self._progress is not None:
-            self._progress.operation("source_file_read")
         if self._snapshot is not None:
             # Completion markers already own an exact bounded no-follow read.
             # The core still derives its content receipt from these bytes.
@@ -383,6 +382,18 @@ class FilesystemSource:
         self,
         locator_components: tuple[str, ...],
     ) -> FilesystemFileObservation:
+        activity = (
+            nullcontext()
+            if self._progress is None
+            else self._progress.activity("source_completion_marker")
+        )
+        with activity:
+            return self._observe_completion_marker(locator_components)
+
+    def _observe_completion_marker(
+        self,
+        locator_components: tuple[str, ...],
+    ) -> FilesystemFileObservation:
         """Read galleryinfo bytes without listing or opening image files.
 
         Every invocation hashes the bytes, regardless of stat equality. All
@@ -395,8 +406,6 @@ class FilesystemSource:
 
         self._require_open()
         self._checkpoint()
-        if self._progress is not None:
-            self._progress.operation("source_completion_marker")
         if type(locator_components) is not tuple or not locator_components:
             raise FilesystemObservationError(
                 "gallery locator must be a nonempty exact tuple"
@@ -632,8 +641,15 @@ class FilesystemSource:
         self._checkpoint()
         if self._discovery_connection is not None:
             return self._discovery_connection
-        if self._progress is not None:
-            self._progress.operation("source_discovery")
+        activity = (
+            nullcontext()
+            if self._progress is None
+            else self._progress.activity("source_discovery")
+        )
+        with activity:
+            return self._build_discovery_index()
+
+    def _build_discovery_index(self) -> sqlite3.Connection:
         temporary = tempfile.TemporaryDirectory(prefix="h2hdb-ingest-discovery-")
         connection = sqlite3.connect(Path(temporary.name) / "locators.sqlite3")
         try:
@@ -824,9 +840,28 @@ class FilesystemSource:
         folder: Path,
         directory_stat: FilesystemStat,
     ) -> _FilesystemGalleryIndex:
+        activity = (
+            nullcontext()
+            if self._progress is None
+            else self._progress.activity("source_gallery_observation")
+        )
+        with activity:
+            return self._build_gallery_snapshot(
+                connection,
+                payload=payload,
+                folder=folder,
+                directory_stat=directory_stat,
+            )
+
+    def _build_gallery_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        payload: bytes,
+        folder: Path,
+        directory_stat: FilesystemStat,
+    ) -> _FilesystemGalleryIndex:
         self._checkpoint()
-        if self._progress is not None:
-            self._progress.operation("source_gallery_observation")
         metadata_path = folder / GALLERY_INFO_NAME
         metadata_stat = self._regular_file_stat(metadata_path)
         if metadata_stat.size_bytes == 0:
@@ -1188,6 +1223,7 @@ class FilesystemSource:
         _insert_discovery_directory(
             connection, directory, self._directory_stat(directory)
         )
+        visited = 0
         while True:
             row = connection.execute(
                 "SELECT ordinal, path, device, inode, size_bytes, modified_ns, "
@@ -1260,15 +1296,23 @@ class FilesystemSource:
                 "UPDATE discovery_directories SET visited = 1 WHERE ordinal = ?",
                 (row[0],),
             )
+            visited += 1
             if self._progress is not None:
                 self._progress.advance("discovery_directories")
         # Revalidate collection ancestry without retaining a Python tree or
         # leaving a recursively open scandir descriptor for every tree level.
+        if self._progress is not None:
+            self._progress.operation(
+                "source_discovery_verify",
+                completed=0,
+                total=visited,
+                unit="directories",
+            )
         rows = connection.execute(
             "SELECT path, device, inode, size_bytes, modified_ns, changed_ns "
             "FROM discovery_directories ORDER BY ordinal"
         )
-        for row in rows:
+        for verified, row in enumerate(rows, start=1):
             self._checkpoint()
             if self._directory_stat(Path(row[0])) != _stat_from_row(row[1:]):
                 raise FilesystemSourceChangedError(
@@ -1276,6 +1320,14 @@ class FilesystemSource:
                 )
             if self._progress is not None:
                 self._progress.advance("discovery_directories_verified")
+                self._progress.operation(
+                    "source_discovery_verify",
+                    completed=verified,
+                    total=visited,
+                    unit="directories",
+                )
+        if self._progress is not None:
+            self._progress.operation("source_discovery_commit")
         connection.execute("DELETE FROM discovery_directories")
 
     def _gallery_path(self, locator_components: tuple[str, ...]) -> Path:

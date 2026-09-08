@@ -2,14 +2,28 @@
 
 from __future__ import annotations
 
+import logging
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Event, Lock, Thread, current_thread
 from time import monotonic
 
+from .progress_format import format_diagnostics, format_progress
+
 MAX_PROGRESS_COUNTERS = 64
 MAX_PROGRESS_TOKEN_LENGTH = 128
+
+_OPERATION_COUNTERS = {
+    "source_discovery": ("galleries_discovered", "galleries"),
+    "source_gallery_observation": ("gallery_indexes_built", "gallery indexes"),
+    "source_file_read": ("file_observations_completed", "files"),
+    "archive_render_pages": ("pages_rendered", "pages"),
+    "archive_write_pages": ("pages_written", "pages"),
+    "library_install": ("library_resources_reconciled", "library files"),
+    "library_remove_stale": ("library_resources_removed", "library files"),
+}
 
 
 @dataclass(frozen=True)
@@ -23,6 +37,28 @@ class ProgressSnapshot:
     phase_elapsed_seconds: float
     last_progress_age_seconds: float
     counters: tuple[tuple[str, int], ...]
+    operation_generation: int = 0
+    operation_elapsed_seconds: float = 0
+    operation_completed: int | None = None
+    operation_total: int | None = None
+    operation_unit: str | None = None
+
+
+@dataclass(frozen=True)
+class _Operation:
+    name: str
+    generation: int
+    started_at: float
+    completed: int | None = None
+    total: int | None = None
+    unit: str | None = None
+    counter_baseline: int = 0
+
+
+@dataclass(frozen=True)
+class _ActivityCheckpoint:
+    phase_generation: int
+    operation: _Operation | None
 
 
 @dataclass
@@ -34,18 +70,37 @@ class _ProgressState:
     phase_started_at: float
     last_progress_at: float
     next_report_at: float
-    operation: str | None = None
+    phase_generation: int = 0
+    operation_generation: int = 0
+    operation: _Operation | None = None
     counters: dict[str, int] = field(default_factory=dict)
 
     def snapshot(self, now: float) -> ProgressSnapshot:
+        operation = self.operation
+        completed = None if operation is None else operation.completed
+        unit = None if operation is None else operation.unit
+        if operation is not None and completed is None:
+            inferred = _OPERATION_COUNTERS.get(operation.name)
+            if inferred is not None:
+                counter, unit = inferred
+                completed = max(
+                    0, self.counters.get(counter, 0) - operation.counter_baseline
+                )
         return ProgressSnapshot(
             generation=self.work.generation,
             phase=self.phase,
-            operation=self.operation,
+            operation=None if operation is None else operation.name,
             elapsed_seconds=max(0.0, now - self.started_at),
             phase_elapsed_seconds=max(0.0, now - self.phase_started_at),
             last_progress_age_seconds=max(0.0, now - self.last_progress_at),
             counters=tuple(sorted(self.counters.items())),
+            operation_generation=0 if operation is None else operation.generation,
+            operation_elapsed_seconds=(
+                0 if operation is None else max(0.0, now - operation.started_at)
+            ),
+            operation_completed=completed,
+            operation_total=None if operation is None else operation.total,
+            operation_unit=unit,
         )
 
 
@@ -69,8 +124,45 @@ class ProgressWork:
     def phase(self, name: str, *, announce: bool = True) -> None:
         self._owner._phase(self, name, announce=announce)
 
-    def operation(self, name: str) -> None:
-        self._owner._operation(self, name)
+    def operation(
+        self,
+        name: str,
+        *,
+        completed: int | None = None,
+        total: int | None = None,
+        unit: str | None = None,
+    ) -> None:
+        """Update the current activity without producing an INFO per item.
+
+        Repeated updates of the same operation preserve its start time. An
+        unknown total is represented by None, including when completed is known.
+        Worker threads should update counters, leaving activity changes to their
+        orchestrator. Use activity() around nested adapter calls.
+        """
+        self._owner._operation(self, name, completed=completed, total=total, unit=unit)
+
+    @contextmanager
+    def activity(
+        self,
+        name: str,
+        *,
+        completed: int | None = None,
+        total: int | None = None,
+        unit: str | None = None,
+    ) -> Iterator[None]:
+        """Restore the enclosing operation after nested work, including errors.
+
+        Scopes belong to the orchestration thread, not concurrent workers.
+        A phase transition or replacement work fences restoration of old state.
+        """
+        checkpoint = self._owner._operation(
+            self, name, completed=completed, total=total, unit=unit, scoped=True
+        )
+        try:
+            yield
+        finally:
+            if checkpoint is not None:
+                self._owner._restore_activity(self, checkpoint)
 
     def advance(self, counter: str, amount: int = 1) -> None:
         self._owner._counter(self, counter, amount, additive=True)
@@ -98,12 +190,15 @@ class IngestProgress:
         *,
         interval_seconds: float = 3600,
         clock: Callable[[], float] = monotonic,
+        emit_debug: Callable[[str], None] | None = None,
     ) -> None:
         if not callable(emit) or not callable(clock):
             raise TypeError("progress emitter and clock must be callable")
         if not math.isfinite(interval_seconds) or interval_seconds <= 0:
             raise ValueError("progress interval must be finite and positive")
         self._emit = emit
+        self._emit_debug = emit_debug or logging.getLogger(__name__).debug
+        self._last_emitted: ProgressSnapshot | None = None
         self._interval_seconds = interval_seconds
         self._clock = clock
         self._lock = Lock()
@@ -182,6 +277,7 @@ class IngestProgress:
                 state.phase = name
                 state.announced = announce
                 state.phase_started_at = now
+                state.phase_generation += 1
                 state.operation = None
                 snapshot = state.snapshot(now)
             if previous is not None:
@@ -189,11 +285,73 @@ class IngestProgress:
             if announce:
                 self._emit_snapshot("phase_started", snapshot)
 
-    def _operation(self, work: ProgressWork, name: str) -> None:
+    def _operation(
+        self,
+        work: ProgressWork,
+        name: str,
+        *,
+        completed: int | None,
+        total: int | None,
+        unit: str | None,
+        scoped: bool = False,
+    ) -> _ActivityCheckpoint | None:
         _require_name(name)
+        _require_measurement(completed, total, unit)
         with self._lock:
-            if self._state is not None and self._state.work is work:
-                self._state.operation = name
+            state = self._state
+            if state is None or state.work is not work:
+                return None
+            previous = state.operation
+            checkpoint = _ActivityCheckpoint(state.phase_generation, previous)
+            now = self._clock()
+            same = not scoped and previous is not None and previous.name == name
+            if not same:
+                state.operation_generation += 1
+            inferred = _OPERATION_COUNTERS.get(name)
+            operation = _Operation(
+                name=name,
+                generation=(
+                    previous.generation
+                    if same and previous is not None
+                    else state.operation_generation
+                ),
+                started_at=(
+                    previous.started_at if same and previous is not None else now
+                ),
+                completed=completed,
+                total=total,
+                unit=unit,
+                counter_baseline=(
+                    previous.counter_baseline
+                    if same and previous is not None
+                    else 0
+                    if inferred is None
+                    else state.counters.get(inferred[0], 0)
+                ),
+            )
+            if completed is not None and (
+                (
+                    same
+                    and previous is not None
+                    and completed != (previous.completed or 0)
+                )
+                or (not same and completed > 0)
+            ):
+                state.last_progress_at = now
+            state.operation = operation
+            return checkpoint
+
+    def _restore_activity(
+        self, work: ProgressWork, checkpoint: _ActivityCheckpoint
+    ) -> None:
+        with self._lock:
+            state = self._state
+            if (
+                state is not None
+                and state.work is work
+                and state.phase_generation == checkpoint.phase_generation
+            ):
+                state.operation = checkpoint.operation
 
     def _counter(
         self, work: ProgressWork, name: str, value: int, *, additive: bool
@@ -269,26 +427,30 @@ class IngestProgress:
         *,
         status: str | None = None,
     ) -> None:
-        parts = [
-            "ingest_progress",
-            f"event={event}",
-            f"generation={snapshot.generation}",
-            f"phase={snapshot.phase}",
-            f"elapsed_seconds={snapshot.elapsed_seconds:.1f}",
-            f"phase_elapsed_seconds={snapshot.phase_elapsed_seconds:.1f}",
-            f"last_progress_age_seconds={snapshot.last_progress_age_seconds:.1f}",
-        ]
-        if snapshot.operation is not None:
-            parts.append(f"operation={snapshot.operation}")
-        if status is not None:
-            parts.append(f"status={status}")
-        parts.extend(f"counter.{name}={value}" for name, value in snapshot.counters)
-        try:
-            self._emit(" ".join(parts))
-        except Exception:
-            # Observability is best effort: a failed logging sink must never
-            # cancel ingest or kill future periodic reports.
-            pass
+        message = format_progress(event, snapshot, self._last_emitted, status=status)
+        self._last_emitted = snapshot
+        for emit, text in (
+            (self._emit, message),
+            (self._emit_debug, format_diagnostics(event, snapshot, status=status)),
+        ):
+            try:
+                emit(text)
+            except Exception:
+                # Each sink is independent and best effort. A failed logger
+                # must not cancel ingest or suppress the other log level.
+                pass
+
+
+def _require_measurement(
+    completed: int | None, total: int | None, unit: str | None
+) -> None:
+    for value in (completed, total):
+        if value is not None and (type(value) is not int or value < 0):
+            raise ValueError("progress measurements must be non-negative ints")
+    if completed is not None and total is not None and completed > total:
+        raise ValueError("completed progress cannot exceed total")
+    if unit is not None:
+        _require_name(unit)
 
 
 def _require_name(value: str) -> None:

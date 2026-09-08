@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -101,7 +102,9 @@ def test_runtime_reports_real_source_database_and_parallel_cbz_progress(
     request: pytest.FixtureRequest,
     artifacts: bool,
     backend: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="h2hdb_ingest.runtime")
     config = _config(tmp_path, artifacts=artifacts)
     if backend == "mariadb":
         config = IngestConfig(
@@ -142,7 +145,9 @@ def test_runtime_reports_real_source_database_and_parallel_cbz_progress(
         revision = runtime.catalog.get_catalog_revision()
         assert revision.publication_count == 1
         assert revision.artifact_count == int(artifacts)
-        records = _progress_records(messages)
+        records = _progress_records([record.getMessage() for record in caplog.records])
+        assert any("Ingest" in message for message in messages)
+        assert not any(message.startswith("ingest_progress ") for message in messages)
         phases = [
             record["phase"] for record in records if record["event"] == "phase_started"
         ]
@@ -301,7 +306,7 @@ def _resident(
 def test_resident_idle_polls_remain_silent_beyond_hourly_interval() -> None:
     clock = _Clock()
     messages: list[str] = []
-    progress = IngestProgress(messages.append, clock=clock)
+    progress = IngestProgress(messages.append, emit_debug=messages.append, clock=clock)
     resident = _resident(progress)
     try:
         for _ in range(4):
@@ -326,7 +331,7 @@ def test_resident_pending_polls_keep_one_hourly_work_generation(
 ) -> None:
     clock = _Clock()
     messages: list[str] = []
-    progress = IngestProgress(messages.append, clock=clock)
+    progress = IngestProgress(messages.append, emit_debug=messages.append, clock=clock)
     resident = _resident(progress, maintenance=maintenance)
     try:
         assert not resident.process_available(periodic_scan=periodic_scan)
@@ -352,7 +357,7 @@ def test_resident_pending_polls_keep_one_hourly_work_generation(
 
 def test_resident_service_failure_finishes_observation_scope() -> None:
     messages: list[str] = []
-    progress = IngestProgress(messages.append)
+    progress = IngestProgress(messages.append, emit_debug=messages.append)
     resident = _resident(progress, facade=_Facade(available=True))
     try:
         with pytest.raises(RuntimeError, match="broken synchronization"):
@@ -385,7 +390,7 @@ def test_blocked_startup_check_reports_without_another_database_call() -> None:
 
     admin = BlockingAdmin()
     facade = _Facade()
-    progress = IngestProgress(emit, clock=clock)
+    progress = IngestProgress(emit, emit_debug=emit, clock=clock)
     resident = _resident(progress, facade=facade, admin=admin)
 
     def initialize() -> None:

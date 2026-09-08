@@ -303,7 +303,9 @@ class _Facade:
         adapter: object,
         *,
         max_new_galleries: int | None,
+        progress: object = None,
     ) -> _PreparedSource:
+        assert progress is None
         self._events.append(("prepare-source", adapter, max_new_galleries))
         return _PreparedSource(self._events)
 
