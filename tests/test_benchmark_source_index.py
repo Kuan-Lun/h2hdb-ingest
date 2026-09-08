@@ -107,19 +107,33 @@ def test_resource_monitor_failure_sets_safety_stop(
     assert str(failures[0]) == "synthetic monitor fault"
 
 
-def test_resource_monitor_does_not_pollute_source_scan_count() -> None:
+def test_resource_monitor_does_not_pollute_source_scan_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = _benchmark_module()
     run_pipeline = cast(_RunPipeline, module.__dict__["_run_pipeline"])
+    tree_usage = cast(_TreeUsage, module.__dict__["_tree_usage"])
+    monitor_scans = 0
 
+    def counted_usage(root: Path) -> tuple[int, int]:
+        nonlocal monitor_scans
+        monitor_scans += 1
+        return tree_usage(root)
+
+    monkeypatch.setitem(module.__dict__, "_tree_usage", counted_usage)
+    baseline = run_pipeline(1, progress_seconds=600.0)
+    scans_before = monitor_scans
     result = run_pipeline(1, progress_seconds=0.05)
 
-    assert result["gallery_scans_including_discovery"] == 4
-    assert result["observation_gallery_scans"] == 4
+    assert monitor_scans > scans_before
+    # Qualification adds one exact PAGE enumeration before source freezing.
+    gallery_scans = baseline["gallery_scans_including_discovery"]
+    assert gallery_scans == 5
+    assert result["gallery_scans_including_discovery"] == gallery_scans
+    assert result["observation_gallery_scans"] == baseline["observation_gallery_scans"]
     assert result["acquisition_count"] == 1
     assert result["artwork_count"] == 1
-    assert result["output_manifest_sha256"] == (
-        "be18c7701def706de9711b83a669944c073c82757e198ef5ba626ef9abb193ae"
-    )
+    assert result["output_manifest_sha256"] == baseline["output_manifest_sha256"]
 
 
 def test_pipeline_surfaces_resource_monitor_failure(
