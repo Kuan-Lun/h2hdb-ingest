@@ -172,6 +172,7 @@ class IngestPathsConfig(ConfigModel):
 
 
 class ResidentConfig(ConfigModel):
+    publication_batch_galleries: StrictInt = Field(default=1000, ge=1, le=1_000_000)
     source_quiet_seconds: float = Field(default=300, gt=0, allow_inf_nan=False)
     source_max_wait_seconds: float = Field(default=1800, gt=0, allow_inf_nan=False)
     source_probe_interval_seconds: float = Field(default=30, gt=0, allow_inf_nan=False)

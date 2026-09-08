@@ -16,6 +16,8 @@ class _Resident:
     def __init__(self, events: list[object], *, available: bool = True) -> None:
         self._events = events
         self._available = available
+        self.last_synchronization_result: object | None = None
+        self.deferred_gallery_count = 0
 
     def initialize(self) -> None:
         self._events.append("initialize")
@@ -25,12 +27,17 @@ class _Resident:
         *,
         periodic_scan: bool,
         preflight: Any = None,
+        postflight: Any = None,
         should_stop: Any = None,
     ) -> bool:
         del should_stop
         self._events.append(("process", periodic_scan))
         if preflight is not None:
             preflight()
+        if self._available:
+            if postflight is not None:
+                postflight()
+            self.last_synchronization_result = object()
         return self._available
 
     def run_forever(self, *, stop: object) -> None:
@@ -290,6 +297,178 @@ def test_bootstrap_refuses_an_existing_catalog_revision(
     assert "current_revision=9" in capsys.readouterr().err
     assert runtime.closed
     assert events[-1] == "runtime-close"
+
+
+class _BatchResident(_Resident):
+    def __init__(self, events: list[object], outcomes: tuple[int | None, ...]) -> None:
+        super().__init__(events)
+        self._outcomes = iter(outcomes)
+
+    def process_available(
+        self,
+        *,
+        periodic_scan: bool,
+        preflight: Any = None,
+        postflight: Any = None,
+        should_stop: Any = None,
+    ) -> bool:
+        deferred = next(self._outcomes)
+        if deferred is None:
+            self._events.append("maintenance")
+            return True
+        result = super().process_available(
+            periodic_scan=periodic_scan,
+            preflight=preflight,
+            postflight=postflight,
+            should_stop=should_stop,
+        )
+        self.deferred_gallery_count = deferred
+        return result
+
+
+def test_bootstrap_continues_empty_batches_and_maintenance_until_first_nonempty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    events: list[object] = []
+    config = _bootstrap_config(tmp_path)
+    first = SimpleNamespace(revision=1, publication_count=0)
+    runtime = _Runtime(
+        events,
+        resident=_BatchResident(events, (None, 2, None, 0)),
+        catalog=_Catalog(
+            [
+                CatalogRevisionNotFoundError(0),
+                first,
+                first,
+                SimpleNamespace(revision=2, publication_count=2),
+            ]
+        ),
+    )
+    monkeypatch.setattr(bootstrap, "load_config", lambda path: config)
+    monkeypatch.setattr(bootstrap, "configure_logging", lambda value: None)
+    monkeypatch.setattr(bootstrap, "build_runtime", lambda value: runtime)
+
+    assert bootstrap.main(["--config", str(tmp_path / "ingest.json")]) == 0
+    assert events == [
+        "initialize",
+        "maintenance",
+        ("process", True),
+        "maintenance",
+        ("process", True),
+        "runtime-close",
+    ]
+    assert "revision=2 publications=2" in capsys.readouterr().out
+
+
+def test_bootstrap_rejects_another_publication_between_its_empty_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    events: list[object] = []
+    config = _bootstrap_config(tmp_path)
+    runtime = _Runtime(
+        events,
+        resident=_BatchResident(events, (2, 0)),
+        catalog=_Catalog(
+            [
+                CatalogRevisionNotFoundError(0),
+                SimpleNamespace(revision=1, publication_count=0),
+                SimpleNamespace(revision=2, publication_count=1),
+            ]
+        ),
+    )
+    monkeypatch.setattr(bootstrap, "load_config", lambda path: config)
+    monkeypatch.setattr(bootstrap, "configure_logging", lambda value: None)
+    monkeypatch.setattr(bootstrap, "build_runtime", lambda value: runtime)
+
+    with pytest.raises(SystemExit) as stopped:
+        bootstrap.main(["--config", str(tmp_path / "ingest.json")])
+    assert stopped.value.code == 2
+    assert "current_revision=2" in capsys.readouterr().err
+    assert runtime.closed
+
+
+def test_bootstrap_reports_empty_final_batch_without_retrying_forever(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    events: list[object] = []
+    config = _bootstrap_config(tmp_path)
+    runtime = _Runtime(
+        events,
+        resident=_BatchResident(events, (0,)),
+        catalog=_Catalog(
+            [
+                CatalogRevisionNotFoundError(0),
+                SimpleNamespace(revision=1, publication_count=0),
+            ]
+        ),
+    )
+    monkeypatch.setattr(bootstrap, "load_config", lambda path: config)
+    monkeypatch.setattr(bootstrap, "configure_logging", lambda value: None)
+    monkeypatch.setattr(bootstrap, "build_runtime", lambda value: runtime)
+
+    with pytest.raises(SystemExit) as stopped:
+        bootstrap.main(["--config", str(tmp_path / "ingest.json")])
+    assert stopped.value.code == 1
+    assert "did not publish a non-empty catalog" in capsys.readouterr().err
+    assert events.count(("process", True)) == 1
+
+
+def test_bootstrap_captures_its_publication_before_releasing_the_ingest_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    events: list[object] = []
+    config = _bootstrap_config(tmp_path)
+
+    class _RacingCatalog(_Catalog):
+        lease_held = False
+        published = False
+        reads_after_release = 0
+
+        def get_catalog_revision(self) -> object:
+            if not self.published:
+                raise CatalogRevisionNotFoundError(0)
+            if self.lease_held:
+                return SimpleNamespace(revision=1, publication_count=2)
+            self.reads_after_release += 1
+            return SimpleNamespace(revision=9, publication_count=99)
+
+    catalog = _RacingCatalog([])
+
+    class _RacingResident(_Resident):
+        def process_available(
+            self,
+            *,
+            periodic_scan: bool,
+            preflight: Any = None,
+            postflight: Any = None,
+            should_stop: Any = None,
+        ) -> bool:
+            del periodic_scan, should_stop
+            catalog.lease_held = True
+            preflight()
+            catalog.published = True
+            if postflight is not None:
+                postflight()
+            self.last_synchronization_result = object()
+            catalog.lease_held = False
+            return True
+
+    runtime = _Runtime(events, resident=_RacingResident(events), catalog=catalog)
+    monkeypatch.setattr(bootstrap, "load_config", lambda path: config)
+    monkeypatch.setattr(bootstrap, "configure_logging", lambda value: None)
+    monkeypatch.setattr(bootstrap, "build_runtime", lambda value: runtime)
+
+    assert bootstrap.main(["--config", str(tmp_path / "ingest.json")]) == 0
+    assert "revision=1 publications=2" in capsys.readouterr().out
+    assert catalog.reads_after_release == 0
 
 
 def test_bootstrap_rejects_a_source_without_gallery_metadata(

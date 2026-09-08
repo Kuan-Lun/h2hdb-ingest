@@ -256,6 +256,7 @@ def test_bounded_runtime_defaults() -> None:
     resident = ResidentConfig()
 
     assert resident.max_rows == 128
+    assert resident.publication_batch_galleries == 1000
 
 
 @pytest.mark.parametrize("value", (0, 8193))
@@ -397,6 +398,20 @@ def test_render_policy_rejects_unsupported_preset() -> None:
 def test_bounded_runtime_limits_are_enforced(field: str, value: int) -> None:
     with pytest.raises(ValidationError):
         ResidentConfig.model_validate({field: value})
+
+
+@pytest.mark.parametrize("value", (0, -1, 1_000_001, True, 1.5, "1000", None))
+def test_publication_batch_rejects_invalid_gallery_counts(value: object) -> None:
+    with pytest.raises(ValidationError):
+        ResidentConfig.model_validate({"publication_batch_galleries": value})
+
+
+@pytest.mark.parametrize("value", (1, 1000, 1_000_000))
+def test_publication_batch_accepts_bounded_gallery_counts(value: int) -> None:
+    assert (
+        ResidentConfig(publication_batch_galleries=value).publication_batch_galleries
+        == value
+    )
 
 
 def test_heartbeat_must_be_shorter_than_lease() -> None:

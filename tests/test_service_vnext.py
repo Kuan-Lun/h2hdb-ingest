@@ -28,6 +28,8 @@ from h2hdb_ingest import IngestConfig, IngestPathsConfig, build_ingest_policy
 from h2hdb_ingest.metrics import IngestMetric
 from h2hdb_ingest.service import (
     VNextIngestService,
+    VNextIngestSourceSynchronizationResult,
+    VNextIngestSynchronizationResult,
     _IngestStopRequested,
     synchronize_analysis,
     synchronize_publication,
@@ -55,6 +57,7 @@ def _session(*, lease_expires_at: int = 10_000_000) -> VNextIngestSession:
 class _PreparedSource:
     def __init__(self, events: list[object]) -> None:
         self._events = events
+        self.deferred_gallery_count = 7
 
     def __enter__(self) -> _PreparedSource:
         self._events.append("enter")
@@ -295,8 +298,13 @@ class _Facade:
         self._events = events
         self._step = 0
 
-    def prepare_source(self, adapter: object) -> _PreparedSource:
-        self._events.append(("prepare-source", adapter))
+    def prepare_source(
+        self,
+        adapter: object,
+        *,
+        max_new_galleries: int | None,
+    ) -> _PreparedSource:
+        self._events.append(("prepare-source", adapter, max_new_galleries))
         return _PreparedSource(self._events)
 
     def issue_source_step(
@@ -350,15 +358,17 @@ def test_source_orchestration_keeps_local_preparation_between_bounded_calls() ->
         database_type="sqlite",
     )
 
-    receipt = synchronize_source(
+    result = synchronize_source(
         controller,
         cast(VNextResolvedIngestPolicy, object()),
         adapter,
+        max_new_galleries=1000,
     )
 
-    assert receipt.build_id == b"b" * 16
+    assert result.receipt.build_id == b"b" * 16
+    assert result.deferred_gallery_count == 7
     assert events == [
-        ("prepare-source", adapter),
+        ("prepare-source", adapter, 1000),
         "enter",
         ("issue", 0, 10_000_000),
         ("prepare-step", 0),
@@ -407,6 +417,22 @@ def test_source_orchestration_rejects_terminal_result_without_sealed_receipt() -
         assert "sealed source receipt" in str(error)
     else:
         raise AssertionError("missing source receipt was accepted")
+
+
+@pytest.mark.parametrize("value", (-1, True, "1"))
+def test_synchronization_results_reject_invalid_deferred_counts(value: object) -> None:
+    source = VNextIngestSourceReceipt(b"s" * 16, 1, 1, True, False)
+    with pytest.raises((TypeError, ValueError), match="deferred_gallery_count"):
+        VNextIngestSourceSynchronizationResult(source, cast(int, value))
+    with pytest.raises((TypeError, ValueError), match="deferred_gallery_count"):
+        VNextIngestSynchronizationResult(
+            source,
+            VNextAnalysisAdvanceResult(
+                b"a" * 16, b"snapshot_manifest", 1, True, True, False, b"m" * 32
+            ),
+            VNextIngestAdvanceResult(VNextIngestPhase.FINALIZATION, 0, True, False),
+            cast(int, value),
+        )
 
 
 class _LibraryActivation:
@@ -915,11 +941,12 @@ def test_complete_service_recovers_before_source_and_guards_publication(
         selected: object,
         adapter: object,
         **kwargs: object,
-    ) -> VNextIngestSourceReceipt:
-        del session, adapter, kwargs
+    ) -> VNextIngestSourceSynchronizationResult:
+        del session, adapter
         assert selected is resolved
+        assert kwargs["max_new_galleries"] == 1000
         events.append("source")
-        return source_receipt
+        return VNextIngestSourceSynchronizationResult(source_receipt, 11)
 
     def fake_analysis(
         session: object,
@@ -970,6 +997,7 @@ def test_complete_service_recovers_before_source_and_guards_publication(
         source_root=tmp_path,
         policy=policy,
         max_rows=128,
+        publication_batch_galleries=1000,
         artifact_adapters={},
         finalization_adapters={},
         library_activation=activation,
@@ -981,6 +1009,7 @@ def test_complete_service_recovers_before_source_and_guards_publication(
     assert outcome.source is source_receipt
     assert outcome.analysis is analysis
     assert outcome.publication is publication
+    assert outcome.deferred_gallery_count == 11
     assert events == [
         ("ensure-policy", 2),
         ("recovery-issue", 0, 10_000_000),
@@ -1086,6 +1115,7 @@ def test_complete_service_stop_during_source_preparation_closes_without_success(
         source_root=tmp_path,
         policy=policy,
         max_rows=128,
+        publication_batch_galleries=1000,
         artifact_adapters={},
         finalization_adapters={},
         library_activation=activation,
@@ -1168,6 +1198,7 @@ def test_service_does_not_construct_source_after_recovery_error(
         source_root=tmp_path,
         policy=policy,
         max_rows=128,
+        publication_batch_galleries=1000,
         artifact_adapters={},
         finalization_adapters={},
         library_activation=activation,

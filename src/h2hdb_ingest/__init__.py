@@ -34,6 +34,7 @@ __all__ = [
     "TextIngestMetricSink",
     "VNextFilesystemSourceAdapter",
     "VNextIngestService",
+    "VNextIngestSourceSynchronizationResult",
     "VNextIngestSynchronizationResult",
     "build_ingest_policy",
     "default_page_render_workers",
@@ -84,5 +85,9 @@ from .page_workers import (
 )
 from .policy import build_ingest_policy
 from .resident import ResidentIngestor
-from .service import VNextIngestService, VNextIngestSynchronizationResult
+from .service import (
+    VNextIngestService,
+    VNextIngestSourceSynchronizationResult,
+    VNextIngestSynchronizationResult,
+)
 from .session import IngestLeaseHeartbeat, IngestSessionController

@@ -166,6 +166,7 @@ A minimal SQLite configuration with artifacts enabled is:
     }
   },
   "resident": {
+    "publication_batch_galleries": 1000,
     "source_quiet_seconds": 300,
     "source_max_wait_seconds": 1800,
     "source_probe_interval_seconds": 30,
@@ -180,6 +181,34 @@ A minimal SQLite configuration with artifacts enabled is:
 Set `library_path` to `null` to publish catalog metadata without producing
 artifacts. `download_path` must already be a nonempty directory. The download
 and library roots must be distinct and must not contain one another.
+
+`publication_batch_galleries` is a strict integer from 1 through 1,000,000,
+defaulting to 1,000. Each synchronization admits at most that many galleries
+that are absent from the currently published source membership, then completes
+analysis, CBZ creation, library activation, and catalog publication for the
+cumulative known collection. Already known galleries remain in the collection;
+their changes and confirmed deletions are applied in the same synchronization
+and do not consume this quota. A batch is therefore not a fixed limit on its
+total work or its number of resulting books.
+
+Every batch takes a fresh complete inventory of gallery completion markers.
+New folders, including names preceding an earlier scan position, are eligible
+in subsequent batches. Missing folders are removed only after this complete
+inventory proves their absence. Incomplete or changing observations fail the
+attempt rather than treating an interrupted scan as evidence of deletion.
+Unchanged markers reuse verified source observations without rereading image
+bytes. Metadata discovery, analysis, catalog indexes, and library reconciliation
+still contribute work; the first batch must finish the full metadata inventory.
+
+After a batch publishes, the resident immediately continues any deferred new
+galleries, with bounded maintenance and a fresh ingest claim between batches.
+It does not wait for another source change or the quiet period. Each published
+batch is complete and downloadable through the current catalog while later
+batches are prepared. OPDS serves only that current publication; activation
+retains its existing publication fence. New evidence can change deduplication
+or spam decisions, so later batches can replace or remove earlier CBZs and
+catalog entries. The known source collection grows progressively, but the number
+of published books need not increase on every batch.
 
 The resident reconciles the source immediately on startup. After that, a source
 change schedules synchronization after `source_quiet_seconds` without another
@@ -327,7 +356,10 @@ h2hdb-ingest-bootstrap --config /config/h2hdb-ingest.json
 ```
 
 Bootstrap refuses an empty source or a catalog that already has a published
-revision.
+revision. It advances publication batches until the first nonempty catalog,
+continuing past an empty batch when new galleries remain deferred. It fails if
+the final batch is empty or another publisher changes its catalog head between
+batches. Normal resident mode continues the remaining collection afterward.
 
 ## Crash and restart behavior
 
@@ -354,11 +386,12 @@ head's library activation is `COMPLETE`. Recovery uses the staged bytes and
 durable receipt from the interrupted turn; it does not require the old source
 files to remain present and does not bind the new ingest generation to that old
 snapshot. The same synchronization then observes the current source and runs
-it through the complete requested policy tuple, including source-manifest,
+its cumulative admitted batch through the complete requested policy tuple, including source-manifest,
 analysis, artifact/render, display-title, operational, and artifact-required
-choices. A successful synchronization therefore means that policy is fully
-published and finalized; there is no hidden deferred-policy success or operator
-retry step. A stop or adapter error before that point propagates without
+choices. A successful synchronization means that batch is fully published and
+finalized; its result separately reports the number of deferred new galleries.
+There is no deferred policy application within the published batch. A stop or
+adapter error before finalization propagates without
 reporting synchronization success, and the next claim resumes from the durable
 boundary.
 

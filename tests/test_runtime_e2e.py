@@ -23,10 +23,13 @@ from h2hdb import (
     CoreConfig,
     DatabaseConfig,
     GalleryStagingCapacityError,
+    VNextAnalysisAdvanceResult,
     VNextCurrentOnlyMaintenanceOutcome,
     VNextIngestAdvanceResult,
     VNextIngestFacade,
+    VNextIngestPhase,
     VNextIngestSession,
+    VNextIngestSourceReceipt,
     VNextIssuedPublicationStep,
     VNextPreparedPublicationStep,
     VNextResolvedIngestPolicy,
@@ -44,6 +47,7 @@ from h2hdb_ingest import (
     ResidentConfig,
     ResidentIngestor,
     VNextIngestService,
+    VNextIngestSynchronizationResult,
 )
 from h2hdb_ingest.filesystem import (
     FilesystemFileObservation,
@@ -53,7 +57,12 @@ from h2hdb_ingest.runtime import IngestRuntime, build_runtime
 from h2hdb_ingest.source_monitor import FilesystemCompletionMarkerProbe
 
 
-@pytest.fixture(params=("sqlite", pytest.param("mariadb", marks=pytest.mark.mariadb)))
+@pytest.fixture(
+    params=(
+        "sqlite",
+        pytest.param("mariadb", marks=(pytest.mark.mariadb, pytest.mark.deep)),
+    )
+)
 def runtime_core_config(
     request: pytest.FixtureRequest,
     tmp_path: Path,
@@ -151,12 +160,19 @@ class _CapacityThenSuccessService:
         session: IngestSessionController,
         *,
         should_stop: Callable[[], bool] | None = None,
-    ) -> object:
+    ) -> VNextIngestSynchronizationResult:
         del session, should_stop
         self.calls += 1
         if self.calls == 1:
             raise GalleryStagingCapacityError(1_500_000)
-        return "recovered"
+        return VNextIngestSynchronizationResult(
+            VNextIngestSourceReceipt(b"b" * 16, 0, 0, True, False),
+            VNextAnalysisAdvanceResult(
+                b"a" * 16, b"snapshot_manifest", 0, True, True, False, b"m" * 32
+            ),
+            VNextIngestAdvanceResult(VNextIngestPhase.FINALIZATION, 0, True, False),
+            0,
+        )
 
 
 class _DoneLibraryMaintenance:
@@ -508,6 +524,113 @@ def test_marker_cache_respects_deletion_and_rejects_incomplete_metadata(
             _synchronize_after_cleanup(runtime)
         assert runtime.catalog.get_catalog_revision() == current
         assert runtime.catalog.discover_publications(revision=current).total == 1
+
+
+@pytest.mark.parametrize("artifacts_enabled", [False, True])
+def test_progressive_batches_refresh_known_galleries_and_rediscover_added_folders(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    artifacts_enabled: bool,
+) -> None:
+    source = tmp_path / "download"
+    library = tmp_path / "library"
+
+    def add_gallery(gid: int, color: str) -> None:
+        _gallery(source, gid, str(gid))
+        Image.new("RGB", (8, 12), color).save(source / str(gid) / "001.jpg")
+        _rewrite_completion_marker(source / str(gid))
+
+    for gid, color in (
+        (2002, "red"),
+        (2003, "green"),
+        (2004, "blue"),
+        (2005, "yellow"),
+    ):
+        add_gallery(gid, color)
+    if artifacts_enabled:
+        _provision_library_root(library)
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(
+            download_path=source,
+            library_path=library if artifacts_enabled else None,
+            page_render_workers=1,
+        ),
+        resident=ResidentConfig(publication_batch_galleries=2),
+    )
+    reads = _count_source_image_reads(monkeypatch)
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
+
+        def publish_batch() -> None:
+            previous = runtime.resident.last_synchronization_result
+            for _attempt in range(128):
+                assert runtime.resident.process_available(periodic_scan=True)
+                if runtime.resident.last_synchronization_result is not previous:
+                    return
+            pytest.fail("small progressive fixture did not finish bounded maintenance")
+
+        def gids() -> set[int]:
+            return {
+                item.gid
+                for item in runtime.catalog.discover_publications().publications
+            }
+
+        def archive_bytes() -> dict[str, bytes]:
+            return {
+                path.name: path.read_bytes()
+                for path in library.rglob("*.cbz")
+                if "current" in path.parts
+            }
+
+        publish_batch()
+        first_gids = gids()
+        assert len(first_gids) == 2
+        assert first_gids <= {2002, 2003, 2004, 2005}
+        assert set(reads) == {str(gid) for gid in first_gids}
+        assert runtime.resident.deferred_gallery_count == 2
+        removed_gid, changed_gid = sorted(first_gids)
+        first_archives = archive_bytes() if artifacts_enabled else {}
+        if artifacts_enabled:
+            assert set(first_archives) == {f"h2h-{gid}.cbz" for gid in first_gids}
+
+        # A newly added locator sorts before the previously visited locators.
+        # Known changes and deletions do not consume the two-new-gallery quota.
+        add_gallery(2001, "purple")
+        rmtree(source / str(removed_gid))
+        Image.new("RGB", (8, 12), "orange").save(source / str(changed_gid) / "001.jpg")
+        _rewrite_completion_marker(source / str(changed_gid))
+        reads.clear()
+        publish_batch()
+        second_gids = gids()
+        final_gids = {2001, 2002, 2003, 2004, 2005} - {removed_gid}
+        assert len(second_gids) == 3
+        assert second_gids <= final_gids
+        assert changed_gid in second_gids
+        assert set(reads) == {str(gid) for gid in second_gids}
+        assert runtime.resident.deferred_gallery_count == 1
+        second_archives = archive_bytes() if artifacts_enabled else {}
+        if artifacts_enabled:
+            assert set(second_archives) == {f"h2h-{gid}.cbz" for gid in second_gids}
+            changed_name = f"h2h-{changed_gid}.cbz"
+            assert second_archives[changed_name] != first_archives[changed_name]
+
+        reads.clear()
+        publish_batch()
+        assert gids() == final_gids
+        assert set(reads) == {str(gid) for gid in final_gids - second_gids}
+        assert runtime.resident.deferred_gallery_count == 0
+        assert runtime.catalog.get_catalog_revision().revision == 3
+        if artifacts_enabled:
+            final_archives = archive_bytes()
+            assert set(final_archives) == {f"h2h-{gid}.cbz" for gid in final_gids}
+            assert all(
+                final_archives[name] == content
+                for name, content in second_archives.items()
+            )
+        assert runtime.database_admin.check().state == "READY"
 
 
 @pytest.mark.parametrize("incomplete", [b"", b"Title: Still writing"])

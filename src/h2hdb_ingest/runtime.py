@@ -152,6 +152,7 @@ def build_runtime(
             source_root=config.paths.download_path,
             policy=build_ingest_policy(config),
             max_rows=config.resident.max_rows,
+            publication_batch_galleries=config.resident.publication_batch_galleries,
             artifact_adapters=artifact_adapters,
             finalization_adapters=finalization_adapters,
             library_activation=library_activation,

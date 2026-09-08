@@ -83,7 +83,12 @@ class SourceScanSchedule:
             return ticket
 
     def finish_scan(
-        self, ticket: SourceScanTicket, *, now: float, succeeded: bool
+        self,
+        ticket: SourceScanTicket,
+        *,
+        now: float,
+        succeeded: bool,
+        pending_batch: bool = False,
     ) -> None:
         """Acknowledge only this scan; newer changes survive its completion.
 
@@ -91,17 +96,26 @@ class SourceScanSchedule:
         Their quiet period can expire earlier, including before completion.
         Transient failure keeps a retry pending with a fresh quiet delay, so a
         continuously mutating source cannot cause an immediate retry loop.
+        A published batch with deferred galleries continues immediately, even
+        when the completion-marker monitor observed no further source changes.
         """
 
         self._validate_time(now)
+        if pending_batch and not succeeded:
+            raise ValueError(
+                "only a successful publication can schedule its next batch"
+            )
         with self._lock:
             if self._active is not ticket:
                 raise RuntimeError("source scan completion has a stale ticket")
             if now < ticket.started_at:
                 raise ValueError("source scan cannot finish before it started")
-            if not succeeded:
+            if pending_batch:
                 self._last_change_at = now
-            if self._last_change_at is not None:
+                self._hard_deadline = now
+            elif not succeeded:
+                self._last_change_at = now
+            if not pending_batch and self._last_change_at is not None:
                 self._hard_deadline = now + self._max_wait_seconds
             self._active = None
 

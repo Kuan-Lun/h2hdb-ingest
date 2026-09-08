@@ -10,11 +10,15 @@ from h2hdb import (
     ArtifactReleaseAdapter,
     GalleryStagingCapacityError,
     SchemaEpochReport,
+    VNextAnalysisAdvanceResult,
     VNextCurrentOnlyMaintenanceOutcome,
     VNextDatabaseAdminFacade,
+    VNextIngestAdvanceResult,
     VNextIngestCompletionReceipt,
     VNextIngestFacade,
+    VNextIngestPhase,
     VNextIngestSession,
+    VNextIngestSourceReceipt,
     VNextSourceChangedError,
     VNextSourceManifestMismatchError,
 )
@@ -37,6 +41,7 @@ from h2hdb_ingest.maintenance import (
     _LibraryStagingSlotConflictError,
 )
 from h2hdb_ingest.resident import IngestSynchronizer, ResidentIngestor
+from h2hdb_ingest.service import VNextIngestSynchronizationResult
 from h2hdb_ingest.session import IngestSessionController
 from h2hdb_ingest.source_schedule import SourceScanSchedule
 
@@ -61,6 +66,21 @@ def _session() -> VNextIngestSession:
         handoff_owner_token=None,
         handoff_kind=None,
         consumed_at=None,
+    )
+
+
+def _synchronized(
+    *, deferred_gallery_count: int = 0
+) -> VNextIngestSynchronizationResult:
+    return VNextIngestSynchronizationResult(
+        source=VNextIngestSourceReceipt(b"b" * 16, 1, 1, True, False),
+        analysis=VNextAnalysisAdvanceResult(
+            b"a" * 16, b"snapshot_manifest", 1, True, True, False, b"m" * 32
+        ),
+        publication=VNextIngestAdvanceResult(
+            VNextIngestPhase.FINALIZATION, 0, True, False
+        ),
+        deferred_gallery_count=deferred_gallery_count,
     )
 
 
@@ -164,18 +184,22 @@ class _InvalidLibraryMaintenance(_LibraryMaintenance):
 
 
 class _Service:
-    def __init__(self, events: list[object]) -> None:
+    def __init__(
+        self, events: list[object], *, deferred_gallery_count: int = 0
+    ) -> None:
         self._events = events
+        self._deferred_gallery_count = deferred_gallery_count
 
     def synchronize_once(
         self,
         session: IngestSessionController,
         *,
         should_stop: Callable[[], bool] | None = None,
-    ) -> object:
+    ) -> VNextIngestSynchronizationResult:
         del should_stop
         self._events.append("synchronize")
-        return session.call(lambda _facade, receipt: receipt.ingest_generation)
+        assert session.call(lambda _facade, receipt: receipt.ingest_generation) == 2
+        return _synchronized(deferred_gallery_count=self._deferred_gallery_count)
 
 
 class _ManifestMismatchService:
@@ -187,7 +211,7 @@ class _ManifestMismatchService:
         session: IngestSessionController,
         *,
         should_stop: Callable[[], bool] | None = None,
-    ) -> object:
+    ) -> VNextIngestSynchronizationResult:
         del session, should_stop
         self._events.append("synchronize")
         raise VNextSourceManifestMismatchError("source changed")
@@ -202,7 +226,7 @@ class _StagingCapacityService:
         session: IngestSessionController,
         *,
         should_stop: Callable[[], bool] | None = None,
-    ) -> object:
+    ) -> VNextIngestSynchronizationResult:
         del session, should_stop
         self._events.append("synchronize")
         raise GalleryStagingCapacityError(1_500_000)
@@ -217,7 +241,7 @@ class _StagingSlotConflictService:
         session: IngestSessionController,
         *,
         should_stop: Callable[[], bool] | None = None,
-    ) -> object:
+    ) -> VNextIngestSynchronizationResult:
         del session, should_stop
         self._events.append("synchronize")
         raise _LibraryStagingSlotConflictError("stale staging owner")
@@ -298,7 +322,11 @@ def test_startup_only_checks_existing_epoch_and_processes_one_session(
         ("current-only", 10_000_000),
         ("claim", True, 10_000_000),
         "synchronize",
-        ("log", "vNext ingest synchronization completed: 2"),
+        (
+            "log",
+            "vNext ingest publication batch completed: deferred_galleries=0 "
+            "known_galleries=1",
+        ),
     ]
     assert events[6] == ("complete", 2)
     assert events[7] == ("current-only", 10_000_000)
@@ -306,6 +334,80 @@ def test_startup_only_checks_existing_epoch_and_processes_one_session(
         "log",
         "vNext ingest session completed: generation=2 replayed=False",
     )
+
+
+def test_maintenance_preserves_last_completed_publication_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    resident = _resident(
+        events,
+        service=_Service(events, deferred_gallery_count=7),
+        maintenance_results=(
+            VNextCurrentOnlyMaintenanceOutcome.DONE,
+            VNextCurrentOnlyMaintenanceOutcome.DONE,
+            VNextCurrentOnlyMaintenanceOutcome.PROGRESSED,
+        ),
+    )
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    initial = resident.last_synchronization_result
+    assert initial is None
+    assert resident.deferred_gallery_count == 0
+    assert resident.process_available(periodic_scan=True)
+    published = resident.last_synchronization_result
+    assert published is not None
+    assert resident.deferred_gallery_count == 7
+    assert resident.process_available(periodic_scan=True)
+    assert resident.last_synchronization_result is published
+    assert resident.deferred_gallery_count == 7
+    assert events.count("synchronize") == 1
+
+
+def test_postflight_runs_after_publication_and_before_heartbeat_and_lease_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+
+    class _OrderedHeartbeat(_Heartbeat):
+        def __exit__(self, *args: object) -> None:
+            del args
+            events.append("heartbeat-stop")
+
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _OrderedHeartbeat)
+    resident = _resident(events)
+    assert resident.process_available(
+        periodic_scan=True,
+        postflight=lambda: events.append("postflight"),
+    )
+    assert events.index("synchronize") < events.index("postflight")
+    assert events.index("postflight") < events.index("heartbeat-stop")
+    assert events.index("heartbeat-stop") < events.index(("complete", 2))
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, VNextSourceChangedError])
+def test_postflight_failure_stops_heartbeat_and_releases_lease_before_propagating(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[RuntimeError],
+) -> None:
+    events: list[object] = []
+
+    class _OrderedHeartbeat(_Heartbeat):
+        def __exit__(self, *args: object) -> None:
+            del args
+            events.append("heartbeat-stop")
+
+    def fail_postflight() -> None:
+        events.append("postflight")
+        raise failure_type("publication capture failed")
+
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _OrderedHeartbeat)
+    resident = _resident(events)
+    with pytest.raises(failure_type, match="publication capture failed"):
+        resident.process_available(periodic_scan=True, postflight=fail_postflight)
+    assert events.index("postflight") < events.index("heartbeat-stop")
+    assert events.index("heartbeat-stop") < events.index(("complete", 2))
+    assert events.count(("complete", 2)) == 1
+    assert resident.last_synchronization_result is None
 
 
 def test_cbz_startup_binds_local_identity_before_any_maintenance() -> None:
@@ -1045,6 +1147,70 @@ def test_run_forever_waits_instead_of_exiting_on_staging_capacity(
     ]
 
 
+def test_run_forever_publishes_pending_batches_without_waiting_for_source_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    deferred = iter((2, 1, 0))
+    scans: list[float] = []
+    now = 100.0
+
+    class _PeriodicFacade(_Facade):
+        def try_claim_ingest(
+            self, periodic: bool, lease_duration_microseconds: int
+        ) -> VNextIngestSession | None:
+            claimed = super().try_claim_ingest(periodic, lease_duration_microseconds)
+            return claimed if periodic else None
+
+    class _BatchService(_Service):
+        def synchronize_once(
+            self,
+            session: IngestSessionController,
+            *,
+            should_stop: Callable[[], bool] | None = None,
+        ) -> VNextIngestSynchronizationResult:
+            del session, should_stop
+            scans.append(now)
+            return _synchronized(deferred_gallery_count=next(deferred))
+
+    class _Stop:
+        waited = False
+
+        def is_set(self) -> bool:
+            return self.waited
+
+        def wait(self, timeout: float) -> bool:
+            assert len(scans) == 3
+            events.append(("wait", timeout))
+            self.waited = True
+            return True
+
+    facade = _PeriodicFacade(
+        events,
+        maintenance_results=(
+            VNextCurrentOnlyMaintenanceOutcome.DONE,
+            VNextCurrentOnlyMaintenanceOutcome.DONE,
+            VNextCurrentOnlyMaintenanceOutcome.PROGRESSED,
+        ),
+    )
+    resident = _resident(events, facade=facade, service=_BatchService(events))
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    monkeypatch.setattr(resident_module, "monotonic", lambda: now)
+    resident.run_forever(stop=cast(Event, _Stop()))
+
+    assert scans == [100.0, 100.0, 100.0]
+    assert [
+        event for event in events if isinstance(event, tuple) and event[0] == "claim"
+    ] == [
+        ("claim", True, 10_000_000),
+        ("claim", True, 10_000_000),
+        ("claim", True, 10_000_000),
+        ("claim", False, 10_000_000),
+    ]
+    assert events.count(("complete", 2)) == 3
+    assert events[-1] == ("wait", 1.0)
+
+
 def test_run_forever_immediately_drains_library_progress_then_waits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1146,7 +1312,7 @@ def test_transient_source_mutation_completes_after_heartbeat_shutdown(
             session: IngestSessionController,
             *,
             should_stop: Callable[[], bool] | None = None,
-        ) -> object:
+        ) -> VNextIngestSynchronizationResult:
             del session, should_stop
             events.append("synchronize")
             raise source_error("marker changed")
@@ -1199,12 +1365,12 @@ def test_run_forever_retries_mutation_after_quiet_period_without_process_restart
             session: IngestSessionController,
             *,
             should_stop: Callable[[], bool] | None = None,
-        ) -> object:
+        ) -> VNextIngestSynchronizationResult:
             del session, should_stop
             scans.append(now[0])
             if len(scans) == 1:
                 raise VNextSourceChangedError("marker changed")
-            return "recovered"
+            return _synchronized()
 
     monkeypatch.setattr(resident_module, "monotonic", lambda: now[0])
     monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
@@ -1257,13 +1423,13 @@ def test_run_forever_preserves_scan_time_change_and_then_stays_clean(
             session: IngestSessionController,
             *,
             should_stop: Callable[[], bool] | None = None,
-        ) -> object:
+        ) -> VNextIngestSynchronizationResult:
             del session, should_stop
             scans.append(now[0])
             if len(scans) == 1:
                 schedules[0].note_change(now=110)
                 now[0] = 200
-            return "synced"
+            return _synchronized()
 
     monkeypatch.setattr(resident_module, "monotonic", lambda: now[0])
     monkeypatch.setattr(resident_module, "SourceScanSchedule", make_schedule)

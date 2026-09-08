@@ -6,7 +6,7 @@ import argparse
 from collections.abc import Sequence
 from pathlib import Path
 
-from h2hdb import CatalogRevisionNotFoundError
+from h2hdb import CatalogRevision, CatalogRevisionNotFoundError
 
 from .config import load_config
 from .runtime import build_runtime, configure_logging
@@ -34,41 +34,56 @@ def main(arguments: Sequence[str] | None = None) -> int:
     configure_logging(config)
     with build_runtime(config) as runtime:
         runtime.resident.initialize()
+        expected: CatalogRevision | None = None
+        captured: list[CatalogRevision] = []
 
-        def require_unpublished_catalog() -> None:
+        def require_expected_catalog() -> None:
             try:
                 current = runtime.catalog.get_catalog_revision()
             except CatalogRevisionNotFoundError as error:
-                if error.revision == 0:
+                if error.revision == 0 and expected is None:
                     return
                 raise
-            raise _AlreadyPublished(str(current.revision))
+            if current != expected:
+                raise _AlreadyPublished(str(current.revision))
 
-        try:
-            processed = runtime.resident.process_available(
-                periodic_scan=True,
-                preflight=require_unpublished_catalog,
-            )
-        except _AlreadyPublished as error:
-            parser.exit(
-                2,
-                "Initial catalog reconciliation has already run: "
-                f"current_revision={error}.\n",
-            )
-        if not processed:
-            parser.exit(2, "No gallery ingest lease is currently available.\n")
+        def capture_published_catalog() -> None:
+            captured.append(runtime.catalog.get_catalog_revision())
 
-        published = runtime.catalog.get_catalog_revision()
-        if published.revision <= 0 or published.publication_count <= 0:
-            parser.exit(
-                1,
-                "Initial reconciliation did not publish a non-empty catalog.\n",
-            )
-        print(
-            "Initial catalog reconciliation completed: "
-            f"revision={published.revision} "
-            f"publications={published.publication_count}."
-        )
+        while True:
+            captured.clear()
+            try:
+                processed = runtime.resident.process_available(
+                    periodic_scan=True,
+                    preflight=require_expected_catalog,
+                    postflight=capture_published_catalog,
+                )
+            except _AlreadyPublished as error:
+                parser.exit(
+                    2,
+                    "Initial catalog reconciliation found an unexpected publication: "
+                    f"current_revision={error}.\n",
+                )
+            if not processed:
+                parser.exit(
+                    2, "No gallery ingest or maintenance progress is available.\n"
+                )
+            if not captured:
+                continue
+            published = captured[0]
+            if published.publication_count > 0:
+                print(
+                    "Initial catalog reconciliation completed: "
+                    f"revision={published.revision} "
+                    f"publications={published.publication_count}."
+                )
+                break
+            if not runtime.resident.deferred_gallery_count:
+                parser.exit(
+                    1,
+                    "Initial reconciliation did not publish a non-empty catalog.\n",
+                )
+            expected = published
     return 0
 
 

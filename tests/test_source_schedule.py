@@ -76,6 +76,33 @@ def test_changes_during_scan_cap_wait_from_completion() -> None:
     assert schedule.next_scan_at() == 2800
 
 
+@pytest.mark.parametrize("changed_during_scan", [False, True])
+def test_pending_publication_batch_bypasses_debounce_and_drains_to_clean(
+    changed_during_scan: bool,
+) -> None:
+    schedule = _schedule()
+    first = schedule.start_scan(now=0)
+    if changed_during_scan:
+        schedule.note_change(now=90)
+    schedule.finish_scan(first, now=100, succeeded=True, pending_batch=True)
+    assert schedule.next_scan_at() == 100
+    schedule.note_change(now=101)
+    assert schedule.next_scan_at() == 100
+    second = schedule.start_scan(now=102)
+    schedule.finish_scan(second, now=200, succeeded=True)
+    assert schedule.next_scan_at() is None
+
+
+def test_failed_publication_cannot_acknowledge_pending_batch() -> None:
+    schedule = _schedule()
+    ticket = schedule.start_scan(now=0)
+    with pytest.raises(ValueError, match="successful publication"):
+        schedule.finish_scan(ticket, now=100, succeeded=False, pending_batch=True)
+    assert schedule.next_scan_at() is None
+    schedule.finish_scan(ticket, now=100, succeeded=False)
+    assert schedule.next_scan_at() == 400
+
+
 def test_downloader_handoff_can_start_a_clean_or_debouncing_scan() -> None:
     schedule = _clean_schedule()
     clean_ticket = schedule.start_scan(now=20)

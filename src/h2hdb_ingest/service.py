@@ -4,6 +4,7 @@ from __future__ import annotations
 
 __all__ = [
     "VNextIngestService",
+    "VNextIngestSourceSynchronizationResult",
     "VNextIngestSynchronizationResult",
     "synchronize_analysis",
     "synchronize_pending_publication",
@@ -64,14 +65,32 @@ def _never_stop() -> bool:
 
 
 @dataclass(frozen=True, slots=True)
+class VNextIngestSourceSynchronizationResult:
+    """One sealed cumulative source batch and its remaining discovery work."""
+
+    receipt: VNextIngestSourceReceipt
+    deferred_gallery_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.receipt, VNextIngestSourceReceipt):
+            raise TypeError("receipt must be VNextIngestSourceReceipt")
+        self.receipt.__post_init__()
+        if not self.receipt.sealed:
+            raise ValueError("synchronization source receipt must be sealed")
+        _require_deferred_gallery_count(self.deferred_gallery_count)
+
+
+@dataclass(frozen=True, slots=True)
 class VNextIngestSynchronizationResult:
-    """Terminal receipts from one complete source-to-publication turn."""
+    """Finalized receipts for one cumulative publication batch."""
 
     source: VNextIngestSourceReceipt
     analysis: VNextAnalysisAdvanceResult
     publication: VNextIngestAdvanceResult
+    deferred_gallery_count: int
 
     def __post_init__(self) -> None:
+        _require_deferred_gallery_count(self.deferred_gallery_count)
         if not isinstance(self.source, VNextIngestSourceReceipt):
             raise TypeError("source must be VNextIngestSourceReceipt")
         self.source.__post_init__()
@@ -101,6 +120,7 @@ class VNextIngestService:
         source_root: Path,
         policy: VNextIngestPolicy,
         max_rows: int,
+        publication_batch_galleries: int,
         artifact_adapters: Mapping[bytes, ArtifactStorageAdapter],
         finalization_adapters: Mapping[bytes, ArtifactReleaseAdapter],
         library_activation: VNextLibraryActivationAdapter,
@@ -116,6 +136,12 @@ class VNextIngestService:
             raise TypeError("max_rows must be int")
         if not 1 <= max_rows <= 128:
             raise ValueError("max_rows must be from 1 through 128")
+        if type(publication_batch_galleries) is not int:
+            raise TypeError("publication_batch_galleries must be int")
+        if not 1 <= publication_batch_galleries <= 1_000_000:
+            raise ValueError(
+                "publication_batch_galleries must be from 1 through 1000000"
+            )
         if not isinstance(library_activation, VNextLibraryActivationAdapter):
             raise TypeError(
                 "library_activation must implement VNextLibraryActivationAdapter"
@@ -127,6 +153,7 @@ class VNextIngestService:
         self._source_root = source_root
         self._policy = policy
         self._max_rows = max_rows
+        self._publication_batch_galleries = publication_batch_galleries
         self._artifact_adapters = dict(artifact_adapters)
         self._finalization_adapters = dict(finalization_adapters)
         self._library_activation = library_activation
@@ -139,7 +166,7 @@ class VNextIngestService:
         *,
         should_stop: Callable[[], bool] | None = None,
     ) -> VNextIngestSynchronizationResult:
-        """Synchronize one exact filesystem snapshot through finalization."""
+        """Publish one cumulative batch from a fresh complete source inventory."""
 
         if not isinstance(session, IngestSessionController):
             raise TypeError("session must be IngestSessionController")
@@ -160,12 +187,14 @@ class VNextIngestService:
             self._source_root,
             checkpoint=lambda: _raise_if_stopping(stop_requested),
         ) as source:
-            source_receipt = synchronize_source(
+            source_result = synchronize_source(
                 session,
                 resolved,
                 VNextFilesystemSourceAdapter(source),
+                max_new_galleries=self._publication_batch_galleries,
                 should_stop=stop_requested,
             )
+        source_receipt = source_result.receipt
         analysis = synchronize_analysis(
             session,
             resolved,
@@ -187,6 +216,7 @@ class VNextIngestService:
             source_receipt,
             analysis,
             publication,
+            source_result.deferred_gallery_count,
         )
 
 
@@ -398,13 +428,19 @@ def synchronize_source(
     policy: VNextResolvedIngestPolicy,
     adapter: VNextIngestSourceAdapter,
     *,
+    max_new_galleries: int | None = None,
     should_stop: Callable[[], bool] = _never_stop,
-) -> VNextIngestSourceReceipt:
+) -> VNextIngestSourceSynchronizationResult:
     """Drive source ingestion while keeping all local I/O outside the lease lock."""
 
     if not isinstance(session, IngestSessionController):
         raise TypeError("session must be IngestSessionController")
-    prepared = session.outside_session(lambda facade: facade.prepare_source(adapter))
+    prepared = session.outside_session(
+        lambda facade: facade.prepare_source(
+            adapter,
+            max_new_galleries=max_new_galleries,
+        )
+    )
     with prepared:
         while True:
             _raise_if_stopping(should_stop)
@@ -438,7 +474,10 @@ def synchronize_source(
                 raise RuntimeError(
                     "terminal source advancement lacks a sealed source receipt"
                 )
-            return source_receipt
+            return VNextIngestSourceSynchronizationResult(
+                source_receipt,
+                prepared.deferred_gallery_count,
+            )
 
 
 def _require_analysis_result(result: VNextAnalysisAdvanceResult) -> None:
@@ -523,3 +562,10 @@ def _emit_publication_metric(
 def _raise_if_stopping(should_stop: Callable[[], bool]) -> None:
     if should_stop():
         raise _IngestStopRequested
+
+
+def _require_deferred_gallery_count(value: int) -> None:
+    if type(value) is not int:
+        raise TypeError("deferred_gallery_count must be int")
+    if value < 0:
+        raise ValueError("deferred_gallery_count must be nonnegative")

@@ -34,7 +34,7 @@ from .maintenance import (
     LibraryMaintenanceOutcome,
     _LibraryStagingSlotConflictError,
 )
-from .service import _IngestStopRequested
+from .service import VNextIngestSynchronizationResult, _IngestStopRequested
 from .session import IngestLeaseHeartbeat, IngestSessionController
 from .source_monitor import CompletionMarkerProbe, SourceChangeMonitor
 from .source_schedule import SourceScanSchedule, SourceScanTicket
@@ -44,9 +44,18 @@ logger = logging.getLogger(__name__)
 
 class _ResidentCycleOutcome(StrEnum):
     INGESTED = "INGESTED"
+    BATCH_PUBLISHED = "BATCH_PUBLISHED"
     MAINTENANCE_PROGRESSED = "MAINTENANCE_PROGRESSED"
     SOURCE_CHANGED = "SOURCE_CHANGED"
     IDLE = "IDLE"
+
+
+class _PostflightFailed(Exception):
+    """Preserve a callback failure until the heartbeat has stopped."""
+
+    def __init__(self, failure: BaseException) -> None:
+        super().__init__(str(failure))
+        self.failure = failure
 
 
 class IngestSynchronizer(Protocol):
@@ -57,7 +66,7 @@ class IngestSynchronizer(Protocol):
         session: IngestSessionController,
         *,
         should_stop: Callable[[], bool] | None = None,
-    ) -> object: ...
+    ) -> VNextIngestSynchronizationResult: ...
 
 
 class ResidentIngestor:
@@ -107,11 +116,28 @@ class ResidentIngestor:
         self._event_logger = event_logger or logger.info
         self._bound_storage_identity: LibraryStorageIdentity | None = None
         self._storage_instance_ready = library_storage_identity is None
+        self._last_synchronization_result: VNextIngestSynchronizationResult | None = (
+            None
+        )
+
+    @property
+    def last_synchronization_result(self) -> VNextIngestSynchronizationResult | None:
+        """Return the last completed batch; maintenance never replaces this value."""
+
+        return self._last_synchronization_result
+
+    @property
+    def deferred_gallery_count(self) -> int:
+        """Report new galleries deferred by this process's last completed batch."""
+
+        result = self._last_synchronization_result
+        return 0 if result is None else result.deferred_gallery_count
 
     def initialize(self) -> SchemaEpochReport:
         """Validate an existing READY epoch without creating or migrating it."""
 
         self._bound_storage_identity = None
+        self._last_synchronization_result = None
         self._storage_instance_ready = self._library_storage_identity is None
         report = self._database_admin.check()
         if self._library_storage_identity is not None:
@@ -130,9 +156,10 @@ class ResidentIngestor:
         *,
         periodic_scan: bool,
         preflight: Callable[[], None] | None = None,
+        postflight: Callable[[], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> bool:
-        """Process one ingest or maintenance progress unit if available."""
+        """Process one unit; postflight runs after publication under the live lease."""
 
         if not self._storage_instance_ready:
             raise RuntimeError(
@@ -143,9 +170,11 @@ class ResidentIngestor:
         return self._process_cycle(
             periodic_scan=periodic_scan,
             preflight=preflight,
+            postflight=postflight,
             should_stop=should_stop,
         ) in (
             _ResidentCycleOutcome.INGESTED,
+            _ResidentCycleOutcome.BATCH_PUBLISHED,
             _ResidentCycleOutcome.MAINTENANCE_PROGRESSED,
         )
 
@@ -154,6 +183,7 @@ class ResidentIngestor:
         *,
         periodic_scan: bool,
         preflight: Callable[[], None] | None = None,
+        postflight: Callable[[], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
         on_scan_started: Callable[[], None] | None = None,
     ) -> _ResidentCycleOutcome:
@@ -223,9 +253,34 @@ class ResidentIngestor:
                         should_stop=should_stop,
                     )
                 heartbeat.raise_if_failed()
+                if not isinstance(outcome, VNextIngestSynchronizationResult):
+                    raise TypeError(
+                        "synchronizer returned an invalid publication result"
+                    )
+                if postflight is not None:
+                    try:
+                        postflight()
+                    except BaseException as error:
+                        raise _PostflightFailed(error) from error
                 self._event_logger(
-                    f"vNext ingest synchronization completed: {outcome!r}"
+                    "vNext ingest publication batch completed: "
+                    f"deferred_galleries={outcome.deferred_gallery_count} "
+                    f"known_galleries={outcome.source.staged_galleries}"
                 )
+        except _PostflightFailed as error:
+            # The context manager has stopped renewal before releasing the
+            # exact session. Callback failures must not retain the ingest lease
+            # or be mistaken for source-change/capacity retry outcomes.
+            try:
+                session.complete()
+                self._try_library_maintenance()
+                self._try_current_only_maintenance(lease_duration)
+            except BaseException as completion_error:
+                error.failure.add_note(
+                    "The ingest session could not be completed after postflight "
+                    f"failed: {completion_error!r}"
+                )
+            raise error.failure from None
         except _IngestStopRequested:
             self._event_logger(
                 "vNext ingest stopped at a durable bounded-step boundary"
@@ -307,6 +362,7 @@ class ResidentIngestor:
                 )
             raise
         completion = session.complete()
+        self._last_synchronization_result = outcome
         self._try_library_maintenance()
         self._try_current_only_maintenance(lease_duration)
         self._event_logger(
@@ -314,7 +370,11 @@ class ResidentIngestor:
             f"generation={completion.ingest_generation} "
             f"replayed={completion.replayed}"
         )
-        return _ResidentCycleOutcome.INGESTED
+        return (
+            _ResidentCycleOutcome.BATCH_PUBLISHED
+            if outcome.deferred_gallery_count
+            else _ResidentCycleOutcome.INGESTED
+        )
 
     def _require_current_storage_identity(self) -> None:
         """Fail before work if the configured library root changed identity."""
@@ -423,10 +483,16 @@ class ResidentIngestor:
                     schedule.finish_scan(
                         ticket,
                         now=monotonic(),
-                        succeeded=outcome is _ResidentCycleOutcome.INGESTED,
+                        succeeded=outcome
+                        in (
+                            _ResidentCycleOutcome.INGESTED,
+                            _ResidentCycleOutcome.BATCH_PUBLISHED,
+                        ),
+                        pending_batch=outcome is _ResidentCycleOutcome.BATCH_PUBLISHED,
                     )
                 if outcome in (
                     _ResidentCycleOutcome.INGESTED,
+                    _ResidentCycleOutcome.BATCH_PUBLISHED,
                     _ResidentCycleOutcome.MAINTENANCE_PROGRESSED,
                 ):
                     continue
