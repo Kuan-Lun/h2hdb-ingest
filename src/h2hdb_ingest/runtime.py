@@ -31,6 +31,7 @@ from .maintenance import (
 from .metrics import TextIngestMetricSink
 from .page_workers import _decide_page_render_workers
 from .policy import build_ingest_policy
+from .progress import IngestProgress
 from .resident import ResidentIngestor
 from .service import VNextIngestService
 from .source_monitor import FilesystemCompletionMarkerProbe
@@ -46,6 +47,7 @@ class IngestRuntime:
     database_admin: VNextDatabaseAdminFacade
     catalog: VNextCatalogFacade
     resident: ResidentIngestor
+    _progress: IngestProgress | None = field(default=None, repr=False, compare=False)
     _lifecycle_lock: Lock = field(
         default_factory=Lock,
         init=False,
@@ -62,6 +64,8 @@ class IngestRuntime:
             if self._closed:
                 return
             errors: list[BaseException] = []
+            if self._progress is not None:
+                self._progress.close()
             for close in (
                 self.facade.close,
                 self.catalog.close,
@@ -111,6 +115,11 @@ def build_runtime(
         owned_closers.append(catalog.close)
         runtime_event_logger = event_logger or logger.info
         metrics_sink = TextIngestMetricSink(runtime_event_logger)
+        progress = IngestProgress(
+            runtime_event_logger,
+            interval_seconds=config.resident.progress_log_interval_seconds,
+        )
+        owned_closers.append(progress.close)
 
         artifact_adapters: dict[bytes, ManagedFilesystemLibraryAdapter] = {}
         finalization_adapters: dict[bytes, ManagedFilesystemLibraryAdapter] = {}
@@ -140,6 +149,7 @@ def build_runtime(
                 render_policy=config.paths.artifact_render_policy(),
                 page_render_workers=worker_decision.selected,
                 metrics_sink=metrics_sink,
+                progress=progress,
             )
             artifact_adapters[library.adapter_id] = library
             finalization_adapters[library.adapter_id] = library
@@ -158,6 +168,7 @@ def build_runtime(
             library_activation=library_activation,
             publication_guard=publication_guard,
             metrics_sink=metrics_sink,
+            progress=progress,
         )
         resident = ResidentIngestor(
             service=service,
@@ -170,8 +181,10 @@ def build_runtime(
             database_type=config.core.database.sql_type,
             artifact_release_adapters=finalization_adapters,
             event_logger=runtime_event_logger,
+            progress=progress,
         )
-        return IngestRuntime(facade, database_admin, catalog, resident)
+        progress.start()
+        return IngestRuntime(facade, database_admin, catalog, resident, progress)
     except BaseException as error:
         for close in reversed(owned_closers):
             try:

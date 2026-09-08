@@ -879,7 +879,9 @@ def test_complete_service_recovers_before_source_and_guards_publication(
             root: Path,
             *,
             checkpoint: Callable[[], None],
+            progress: object = None,
         ) -> None:
+            assert progress is None
             assert root == tmp_path
             assert callable(checkpoint)
             events.append("source-construct")
@@ -1049,7 +1051,9 @@ def test_complete_service_stop_during_source_preparation_closes_without_success(
             root: Path,
             *,
             checkpoint: Callable[[], None],
+            progress: object = None,
         ) -> None:
+            assert progress is None
             assert root == tmp_path
             self.checkpoint = checkpoint
             events.append("source-construct")

@@ -48,6 +48,7 @@ from h2hdb_ingest.artifact import (
 from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
 from h2hdb_ingest.metrics import IngestMetric
 from h2hdb_ingest.page_workers import resolve_page_render_workers
+from h2hdb_ingest.progress import ProgressWork
 
 
 class _PartialWriter(BytesIO):
@@ -870,9 +871,10 @@ def test_sequential_page_batch_closes_completed_spools_after_later_failure(
         _member: ArtifactSourceMember,
         *,
         policy: ArtifactRenderPolicy,
+        progress: ProgressWork | None = None,
     ) -> artifact_module._RenderedPageBuffer:
         nonlocal calls
-        del policy
+        del policy, progress
         calls += 1
         if calls == 1:
             return first

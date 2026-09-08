@@ -257,6 +257,7 @@ def test_bounded_runtime_defaults() -> None:
 
     assert resident.max_rows == 128
     assert resident.publication_batch_galleries == 1000
+    assert resident.progress_log_interval_seconds == 3600
 
 
 @pytest.mark.parametrize("value", (0, 8193))
@@ -412,6 +413,12 @@ def test_publication_batch_accepts_bounded_gallery_counts(value: int) -> None:
         ResidentConfig(publication_batch_galleries=value).publication_batch_galleries
         == value
     )
+
+
+@pytest.mark.parametrize("value", (0, -1, float("inf"), float("nan")))
+def test_progress_log_interval_rejects_nonpositive_or_nonfinite(value: float) -> None:
+    with pytest.raises(ValidationError):
+        ResidentConfig(progress_log_interval_seconds=value)
 
 
 def test_heartbeat_must_be_shorter_than_lease() -> None:

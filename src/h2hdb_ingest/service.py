@@ -40,6 +40,7 @@ from .metrics import (
     IngestMetricValue,
     emit_ingest_metric,
 )
+from .progress import IngestProgress, ProgressWork
 from .session import IngestSessionController
 
 _ANALYSIS_SNAPSHOT_STAGE = b"snapshot_manifest"
@@ -126,6 +127,7 @@ class VNextIngestService:
         library_activation: VNextLibraryActivationAdapter,
         publication_guard: Callable[[], AbstractContextManager[None]],
         metrics_sink: IngestMetricSink | None = None,
+        progress: IngestProgress | None = None,
     ) -> None:
         if not isinstance(source_root, Path):
             raise TypeError("source_root must be Path")
@@ -159,6 +161,7 @@ class VNextIngestService:
         self._library_activation = library_activation
         self._publication_guard = publication_guard
         self._metrics_sink = metrics_sink
+        self._progress = progress
 
     def synchronize_once(
         self,
@@ -171,10 +174,16 @@ class VNextIngestService:
         if not isinstance(session, IngestSessionController):
             raise TypeError("session must be IngestSessionController")
         stop_requested = should_stop or _never_stop
+        work = None if self._progress is None else self._progress.current()
+        if work is not None:
+            work.phase("policy")
         _raise_if_stopping(stop_requested)
         resolved = session.call(
             lambda facade, receipt: facade.ensure_policy(receipt, self._policy)
         )
+        if work is not None:
+            work.phase("recovery")
+            work.operation("waiting_publication_guard")
         with self._publication_guard():
             synchronize_pending_publication(
                 session,
@@ -182,10 +191,14 @@ class VNextIngestService:
                 finalization_adapters=self._finalization_adapters,
                 library_activation=self._library_activation,
                 should_stop=stop_requested,
+                progress=work,
             )
+        if work is not None:
+            work.phase("source")
         with FilesystemSource(
             self._source_root,
             checkpoint=lambda: _raise_if_stopping(stop_requested),
+            progress=work,
         ) as source:
             source_result = synchronize_source(
                 session,
@@ -193,15 +206,24 @@ class VNextIngestService:
                 VNextFilesystemSourceAdapter(source),
                 max_new_galleries=self._publication_batch_galleries,
                 should_stop=stop_requested,
+                progress=work,
             )
         source_receipt = source_result.receipt
+        if work is not None:
+            work.set_counter("source_galleries", source_receipt.staged_galleries)
+            work.set_counter("deferred_galleries", source_result.deferred_gallery_count)
+            work.phase("analysis")
         analysis = synchronize_analysis(
             session,
             resolved,
             source_receipt,
             self._max_rows,
             should_stop=stop_requested,
+            progress=work,
         )
+        if work is not None:
+            work.phase("publication")
+            work.operation("waiting_publication_guard")
         with self._publication_guard():
             publication = synchronize_publication(
                 session,
@@ -211,7 +233,10 @@ class VNextIngestService:
                 library_activation=self._library_activation,
                 should_stop=stop_requested,
                 metrics_sink=self._metrics_sink,
+                progress=work,
             )
+        if work is not None:
+            work.advance("publication_batches_finalized")
         return VNextIngestSynchronizationResult(
             source_receipt,
             analysis,
@@ -227,6 +252,7 @@ def synchronize_pending_publication(
     finalization_adapters: Mapping[bytes, ArtifactReleaseAdapter],
     library_activation: VNextLibraryActivationAdapter,
     should_stop: Callable[[], bool] = _never_stop,
+    progress: ProgressWork | None = None,
 ) -> VNextIngestAdvanceResult | None:
     """Finish durable publication work before reading a new filesystem snapshot.
 
@@ -245,6 +271,8 @@ def synchronize_pending_publication(
     progressed = False
     while True:
         _raise_if_stopping(should_stop)
+        if progress is not None:
+            progress.operation("recovery_issue")
         issued = session.call(
             lambda facade, receipt: facade.try_issue_publication_recovery_step(receipt)
         )
@@ -254,6 +282,8 @@ def synchronize_pending_publication(
                     "publication recovery authority disappeared after progress"
                 )
             return None
+        if progress is not None:
+            progress.operation(f"recovery_{issued.operation}_prepare")
         prepared = session.outside_session(
             lambda facade: facade.prepare_publication_step(
                 issued,  # noqa: B023
@@ -263,6 +293,8 @@ def synchronize_pending_publication(
             )
         )
         with prepared:
+            if progress is not None:
+                progress.operation(f"recovery_{issued.operation}_commit")
             result = session.call(
                 lambda facade, receipt: facade.commit_publication_step(
                     receipt,
@@ -270,6 +302,7 @@ def synchronize_pending_publication(
                 )
             )
         _require_publication_result(result)
+        _record_committed_progress(progress, "recovery", result)
         if result.phase is not VNextIngestPhase.FINALIZATION:
             raise RuntimeError(
                 "publication recovery advancement is outside finalization"
@@ -287,6 +320,7 @@ def synchronize_analysis(
     max_rows: int,
     *,
     should_stop: Callable[[], bool] = _never_stop,
+    progress: ProgressWork | None = None,
 ) -> VNextAnalysisAdvanceResult:
     """Drive bounded core analysis while leaving preparation outside the lock."""
 
@@ -302,6 +336,8 @@ def synchronize_analysis(
     if not 1 <= max_rows <= 128:
         raise ValueError("analysis max_rows must be from 1 through 128")
 
+    if progress is not None:
+        progress.operation("analysis_prepare")
     prepared = session.outside_session(
         lambda facade: facade.prepare_analysis(
             source_receipt.build_id,
@@ -312,6 +348,8 @@ def synchronize_analysis(
     with prepared:
         while True:
             _raise_if_stopping(should_stop)
+            if progress is not None:
+                progress.operation("analysis_issue")
             issued = session.call(
                 lambda facade, receipt: facade.issue_analysis_step(
                     receipt,
@@ -319,6 +357,8 @@ def synchronize_analysis(
                 )
             )
             # outside_session invokes its callback before this loop advances.
+            if progress is not None:
+                progress.operation("analysis_prepare_step")
             prepared_step = session.outside_session(
                 lambda facade: facade.prepare_analysis_step(
                     prepared,
@@ -326,6 +366,8 @@ def synchronize_analysis(
                 )
             )
             # call invokes its callback before prepared_step can be reassigned.
+            if progress is not None:
+                progress.operation("analysis_commit")
             result = session.call(
                 lambda facade, receipt: facade.commit_analysis_step(
                     receipt,
@@ -333,6 +375,14 @@ def synchronize_analysis(
                 )
             )
             _require_analysis_result(result)
+            if progress is not None:
+                progress.advance(
+                    "analysis_replayed_steps"
+                    if result.replayed
+                    else "analysis_committed_steps"
+                )
+                if not result.replayed:
+                    progress.advance("analysis_operation_rows", result.processed_rows)
             _raise_if_stopping(should_stop)
             if not result.terminal:
                 continue
@@ -356,6 +406,7 @@ def synchronize_publication(
     library_activation: VNextLibraryActivationAdapter,
     should_stop: Callable[[], bool] = _never_stop,
     metrics_sink: IngestMetricSink | None = None,
+    progress: ProgressWork | None = None,
 ) -> VNextIngestAdvanceResult:
     """Drive publication and finalization inside the caller's outer guard."""
 
@@ -371,6 +422,8 @@ def synchronize_publication(
     operation_metrics: dict[str, _PublicationMetricAccumulator] = {}
     while True:
         _raise_if_stopping(should_stop)
+        if progress is not None:
+            progress.operation("publication_issue")
         issue_started_ns = monotonic_ns()
         issued = session.call(
             lambda facade, receipt: facade.issue_publication_step(receipt, policy)
@@ -386,6 +439,8 @@ def synchronize_publication(
         aggregate.issue_ns += issue_ns
         # outside_session invokes its callback before this loop advances.
         prepare_started_ns = monotonic_ns()
+        if progress is not None:
+            progress.operation(f"publication_{operation}_prepare")
         prepared = session.outside_session(
             lambda facade: facade.prepare_publication_step(
                 issued,  # noqa: B023
@@ -398,6 +453,8 @@ def synchronize_publication(
         with prepared:
             # call invokes its callback before prepared can be reassigned.
             commit_started_ns = monotonic_ns()
+            if progress is not None:
+                progress.operation(f"publication_{operation}_commit")
             result = session.call(
                 lambda facade, receipt: facade.commit_publication_step(
                     receipt,
@@ -408,6 +465,7 @@ def synchronize_publication(
             cleanup_started_ns = monotonic_ns()
         aggregate.cleanup_ns += monotonic_ns() - cleanup_started_ns
         _require_publication_result(result)
+        _record_committed_progress(progress, "publication", result)
         aggregate.steps += 1
         aggregate.processed_rows += result.processed_rows
         aggregate.replayed_steps += int(result.replayed)
@@ -430,11 +488,14 @@ def synchronize_source(
     *,
     max_new_galleries: int | None = None,
     should_stop: Callable[[], bool] = _never_stop,
+    progress: ProgressWork | None = None,
 ) -> VNextIngestSourceSynchronizationResult:
     """Drive source ingestion while keeping all local I/O outside the lease lock."""
 
     if not isinstance(session, IngestSessionController):
         raise TypeError("session must be IngestSessionController")
+    if progress is not None:
+        progress.operation("source_prepare")
     prepared = session.outside_session(
         lambda facade: facade.prepare_source(
             adapter,
@@ -444,6 +505,8 @@ def synchronize_source(
     with prepared:
         while True:
             _raise_if_stopping(should_stop)
+            if progress is not None:
+                progress.operation("source_issue")
             issued = session.call(
                 lambda facade, receipt: facade.issue_source_step(
                     receipt,
@@ -452,6 +515,8 @@ def synchronize_source(
                 )
             )
             # outside_session invokes its callback before this loop advances.
+            if progress is not None:
+                progress.operation("source_prepare_step")
             prepared_step = session.outside_session(
                 lambda facade: facade.prepare_source_step(
                     prepared,
@@ -459,6 +524,8 @@ def synchronize_source(
                 )
             )
             # call invokes its callback before prepared_step can be reassigned.
+            if progress is not None:
+                progress.operation("source_commit")
             result = session.call(
                 lambda facade, receipt: facade.commit_source_step(
                     receipt,
@@ -466,6 +533,7 @@ def synchronize_source(
                 )
             )
             _require_source_result(result)
+            _record_committed_progress(progress, "source", result)
             _raise_if_stopping(should_stop)
             if not result.terminal:
                 continue
@@ -478,6 +546,20 @@ def synchronize_source(
                 source_receipt,
                 prepared.deferred_gallery_count,
             )
+
+
+def _record_committed_progress(
+    progress: ProgressWork | None,
+    phase: str,
+    result: VNextIngestAdvanceResult,
+) -> None:
+    if progress is None:
+        return
+    progress.advance(
+        f"{phase}_replayed_steps" if result.replayed else f"{phase}_committed_steps"
+    )
+    if not result.replayed:
+        progress.advance(f"{phase}_operation_rows", result.processed_rows)
 
 
 def _require_analysis_result(result: VNextAnalysisAdvanceResult) -> None:

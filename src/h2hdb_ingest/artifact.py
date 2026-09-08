@@ -77,6 +77,7 @@ from .metrics import (
     emit_ingest_metric,
 )
 from .page_workers import MAX_PAGE_RENDER_WORKERS, resolve_page_render_workers
+from .progress import IngestProgress, ProgressWork
 from .storage import artifact_name
 
 ARTIFACT_ADAPTER_ID = b"managed-filesystem"
@@ -339,10 +340,12 @@ class ArtifactPreparationRenderer:
         policy: ArtifactRenderPolicy,
         page_render_workers: int | None = None,
         metrics_sink: IngestMetricSink | None = None,
+        progress: IngestProgress | None = None,
     ) -> None:
         self._policy = policy
         self._workers = page_render_workers
         self._metrics_sink = metrics_sink
+        self._progress = progress
         self._inspection: PreparedPresentationEvidence | None = None
         self._inspection_lock = Lock()
 
@@ -362,6 +365,7 @@ class ArtifactPreparationRenderer:
             page_render_workers=self._workers,
             metrics_sink=self._metrics_sink,
             preparation=self,
+            progress=None if self._progress is None else self._progress.current(),
         )
 
     def render_presentation(
@@ -379,6 +383,7 @@ class ArtifactPreparationRenderer:
             policy=self._policy,
             metrics_sink=self._metrics_sink,
             preparation=self,
+            progress=None if self._progress is None else self._progress.current(),
         )
 
     def _remember(self, inspected: PreparedPresentationEvidence) -> None:
@@ -416,6 +421,7 @@ def render_archive(
     policy: ArtifactRenderPolicy,
     page_render_workers: int | None = None,
     metrics_sink: IngestMetricSink | None = None,
+    progress: ProgressWork | None = None,
 ) -> ArtifactArchiveRenderEvidence:
     """Render and fully inspect one canonical CBZ without retaining evidence."""
 
@@ -427,6 +433,7 @@ def render_archive(
         page_render_workers=page_render_workers,
         metrics_sink=metrics_sink,
         preparation=None,
+        progress=progress,
     )
 
 
@@ -439,10 +446,13 @@ def _render_archive(
     page_render_workers: int | None = None,
     metrics_sink: IngestMetricSink | None = None,
     preparation: ArtifactPreparationRenderer | None,
+    progress: ProgressWork | None = None,
 ) -> ArtifactArchiveRenderEvidence:
     """Render one closed-world non-ZIP64 CBZ before exposing destination bytes."""
 
     started_ns = monotonic_ns()
+    if progress is not None:
+        progress.operation("archive_preflight")
     download_name = artifact_name(gid)
     if type(members) is not tuple:
         raise TypeError("archive members must be an exact tuple")
@@ -495,6 +505,8 @@ def _render_archive(
                 )
                 member_names.append(_METADATA_MEMBER_NAME)
                 render_pages_started_ns = monotonic_ns()
+                if progress is not None:
+                    progress.operation("archive_render_pages")
                 executor = (
                     ThreadPoolExecutor(
                         max_workers=workers,
@@ -505,13 +517,18 @@ def _render_archive(
                 )
                 try:
                     for batch_start in range(0, len(pages), workers):
+                        if progress is not None:
+                            progress.operation("archive_render_pages")
                         batch = pages[batch_start : batch_start + workers]
                         rendered_batch = _render_page_batch(
                             batch,
                             policy=policy,
                             executor=executor,
+                            progress=progress,
                         )
                         try:
+                            if progress is not None:
+                                progress.operation("archive_write_pages")
                             for offset, (member, rendered) in enumerate(
                                 zip(batch, rendered_batch, strict=True)
                             ):
@@ -549,6 +566,8 @@ def _render_archive(
                                         locator=locator,
                                     )
                                 )
+                                if progress is not None:
+                                    progress.advance("pages_written")
                         finally:
                             for rendered in rendered_batch:
                                 rendered.close()
@@ -563,6 +582,8 @@ def _render_archive(
         if not 1 <= size_bytes <= MAX_ARCHIVE_SIZE_BYTES:
             raise PresentationImageError("rendered archive exceeds the v2 size cap")
         archive_inspect_started_ns = monotonic_ns()
+        if progress is not None:
+            progress.operation("archive_inspect")
         staged.seek(0)
         artifact_sha256 = _stream_digest(cast(BinaryIO, staged), size_bytes)
         staged.seek(0)
@@ -579,6 +600,8 @@ def _render_archive(
             )
         archive_inspect_ns = monotonic_ns() - archive_inspect_started_ns
         archive_copy_started_ns = monotonic_ns()
+        if progress is not None:
+            progress.operation("archive_copy")
         staged.seek(0)
         destination.seek(0)
         destination.truncate(0)
@@ -602,6 +625,8 @@ def _render_archive(
         download_name=download_name,
         pages=tuple(page_evidence),
     )
+    if progress is not None:
+        progress.advance("archives_rendered")
     emit_ingest_metric(
         metrics_sink,
         IngestMetric(
@@ -632,6 +657,7 @@ def _render_page_member(
     member: ArtifactSourceMember,
     *,
     policy: ArtifactRenderPolicy,
+    progress: ProgressWork | None = None,
 ) -> _RenderedPageBuffer:
     _verify_source_stream(member, maximum_size=MAX_ENCODED_PAGE_BYTES)
     stream = cast(
@@ -642,6 +668,10 @@ def _render_page_member(
         image = _render_page(member.source, stream, policy=policy)
         _verify_source_stream(member, maximum_size=MAX_ENCODED_PAGE_BYTES)
         stream.seek(0)
+        # Record completion in the worker: an earlier slow future must not hide
+        # another page's successful render. The captured work fences late workers.
+        if progress is not None:
+            progress.advance("pages_rendered")
         return _RenderedPageBuffer(image=image, stream=stream)
     except BaseException:
         stream.close()
@@ -653,12 +683,15 @@ def _render_page_batch(
     *,
     policy: ArtifactRenderPolicy,
     executor: ThreadPoolExecutor | None,
+    progress: ProgressWork | None = None,
 ) -> tuple[_RenderedPageBuffer, ...]:
     if executor is None:
         rendered_members: list[_RenderedPageBuffer] = []
         try:
             for member in members:
-                rendered_members.append(_render_page_member(member, policy=policy))
+                rendered_members.append(
+                    _render_page_member(member, policy=policy, progress=progress)
+                )
         except BaseException:
             for rendered in rendered_members:
                 rendered.close()
@@ -666,7 +699,7 @@ def _render_page_batch(
         return tuple(rendered_members)
 
     futures: tuple[Future[_RenderedPageBuffer], ...] = tuple(
-        executor.submit(_render_page_member, member, policy=policy)
+        executor.submit(_render_page_member, member, policy=policy, progress=progress)
         for member in members
     )
     try:
@@ -973,6 +1006,7 @@ def render_presentation(
     rendered_pages: tuple[ArtifactRenderedPage, ...],
     policy: ArtifactRenderPolicy,
     metrics_sink: IngestMetricSink | None = None,
+    progress: ProgressWork | None = None,
 ) -> ArtifactPresentationRenderEvidence:
     """Fully inspect acquisition bytes and render a standalone thumbnail."""
 
@@ -983,6 +1017,7 @@ def render_presentation(
         policy=policy,
         metrics_sink=metrics_sink,
         preparation=None,
+        progress=progress,
     )
 
 
@@ -994,6 +1029,7 @@ def _render_presentation(
     policy: ArtifactRenderPolicy,
     metrics_sink: IngestMetricSink | None = None,
     preparation: ArtifactPreparationRenderer | None,
+    progress: ProgressWork | None = None,
 ) -> ArtifactPresentationRenderEvidence:
     """Derive neutral page facts and write one standalone thumbnail.
 
@@ -1003,6 +1039,8 @@ def _render_presentation(
     """
 
     started_ns = monotonic_ns()
+    if progress is not None:
+        progress.operation("presentation_inspect")
     if type(rendered_pages) is not tuple:
         raise TypeError("rendered_pages must be an exact tuple")
     if not isinstance(policy, ArtifactRenderPolicy):
@@ -1052,6 +1090,8 @@ def _render_presentation(
     thumbnail_ns = 0
     if inspected.cover is not None:
         thumbnail_started_ns = monotonic_ns()
+        if progress is not None:
+            progress.operation("thumbnail_render")
         image = _render_thumbnail(
             archive,
             inspected.cover,
@@ -1068,6 +1108,8 @@ def _render_presentation(
         thumbnail_ns = monotonic_ns() - thumbnail_started_ns
     archive.seek(0)
     evidence = ArtifactPresentationRenderEvidence(pages=pages, thumbnail=thumbnail)
+    if progress is not None:
+        progress.advance("presentations_rendered")
     emit_ingest_metric(
         metrics_sink,
         IngestMetric(

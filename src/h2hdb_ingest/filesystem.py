@@ -32,6 +32,7 @@ from pathlib import Path
 from h2h_galleryinfo_parser import GalleryInfoParser, parse_gid
 
 from ._limits import MAX_METADATA_BYTES
+from .progress import ProgressWork
 
 FILESYSTEM_OBSERVATION_VERSION = 3
 GALLERY_INFO_NAME = "galleryinfo.txt"
@@ -118,16 +119,23 @@ class FilesystemFileObservation:
         compare=False,
         kw_only=True,
     )
+    _progress: ProgressWork | None = field(
+        default=None, repr=False, compare=False, kw_only=True
+    )
 
     def content_parts(self) -> Iterator[bytes]:
         """Yield exact file bytes after a no-follow open and stat check."""
 
         self._checkpoint()
+        if self._progress is not None:
+            self._progress.operation("source_file_read")
         if self._snapshot is not None:
             # Completion markers already own an exact bounded no-follow read.
             # The core still derives its content receipt from these bytes.
             yield self._snapshot
             self._checkpoint()
+            if self._progress is not None:
+                self._progress.advance("file_observations_completed")
             return
         directory_descriptor: int | None = None
         descriptor: int | None = None
@@ -154,6 +162,8 @@ class FilesystemFileObservation:
                 if not part:
                     break
                 digest.update(part)
+                if self._progress is not None:
+                    self._progress.advance("source_bytes_read", len(part))
                 yield part
             self._checkpoint()
             self._require_stat(os.fstat(descriptor), stage="after read")
@@ -163,6 +173,8 @@ class FilesystemFileObservation:
                 raise FilesystemSourceChangedError(
                     f"source metadata bytes changed after parsing: {self.path}"
                 )
+            if self._progress is not None:
+                self._progress.advance("file_observations_completed")
         except OSError as error:
             raise _source_io_error(
                 f"unable to read source file {self.path}: {error}", error
@@ -250,10 +262,12 @@ class FilesystemSource:
         root: Path,
         *,
         checkpoint: Callable[[], None] | None = None,
+        progress: ProgressWork | None = None,
     ) -> None:
         if checkpoint is not None and not callable(checkpoint):
             raise TypeError("checkpoint must be callable or None")
         self._checkpoint = checkpoint if checkpoint is not None else _noop_checkpoint
+        self._progress = progress
         self._checkpoint()
         try:
             resolved = root.resolve(strict=True)
@@ -381,6 +395,8 @@ class FilesystemSource:
 
         self._require_open()
         self._checkpoint()
+        if self._progress is not None:
+            self._progress.operation("source_completion_marker")
         if type(locator_components) is not tuple or not locator_components:
             raise FilesystemObservationError(
                 "gallery locator must be a nonempty exact tuple"
@@ -462,6 +478,7 @@ class FilesystemSource:
                 expected_sha256=digest,
                 _snapshot=content,
                 _checkpoint=self._checkpoint,
+                _progress=self._progress,
             )
         except OSError as error:
             raise _source_io_error(
@@ -532,6 +549,7 @@ class FilesystemSource:
                     else None
                 ),
                 _checkpoint=self._checkpoint,
+                _progress=self._progress,
             )
             for row in rows[:bound]
         )
@@ -614,6 +632,8 @@ class FilesystemSource:
         self._checkpoint()
         if self._discovery_connection is not None:
             return self._discovery_connection
+        if self._progress is not None:
+            self._progress.operation("source_discovery")
         temporary = tempfile.TemporaryDirectory(prefix="h2hdb-ingest-discovery-")
         connection = sqlite3.connect(Path(temporary.name) / "locators.sqlite3")
         try:
@@ -729,6 +749,8 @@ class FilesystemSource:
                     raise FilesystemObservationError(
                         f"duplicate gallery locator: {locator!r}"
                     ) from error
+                if self._progress is not None:
+                    self._progress.advance("galleries_discovered")
             if self._directory_stat(self._root) != expected_root:
                 raise FilesystemSourceChangedError(
                     f"source root changed during discovery snapshot: {self._root}"
@@ -803,6 +825,8 @@ class FilesystemSource:
         directory_stat: FilesystemStat,
     ) -> _FilesystemGalleryIndex:
         self._checkpoint()
+        if self._progress is not None:
+            self._progress.operation("source_gallery_observation")
         metadata_path = folder / GALLERY_INFO_NAME
         metadata_stat = self._regular_file_stat(metadata_path)
         if metadata_stat.size_bytes == 0:
@@ -1026,6 +1050,8 @@ class FilesystemSource:
         ).fetchone()
         if persisted is None:  # pragma: no cover - inserted in the transaction above
             raise RuntimeError("filesystem gallery index lacks its snapshot")
+        if self._progress is not None:
+            self._progress.advance("gallery_indexes_built")
         return self._gallery_index_from_row(
             connection,
             folder=folder,
@@ -1210,6 +1236,8 @@ class FilesystemSource:
                     with os.scandir(directory) as entries:
                         for entry in entries:
                             self._checkpoint()
+                            if self._progress is not None:
+                                self._progress.advance("discovery_entries")
                             if entry.is_dir(follow_symlinks=False):
                                 _strict_component(entry.name)
                                 _insert_discovery_directory(
@@ -1232,6 +1260,8 @@ class FilesystemSource:
                 "UPDATE discovery_directories SET visited = 1 WHERE ordinal = ?",
                 (row[0],),
             )
+            if self._progress is not None:
+                self._progress.advance("discovery_directories")
         # Revalidate collection ancestry without retaining a Python tree or
         # leaving a recursively open scandir descriptor for every tree level.
         rows = connection.execute(
@@ -1244,6 +1274,8 @@ class FilesystemSource:
                 raise FilesystemSourceChangedError(
                     f"directory changed during gallery discovery: {row[0]}"
                 )
+            if self._progress is not None:
+                self._progress.advance("discovery_directories_verified")
         connection.execute("DELETE FROM discovery_directories")
 
     def _gallery_path(self, locator_components: tuple[str, ...]) -> Path:
@@ -1362,6 +1394,8 @@ class FilesystemSource:
                     break
                 content.extend(part)
                 digest.update(part)
+                if self._progress is not None:
+                    self._progress.advance("source_bytes_read", len(part))
             self._checkpoint()
             if len(content) != expected.size_bytes:
                 raise FilesystemSourceChangedError(

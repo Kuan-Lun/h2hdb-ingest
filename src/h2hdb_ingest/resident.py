@@ -34,6 +34,7 @@ from .maintenance import (
     LibraryMaintenanceOutcome,
     _LibraryStagingSlotConflictError,
 )
+from .progress import IngestProgress, ProgressWork
 from .service import VNextIngestSynchronizationResult, _IngestStopRequested
 from .session import IngestLeaseHeartbeat, IngestSessionController
 from .source_monitor import CompletionMarkerProbe, SourceChangeMonitor
@@ -83,6 +84,7 @@ class ResidentIngestor:
         database_type: str,
         artifact_release_adapters: Mapping[bytes, ArtifactReleaseAdapter],
         event_logger: Callable[[str], None] | None = None,
+        progress: IngestProgress | None = None,
     ) -> None:
         self._service = service
         self._source_probe = source_probe
@@ -114,6 +116,10 @@ class ResidentIngestor:
         self._config = config
         self._database_type = database_type.casefold()
         self._event_logger = event_logger or logger.info
+        self._progress = progress
+        self._progress_pending = False
+        self._scheduled_progress = False
+        self._progress_wait_reason = "waiting_for_ingest_lease"
         self._bound_storage_identity: LibraryStorageIdentity | None = None
         self._storage_instance_ready = library_storage_identity is None
         self._last_synchronization_result: VNextIngestSynchronizationResult | None = (
@@ -136,10 +142,24 @@ class ResidentIngestor:
     def initialize(self) -> SchemaEpochReport:
         """Validate an existing READY epoch without creating or migrating it."""
 
+        work = self._begin_progress("startup_check", announce=True)
+        try:
+            report = self._initialize()
+        except BaseException:
+            if work is not None:
+                work.finish("failed")
+            raise
+        if work is not None:
+            work.finish()
+        return report
+
+    def _initialize(self) -> SchemaEpochReport:
+
         self._bound_storage_identity = None
         self._last_synchronization_result = None
         self._storage_instance_ready = self._library_storage_identity is None
         report = self._database_admin.check()
+        self._progress_operation("initialize_storage")
         if self._library_storage_identity is not None:
             identity = self._library_storage_identity.ensure_storage_identity()
             self._database_admin.bind_storage_instance(
@@ -187,19 +207,79 @@ class ResidentIngestor:
         should_stop: Callable[[], bool] | None = None,
         on_scan_started: Callable[[], None] | None = None,
     ) -> _ResidentCycleOutcome:
+        if self._progress_stop_requested(should_stop):
+            self._finish_progress("stopped", announce=False)
+            return _ResidentCycleOutcome.IDLE
+        work = self._begin_progress("coordination", announce=False)
+        self._progress_pending = periodic_scan or self._scheduled_progress
+        self._progress_wait_reason = (
+            "waiting_for_ingest_lease" if periodic_scan else "source_quiet_period"
+        )
+        try:
+            outcome = self._process_cycle_step(
+                periodic_scan=periodic_scan,
+                preflight=preflight,
+                postflight=postflight,
+                should_stop=should_stop,
+                on_scan_started=on_scan_started,
+            )
+            stopped = should_stop is not None and should_stop()
+        except BaseException:
+            self._finish_progress("failed")
+            raise
+        if stopped:
+            self._finish_progress("stopped", announce=False)
+        elif outcome in (
+            _ResidentCycleOutcome.INGESTED,
+            _ResidentCycleOutcome.BATCH_PUBLISHED,
+        ):
+            self._finish_progress("completed")
+        elif outcome is _ResidentCycleOutcome.SOURCE_CHANGED:
+            self._finish_progress("retry")
+        elif outcome is _ResidentCycleOutcome.MAINTENANCE_PROGRESSED:
+            if work is not None:
+                work.phase("maintenance", announce=False)
+        elif self._progress_pending:
+            if work is not None:
+                work.phase("waiting_for_work", announce=False)
+                work.operation(self._progress_wait_reason)
+        else:
+            self._finish_progress("idle", announce=False)
+        return outcome
+
+    def _process_cycle_step(
+        self,
+        *,
+        periodic_scan: bool,
+        preflight: Callable[[], None] | None = None,
+        postflight: Callable[[], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+        on_scan_started: Callable[[], None] | None = None,
+    ) -> _ResidentCycleOutcome:
         if should_stop is not None and should_stop():
             return _ResidentCycleOutcome.IDLE
+        self._progress_operation("inspect_storage")
         self._require_current_storage_identity()
         lease_duration = self._config.lease_seconds * 1_000_000
         # A previous bounded sweep may have lost its response, contended on the
         # EXCLUSIVE gate, or remained blocked by a live predecessor.  Retrying
         # once before every claim also provides progress while ingest is idle.
         library_maintenance = self._try_library_maintenance()
+        self._progress_pending |= (
+            library_maintenance is not LibraryMaintenanceOutcome.DONE
+        )
+        if library_maintenance is not LibraryMaintenanceOutcome.DONE:
+            self._progress_wait_reason = "waiting_for_library_cleanup"
         if should_stop is not None and should_stop():
             return _ResidentCycleOutcome.IDLE
         if library_maintenance is LibraryMaintenanceOutcome.PROGRESSED:
             return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
         database_maintenance = self._try_current_only_maintenance(lease_duration)
+        self._progress_pending |= (
+            database_maintenance is not VNextCurrentOnlyMaintenanceOutcome.DONE
+        )
+        if database_maintenance is not VNextCurrentOnlyMaintenanceOutcome.DONE:
+            self._progress_wait_reason = "waiting_for_catalog_cleanup"
         if should_stop is not None and should_stop():
             return _ResidentCycleOutcome.IDLE
         if database_maintenance is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED:
@@ -207,6 +287,7 @@ class ResidentIngestor:
         self._require_current_storage_identity()
         if should_stop is not None and should_stop():
             return _ResidentCycleOutcome.IDLE
+        self._progress_operation("claim_ingest")
         claimed = self._facade.try_claim_ingest(periodic_scan, lease_duration)
         if (
             claimed is None
@@ -218,6 +299,10 @@ class ResidentIngestor:
             claimed = self._facade.try_claim_ingest(False, lease_duration)
         if claimed is None:
             return _ResidentCycleOutcome.IDLE
+        work = self._current_progress()
+        if work is not None:
+            work.phase("ingest")
+            work.advance("attempts_started")
         session = IngestSessionController(
             self._facade,
             claimed,
@@ -287,6 +372,9 @@ class ResidentIngestor:
             )
             return _ResidentCycleOutcome.IDLE
         except _LibraryStagingSlotConflictError as error:
+            self._progress_pending = True
+            self._progress_wait_reason = "waiting_for_staging_slot"
+            self._progress_operation("waiting_for_staging_slot")
             # A crashed predecessor can retain the same destination until the
             # new policy makes that candidate inactive.  Release this
             # session's SHARED gate, reconcile the predecessor under
@@ -310,6 +398,9 @@ class ResidentIngestor:
                 raise error
             return _ResidentCycleOutcome.IDLE
         except GalleryStagingCapacityError as error:
+            self._progress_pending = True
+            self._progress_wait_reason = "waiting_for_staging_capacity"
+            self._progress_operation("waiting_for_staging_capacity")
             # Capacity is bounded backpressure, not a failed resident process.
             # The rejected request committed no rows, while completing the
             # exact session releases its SHARED gate and makes stale terminal
@@ -402,8 +493,14 @@ class ResidentIngestor:
     ) -> LibraryMaintenanceOutcome | None:
         """Make one bounded ingest-owned presentation cleanup attempt."""
 
+        self._progress_operation("library_cleanup")
         try:
-            return self._run_library_maintenance()
+            outcome = self._run_library_maintenance()
+            if outcome is LibraryMaintenanceOutcome.PROGRESSED:
+                work = self._current_progress()
+                if work is not None:
+                    work.advance("library_cleanup_steps")
+            return outcome
         except LibraryStorageIdentityMismatchError:
             self._storage_instance_ready = False
             raise
@@ -426,11 +523,17 @@ class ResidentIngestor:
         duration = lease_duration_microseconds
         if duration is None:
             duration = self._config.lease_seconds * 1_000_000
+        self._progress_operation("catalog_cleanup")
         try:
-            return self._facade.drain_current_only_maintenance(
+            outcome = self._facade.drain_current_only_maintenance(
                 duration,
                 artifact_release_adapters=self._artifact_release_adapters,
             )
+            if outcome is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED:
+                work = self._current_progress()
+                if work is not None:
+                    work.advance("catalog_cleanup_steps")
+            return outcome
         except LibraryStorageIdentityMismatchError:
             self._storage_instance_ready = False
             raise
@@ -442,7 +545,45 @@ class ResidentIngestor:
             logger.exception("current-only maintenance attempt failed")
             return None
 
+    def _current_progress(self) -> ProgressWork | None:
+        return None if self._progress is None else self._progress.current()
+
+    def _begin_progress(self, phase: str, *, announce: bool) -> ProgressWork | None:
+        if self._progress is None:
+            return None
+        work = self._progress.current()
+        if work is None:
+            work = self._progress.begin(phase, announce=announce)
+        return work
+
+    def _progress_operation(self, name: str) -> None:
+        work = self._current_progress()
+        if work is not None:
+            work.operation(name)
+
+    def _finish_progress(self, status: str, *, announce: bool = True) -> None:
+        work = self._current_progress()
+        if work is not None:
+            work.finish(status, announce=announce)
+
+    def _progress_stop_requested(self, should_stop: Callable[[], bool] | None) -> bool:
+        try:
+            return should_stop is not None and should_stop()
+        except BaseException:
+            self._finish_progress("failed")
+            raise
+
     def run_forever(self, *, stop: Event | None = None) -> None:
+        try:
+            self._run_forever(stop=stop)
+        except BaseException:
+            self._finish_progress("failed")
+            raise
+        finally:
+            self._scheduled_progress = False
+            self._finish_progress("stopped", announce=False)
+
+    def _run_forever(self, *, stop: Event | None = None) -> None:
         if not self._storage_instance_ready:
             raise RuntimeError(
                 "CBZ-enabled resident must initialize its storage instance before "
@@ -467,6 +608,7 @@ class ResidentIngestor:
 
             while not should_stop():
                 deadline = schedule.next_scan_at()
+                self._scheduled_progress = deadline is not None
                 source_due = deadline is not None and monotonic() >= deadline
                 ticket: SourceScanTicket | None = None
 

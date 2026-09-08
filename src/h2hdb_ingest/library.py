@@ -61,6 +61,7 @@ from .library_identity import (
 from .maintenance import LibraryMaintenanceOutcome, _LibraryStagingSlotConflictError
 from .metrics import IngestMetricSink
 from .page_workers import resolve_page_render_workers
+from .progress import IngestProgress
 from .storage import (
     STORAGE_OBJECT_CODEC,
     storage_key_gid,
@@ -192,6 +193,7 @@ class ManagedFilesystemLibraryAdapter:
         render_policy: ArtifactRenderPolicy,
         page_render_workers: int | None = None,
         metrics_sink: IngestMetricSink | None = None,
+        progress: IngestProgress | None = None,
     ) -> None:
         if not isinstance(library_path, Path):
             raise TypeError("library_path must be Path")
@@ -230,10 +232,12 @@ class ManagedFilesystemLibraryAdapter:
         self._render_policy = render_policy
         self._page_render_workers = effective_page_render_workers
         self._metrics_sink = metrics_sink
+        self._progress = progress
         self._artifact_renderer = ArtifactPreparationRenderer(
             policy=render_policy,
             page_render_workers=effective_page_render_workers,
             metrics_sink=metrics_sink,
+            progress=progress,
         )
         self.policy_fingerprint_sha256 = artifact_policy_fingerprint_sha256(
             render_policy
@@ -1529,6 +1533,7 @@ class ManagedFilesystemLibraryAdapter:
             ).fetchall()
 
         last_cursor: VNextLibraryActivationCursor | None = None
+        progress = None if self._progress is None else self._progress.current()
         for publication_key, resource_kind in rows:
             plan = self._claim_pending_install(
                 revision=revision,
@@ -1536,12 +1541,16 @@ class ManagedFilesystemLibraryAdapter:
                 publication_key=bytes(publication_key),
                 resource_kind=str(resource_kind),
             )
+            if progress is not None:
+                progress.operation("library_install")
             signature, terminal_token = self._perform_pending_install(plan)
             self._commit_pending_install(
                 plan,
                 signature=signature,
                 terminal_token=terminal_token,
             )
+            if progress is not None:
+                progress.advance("library_resources_reconciled")
             last_cursor = _activation_cursor_from_fields(
                 plan.publication_key,
                 plan.resource_kind,
@@ -2336,6 +2345,7 @@ class ManagedFilesystemLibraryAdapter:
             ).fetchall()
 
         last_cursor: VNextLibraryActivationCursor | None = None
+        progress = None if self._progress is None else self._progress.current()
         for row in rows:
             with self._exclusive_state() as connection:
                 state = _journal_state(connection)
@@ -2374,6 +2384,8 @@ class ManagedFilesystemLibraryAdapter:
                         connection.rollback()
                         raise
 
+            if progress is not None:
+                progress.operation("library_remove_stale")
             key = _key_from_row(str(row[2]), str(row[3]))
             digest = bytes(row[4])
             size_bytes = int(row[5])
@@ -2489,6 +2501,8 @@ class ManagedFilesystemLibraryAdapter:
                 bytes(row[0]),
                 str(row[1]),
             )
+            if progress is not None:
+                progress.advance("library_resources_removed")
         return last_cursor
 
     def _staged_candidate_authority(
@@ -2731,6 +2745,9 @@ class ManagedFilesystemLibraryAdapter:
         expected_sha256: bytes,
         expected_size: int,
     ) -> _Signature:
+        progress = None if self._progress is None else self._progress.current()
+        if progress is not None:
+            progress.operation("library_stage_write")
         if _TEMPORARY_LEAF.fullmatch(temporary_path.name) is None:
             raise RuntimeError("unsafe staging temporary name")
         if _STAGE_LEAF.fullmatch(final_path.name) is None:
@@ -3202,6 +3219,9 @@ class ManagedFilesystemLibraryAdapter:
             )
 
     def _ensure_layout(self) -> None:
+        progress = None if self._progress is None else self._progress.current()
+        if progress is not None:
+            progress.operation("library_layout")
         with self._storage_identity_lock:
             self._require_pinned_storage_identity()
             validate_precreated_library_layout(self._root, durable=False)
@@ -3354,6 +3374,9 @@ class ManagedFilesystemLibraryAdapter:
     @contextmanager
     def _exclusive_state(self) -> Iterator[sqlite3.Connection]:
         self._require_pinned_storage_identity()
+        progress = None if self._progress is None else self._progress.current()
+        if progress is not None:
+            progress.operation("library_state_lock_wait")
         with self._state_process_lock:
             descriptor = os.open(
                 self._state_lock_path,
@@ -3366,6 +3389,8 @@ class ManagedFilesystemLibraryAdapter:
                     label="library state lock",
                 )
                 fcntl.flock(descriptor, fcntl.LOCK_EX)
+                if progress is not None:
+                    progress.operation("library_state")
                 with self._connection() as connection:
                     yield connection
             finally:
@@ -3381,6 +3406,9 @@ class ManagedFilesystemLibraryAdapter:
                 raise RuntimeError("library activation requires publication_guard")
             if self._publication_descriptor is not None:
                 return
+        progress = None if self._progress is None else self._progress.current()
+        if progress is not None:
+            progress.operation("library_publication_lock_wait")
         descriptor = os.open(
             self._publication_lock_path,
             os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
@@ -3392,6 +3420,8 @@ class ManagedFilesystemLibraryAdapter:
                 label="library publication lock",
             )
             fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if progress is not None:
+                progress.operation("library_activation")
         except BaseException:
             os.close(descriptor)
             raise
@@ -3446,9 +3476,14 @@ class ManagedFilesystemLibraryAdapter:
             return
         if descriptor is None:
             raise RuntimeError("library publication I/O guard lacks its descriptor")
+        progress = None if self._progress is None else self._progress.current()
         try:
             operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            if progress is not None:
+                progress.operation("library_publication_lock_wait")
             fcntl.flock(descriptor, operation)
+            if progress is not None:
+                progress.operation("library_storage")
             yield
         finally:
             try:
@@ -3461,6 +3496,7 @@ class ManagedFilesystemLibraryAdapter:
         """Serialize one bounded token stripe without blocking unrelated protects."""
 
         self._require_pinned_storage_identity()
+        progress = None if self._progress is None else self._progress.current()
         stripe = sha256(token).hexdigest()[:2]
         lock_path = self._locks / f"{_PROTECTION_LOCK_PREFIX}{stripe}.lock"
         _ensure_managed_file(
@@ -3478,7 +3514,11 @@ class ManagedFilesystemLibraryAdapter:
                 descriptor,
                 label="library protection stripe lock",
             )
+            if progress is not None:
+                progress.operation("library_protection_lock_wait")
             fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if progress is not None:
+                progress.operation("library_protect")
             yield
         finally:
             try:
