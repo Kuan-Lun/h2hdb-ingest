@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-08T14:05:58+00:00",
+  "checked_at": "2026-09-08T16:25:30+00:00",
   "manifest_sha256": "357fa5880f20542563f188354999f855abf3cb7d716aa038bd2cc3c015f577ed",
   "node": [
     {
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.18.0",
+  "project_version": "0.18.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -32,8 +32,8 @@
     {
       "declared": "h2hdb>=0.35.3,<0.36.0",
       "group": "runtime",
-      "latest": "0.35.2",
-      "latest_satisfies": false,
+      "latest": "0.35.3",
+      "latest_satisfies": true,
       "name": "h2hdb",
       "python_3_14": true,
       "url": "https://pypi.org/project/h2hdb/"
@@ -139,7 +139,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all direct build, runtime, optional development and Node registry candidates on Python 3.14 against the preceding reviewed cohort. External dependency candidates and compatibility bounds are unchanged. The h2hdb lower bound is raised to 0.35.3 for the new public cumulative-source batching API; the coordinated cross-repository release is tested using an explicit local h2hdb 0.35.3 wheel, and that core version must be published before the ingest distribution. No sibling path or fallback API is embedded in the package. Existing source-marker caching and CBZ rendering contracts remain unchanged. Focused SQLite progressive publication, artifact reuse and rebuild, source additions and deletions, restart, bootstrap lease fencing and error cleanup tests pass. Complete bounded release gates and manual live MariaDB evidence are recorded separately; this audit does not claim full deep matrices.",
+    "note": "Reviewed all direct build, runtime, optional development and Node dependencies against latest stable non-yanked registry candidates on Python 3.14. External candidates and declared compatibility bounds are unchanged and the installed environment matches every latest stable candidate. The only registry change is that h2hdb 0.35.3 is now published and satisfies the existing requirement; this task validates the explicit local 0.35.3 wheel and its additive cumulative-source API with unchanged schema. Hourly progress reporting uses standard-library threading and adds no dependency or new third-party API requirement. Focused progress, real SQLite and parallel CBZ tests (42 cases), existing configuration and orchestration regressions (265 cases), Ruff and strict mypy pass. The complete bounded release gate and manual MariaDB results are recorded separately; this receipt does not claim full deep matrices.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
