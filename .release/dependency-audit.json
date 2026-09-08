@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-06T20:15:43+00:00",
-  "manifest_sha256": "68f1592ce0ff28d50333eaaa5eb8e283e7a4c627c1790004ad69491c803e0517",
+  "checked_at": "2026-09-08T14:05:58+00:00",
+  "manifest_sha256": "357fa5880f20542563f188354999f855abf3cb7d716aa038bd2cc3c015f577ed",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.17.1",
+  "project_version": "0.18.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,9 +30,9 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.35.1,<0.36.0",
+      "declared": "h2hdb>=0.35.3,<0.36.0",
       "group": "runtime",
-      "latest": "0.35.0",
+      "latest": "0.35.2",
       "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
@@ -139,7 +139,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed every direct build, runtime, optional development and Node registry candidate against the preceding receipt and the installed Python 3.14 environment. External candidates and upper bounds are unchanged. The h2hdb lower bound is now 0.35.1 because deterministic runtime teardown calls its newly added public admin/catalog close methods; registry latest 0.35.0 is below this requirement, so this explicitly coordinated cross-repository task validates an explicit local 0.35.1 wheel before release instead of using a fallback. JPEG re-encoding and output/storage contracts are unchanged. Focused artifact corruption, byte-equivalence, process-signal replay and runtime teardown tests passed; complete wheel and live MariaDB integration validation is recorded separately from this receipt.",
+    "note": "Reviewed all direct build, runtime, optional development and Node registry candidates on Python 3.14 against the preceding reviewed cohort. External dependency candidates and compatibility bounds are unchanged. The h2hdb lower bound is raised to 0.35.3 for the new public cumulative-source batching API; the coordinated cross-repository release is tested using an explicit local h2hdb 0.35.3 wheel, and that core version must be published before the ingest distribution. No sibling path or fallback API is embedded in the package. Existing source-marker caching and CBZ rendering contracts remain unchanged. Focused SQLite progressive publication, artifact reuse and rebuild, source additions and deletions, restart, bootstrap lease fencing and error cleanup tests pass. Complete bounded release gates and manual live MariaDB evidence are recorded separately; this audit does not claim full deep matrices.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
