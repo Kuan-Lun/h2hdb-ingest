@@ -33,6 +33,52 @@ def _load_module(name: str, path: Path) -> ModuleType:
 runner = _load_module("h2hdb_ingest_pytest_budget_runner", RUNNER)
 
 
+def test_windows_fixture_publishes_only_a_complete_pid(tmp_path: Path) -> None:
+    fixture = _load_module(
+        "windows_pid_publication_fixture",
+        ROOT / "tests" / "test_pytest_budget_runner_windows.py",
+    )
+    pid_path = tmp_path / "child.pid"
+    command = fixture._tree_command(pid_path, leader_exits=False)
+    # Exercise the real producer script with a known PID and no live child.
+    # Inspect both incomplete-write windows deterministically, rather than
+    # depending on another process being scheduled at exactly the right time.
+    instrumentation = """
+import pathlib
+import subprocess
+import sys
+import time
+import types
+
+subprocess.Popen = lambda *args, **kwargs: types.SimpleNamespace(pid=12345)
+time.sleep = lambda seconds: None
+final_path = pathlib.Path(sys.argv[1])
+
+def checked_write(path, text, *, encoding):
+    with path.open('w', encoding=encoding) as stream:
+        assert not final_path.exists(), 'empty PID became visible'
+        stream.write(text[:1])
+        stream.flush()
+        assert not final_path.exists(), 'partial PID became visible'
+        stream.write(text[1:])
+    assert not final_path.exists(), 'PID became visible before publication'
+    return len(text)
+
+pathlib.Path.write_text = checked_write
+"""
+    completed = subprocess.run(
+        (command[0], "-c", instrumentation + command[2], *command[3:]),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert pid_path.read_text(encoding="ascii") == "12345"
+    assert tuple(tmp_path.iterdir()) == (pid_path,)
+
+
 def test_merge_runner_has_one_aggregate_five_minute_budget() -> None:
     arguments = runner._arguments(["merge"])
 

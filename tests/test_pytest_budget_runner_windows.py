@@ -38,7 +38,12 @@ def _tree_command(pid_path: Path, *, leader_exits: bool) -> tuple[str, ...]:
         f"'import time;time.sleep({_CHILD_SLEEP_SECONDS})'),"
         "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
         "stderr=subprocess.DEVNULL);"
-        "pathlib.Path(sys.argv[1]).write_text(str(child.pid),encoding='ascii');"
+        # Readers treat the final path as readiness. Publish it only after the
+        # complete PID has been written and the Windows writer handle is closed.
+        "pid_path=pathlib.Path(sys.argv[1]);"
+        "pending_path=pid_path.with_suffix('.pending');"
+        "pending_path.write_text(str(child.pid),encoding='ascii');"
+        "pending_path.replace(pid_path);"
         + ("os._exit(0)" if leader_exits else f"time.sleep({_CHILD_SLEEP_SECONDS})")
     )
     return sys.executable, "-c", script, str(pid_path)
