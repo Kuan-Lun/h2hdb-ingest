@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import struct
+import zlib
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -33,6 +35,7 @@ from h2hdb import (
     VNextIssuedPublicationStep,
     VNextPreparedPublicationStep,
     VNextResolvedIngestPolicy,
+    VNextSourceQualification,
 )
 from PIL import Image
 
@@ -51,8 +54,11 @@ from h2hdb_ingest import (
 )
 from h2hdb_ingest.filesystem import (
     FilesystemFileObservation,
+    FilesystemGalleryObservation,
     FilesystemObservationError,
+    FilesystemSource,
 )
+from h2hdb_ingest.image_qualification import ImageGalleryQualifier
 from h2hdb_ingest.runtime import IngestRuntime, build_runtime
 from h2hdb_ingest.source_monitor import FilesystemCompletionMarkerProbe
 
@@ -237,7 +243,7 @@ def test_fresh_epoch_runs_source_analysis_and_publication(
     revision = runtime.catalog.get_catalog_revision()
 
     assert initialized.epoch == checked.epoch
-    assert initialized.schema_version == checked.schema_version == 5
+    assert initialized.schema_version == checked.schema_version == 6
     assert processed
     assert revision.revision == 1
     assert revision.publication_count == 1
@@ -1314,3 +1320,190 @@ def test_many_replacements_keep_one_stable_current_file_per_gid(
     assert not list((state / "staging").glob("*.cbz"))
     assert not list((state / "quarantine").glob("*.cbz"))
     assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
+
+
+def _large_monochrome_png(path: Path) -> None:
+    """Write 100 MP without allocating its decoded pixels in the fixture."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data))
+        )
+
+    compressor = zlib.compressobj()
+    with path.open("wb") as output:
+        output.write(b"\x89PNG\r\n\x1a\n")
+        output.write(
+            chunk(b"IHDR", struct.pack(">IIBBBBB", 10000, 10000, 1, 0, 0, 0, 0))
+        )
+        row = bytes(1 + 10000 // 8)
+        for _ in range(10000):
+            part = compressor.compress(row)
+            if part:
+                output.write(chunk(b"IDAT", part))
+        output.write(chunk(b"IDAT", compressor.flush()))
+        output.write(chunk(b"IEND", b""))
+
+
+def _assert_current_gallery_ids(
+    runtime: IngestRuntime, library: Path, expected: set[int]
+) -> None:
+    publications = runtime.catalog.discover_publications().publications
+    assert {item.gid for item in publications} == expected
+    archives = tuple((library / "current" / "acquisitions").rglob("*.cbz"))
+    assert len(archives) == len(expected)
+    for publication in publications:
+        artifact = publication.artifacts[0]
+        path = library.joinpath("current", *artifact.storage_object.key.segments)
+        assert sha256(path.read_bytes()).hexdigest() == artifact.storage_object.sha256
+        with ZipFile(path) as archive:
+            assert archive.testzip() is None
+            assert archive.namelist() == ["galleryinfo.txt", "pages/0000.jpg"]
+            with Image.open(BytesIO(archive.read("pages/0000.jpg"))) as page:
+                page.load()
+                assert max(page.size) <= 8192
+                assert page.width * page.height <= 40_000_000
+        assert publication.thumbnail is not None
+    assert runtime.database_admin.check().state == "READY"
+    assert not (library / ".h2hdb-coordination" / "ACTIVATING").exists()
+
+
+def test_progressive_mixed_images_publish_restart_repair_and_remove_rejected_gallery(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The production failure fixture must publish usable results, including 100 MP."""
+    source = tmp_path / "download"
+    for gid in (4001, 4002, 4003):
+        _gallery(source, gid, "shared")
+        marker = source / str(gid) / "galleryinfo.txt"
+        marker.write_text(
+            marker.read_text().replace("artist:shared", "artist:shared, group:shared"),
+            encoding="utf-8",
+        )
+    Image.new("RGB", (8, 12), "red").save(source / "4001" / "001.jpg")
+    (source / "4002" / "001.jpg").write_bytes(b"invalid image input")
+    (source / "4003" / "001.jpg").unlink()
+    _large_monochrome_png(source / "4003" / "001.png")
+    library = tmp_path / "library"
+    _provision_library_root(library)
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(
+            download_path=source, library_path=library, page_render_workers=4
+        ),
+        resident=ResidentConfig(
+            publication_batch_galleries=2, lease_seconds=30, heartbeat_seconds=5
+        ),
+    )
+    qualified: list[int] = []
+    original = ImageGalleryQualifier.__call__
+
+    def track(
+        qualifier: ImageGalleryQualifier,
+        filesystem: FilesystemSource,
+        locator: tuple[str, ...],
+        observed: FilesystemGalleryObservation,
+    ) -> VNextSourceQualification:
+        qualified.append(observed.metadata.gid)
+        return original(qualifier, filesystem, locator, observed)
+
+    monkeypatch.setattr(ImageGalleryQualifier, "__call__", track)
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
+        assert runtime.resident.process_available(periodic_scan=True)
+        _assert_current_gallery_ids(runtime, library, {4001})
+        assert qualified == [4001, 4002]
+        first = runtime.catalog.get_catalog_revision()
+        _synchronize_after_cleanup(runtime)
+        _assert_current_gallery_ids(runtime, library, {4001, 4003})
+        assert runtime.catalog.get_catalog_revision() != first
+        assert qualified == [4001, 4002, 4003]
+        assert len(runtime.catalog.list_tag_values(namespace="artist").values) == 1
+        assert len(runtime.catalog.list_tag_values(namespace="group").values) == 1
+    warnings = [
+        record.message
+        for record in caplog.records
+        if "gallery_image_rejected" in record.message
+    ]
+    assert len(warnings) == 1
+    assert f'gallery_folder="{source / "4002"}"' in warnings[0]
+    assert 'file="001.jpg"' in warnings[0]
+    # A fresh process reuses the durable negative qualification. Repairing the
+    # marker revalidates exactly that gallery and makes it publishable again.
+    qualified.clear()
+    with build_runtime(config) as restarted:
+        restarted.resident.initialize()
+        _synchronize_after_cleanup(restarted)
+        assert qualified == []
+        Image.new("RGB", (8, 12), "blue").save(source / "4002" / "001.jpg")
+        _rewrite_completion_marker(source / "4002")
+        _synchronize_after_cleanup(restarted)
+        _assert_current_gallery_ids(restarted, library, {4001, 4002, 4003})
+        assert qualified == [4002]
+        (source / "4001" / "001.jpg").write_bytes(b"newly damaged input")
+        _rewrite_completion_marker(source / "4001")
+        _synchronize_after_cleanup(restarted)
+        _assert_current_gallery_ids(restarted, library, {4002, 4003})
+        assert qualified == [4002, 4001]
+
+
+def test_all_invalid_source_publishes_empty_catalog_and_policy_change_rechecks(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "download"
+    _gallery(source, 4101, "invalid", page_bytes=b"invalid image")
+    library = tmp_path / "library"
+    _provision_library_root(library)
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(download_path=source, library_path=library),
+        resident=ResidentConfig(lease_seconds=30, heartbeat_seconds=5),
+    )
+    qualified: list[int] = []
+    original = ImageGalleryQualifier.__call__
+
+    def track(
+        qualifier: ImageGalleryQualifier,
+        filesystem: FilesystemSource,
+        locator: tuple[str, ...],
+        observed: FilesystemGalleryObservation,
+    ) -> VNextSourceQualification:
+        qualified.append(observed.metadata.gid)
+        return original(qualifier, filesystem, locator, observed)
+
+    monkeypatch.setattr(ImageGalleryQualifier, "__call__", track)
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
+        assert runtime.resident.process_available(periodic_scan=True)
+        _assert_current_gallery_ids(runtime, library, set())
+        assert runtime.catalog.get_catalog_revision().publication_count == 0
+        assert qualified == [4101]
+    changed_policy = config.model_copy(
+        update={
+            "paths": config.paths.model_copy(
+                update={
+                    "render_policy": ArtifactRenderPolicyConfig(page_jpeg_quality=85)
+                }
+            )
+        }
+    )
+    with build_runtime(changed_policy) as restarted:
+        restarted.resident.initialize()
+        _synchronize_after_cleanup(restarted)
+        _assert_current_gallery_ids(restarted, library, set())
+        assert qualified == [4101, 4101]
+        Image.new("RGB", (12, 8), "green").save(source / "4101" / "001.jpg")
+        _rewrite_completion_marker(source / "4101")
+        _synchronize_after_cleanup(restarted)
+        _assert_current_gallery_ids(restarted, library, {4101})
+        assert qualified == [4101, 4101, 4101]

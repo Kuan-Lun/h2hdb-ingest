@@ -45,4 +45,6 @@ smoke_site="$("$smoke_python" -c \
         'import h2hdb_ingest, pathlib, sys; assert pathlib.Path(h2hdb_ingest.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve())'
     "$smoke_python" -I -m h2hdb_ingest --help >/dev/null
     "$artifact_root/smoke-venv/bin/h2hdb-ingest-bootstrap" --help >/dev/null
+    cp "$repository_root/scripts/smoke-installed-pipeline.py" "$artifact_root/smoke-installed-pipeline.py"
+    "$smoke_python" -I "$artifact_root/smoke-installed-pipeline.py" --allow-external-core-wheel
 )

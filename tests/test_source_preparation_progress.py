@@ -16,6 +16,7 @@ from h2hdb import (
     VNextIngestFacade,
     VNextIngestSourceAdapter,
     VNextPreparedSource,
+    VNextResolvedIngestPolicy,
     VNextSourcePreparationObserver,
     VNextSourcePreparationOperation,
     VNextSourcePreparationProgress,
@@ -141,6 +142,7 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
         facade: VNextIngestFacade,
         adapter: VNextIngestSourceAdapter,
         *,
+        policy: VNextResolvedIngestPolicy,
         max_new_galleries: int | None = None,
         progress: VNextSourcePreparationObserver | None = None,
     ) -> VNextPreparedSource:
@@ -191,6 +193,7 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
         prepared = original_prepare(
             facade,
             adapter,
+            policy=policy,
             max_new_galleries=max_new_galleries,
             progress=observe,
         )

@@ -22,6 +22,7 @@ from h2hdb import (
     VNextSourceManifestMismatchError,
 )
 
+from .artifact_errors import format_artifact_failure
 from .config import ResidentConfig
 from .filesystem import FilesystemSourceChangedError
 from .library_identity import (
@@ -451,6 +452,11 @@ class ResidentIngestor:
                     "The ingest session could not be completed after source "
                     f"synchronization failed: {completion_error!r}"
                 )
+            raise
+        except Exception as error:
+            diagnostic = format_artifact_failure(error)
+            if diagnostic is not None:
+                logger.error("%s", diagnostic)
             raise
         completion = session.complete()
         self._last_synchronization_result = outcome

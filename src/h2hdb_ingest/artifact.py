@@ -24,9 +24,11 @@ __all__ = [
     "PreparedPageEvidence",
     "PreparedPresentationEvidence",
     "PresentationImageError",
+    "SourceImageSizeLimitError",
     "artifact_policy_fingerprint_sha256",
     "canonical_page_member_name",
     "inspect_presentation_archive",
+    "load_source_page_image",
     "render_archive",
     "render_presentation",
 ]
@@ -70,6 +72,7 @@ from PIL import Image, ImageFile, ImageOps, UnidentifiedImageError, features
 from PIL import __version__ as PILLOW_VERSION
 
 from ._limits import MAX_METADATA_BYTES
+from .artifact_errors import attach_page_failure_context
 from .metrics import (
     IngestMetric,
     IngestMetricSink,
@@ -78,6 +81,12 @@ from .metrics import (
 )
 from .page_workers import MAX_PAGE_RENDER_WORKERS, resolve_page_render_workers
 from .progress import IngestProgress, ProgressWork
+from .source_image import (
+    SOURCE_IMAGE_NATIVE_VERSIONS,
+    SOURCE_IMAGE_PIPELINE_ID,
+    SourceImageDecodeError,
+    load_source_image,
+)
 from .storage import artifact_name
 
 ARTIFACT_ADAPTER_ID = b"managed-filesystem"
@@ -116,15 +125,28 @@ _CANONICAL_ZIP_VERSION = 20
 _CANONICAL_EXTERNAL_ATTR = 0o100644 << 16
 _IMAGE_HEADER_WARNING_LOCK = Lock()
 
-# Pillow normally warns at MAX_IMAGE_PIXELS and raises only above twice that
-# value. Rendering below turns the warning into a hard error and validates the
-# dimensions itself.
+# Pillow only opens canonical output images. Source headers and pixels use
+# the streaming decoder and are not subject to this output-only bound.
 Image.MAX_IMAGE_PIXELS = MAX_DECODED_PIXELS
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 
 
 class PresentationImageError(ValueError):
     """Raised when a source cannot safely become a presentation-v2 image."""
+
+
+class SourceImageSizeLimitError(PresentationImageError):
+    """A source exceeds the retained encoded-byte policy, not a decode failure."""
+
+    def __init__(
+        self, size_bytes: int, limit_bytes: int = MAX_ENCODED_PAGE_BYTES
+    ) -> None:
+        self.size_bytes = size_bytes
+        self.limit_bytes = limit_bytes
+        super().__init__(
+            "artifact source exceeds its encoded-size bound: "
+            f"source_bytes={size_bytes} limit_bytes={limit_bytes}"
+        )
 
 
 class ArtifactImageResampler(StrEnum):
@@ -295,6 +317,8 @@ def artifact_policy_fingerprint_sha256(policy: ArtifactRenderPolicy) -> bytes:
     jpeg = features.version_codec("jpg") or "unknown"
     fields = (
         ARTIFACT_WRITER_ID,
+        SOURCE_IMAGE_PIPELINE_ID,
+        *(value.encode("ascii") for value in SOURCE_IMAGE_NATIVE_VERSIONS),
         cache_tag.encode("ascii", errors="strict"),
         PILLOW_VERSION.encode("ascii", errors="strict"),
         jpeg.encode("ascii", errors="strict"),
@@ -306,7 +330,7 @@ def artifact_policy_fingerprint_sha256(policy: ArtifactRenderPolicy) -> bytes:
         policy.resampler.value.encode("ascii"),
         str(THUMBNAIL_MAX_SIDE).encode("ascii"),
     )
-    framed = sha256(b"h2hdb-ingest-artifact-policy-v4\0")
+    framed = sha256(b"h2hdb-ingest-artifact-policy-v5\0")
     for value in fields:
         framed.update(len(value).to_bytes(4, "big"))
         framed.update(value)
@@ -659,12 +683,16 @@ def _render_page_member(
     policy: ArtifactRenderPolicy,
     progress: ProgressWork | None = None,
 ) -> _RenderedPageBuffer:
-    _verify_source_stream(member, maximum_size=MAX_ENCODED_PAGE_BYTES)
     stream = cast(
         BinaryIO,
         SpooledTemporaryFile(max_size=4 * 1024 * 1024, mode="w+b"),
     )
     try:
+        if member.expected_size_bytes > MAX_ENCODED_PAGE_BYTES:
+            raise SourceImageSizeLimitError(
+                member.expected_size_bytes, MAX_ENCODED_PAGE_BYTES
+            )
+        _verify_source_stream(member, maximum_size=MAX_ENCODED_PAGE_BYTES)
         image = _render_page(member.source, stream, policy=policy)
         _verify_source_stream(member, maximum_size=MAX_ENCODED_PAGE_BYTES)
         stream.seek(0)
@@ -673,7 +701,13 @@ def _render_page_member(
         if progress is not None:
             progress.advance("pages_rendered")
         return _RenderedPageBuffer(image=image, stream=stream)
-    except BaseException:
+    except BaseException as error:
+        attach_page_failure_context(
+            error,
+            source_position=member.position,
+            source_name=member.source_name,
+            expected_size_bytes=member.expected_size_bytes,
+        )
         stream.close()
         raise
 
@@ -751,8 +785,8 @@ def _preflight_archive_members(
             metadata = member
             continue
         if member.expected_size_bytes > MAX_ENCODED_PAGE_BYTES:
-            raise PresentationImageError(
-                "artifact source exceeds its encoded-size bound"
+            raise SourceImageSizeLimitError(
+                member.expected_size_bytes, MAX_ENCODED_PAGE_BYTES
             )
         pages.append(member)
         if len(pages) > MAX_PAGE_COUNT:
@@ -1466,13 +1500,8 @@ def _render_page(
     policy: ArtifactRenderPolicy,
 ) -> CanonicalImageEvidence:
     policy.__post_init__()
-    image = _load_safe_image(source)
+    image = load_source_page_image(source, policy=policy)
     try:
-        if image.height >= image.width:
-            bounds = (policy.max_image_short_side, MAX_IMAGE_LONG_SIDE)
-        else:
-            bounds = (MAX_IMAGE_LONG_SIDE, policy.max_image_short_side)
-        image.thumbnail(bounds, policy.pillow_resampler)
         image = _rgb_on_white(image)
         return _encode_jpeg(
             image,
@@ -1483,6 +1512,32 @@ def _render_page(
         )
     finally:
         image.close()
+
+
+def load_source_page_image(
+    source: BinaryIO, *, policy: ArtifactRenderPolicy
+) -> Image.Image:
+    """Fully decode one source into an owned canonical-sized image for preflight."""
+
+    policy.__post_init__()
+    try:
+        image = load_source_image(
+            source,
+            max_short_side=policy.max_image_short_side,
+            max_long_side=MAX_IMAGE_LONG_SIDE,
+            max_pixels=MAX_DECODED_PIXELS,
+            resampler=policy.pillow_resampler,
+        )
+    except SourceImageDecodeError as error:
+        raise PresentationImageError(str(error)) from error
+    try:
+        _validate_dimensions(
+            image.width, image.height, max_long_side=MAX_IMAGE_LONG_SIDE
+        )
+    except BaseException:
+        image.close()
+        raise
+    return image
 
 
 def _load_safe_image(source: BinaryIO) -> Image.Image:

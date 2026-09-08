@@ -33,7 +33,7 @@ from h2hdb import (
     VNextSourcePreparationProgress,
 )
 
-from .core_source import VNextFilesystemSourceAdapter
+from .core_source import SourceGalleryQualifier, VNextFilesystemSourceAdapter
 from .filesystem import FilesystemSource
 from .metrics import (
     IngestMetric,
@@ -128,6 +128,7 @@ class VNextIngestService:
         finalization_adapters: Mapping[bytes, ArtifactReleaseAdapter],
         library_activation: VNextLibraryActivationAdapter,
         publication_guard: Callable[[], AbstractContextManager[None]],
+        qualify_gallery: SourceGalleryQualifier | None = None,
         metrics_sink: IngestMetricSink | None = None,
         progress: IngestProgress | None = None,
     ) -> None:
@@ -154,6 +155,7 @@ class VNextIngestService:
             raise TypeError("publication_guard must be callable")
         if metrics_sink is not None and not callable(metrics_sink):
             raise TypeError("metrics_sink must be callable")
+        self._qualify_gallery = qualify_gallery
         self._source_root = source_root
         self._policy = policy
         self._max_rows = max_rows
@@ -209,7 +211,9 @@ class VNextIngestService:
             source_result = synchronize_source(
                 session,
                 resolved,
-                VNextFilesystemSourceAdapter(source),
+                VNextFilesystemSourceAdapter(
+                    source, qualify_gallery=self._qualify_gallery
+                ),
                 max_new_galleries=self._publication_batch_galleries,
                 should_stop=stop_requested,
                 progress=work,
@@ -521,6 +525,7 @@ def synchronize_source(
     prepared = session.outside_session(
         lambda facade: facade.prepare_source(
             adapter,
+            policy=policy,
             max_new_galleries=max_new_galleries,
             progress=observe if progress is not None else None,
         )

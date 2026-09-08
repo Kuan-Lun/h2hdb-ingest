@@ -22,6 +22,7 @@ from h2hdb import (
 )
 
 from .config import IngestConfig
+from .image_qualification import ImageGalleryQualifier
 from .library import ManagedFilesystemLibraryAdapter
 from .library_identity import LibraryStorageIdentityProvider
 from .maintenance import (
@@ -128,6 +129,7 @@ def build_runtime(
         library_storage_identity: LibraryStorageIdentityProvider | None
         library_maintenance: LibraryMaintenanceAdapter
         publication_guard: Callable[[], AbstractContextManager[None]]
+        qualify_gallery: ImageGalleryQualifier | None = None
         if config.paths.library_path is None:
             disabled_library = _DisabledLibraryActivationAdapter()
             library_activation = disabled_library
@@ -144,6 +146,11 @@ def build_runtime(
                 config.paths.page_render_workers
             )
             runtime_event_logger(worker_decision.log_line())
+            qualify_gallery = ImageGalleryQualifier(
+                config.paths.artifact_render_policy(),
+                workers=worker_decision.selected,
+                progress=progress,
+            )
             library = ManagedFilesystemLibraryAdapter(
                 config.paths.library_path,
                 source_root=config.paths.download_path,
@@ -168,6 +175,7 @@ def build_runtime(
             finalization_adapters=finalization_adapters,
             library_activation=library_activation,
             publication_guard=publication_guard,
+            qualify_gallery=qualify_gallery,
             metrics_sink=metrics_sink,
             progress=progress,
         )

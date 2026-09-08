@@ -191,6 +191,12 @@ neutral descriptor，但不得決定其格式、尺寸、品質、storage key或
 filesystem observation負責分類 PAGE/OTHER；canonical writer
 對每個 PAGE 都必須輸出一個 dense JPEG page，decode失敗則整個artifact fail。
 
+CBZ啟用時，每個new/changed gallery在global analysis與dedup前必須以同一
+source decoder及bounded page workers預檢所有PAGE。只有accepted gallery可
+參與analysis；拒絕必須以整gallery為單位，不得靜默省略一頁後發行其餘頁。
+Source facts與拒絕原因必須保留；source marker或artifact policy變更後重新
+qualification。Metadata-only模式不得為此decode圖片。
+
 每個 core operation 維持 issue/prepare/commit 分離。session controller lock
 只包住有界的 database issue 或 commit call；filesystem scan、hash、image/ZIP
 work、artifact staging、activation spooling 與其他 local I/O 必須在 lock
@@ -236,11 +242,16 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
 - canonical archive必須是 closed-world `galleryinfo.txt`加dense
   `pages/{page_index:04d}.jpg`。Metadata固定DEFLATE；PAGE固定ZIP_STORED；flags、
   comment、extra、data descriptor與ZIP64皆禁止。最多4096 PAGE、每個source/output
-  encoded page 32 MiB、decoded 40 MP、long side 8192、aggregate archive
+  encoded page 32 MiB；source不得因pixel count或dimensions拒絕，須使用streaming
+  decode/shrink；output decoded最多40 MP、long side最多8192、aggregate archive
   2,147,483,647 bytes。Render policy預設page quality 90、thumbnail quality 85、
   optimize true與LANCZOS；所有byte-affecting選項都必須bounded、寫入policy
   fingerprint且由frozen config/domain傳遞。GIF只取frame zero；page zero是
   full-size cover alias。Standalone thumbnail-320不得request-time resize。
+  Source先用libvips串流縮至最多兩倍output尺寸且最多40 MP的intermediate，
+  再用Pillow套用config的final resampler；兩階段及native versions都進入fingerprint。
+  Progressive/interlaced codecs仍可能持有full-image buffers，必須與其他source
+  decode互斥，不得宣稱hard RSS上限或以pixel count拒絕合法來源。
   Writer完成後必須重驗central/local header、CRC、SHA-256、size與page
   extents，destination partial write必須fail closed。
 - acquisition與thumbnail artifact必須先在同 filesystem 的 private staging以

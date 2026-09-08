@@ -1211,7 +1211,7 @@ def test_truncated_image_is_rejected(tmp_path: Path) -> None:
         _rendered_page_bytes(adapter, truncated, source_name=b"page.jpg")
 
 
-def test_decompression_bomb_warning_is_a_hard_error(
+def test_canonical_output_decompression_warning_is_a_hard_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

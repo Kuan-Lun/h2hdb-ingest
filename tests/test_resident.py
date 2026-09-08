@@ -7,6 +7,7 @@ from typing import cast
 
 import pytest
 from h2hdb import (
+    ArtifactFailureContext,
     ArtifactReleaseAdapter,
     GalleryStagingCapacityError,
     SchemaEpochReport,
@@ -23,6 +24,7 @@ from h2hdb import (
     VNextSourceManifestMismatchError,
 )
 
+import h2hdb_ingest.artifact_errors as artifact_errors_module
 import h2hdb_ingest.resident as resident_module
 from h2hdb_ingest import (
     ArtifactRenderPolicy,
@@ -1443,3 +1445,44 @@ def test_run_forever_preserves_scan_time_change_and_then_stays_clean(
     assert scans == [100.0, 200.0]
     assert events.count(("claim", True, 10_000_000)) == 2
     assert schedules[0].next_scan_at() is None
+
+
+def test_fatal_artifact_failure_logs_exact_context_and_preserves_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    events: list[object] = []
+    failure = RuntimeError("render failed")
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+
+    def context_for_error(error: BaseException) -> ArtifactFailureContext:
+        assert error is failure
+        return ArtifactFailureContext(7, ("source",), ("gallery",), b"002.jpg", 123)
+
+    monkeypatch.setattr(
+        artifact_errors_module, "get_artifact_failure_context", context_for_error
+    )
+
+    class _ArtifactFailureService:
+        def synchronize_once(
+            self,
+            session: IngestSessionController,
+            *,
+            should_stop: Callable[[], bool] | None = None,
+        ) -> VNextIngestSynchronizationResult:
+            del session, should_stop
+            raise failure
+
+    resident = _resident(events, service=_ArtifactFailureService())
+    resident.initialize()
+    with pytest.raises(RuntimeError) as caught:
+        resident.process_available(periodic_scan=True)
+    assert caught.value is failure
+    errors = [record for record in caplog.records if record.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert (
+        'event="artifact_failed" gid=7 gallery_folder="/source/gallery"'
+        in errors[0].message
+    )
+    assert 'file="002.jpg" source_bytes=123' in errors[0].message
+    assert 'reason="render failed"' in errors[0].message
+    assert resident.last_synchronization_result is None

@@ -83,7 +83,13 @@ class ArtifactRenderPolicyConfig(ConfigModel):
         le=MAX_SUPPORTED_JPEG_QUALITY,
     )
     optimize: StrictBool = True
-    resampler: ArtifactImageResampler = ArtifactImageResampler.LANCZOS
+    resampler: ArtifactImageResampler = Field(
+        default=ArtifactImageResampler.LANCZOS,
+        description=(
+            "Final Pillow resampler after fixed libvips streaming reduction to "
+            "at most twice the output dimensions; applied when resizing is needed"
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod

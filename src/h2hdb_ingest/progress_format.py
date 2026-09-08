@@ -47,6 +47,7 @@ _OPERATION_LABELS = {
     "source_completion_marker": "Checking whether gallery metadata has changed",
     "source_gallery_observation": "Reading gallery metadata and indexing its files",
     "source_file_read": "Reading and verifying source file contents",
+    "source_image_qualification": "Checking gallery images before publication selection",
     "source_issue": "Loading the next source database operation",
     "source_prepare_step": "Preparing the next source database operation",
     "source_commit": "Saving source observations to the database",
@@ -82,6 +83,9 @@ _COUNTER_LABELS = {
     "gallery_indexes_built": "gallery file indexes built",
     "file_observations_completed": "source files read and verified",
     "source_bytes_read": "source bytes read",
+    "source_images_checked": "source images checked",
+    "source_galleries_qualified": "galleries checked for readable images",
+    "source_galleries_rejected": "galleries excluded because an image could not be processed",
     "pages_rendered": "pages rendered",
     "pages_written": "pages written into CBZs",
     "archives_rendered": "CBZs rendered",
@@ -244,6 +248,11 @@ def _results(snapshot: ProgressSnapshot) -> list[str]:
     if "batch_selected_galleries" in counts:
         parts.append(
             f"galleries in this batch {counts['batch_selected_galleries']:,} (existing and new)"
+        )
+    if counts.get("source_galleries_rejected", 0):
+        parts.append(
+            f"galleries excluded due to image failures {counts['source_galleries_rejected']:,} "
+            "(see gallery_image_rejected warnings for folders and files)"
         )
     if counts.get("cbz_enabled") or "archives_rendered" in counts:
         parts.append(f"CBZs rendered this work {counts.get('archives_rendered', 0):,}")

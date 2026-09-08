@@ -4,6 +4,8 @@ from __future__ import annotations
 
 __all__ = ["VNextFilesystemSourceAdapter"]
 
+from collections.abc import Callable
+
 from h2hdb import (
     ArtifactSourceRole,
     DirectoryObservation,
@@ -15,6 +17,7 @@ from h2hdb import (
     VNextIngestGalleryObservation,
     VNextIngestPage,
     VNextSourceCompletionMarker,
+    VNextSourceQualification,
 )
 
 from .filesystem import (
@@ -27,12 +30,23 @@ from .filesystem import (
     FilesystemSourceChangedError,
 )
 
+SourceGalleryQualifier = Callable[
+    [FilesystemSource, tuple[str, ...], FilesystemGalleryObservation],
+    VNextSourceQualification,
+]
+
 
 class VNextFilesystemSourceAdapter:
     """Implement the public replayable source protocol without database access."""
 
-    def __init__(self, source: FilesystemSource) -> None:
+    def __init__(
+        self,
+        source: FilesystemSource,
+        *,
+        qualify_gallery: SourceGalleryQualifier | None = None,
+    ) -> None:
         self._source = source
+        self._qualify_gallery = qualify_gallery
 
     @property
     def source_root_components(self) -> tuple[str, ...]:
@@ -62,6 +76,11 @@ class VNextFilesystemSourceAdapter:
         return VNextIngestGalleryObservation(
             locator_components=locator_components,
             metadata=_metadata(observed.metadata),
+            qualification=(
+                VNextSourceQualification()
+                if self._qualify_gallery is None
+                else self._qualify_gallery(self._source, locator_components, observed)
+            ),
         )
 
     def observe_completion_marker(

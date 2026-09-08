@@ -21,13 +21,38 @@ Every eligible page becomes a deterministic JPEG. Eligible filenames use an
 ASCII case-insensitive `.avif`, `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, or
 `.webp` suffix. Other regular files remain source observations but are not
 pages; they are never opened by the artifact renderer. Animated GIF input uses
-its first frame. A source is rejected if it is
-truncated, cannot be decoded, is larger than 40 megapixels, has a side longer
-than 8192 pixels, or if its source or rendered JPEG exceeds 32 MiB. A gallery
-may contain at most 4096 pages. The configurable short-side limit defaults to
-768 pixels; images are never enlarged. The canonical render policy defaults to
-page JPEG quality 90, thumbnail JPEG quality 85, optimized encoding, and the
-LANCZOS resampler. The separate thumbnail has a maximum side of 320 pixels.
+its first frame. Sources are streamed through libvips and are not rejected for
+pixel count or dimensions. Truncated or undecodable images still fail the
+artifact; source and rendered JPEG size remain limited to 32 MiB. A gallery
+may contain at most 4096 pages. The generated page fits within the configured
+short-side limit (768 pixels by default), an 8192-pixel long side, and
+40 megapixels, preserving aspect ratio without enlarging images.
+
+Source reduction uses libvips's sequential thumbnail pipeline, including
+JPEG shrink-on-load where available, to produce an intermediate no larger than
+twice the target dimensions and 40 megapixels. Pillow then applies the configured
+resampler for the final resize when needed. The default is LANCZOS, page JPEG
+quality 90, thumbnail JPEG quality 85, and optimized encoding. The separate
+thumbnail has a maximum side of 320 pixels. Decoder, native library versions,
+and both resizing stages participate in the artifact policy fingerprint.
+
+Progressive JPEG and interlaced PNG still require codec-owned full-image
+buffers. They run one at a time, exclusively with respect to other source
+pixel decoding. Regular images retain the configured page-worker concurrency;
+libvips uses one native worker per page and does not cache past operations.
+This lowers memory pressure without claiming a hard process memory ceiling or
+rejecting large legitimate images. The manual image-memory benchmark in
+`scripts/benchmark-source-images.py` generates real 100-megapixel fixtures and
+reports per-process peak RSS for all four formats.
+
+When CBZ generation is enabled, each new or changed gallery passes a source
+qualification step before global analysis and deduplication. It evaluates every
+PAGE with the same decoder and the configured bounded page-worker pool. A
+rejected image excludes the entire gallery from artifact selection; no page is
+silently omitted from a book. The service preserves the source facts and the
+precise rejection reason, then retries qualification when the source marker or
+artifact policy changes. Only qualified galleries participate in analysis.
+Metadata-only operation does not decode images.
 
 The canonical CBZ contains only:
 
@@ -52,11 +77,15 @@ cover extent or thumbnail resource.
 
 ## Important upgrade notice
 
-This release requires the H2HDB `0.35` compatibility lane and schema epoch 3,
-schema version 5. Verified completion markers are stored with immutable source
+This release requires the H2HDB `0.36` compatibility lane and schema epoch 3,
+schema version 6. Verified completion markers are stored with immutable source
 observations so unchanged galleries can reuse those observations across restarts.
+Image qualifications are sealed with the exact source observation and render policy;
+rejected galleries stay in source membership while only accepted galleries enter
+analysis and publication. Changing a completion marker or render policy rechecks
+qualification. Known malformed images no longer abort publication of every other gallery.
 
-Schema-version-4 and older databases are rejected. Initialize a new empty database with
+Schema-version-5 and older databases are rejected. Initialize a new empty database with
 the H2HDB administrator command, then rebuild the catalog from the source
 download tree. There is no in-place schema migration or older-core fallback.
 
@@ -509,6 +538,34 @@ H2HDB_INGEST_TEST_PRIVATE_CORPUS=1 \
 H2HDB_TEST_MARIADB=1 \
 .venv/bin/pytest tests/test_local_download_corpus.py
 ```
+
+### Installed distribution pipeline smoke
+
+`scripts/check-full.sh` builds the candidate ingest wheel and executes
+`scripts/smoke-installed-pipeline.py` with Python isolated mode, in addition to
+CLI/import checks. The smoke uses temporary SQLite and gallery/library roots,
+two valid galleries (including a source longer than 8192 pixels), one corrupt
+gallery, cross-namespace equal tag values, real CBZ/thumbnail bytes, runtime
+restart, source repair, and a newer publication revision.
+
+Ingest must load from its installed wheel in the smoke environment. The default
+local gate explicitly shares the development environment's installed dependency
+wheels; `--allow-external-core-wheel` permits core's wheel at that reported path,
+but rejects editable or source-checkout imports. The printed origin records are
+part of the evidence; this is not a claim that all dependencies were freshly
+installed in the smoke environment.
+
+For a fully isolated environment containing candidate core and ingest wheels:
+
+```sh
+/path/to/smoke-venv/bin/python -I scripts/smoke-installed-pipeline.py
+```
+
+With a compatible installed `h2hdb-opds` wheel and `httpx`, add `--opds` to check
+the real OPDS feed, complete CBZ downloads, byte ranges, and thumbnails through
+in-process ASGI. The probe opens no network socket. It reports incompatible
+package constraints and exits unsuccessfully even if diagnostic HTTP requests
+succeed; no dependency overrides or third-repository changes are performed.
 
 ## License
 
