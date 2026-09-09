@@ -1848,12 +1848,12 @@ def test_archive_reads_and_crc_validates_bounded_metadata() -> None:
         inspect_presentation_archive(BytesIO(archive), names)
 
 
-def test_every_worker_path_fails_identically_and_preserves_destination(
+def test_every_worker_path_fails_identically_and_discards_scratch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Differential: the decision-driven automatic path and every manual
     override raise the same failure on the same corrupt page and leave the
-    destination bytes untouched, exactly like sequential rendering."""
+    scratch empty when cleanup succeeds, exactly like sequential rendering."""
 
     pages: list[bytes] = []
     for index in range(3):

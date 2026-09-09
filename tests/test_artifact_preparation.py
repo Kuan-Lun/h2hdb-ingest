@@ -212,7 +212,7 @@ def test_changed_actual_archive_never_uses_retained_inspection(
     assert calls == 1
 
 
-def test_failed_destination_copy_does_not_publish_inspection_slot() -> None:
+def test_failed_finalization_does_not_publish_inspection_slot() -> None:
     class FailedWriter(BytesIO):
         def flush(self) -> None:
             raise OSError("destination failed after accepting bytes")
