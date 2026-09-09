@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-08T23:38:39+00:00",
+  "checked_at": "2026-09-09T00:34:19+00:00",
   "manifest_sha256": "318afc530a2cd49236ffeeb47812e60b15219282c5fee306d6a55897d8599ea2",
   "node": [
     {
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.19.0",
+  "project_version": "0.20.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all direct build/runtime/development and Node registry candidates and official release notes, including versions outside current bounds. Existing third-party latest candidates remain within their tested bounds and support Python 3.14. Local Python 3.14.1 / Node 26.7.0 environments use current Pydantic 2.13.5, build 1.6.0, Hypothesis 6.168.0, Ruff 0.16.6, packaging 26.3 and markdownlint-cli2 0.23.2; reviewed validator/GC/union, build constraints-hash, datetime/cache, lint and requirement/marker fixes without relaxing checks. Added pyvips>=3.2.0,<4 because concurrency_set is new in 3.2; pyvips-binary>=8.18.6,<9 matches audited libvips 8.18.6. Tested SourceCustom bounded reads, strict fail_on loader options, error-buffer concurrency isolation, PNG/JPEG truncation, EXIF/alpha/GIF frame zero, final configured resampling and true 100 MP JPEG/PNG output; unknown native/resource errors retain their type. Native and binding major upper bounds exclude unaudited API/codec changes. Ingest now requires h2hdb>=0.36.0,<0.37.0 for schema6/policy-bound source qualification. Registry latest core is still 0.35.5, below this intentional new minimum; installed the locally built core 0.36.0 candidate wheel and validated real mixed-image SQLite/MariaDB publication, restart, repair, removal and policy-change behavior. This receipt does not claim core0.36.0 is already on PyPI or that the independent exact-tree release gate/deep matrices ran. References: https://github.com/libvips/pyvips/blob/master/CHANGELOG.rst ; https://github.com/libvips/libvips/releases/tag/v8.18.6 ; https://github.com/kleisauke/pyvips-binary/releases/tag/v8.18.6 ; https://github.com/pydantic/pydantic/releases/tag/v2.13.5 ; https://github.com/pypa/build/releases/tag/1.6.0 ; https://hypothesis.readthedocs.io/en/latest/changelog.html#v6-168-0 ; https://github.com/astral-sh/ruff/releases/tag/0.16.6 ; https://github.com/pypa/packaging/blob/main/CHANGELOG.rst ; https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/main/CHANGELOG.md .",
+    "note": "Requeried all direct build, runtime, optional development and Node registry dependencies for 0.20.0. Dependency declarations, all 16 Python group records, the Node candidate and Python 3.14 metadata are unchanged from the reviewed 0.19.0 release, so its official release-note compatibility conclusions remain applicable; local third-party versions match these latest candidates. This release removes the source encoded-byte ceiling and SourceImageSizeLimitError without adding or changing dependencies. Source reads, disk spooling, exact source size/SHA256 verification and generated output bounds remain enforced. Genuine 34,621,850-byte PNG qualification and full publication from an empty database passed on SQLite and MariaDB 10.11.11, with decoder and source-mutation regressions passing. No old-database migration, schema fallback or size-rejection compatibility branch was introduced. PyPI h2hdb latest remains 0.35.5, below the intentional 0.36 minimum; validation uses the locally built and installed core 0.36.0 wheel, not a claim that it is published. Final release-gate evidence is separate. Previously reviewed upstream references: https://github.com/libvips/pyvips/blob/master/CHANGELOG.rst ; https://github.com/libvips/libvips/releases/tag/v8.18.6 ; https://github.com/kleisauke/pyvips-binary/releases/tag/v8.18.6 ; https://github.com/pydantic/pydantic/releases/tag/v2.13.5 ; https://github.com/pypa/build/releases/tag/1.6.0 ; https://hypothesis.readthedocs.io/en/latest/changelog.html#v6-168-0 ; https://github.com/astral-sh/ruff/releases/tag/0.16.6 ; https://github.com/pypa/packaging/blob/main/CHANGELOG.md ; https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/main/CHANGELOG.md .",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
