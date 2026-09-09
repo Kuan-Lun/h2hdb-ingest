@@ -496,7 +496,7 @@ def test_info_reports_counter_deltas_when_operations_change() -> None:
     )
     work.advance("pages_written", 2)
     work.advance("archives_rendered")
-    work.operation("archive_copy")
+    work.operation("archive_finalize")
     clock.advance(3600)
     progress._report_due()
     assert (

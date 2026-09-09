@@ -8,7 +8,7 @@ TLA_MODEL = ROOT / "verification" / "tla" / "OrderedPageRendering.tla"
 SMALL_PROFILE = ROOT / "verification" / "tla" / "OrderedPageRenderingSmall.cfg"
 
 
-def test_lean_model_proves_order_serialization_and_publish_last() -> None:
+def test_lean_ordered_serialization_has_explicit_storage_boundary() -> None:
     model = LEAN_MODEL.read_text(encoding="utf-8")
     prose = " ".join(model.split())
 
@@ -34,7 +34,6 @@ def test_lean_model_proves_order_serialization_and_publish_last() -> None:
         "BoundedExecution",
         "orderedCollect",
         "serializeOrdered",
-        "publishLast",
     }:
         assert f"def {definition}" in model or f"structure {definition}" in model
     for theorem in {
@@ -68,7 +67,6 @@ def test_lean_model_proves_order_serialization_and_publish_last() -> None:
         "worker_and_every_batch_are_hard_bounded",
         "ordered_serialization_equals_sequential_serialization",
         "every_deterministic_serializer_observes_sequential_input",
-        "every_prepublication_failure_preserves_destination",
     }:
         assert f"theorem {theorem}" in model
 
@@ -82,10 +80,13 @@ def test_lean_model_proves_order_serialization_and_publish_last() -> None:
     assert "do not prove Pillow determinism or thread safety" in prose
     assert "Python future/executor behavior" in prose
     assert "filesystem semantics" in prose
-    assert "final destination write itself fails" in prose
+    assert "do not establish destination byte preservation" in prose
+    assert "Cleanup itself can fail" in prose
+    assert "separate library activation protocol" in prose
+    assert "def publishLast" not in model
 
 
-def test_tla_model_explores_bounded_schedules_failures_and_publish_last() -> None:
+def test_tla_bounded_schedules_do_not_claim_storage_preservation() -> None:
     model = TLA_MODEL.read_text(encoding="utf-8")
     prose = " ".join(model.split())
 
@@ -97,7 +98,6 @@ def test_tla_model_explores_bounded_schedules_failures_and_publish_last() -> Non
         "WorkerFailure",
         "ValidationFailure",
         "SerializationFailure",
-        "PublishLast",
     }:
         assert f"{action} ==" in model or f"{action}(page) ==" in model
     for invariant in {
@@ -106,20 +106,20 @@ def test_tla_model_explores_bounded_schedules_failures_and_publish_last() -> Non
         "FinishedWithinCurrentBatch",
         "OrderedCollectIsSequentialPrefix",
         "AllCollectedBeforePostProcessing",
-        "ReadyOrPublishedHasSequentialSerialization",
-        "FailurePreservesDestination",
-        "DestinationChangesOnlyAtPublish",
-        "PublishedDestinationIsSequential",
+        "ReadyHasSequentialSerialization",
     }:
         assert f"{invariant} ==" in model
 
     assert "arbitrary non-empty batches" in prose
     assert "finish each page in any order" in prose
-    assert "PublishLast is the sole action that changes destination" in prose
+    assert "scratch bytes may change during rendering" in prose
+    assert "cleanup itself can fail" in prose
+    assert "FAILED deliberately imposes no empty-scratch" in prose
+    assert "PublishLast ==" not in model
+    assert "FailurePreservesDestination ==" not in model
     assert "does not establish Pillow determinism or thread safety" in prose
     assert "Python executor or future semantics" in prose
     assert "filesystem atomicity or durability" in prose
-    assert "failure during the final destination write itself" in prose
 
 
 def test_tla_small_profile_wires_sixteen_worker_safety_contract() -> None:
@@ -131,7 +131,7 @@ def test_tla_small_profile_wires_sixteen_worker_safety_contract() -> None:
     assert "WorkerCountHardBound" in profile
     assert "BatchSizeHardBound" in profile
     assert "OrderedCollectIsSequentialPrefix" in profile
-    assert "FailurePreservesDestination" in profile
-    assert "PublishedDestinationIsSequential" in profile
+    assert "ReadyHasSequentialSerialization" in profile
+    assert "FailurePreservesDestination" not in profile
     assert "not a Python/Pillow/filesystem refinement proof" in profile
     assert "PROPERTY" not in profile

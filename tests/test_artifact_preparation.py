@@ -266,7 +266,9 @@ members = tuple(
 renderer = ArtifactPreparationRenderer(policy=ArtifactRenderPolicy(max_image_short_side=32), page_render_workers=1)
 with open(sys.argv[1], "w+b") as destination:
     if sys.argv[2] == "partial":
-        class InterruptedCopy:
+        class InterruptedScratch:
+            def readable(self): return destination.readable()
+            def read(self, *args): return destination.read(*args)
             def seek(self, *args): return destination.seek(*args)
             def truncate(self, *args): return destination.truncate(*args)
             def write(self, content):
@@ -274,7 +276,7 @@ with open(sys.argv[1], "w+b") as destination:
                 destination.flush()
                 os.fsync(destination.fileno())
                 os.kill(os.getpid(), int(sys.argv[3]))
-        renderer.render_archive(members, InterruptedCopy(), gid=42)
+        renderer.render_archive(members, InterruptedScratch(), gid=42)
     else:
         renderer.render_archive(members, destination, gid=42)
         destination.flush()

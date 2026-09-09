@@ -3,9 +3,10 @@ import Std
 /-!
 # Single-use archive inspection reuse
 
-The adapter remembers only the facts produced by full inspection of its private
-completed writer stage. The next presentation independently computes size and
-SHA-256 over the actual bytes and checks exact ordered locators before reuse.
+The adapter remembers only fully inspected facts after finalizing its
+caller-owned, unpublished scratch stream. The next presentation independently
+computes size and SHA-256 over the actual bytes and checks exact ordered locators
+before reuse.
 The retained slot is consumed even when those checks fail; restart is empty.
 
 These theorems concern a pure inspector and mathematical bytes. In particular,
@@ -16,8 +17,8 @@ Core performs before/after archive hashes and exact extent verification; ingest
 rehashes cover bytes immediately before decoding them. Python I/O, Pillow full
 decoding, thread locks, and process termination are not proved by these theorems.
 The implementation refinement is exercised by test_artifact_preparation.py's
-byte-for-byte differential, malformed-JPEG, tampering, failed-copy, and actual
-SIGTERM/SIGKILL partial/complete-copy restart tests.
+byte-for-byte differential, malformed-JPEG, tampering, failed-finalization, and
+actual SIGTERM/SIGKILL partial/complete scratch-write restart tests.
 -/
 
 namespace H2HDBIngest.Verification.ArchiveInspectionReuse
@@ -89,15 +90,15 @@ def restart {Entry : Type} (_slot : Option Entry) : Option Entry := none
 theorem restart_requires_full_inspection
     {Entry : Type} (slot : Option Entry) : restart slot = none := rfl
 
-/-- A failed destination write/flush cannot publish newly inspected facts. -/
-def publishAfterCopy
+/-- A failed scratch write/inspection/flush cannot publish newly inspected facts. -/
+def publishAfterFinalization
     {Entry : Type} (previous : Option Entry) (verified : Entry)
-    (copyCompleted : Bool) : Option Entry :=
-  if copyCompleted then remember previous verified else previous
+    (finalized : Bool) : Option Entry :=
+  if finalized then remember previous verified else previous
 
-theorem failed_copy_does_not_publish_new_facts
+theorem failed_finalization_does_not_publish_new_facts
     {Entry : Type} (previous : Option Entry) (verified : Entry) :
-    publishAfterCopy previous verified false = previous := by
-  simp [publishAfterCopy]
+    publishAfterFinalization previous verified false = previous := by
+  simp [publishAfterFinalization]
 
 end H2HDBIngest.Verification.ArchiveInspectionReuse

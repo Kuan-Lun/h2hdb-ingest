@@ -9,9 +9,8 @@ This directory contains executable specifications owned by filesystem ingest.
 - `lean/OrderedPageRendering.lean` proves that, for a deterministic pure page
   renderer, ordered collection after arbitrary worker completion schedules and
   worker-bounded batches equals the sequential map. Therefore deterministic
-  serialization receives the same ordered results. It also proves that worker,
-  validation, and serialization failures preserve the destination when
-  publication is the final step.
+  serialization receives the same ordered results. It makes no claim that
+  renderer scratch bytes are preserved or that cleanup cannot fail.
 - `lean/IngestRuntimeLifecycle.lean` proves the abstract runtime close is
   idempotent, two linearized callers delegate close once, every modeled CLI
   exit kind reaches closed state, entered/closed runtimes reject reentry,
@@ -31,10 +30,10 @@ This directory contains executable specifications owned by filesystem ingest.
 - `lean/ArchiveInspectionReuse.lean` proves that a single-use inspection slot
   agrees with full inspection when the actual rehashed bytes match, under an
   explicit collision-free-at-the-inspected-bytes assumption. It also proves
-  one-slot retention, consume-before-I/O, empty restart, and failed-copy
+  one-slot retention, consume-before-I/O, empty restart, and failed-finalization
   nonpublication. Runtime refinement covers full JPEG decode without pixel
   copies, byte-for-byte output equivalence, archive/cover tampering, and actual
-  SIGTERM/SIGKILL during and after destination copy. Neither SHA-256 security
+  SIGTERM/SIGKILL during and after scratch writing. Neither SHA-256 security
   nor Python/Pillow/OS behavior is proved by the mathematical model.
 - `tla/CbzLibraryActivation.tla` model-checks crash recovery between
   reader-invisible
@@ -42,8 +41,8 @@ This directory contains executable specifications owned by filesystem ingest.
   finalization, including maintenance-marker and unknown-path safety.
 - `tla/OrderedPageRendering.tla` model-checks finite choices of worker count,
   batch size, page-completion interleavings, ordered collection, validation and
-  serialization failures, and publish-last destination safety. Its required
-  `Small` profile uses four pages and explores worker counts `1..16`.
+  serialization failures, and exact serialization in the ready state. Its
+  required `Small` profile uses four pages and explores worker counts `1..16`.
 - `tla/IngestRuntimeLifecycle.tla` model-checks partial construction failure,
   two arbitrarily ordered explicit close callers, normal/one-shot/exception/
   `SystemExit`/`KeyboardInterrupt` CLI exits, and fail-closed reentry/work.
@@ -76,12 +75,14 @@ The ordered-rendering proofs additionally assume that one page has a pure,
 deterministic render result and that indexed worker results are exact. They do
 not prove Pillow determinism or thread safety, Python `ThreadPoolExecutor` and
 `Future` behavior, cancellation or spool cleanup, ZIP implementation details,
-filesystem atomicity or durability, or that the Python batching and
-publish-last code refines the models. The preservation result covers failures
-before publication; it does not claim that a failure during the final
-destination write is atomic. Exact-byte differential, measured concurrency-
-bound, validation/serialization fault, and destination-preservation tests
-remain the implementation evidence for those boundaries.
+filesystem atomicity or durability, or that Python refines the models. The
+abstract serialized value is not a second CBZ file: runtime writes directly
+into caller-owned, unpublished scratch, whose bytes can change during rendering.
+Failure attempts to seek and truncate that stream; cleanup can itself fail, so
+neither prior-content preservation nor unconditional empty scratch is claimed.
+Exact-byte differential, measured concurrency-bound, validation/serialization
+fault, and scratch-cleanup tests provide implementation evidence. Reader-visible
+publication belongs to the separate library activation protocol and model.
 
 The worker-policy Lean theorems prove only that natural-number auto selection is
 clamped into `1..16`, that a valid explicit override is preserved exactly, and

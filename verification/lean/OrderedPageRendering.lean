@@ -1,7 +1,7 @@
 import Std
 
 /-!
-# Bounded concurrent page rendering with ordered publication
+# Bounded concurrent page rendering with ordered serialization
 
 The renderer is modeled as a deterministic pure function from one indexed page
 to its exact bytes and evidence.  A `BoundedExecution` may complete pages in any
@@ -13,17 +13,19 @@ the exact result at increasing page index.
 The main theorem proves that ordered collection equals the sequential map for
 arbitrary page count, valid batching, and completion schedule.  Consequently
 any deterministic canonical serializer receives the same ordered bytes and
-evidence.  A separate publish-last model exposes a completed archive only after
-worker execution, validation, and serialization all succeed; each earlier
-failure leaves the prior destination unchanged.
+evidence. The abstract serialized value is not a separate CBZ file. Runtime
+writes directly into caller-owned, unpublished scratch: scratch bytes may change
+during rendering, and failure attempts to discard them. Cleanup itself can fail.
+These theorems do not establish destination byte preservation or guarantee that
+failed scratch is empty. Reader-visible publication belongs to the
+separate library activation protocol, not to this renderer model.
 
 These are mathematical results under the explicit pure-renderer and exact
 completion assumptions.  They do not prove Pillow determinism or thread
 safety, Python future/executor behavior, spool cleanup, filesystem semantics,
-ZIP serialization, or that production code refines this model.  The model also
-does not claim destination preservation when the final destination write itself
-fails.  Exact-byte, concurrency, and fault tests remain required implementation
-evidence.
+ZIP serialization, or that production code refines this model. Exact-byte,
+concurrency, write/validation failure, and scratch-cleanup fault tests remain
+required implementation evidence.
 -/
 
 namespace H2HDBIngest.Verification.OrderedPageRendering
@@ -662,45 +664,5 @@ theorem every_deterministic_serializer_observes_sequential_input
       serialize (sequentialMap pages render) := by
   rw [arbitrary_bounded_schedule_ordered_collect_equals_sequential_map
     pages render execution]
-
-inductive PreparationResult where
-  | ready (archive : SerializedArchive)
-  | workerFailure
-  | validationFailure
-  | serializationFailure
-deriving DecidableEq, Repr
-
-/-- Destination mutation is the last step and occurs only for `ready`. -/
-def publishLast
-    (destination : List Nat)
-    (prepared : PreparationResult) : List Nat :=
-  match prepared with
-  | .ready archive => archive.bytes
-  | .workerFailure => destination
-  | .validationFailure => destination
-  | .serializationFailure => destination
-
-theorem worker_failure_preserves_destination
-    (destination : List Nat) :
-    publishLast destination .workerFailure = destination := by
-  rfl
-
-theorem validation_failure_preserves_destination
-    (destination : List Nat) :
-    publishLast destination .validationFailure = destination := by
-  rfl
-
-theorem serialization_failure_preserves_destination
-    (destination : List Nat) :
-    publishLast destination .serializationFailure = destination := by
-  rfl
-
-theorem every_prepublication_failure_preserves_destination
-    (destination : List Nat)
-    (result : PreparationResult)
-    (failed : result = .workerFailure ∨ result = .validationFailure ∨
-      result = .serializationFailure) :
-    publishLast destination result = destination := by
-  cases result <;> simp_all [publishLast]
 
 end H2HDBIngest.Verification.OrderedPageRendering

@@ -2,19 +2,25 @@
 EXTENDS FiniteSets, Naturals, Sequences, TLC
 
 (***************************************************************************
-Finite refinement model for bounded concurrent page rendering.
+Finite abstract model for bounded concurrent page rendering.
 
 Rendered(page) is a deterministic pure page renderer.  A run chooses a worker
 count and arbitrary non-empty batches no larger than that count.  CompletePage
 may finish each page in any order, while CollectPage can append only the next
-canonical page index.  Validation and serialization happen after every page
-has been collected.  PublishLast is the sole action that changes destination.
+canonical page index. Abstract validation and serialization happen after every
+page has been collected. READY contains the exact sequential serialization.
+
+The abstract staged value is not a second CBZ file or a storage-I/O schedule.
+Runtime writes directly into caller-owned, unpublished scratch: scratch bytes
+may change during rendering. Failure attempts to discard those bytes, but
+cleanup itself can fail. FAILED deliberately imposes no empty-scratch or
+prior-destination-preservation requirement. Reader-visible publication belongs
+to the separate library activation protocol, not to this renderer model.
 
 TLC exhaustively checks the configured finite PageCount and MaxWorkers.  This
 model does not establish Pillow determinism or thread safety, Python executor
 or future semantics, cancellation and spool cleanup, ZIP behavior, filesystem
-atomicity or durability, or refinement by the production implementation.  It
-does not model a failure during the final destination write itself.
+atomicity or durability, or refinement by the production implementation.
 ***************************************************************************)
 
 CONSTANTS PageCount, MaxWorkers
@@ -30,7 +36,6 @@ SequentialPages == [page \in Pages |-> Rendered(page)]
 
 ArchiveHeader == <<999>>
 SequentialArchive == ArchiveHeader \o SequentialPages
-OriginalDestination == <<777>>
 FailedStaging == <<888>>
 
 VARIABLES
@@ -43,13 +48,12 @@ VARIABLES
     collectCursor,
     collected,
     staged,
-    destination,
     failureKind,
     lastEvent
 
 vars ==
     <<workerCount, phase, nextPage, batchStart, batchEnd, completed,
-      collectCursor, collected, staged, destination, failureKind, lastEvent>>
+      collectCursor, collected, staged, failureKind, lastEvent>>
 
 CurrentBatch ==
     IF batchStart = 0 THEN {} ELSE batchStart..batchEnd
@@ -64,7 +68,6 @@ Init ==
     /\ collectCursor = 0
     /\ collected = <<>>
     /\ staged = <<>>
-    /\ destination = OriginalDestination
     /\ failureKind = "NONE"
     /\ lastEvent = "INIT"
 
@@ -82,7 +85,7 @@ StartBatch ==
     /\ completed' = {}
     /\ lastEvent' = "START_BATCH"
     /\ UNCHANGED <<workerCount, phase, nextPage, collected, staged,
-                    destination, failureKind>>
+                    failureKind>>
 
 CompletePage(page) ==
     /\ phase = "RENDERING"
@@ -91,7 +94,7 @@ CompletePage(page) ==
     /\ completed' = completed \cup {page}
     /\ lastEvent' = "COMPLETE_PAGE"
     /\ UNCHANGED <<workerCount, phase, nextPage, batchStart, batchEnd,
-                    collectCursor, collected, staged, destination,
+                    collectCursor, collected, staged,
                     failureKind>>
 
 CollectPage ==
@@ -103,7 +106,7 @@ CollectPage ==
     /\ collectCursor' = collectCursor + 1
     /\ lastEvent' = "COLLECT_PAGE"
     /\ UNCHANGED <<workerCount, phase, nextPage, batchStart, batchEnd,
-                    completed, staged, destination, failureKind>>
+                    completed, staged, failureKind>>
 
 FinishBatch ==
     /\ phase = "RENDERING"
@@ -116,7 +119,7 @@ FinishBatch ==
     /\ completed' = {}
     /\ collectCursor' = 0
     /\ lastEvent' = "FINISH_BATCH"
-    /\ UNCHANGED <<workerCount, collected, staged, destination, failureKind>>
+    /\ UNCHANGED <<workerCount, collected, staged, failureKind>>
 
 WorkerFailure ==
     /\ phase = "RENDERING"
@@ -124,14 +127,14 @@ WorkerFailure ==
     /\ failureKind' = "WORKER"
     /\ lastEvent' = "WORKER_FAILURE"
     /\ UNCHANGED <<workerCount, nextPage, batchStart, batchEnd, completed,
-                    collectCursor, collected, staged, destination>>
+                    collectCursor, collected, staged>>
 
 ValidationSuccess ==
     /\ phase = "VALIDATING"
     /\ phase' = "SERIALIZING"
     /\ lastEvent' = "VALIDATION_SUCCESS"
     /\ UNCHANGED <<workerCount, nextPage, batchStart, batchEnd, completed,
-                    collectCursor, collected, staged, destination,
+                    collectCursor, collected, staged,
                     failureKind>>
 
 ValidationFailure ==
@@ -140,7 +143,7 @@ ValidationFailure ==
     /\ failureKind' = "VALIDATION"
     /\ lastEvent' = "VALIDATION_FAILURE"
     /\ UNCHANGED <<workerCount, nextPage, batchStart, batchEnd, completed,
-                    collectCursor, collected, staged, destination>>
+                    collectCursor, collected, staged>>
 
 SerializationSuccess ==
     /\ phase = "SERIALIZING"
@@ -148,7 +151,7 @@ SerializationSuccess ==
     /\ phase' = "READY"
     /\ lastEvent' = "SERIALIZATION_SUCCESS"
     /\ UNCHANGED <<workerCount, nextPage, batchStart, batchEnd, completed,
-                    collectCursor, collected, destination, failureKind>>
+                    collectCursor, collected, failureKind>>
 
 SerializationFailure ==
     /\ phase = "SERIALIZING"
@@ -157,18 +160,10 @@ SerializationFailure ==
     /\ failureKind' = "SERIALIZATION"
     /\ lastEvent' = "SERIALIZATION_FAILURE"
     /\ UNCHANGED <<workerCount, nextPage, batchStart, batchEnd, completed,
-                    collectCursor, collected, destination>>
-
-PublishLast ==
-    /\ phase = "READY"
-    /\ destination' = staged
-    /\ phase' = "PUBLISHED"
-    /\ lastEvent' = "PUBLISH_LAST"
-    /\ UNCHANGED <<workerCount, nextPage, batchStart, batchEnd, completed,
-                    collectCursor, collected, staged, failureKind>>
+                    collectCursor, collected>>
 
 TerminalStutter ==
-    /\ phase \in {"FAILED", "PUBLISHED"}
+    /\ phase \in {"FAILED", "READY"}
     /\ UNCHANGED vars
 
 Next ==
@@ -181,7 +176,6 @@ Next ==
     \/ ValidationFailure
     \/ SerializationSuccess
     \/ SerializationFailure
-    \/ PublishLast
     \/ TerminalStutter
 
 Spec == Init /\ [][Next]_vars
@@ -189,8 +183,7 @@ Spec == Init /\ [][Next]_vars
 TypeOK ==
     /\ workerCount \in 1..MaxWorkers
     /\ phase \in
-        {"RENDERING", "VALIDATING", "SERIALIZING", "READY", "PUBLISHED",
-         "FAILED"}
+        {"RENDERING", "VALIDATING", "SERIALIZING", "READY", "FAILED"}
     /\ nextPage \in 1..(PageCount + 1)
     /\ batchStart \in 0..PageCount
     /\ batchEnd \in 0..PageCount
@@ -198,13 +191,12 @@ TypeOK ==
     /\ collectCursor \in 0..(PageCount + 1)
     /\ collected \in Seq(Nat)
     /\ staged \in Seq(Nat)
-    /\ destination \in Seq(Nat)
     /\ failureKind \in {"NONE", "WORKER", "VALIDATION", "SERIALIZATION"}
     /\ lastEvent \in
         {"INIT", "START_BATCH", "COMPLETE_PAGE", "COLLECT_PAGE",
          "FINISH_BATCH", "WORKER_FAILURE", "VALIDATION_SUCCESS",
          "VALIDATION_FAILURE", "SERIALIZATION_SUCCESS",
-         "SERIALIZATION_FAILURE", "PUBLISH_LAST"}
+         "SERIALIZATION_FAILURE"}
 
 WorkerCountHardBound ==
     /\ 1 \leq workerCount
@@ -223,20 +215,11 @@ OrderedCollectIsSequentialPrefix ==
     /\ collected = [page \in 1..Len(collected) |-> Rendered(page)]
 
 AllCollectedBeforePostProcessing ==
-    phase \in {"VALIDATING", "SERIALIZING", "READY", "PUBLISHED"}
+    phase \in {"VALIDATING", "SERIALIZING", "READY"}
         => collected = SequentialPages
 
-ReadyOrPublishedHasSequentialSerialization ==
-    phase \in {"READY", "PUBLISHED"} => staged = SequentialArchive
-
-FailurePreservesDestination ==
-    phase = "FAILED" => destination = OriginalDestination
-
-DestinationChangesOnlyAtPublish ==
-    phase # "PUBLISHED" => destination = OriginalDestination
-
-PublishedDestinationIsSequential ==
-    phase = "PUBLISHED" => destination = SequentialArchive
+ReadyHasSequentialSerialization ==
+    phase = "READY" => staged = SequentialArchive
 
 Safety ==
     /\ TypeOK
@@ -245,9 +228,6 @@ Safety ==
     /\ FinishedWithinCurrentBatch
     /\ OrderedCollectIsSequentialPrefix
     /\ AllCollectedBeforePostProcessing
-    /\ ReadyOrPublishedHasSequentialSerialization
-    /\ FailurePreservesDestination
-    /\ DestinationChangesOnlyAtPublish
-    /\ PublishedDestinationIsSequential
+    /\ ReadyHasSequentialSerialization
 
 =============================================================================
