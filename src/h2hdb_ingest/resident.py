@@ -23,6 +23,7 @@ from h2hdb import (
     VNextSourceManifestMismatchError,
 )
 
+from ._log_recovery import RecoveryLog
 from .artifact_errors import format_artifact_failure
 from .config import ResidentConfig
 from .filesystem import FilesystemSourceChangedError
@@ -119,6 +120,18 @@ class ResidentIngestor:
                 "artifact-enabled resident requires a library storage identity"
             )
         self._config = config
+        self._library_maintenance_failure_log = RecoveryLog(
+            logger,
+            operation="library_cleanup",
+            interval_seconds=config.progress_log_interval_seconds,
+            clock=monotonic,
+        )
+        self._catalog_maintenance_failure_log = RecoveryLog(
+            logger,
+            operation="catalog_cleanup",
+            interval_seconds=config.progress_log_interval_seconds,
+            clock=monotonic,
+        )
         self._database_type = database_type.casefold()
         self._event_logger = event_logger or logger.info
         self._progress = progress
@@ -411,7 +424,7 @@ class ResidentIngestor:
                     f"mutation: {completion_error!r}"
                 )
                 raise error from completion_error
-            self._event_logger("source changed during synchronization; retry pending")
+            logger.debug("source changed during synchronization; retry pending")
             return _ResidentCycleOutcome.SOURCE_CHANGED
         except VNextSourceManifestMismatchError as error:
             # The mismatch has already abandoned the exact build.  Completing
@@ -468,7 +481,7 @@ class ResidentIngestor:
             # Publication and lease completion are already durable. Report
             # cleanup pressure without claiming that this batch rolled back.
             self._wait_for_storage_capacity(error, operation="completed batch cleanup")
-        self._event_logger(
+        logger.debug(
             "vNext ingest session completed: "
             f"generation={completion.ingest_generation} "
             f"replayed={completion.replayed}"
@@ -571,6 +584,7 @@ class ResidentIngestor:
         self._progress_operation("library_cleanup")
         try:
             outcome = self._run_library_maintenance()
+            self._library_maintenance_failure_log.recovered()
             if outcome is LibraryMaintenanceOutcome.PROGRESSED:
                 work = self._current_progress()
                 if work is not None:
@@ -582,7 +596,7 @@ class ResidentIngestor:
         except Exception as error:
             if storage_capacity_error(error) is not None:
                 raise
-            logger.exception("library maintenance attempt failed")
+            self._library_maintenance_failure_log.log_failure(error)
             return None
 
     def _run_library_maintenance(self) -> LibraryMaintenanceOutcome:
@@ -608,6 +622,7 @@ class ResidentIngestor:
                 duration,
                 artifact_release_adapters=self._artifact_release_adapters,
             )
+            self._catalog_maintenance_failure_log.recovered()
             if outcome is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED:
                 work = self._current_progress()
                 if work is not None:
@@ -623,7 +638,7 @@ class ResidentIngestor:
             # completion.  Maintenance is response-loss safe and the resident
             # retries on the next poll, so a transient failure must not make a
             # completed ingest appear to have rolled back.
-            logger.exception("current-only maintenance attempt failed")
+            self._catalog_maintenance_failure_log.log_failure(error)
             return None
 
     def _current_progress(self) -> ProgressWork | None:

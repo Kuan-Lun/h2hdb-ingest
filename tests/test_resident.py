@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import logging
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -286,6 +287,7 @@ def _resident(
     artifact_release_adapters: Mapping[bytes, ArtifactReleaseAdapter] | None = None,
     facade: _Facade | None = None,
     temporary_cleanup: Callable[[], object] | None = None,
+    progress_log_interval_seconds: float = 3600,
 ) -> ResidentIngestor:
     facade = facade or _Facade(
         events,
@@ -301,6 +303,7 @@ def _resident(
         library_storage_identity=library_storage_identity,
         library_maintenance=(library_maintenance or _LibraryMaintenance()),
         config=ResidentConfig(
+            progress_log_interval_seconds=progress_log_interval_seconds,
             source_quiet_seconds=5,
             source_max_wait_seconds=60,
             poll_seconds=1,
@@ -317,7 +320,9 @@ def _resident(
 
 def test_startup_only_checks_existing_epoch_and_processes_one_session(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger=resident_module.__name__)
     events: list[object] = []
     monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
     resident = _resident(events)
@@ -339,10 +344,10 @@ def test_startup_only_checks_existing_epoch_and_processes_one_session(
     ]
     assert events[6] == ("complete", 2)
     assert events[7] == ("current-only", 10_000_000)
-    assert events[8] == (
-        "log",
-        "vNext ingest session completed: generation=2 replayed=False",
-    )
+    assert len(events) == 8
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.DEBUG, "vNext ingest session completed: generation=2 replayed=False")
+    ]
 
 
 def test_maintenance_preserves_last_completed_publication_progress(
@@ -729,6 +734,129 @@ def test_poll_keeps_library_maintenance_failure_best_effort() -> None:
     ]
 
 
+@pytest.mark.parametrize("operation", ["library_cleanup", "catalog_cleanup"])
+def test_maintenance_errors_are_summarized_without_skipping_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    operation: str,
+) -> None:
+    events: list[object] = []
+    now = [0.0]
+    failure: str | None = "first error"
+    attempts = 0
+
+    def attempt() -> None:
+        nonlocal attempts
+        attempts += 1
+        if failure is not None:
+            raise OSError(errno.EIO, failure, "/library/damaged-entry")
+
+    class FailingLibrary(_LibraryMaintenance):
+        def maintain_cleanup(self) -> LibraryMaintenanceOutcome:
+            if operation == "library_cleanup":
+                attempt()
+            return super().maintain_cleanup()
+
+    class FailingFacade(_Facade):
+        def drain_current_only_maintenance(
+            self,
+            lease_duration_microseconds: int,
+            *,
+            artifact_release_adapters: object,
+        ) -> VNextCurrentOnlyMaintenanceOutcome:
+            if operation == "catalog_cleanup":
+                attempt()
+            return super().drain_current_only_maintenance(
+                lease_duration_microseconds,
+                artifact_release_adapters=artifact_release_adapters,
+            )
+
+    monkeypatch.setattr(resident_module, "monotonic", lambda: now[0])
+    caplog.set_level(logging.INFO, logger=resident_module.__name__)
+    resident = _resident(
+        events,
+        facade=FailingFacade(events, available=False),
+        library_maintenance=FailingLibrary(),
+        progress_log_interval_seconds=30,
+    )
+    assert not resident.process_available(periodic_scan=False)
+    assert len(caplog.records) == 1
+    first = caplog.records[0]
+    assert first.levelno == logging.ERROR
+    assert f"operation={operation} suppressed_repeats=0" in first.getMessage()
+    assert first.exc_info is not None
+    assert "/library/damaged-entry" in str(first.exc_info[1])
+    for second in range(1, 20):
+        now[0] = float(second)
+        assert not resident.process_available(periodic_scan=False)
+    now[0] = 29.999
+    assert not resident.process_available(periodic_scan=False)
+    assert len(caplog.records) == 1
+    assert attempts == 21
+    assert events.count(("claim", False, 10_000_000)) == attempts
+
+    now[0] = 30.0
+    assert not resident.process_available(periodic_scan=False)
+    assert len(caplog.records) == 2
+    assert "suppressed_repeats=20" in caplog.records[-1].getMessage()
+    assert caplog.records[-1].exc_info is not None
+
+    now[0] = 31.0
+    failure = "different error"
+    assert not resident.process_available(periodic_scan=False)
+    assert len(caplog.records) == 3
+    assert "different error" in str(caplog.records[-1].exc_info)
+    now[0] = 32.0
+    assert not resident.process_available(periodic_scan=False)
+    assert len(caplog.records) == 3
+
+    failure = None
+    now[0] = 33.0
+    assert not resident.process_available(periodic_scan=False)
+    assert len(caplog.records) == 4
+    recovered = caplog.records[-1]
+    assert recovered.levelno == logging.INFO
+    assert recovered.getMessage() == (
+        f"Operation recovered: operation={operation} suppressed_repeats=21"
+    )
+    assert not resident.process_available(periodic_scan=False)
+    assert len(caplog.records) == 4
+    failure = "different error"
+    assert not resident.process_available(periodic_scan=False)
+    assert len(caplog.records) == 5
+    assert "suppressed_repeats=0" in caplog.records[-1].getMessage()
+    assert attempts == 27
+    assert events.count(("claim", False, 10_000_000)) == attempts
+
+
+def test_maintenance_failure_diagnostics_are_independent_per_operation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[object] = []
+
+    class FailingFacade(_Facade):
+        def drain_current_only_maintenance(
+            self,
+            lease_duration_microseconds: int,
+            *,
+            artifact_release_adapters: object,
+        ) -> VNextCurrentOnlyMaintenanceOutcome:
+            del lease_duration_microseconds, artifact_release_adapters
+            raise RuntimeError("library layout unavailable")
+
+    resident = _resident(
+        events,
+        facade=FailingFacade(events, available=False),
+        library_maintenance=_FailingLibraryMaintenance(),
+    )
+    for _ in range(20):
+        assert not resident.process_available(periodic_scan=False)
+    assert len(caplog.records) == 2
+    assert "operation=library_cleanup" in caplog.records[0].getMessage()
+    assert "operation=catalog_cleanup" in caplog.records[1].getMessage()
+    assert events.count(("claim", False, 10_000_000)) == 20
+
+
 def test_requested_stop_skips_maintenance_and_does_not_claim_new_work() -> None:
     events: list[object] = []
     library_maintenance = _LibraryMaintenance()
@@ -1079,10 +1207,11 @@ def test_maintenance_failure_does_not_undo_completed_ingest(
 
     assert resident.process_available(periodic_scan=True)
     assert ("complete", 2) in events
-    assert events[-1] == (
+    assert (
         "log",
-        "vNext ingest session completed: generation=2 replayed=False",
-    )
+        "vNext ingest publication batch completed: deferred_galleries=0 "
+        "known_galleries=1",
+    ) in events
 
 
 def test_run_forever_retries_progress_immediately_without_resetting_source_deadline(
@@ -1311,7 +1440,9 @@ def test_stop_between_due_claim_and_handoff_fallback_prevents_new_claim() -> Non
     "source_error", [VNextSourceChangedError, FilesystemSourceChangedError]
 )
 def test_transient_source_mutation_completes_after_heartbeat_shutdown(
-    monkeypatch: pytest.MonkeyPatch, source_error: type[RuntimeError]
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    source_error: type[RuntimeError],
 ) -> None:
     events: list[object] = []
 
@@ -1333,6 +1464,7 @@ def test_transient_source_mutation_completes_after_heartbeat_shutdown(
 
     monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _OrderedHeartbeat)
     resident = _resident(events, service=_ChangingService(events))
+    caplog.set_level(logging.DEBUG, logger=resident_module.__name__)
     assert not resident.process_available(periodic_scan=True)
     assert events == [
         ("current-only", 10_000_000),
@@ -1341,7 +1473,9 @@ def test_transient_source_mutation_completes_after_heartbeat_shutdown(
         "heartbeat-stop",
         ("complete", 2),
         ("current-only", 10_000_000),
-        ("log", "source changed during synchronization; retry pending"),
+    ]
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.DEBUG, "source changed during synchronization; retry pending")
     ]
 
 

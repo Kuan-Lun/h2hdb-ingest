@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import pytest
 from h2hdb import ArtifactFailureContext
 
 from h2hdb_ingest.artifact_errors import (
     PageFailureContext,
     attach_image_dimensions,
     attach_page_failure_context,
+    attach_qualification_failure_context,
     format_artifact_failure,
     get_page_failure_context,
 )
@@ -105,3 +107,66 @@ def test_page_context_lookup_terminates_on_cyclic_cause_and_keeps_first_member()
         failure, source_position=3, source_name=b"wrong.jpg", expected_size_bytes=13
     )
     assert get_page_failure_context(failure) == PageFailureContext(2, b"exact.jpg", 12)
+
+
+@pytest.mark.parametrize("wrapped", (False, True))
+def test_qualification_failure_keeps_original_error_and_context_through_causes(
+    wrapped: bool,
+) -> None:
+    failure = OSError(28, "source spool is full")
+    original_args = failure.args
+    attach_page_failure_context(
+        failure, source_position=3, source_name=b"004.png", expected_size_bytes=12345
+    )
+    attach_qualification_failure_context(
+        failure, ArtifactFailureContext(812, ("source",), ("作品",))
+    )
+    observed: BaseException = failure
+    if wrapped:
+        observed = RuntimeError("qualification could not finish")
+        observed.__cause__ = failure
+    diagnostic = format_artifact_failure(observed)
+    assert diagnostic is not None
+    assert 'event="gallery_image_check_failed"' in diagnostic
+    assert 'gid=812 gallery_folder="/source/作品"' in diagnostic
+    assert 'file="004.png" source_bytes=12345 source_position=3' in diagnostic
+    assert 'error_type="OSError"' in diagnostic
+    assert "action=abort_batch qualification=not_saved" in diagnostic
+    assert diagnostic in failure.__notes__
+    assert failure.args == original_args
+    if wrapped:
+        assert observed.__cause__ is failure
+    else:
+        assert observed is failure
+
+
+def test_qualification_context_preserves_first_owner_and_does_not_duplicate_notes() -> (
+    None
+):
+    failure = OSError("disk unavailable")
+    failure.__cause__ = failure
+    assert format_artifact_failure(failure) is None
+    attach_qualification_failure_context(
+        failure, ArtifactFailureContext(15, ("source",), ("first",))
+    )
+    notes = tuple(failure.__notes__)
+    attach_qualification_failure_context(
+        failure, ArtifactFailureContext(16, ("source",), ("second",))
+    )
+    diagnostic = format_artifact_failure(failure)
+    assert diagnostic is not None
+    assert 'gid=15 gallery_folder="/source/first"' in diagnostic
+    assert "second" not in diagnostic
+    assert tuple(failure.__notes__) == notes == (diagnostic,)
+
+
+def test_qualification_context_does_not_leak_through_ambient_exception_context() -> (
+    None
+):
+    unrelated = OSError("source failure")
+    attach_qualification_failure_context(
+        unrelated, ArtifactFailureContext(15, ("source",), ("first",))
+    )
+    failure = RuntimeError("lease owner changed")
+    failure.__context__ = unrelated
+    assert format_artifact_failure(failure) is None

@@ -14,9 +14,18 @@ __all__ = [
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from threading import RLock
 from typing import Protocol
 
+from ._log_recovery import RecoveryLog
+
 logger = logging.getLogger(__name__)
+
+
+def _configure_metric_log_interval(interval_seconds: float) -> None:
+    """Reset the one process-owned metric delivery diagnostic at configuration."""
+    global _sink_failures
+    _sink_failures = _MetricSinkDiagnostics(interval_seconds=interval_seconds)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +99,43 @@ class IngestMetricSink(Protocol):
         """Consume one complete metric."""
 
 
+class _MetricSinkDiagnostics:
+    """Retain only the latest failed callable and its bounded diagnostic state.
+
+    Only that same callable's successful delivery establishes recovery. A failure
+    from a different sink replaces the owner and is reported immediately; there
+    is no growing per-sink registry and no claim that the previous sink recovered.
+    """
+
+    def __init__(
+        self, *, interval_seconds: float, clock: Callable[[], float] | None = None
+    ) -> None:
+        self._lock = RLock()
+        self._owner: IngestMetricSink | None = None
+        self._reporter = RecoveryLog(
+            logger,
+            operation="ingest metric sink",
+            interval_seconds=interval_seconds,
+            clock=clock,
+        )
+
+    def failed(self, sink: IngestMetricSink, error: BaseException) -> None:
+        with self._lock:
+            if sink is not self._owner:
+                self._reporter.reset()
+                self._owner = sink
+            self._reporter.log_failure(error)
+
+    def succeeded(self, sink: IngestMetricSink) -> None:
+        with self._lock:
+            if sink is self._owner:
+                self._owner = None
+                self._reporter.recovered()
+
+
+_sink_failures = _MetricSinkDiagnostics(interval_seconds=3600.0)
+
+
 @dataclass(frozen=True, slots=True)
 class TextIngestMetricSink:
     """Emit one compact log record for each complete metric."""
@@ -135,8 +181,10 @@ def emit_ingest_metric(
         return
     try:
         sink(metric)
-    except Exception:
-        logger.exception("ingest metric sink failed")
+    except Exception as error:
+        _sink_failures.failed(sink, error)
+    else:
+        _sink_failures.succeeded(sink)
 
 
 def _validate_metric_values(

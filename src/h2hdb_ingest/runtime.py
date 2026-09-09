@@ -31,7 +31,7 @@ from .maintenance import (
     LibraryMaintenanceAdapter,
     LibraryMaintenanceOutcome,
 )
-from .metrics import TextIngestMetricSink
+from .metrics import TextIngestMetricSink, _configure_metric_log_interval
 from .page_workers import _decide_page_render_workers
 from .policy import build_ingest_policy
 from .progress import IngestProgress
@@ -123,7 +123,11 @@ def build_runtime(
         catalog = VNextCatalogFacade(config.core)
         owned_closers.append(catalog.close)
         runtime_event_logger = event_logger or logger.info
-        metrics_sink = TextIngestMetricSink(runtime_event_logger)
+        # Timing/counter records are diagnostics, independent of the human
+        # progress callback and its INFO-level delivery.
+        metrics_sink = TextIngestMetricSink(
+            logging.getLogger("h2hdb_ingest.metrics").debug
+        )
         progress = IngestProgress(
             runtime_event_logger,
             interval_seconds=config.resident.progress_log_interval_seconds,
@@ -216,19 +220,34 @@ def build_runtime(
 
 
 def configure_logging(config: IngestConfig) -> None:
-    """Configure the process logger from the embedded public core settings."""
+    """Own the process handlers and apply core levels plus dependency verbosity."""
 
     if not isinstance(config, IngestConfig):
         raise TypeError("config must be IngestConfig")
+    _configure_metric_log_interval(config.resident.progress_log_interval_seconds)
+    level = int(config.core.logger.level)
+    dependency_level = (
+        logging.DEBUG if level <= logging.DEBUG else max(level, logging.WARNING)
+    )
+    # These libraries emit normal decoder/authentication details at INFO.
+    # Logger propagation does not re-check the root logger's level, so their
+    # explicit thresholds must also honor ERROR/CRITICAL configurations.
+    logging.getLogger("mysql.connector").setLevel(dependency_level)
+    # Native VIPS processing details are INFO. Python-wrapper DEBUG formats
+    # Image objects whose repr logs again; parallel console/file handlers can
+    # deadlock on those recursive records. Keep that wrapper tracing disabled
+    # even in application DEBUG mode, while retaining native diagnostics.
+    logging.getLogger("pyvips").setLevel(max(logging.INFO, dependency_level))
     handlers: list[logging.Handler] = [logging.StreamHandler()]
     log_file = config.core.logger.file
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
     logging.basicConfig(
-        level=int(config.core.logger.level),
+        level=level,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=handlers,
+        force=True,
     )
 
 

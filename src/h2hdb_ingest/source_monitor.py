@@ -198,7 +198,7 @@ class SourceChangeMonitor:
                     # An incomplete pass cannot establish absence. Its
                     # comparison transaction rolls back before the next probe.
                     self._changed()
-                    logger.info("source changed during metadata probe; retrying")
+                    logger.debug("source changed during metadata probe; retrying")
                 else:
                     raise
             else:

@@ -18,7 +18,11 @@ from .artifact import (
     ArtifactRenderPolicy,
     load_source_page_image,
 )
-from .artifact_errors import attach_page_failure_context, format_artifact_failure
+from .artifact_errors import (
+    attach_page_failure_context,
+    attach_qualification_failure_context,
+    format_artifact_failure,
+)
 from .filesystem import (
     FilesystemArtifactSourceRole,
     FilesystemFileObservation,
@@ -222,16 +226,18 @@ class ImageGalleryQualifier:
                     if failure is None:
                         failure = additional
         except Exception as error:
-            message = format_artifact_failure(
+            attach_qualification_failure_context(
                 error,
-                event="gallery_image_check_failed",
-                context=ArtifactFailureContext(
+                ArtifactFailureContext(
                     gid=observed.metadata.gid,
                     source_root_components=source.source_root_components,
                     gallery_locator_components=locator,
                 ),
             )
-            logger.error("%s action=abort_batch qualification=not_saved", message)
+            # The resident owns fatal/capacity reporting and retry suppression.
+            # Keep standalone diagnostics on the original exception and at DEBUG;
+            # logging ERROR here would repeat it on every storage-pressure retry.
+            logger.debug("%s", format_artifact_failure(error))
             raise
         if work is not None:
             work.advance("source_galleries_qualified")

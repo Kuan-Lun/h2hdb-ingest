@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
@@ -228,7 +229,10 @@ def test_raw_empty_partial_and_complete_markers_extend_the_same_quiet_window(
         index.close()
 
 
-def test_monitor_retries_transient_mutation_and_retains_dirty_generation() -> None:
+def test_monitor_retries_transient_mutation_and_retains_dirty_generation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="h2hdb_ingest.source_monitor")
     retried = Event()
     attempts = 0
     schedule = SourceScanSchedule(quiet_seconds=300, max_wait_seconds=1800, now=0)
@@ -254,6 +258,9 @@ def test_monitor_retries_transient_mutation_and_retains_dirty_generation() -> No
         monitor.raise_if_failed()
         assert schedule.next_scan_at() == 400
     monitor.raise_if_failed()
+    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
+        (logging.DEBUG, "source changed during metadata probe; retrying")
+    ]
 
 
 def test_monitor_reports_unsafe_source_as_fatal() -> None:

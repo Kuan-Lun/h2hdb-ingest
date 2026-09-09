@@ -267,14 +267,44 @@ transitions and work completion are reported immediately. Operation changes only
 update the next summary; they do not emit a log for every gallery or page. Nested
 preparation restores its enclosing operation when it returns or fails, so the
 summary does not keep reporting a completed discovery operation. The interval
-only controls periodic progress summaries; existing artifact and publication
-metrics retain their completion records.
+only controls periodic progress summaries and repeated maintenance-failure
+diagnostics. It does not emit a completion record for every image or gallery.
 
 An idle resident with no pending work emits no periodic progress record.
 Pending scans, lease waits and cleanup retain their original work timer across
 polls. Startup validation and blocked preparation or library-lock calls remain
 observable while the reporting thread can run. Summaries describe observations,
 not a wall-clock timeout or a promise that a blocked operation will finish.
+
+Normal INFO output contains startup details, phase boundaries, publication-batch
+results and periodic progress. Detailed `ingest_metric` records (including archive,
+thumbnail and publication timings), session receipts and ordinary source-change
+retries are DEBUG diagnostics. The optional `build_runtime(event_logger=...)`
+callback receives human progress/events; metrics use the
+`h2hdb_ingest.metrics` logger independently.
+
+At normal verbosity, `pyvips` and `mysql.connector` retain WARNING and higher
+severity, respecting stricter ERROR/CRITICAL settings. Setting
+`core.logger.level` to `DEBUG` enables native VIPS processing details and ingest
+metrics. Python-wrapper pyvips DEBUG tracing remains disabled: formatting an
+image can recursively log and deadlock parallel console/file handlers. Native
+VIPS details are emitted at INFO by that dependency and are enabled only in the
+application's DEBUG mode. Explicit `configure_logging` replaces and closes the
+previous process handlers, so reconfiguration neither ignores settings nor
+duplicates console/file output.
+
+Repeated failures of each maintenance operation or metric delivery are summarized
+using bounded in-memory state: the first failure and a changed error retain their
+traceback, identical failures are counted until the configured interval, and one
+INFO record reports recovery. Metric recovery requires the same failing callback
+to succeed; switching to another failing callback starts a new diagnostic sequence.
+Only the latest failed metric callback is retained, without a growing registry.
+This changes diagnostics only; it does not reduce maintenance retries or replay
+lost metrics. Fatal image-check diagnostics are
+attached to the original exception and reported by the resident, allowing
+storage-pressure retries to coalesce without losing gallery/file context.
+Distinct rejected galleries retain their WARNING with the exact folder, file and
+reason; their unchanged qualification results are reused normally.
 
 The detailed `ingest_progress event=... generation=... counter...` records are
 emitted at DEBUG. Counters belong to one process-local work generation and are

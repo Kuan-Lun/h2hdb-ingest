@@ -559,7 +559,7 @@ def test_runtime_logs_the_worker_decision_once_not_per_archive(
         )
 
     assert len(_worker_lines(events)) == 1
-    assert sum(event.startswith("ingest_metric ") for event in events) == 3
+    assert not any(event.startswith("ingest_metric ") for event in events)
 
 
 def test_artifact_disabled_runtime_does_not_log_or_probe_worker_selection(

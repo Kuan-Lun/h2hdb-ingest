@@ -6,6 +6,7 @@ __all__ = [
     "PageFailureContext",
     "attach_image_dimensions",
     "attach_page_failure_context",
+    "attach_qualification_failure_context",
     "format_artifact_failure",
     "get_page_failure_context",
 ]
@@ -20,6 +21,7 @@ _MAXIMUM_ERROR_CHAIN = 32
 _MAXIMUM_FIELD_CHARACTERS = 4096
 _PAGE_CONTEXT_ATTRIBUTE = "_h2hdb_ingest_page_failure_context"
 _DIMENSIONS_ATTRIBUTE = "_h2hdb_ingest_image_dimensions"
+_QUALIFICATION_ATTRIBUTE = "_h2hdb_ingest_qualification_failure_context"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +54,26 @@ def _error_chain(error: BaseException) -> tuple[BaseException, ...]:
         chain.append(current)
         current = current.__cause__
     return tuple(chain)
+
+
+def _qualification_context(error: BaseException) -> ArtifactFailureContext | None:
+    for cause in _error_chain(error):
+        context = getattr(cause, _QUALIFICATION_ATTRIBUTE, None)
+        if isinstance(context, ArtifactFailureContext):
+            return context
+    return None
+
+
+def attach_qualification_failure_context(
+    error: BaseException, context: ArtifactFailureContext
+) -> None:
+    """Keep source identity on the original error for the orchestration logger."""
+    if _qualification_context(error) is not None:
+        return
+    setattr(error, _QUALIFICATION_ATTRIBUTE, context)
+    diagnostic = format_artifact_failure(error)
+    if diagnostic is not None:
+        error.add_note(diagnostic)
 
 
 def attach_image_dimensions(
@@ -127,9 +149,17 @@ def format_artifact_failure(
 ) -> str | None:
     """Render one complete diagnostic line; never guess a gallery from a filename."""
 
-    source = get_artifact_failure_context(error) if context is None else context
+    qualification = _qualification_context(error)
+    source = (
+        get_artifact_failure_context(error) or qualification
+        if context is None
+        else context
+    )
     if source is None:
         return None
+    failed_qualification = qualification is not None and event == "artifact_failed"
+    if failed_qualification:
+        event = "gallery_image_check_failed"
     page = get_page_failure_context(error)
     source_name = source.source_name if page is None else page.source_name
     source_size = (
@@ -171,4 +201,6 @@ def format_artifact_failure(
             f"reason={_quoted(str(cause))}",
         )
     )
+    if failed_qualification:
+        fields.extend(("action=abort_batch", "qualification=not_saved"))
     return " ".join(fields)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from io import BytesIO
 from pathlib import Path
@@ -14,6 +15,10 @@ from PIL import Image
 
 import h2hdb_ingest.image_qualification as qualification_module
 from h2hdb_ingest.artifact import ArtifactRenderPolicy, load_source_page_image
+from h2hdb_ingest.artifact_errors import (
+    format_artifact_failure,
+    get_page_failure_context,
+)
 from h2hdb_ingest.core_source import VNextFilesystemSourceAdapter
 from h2hdb_ingest.filesystem import (
     FilesystemFileObservation,
@@ -38,6 +43,31 @@ def _gallery(root: Path) -> Path:
         encoding="utf-8",
     )
     return folder
+
+
+def _assert_deferred_failure_diagnostic(
+    failure: BaseException, folder: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    diagnostic = format_artifact_failure(failure)
+    assert diagnostic is not None
+    assert 'event="gallery_image_check_failed"' in diagnostic
+    assert f'gallery_folder="{folder}"' in diagnostic
+    assert "gid=1234" in diagnostic
+    assert 'file="001.jpg"' in diagnostic
+    assert "qualification=not_saved" in diagnostic
+    assert diagnostic in failure.__notes__
+    page = get_page_failure_context(failure)
+    assert page is not None and page.source_name == b"001.jpg"
+    assert page.expected_size_bytes == (folder / "001.jpg").stat().st_size
+    records = [
+        record
+        for record in caplog.records
+        if "gallery_image_check_failed" in record.message
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.DEBUG
+    assert records[0].message == diagnostic
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)
 
 
 @pytest.mark.parametrize("workers", (1, 4))
@@ -111,6 +141,7 @@ def test_resource_errors_are_not_cached_as_bad_images(
     failure: Exception,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="h2hdb_ingest.image_qualification")
     root = tmp_path / "source"
     folder = _gallery(root)
     Image.new("RGB", (8, 12), "blue").save(folder / "001.jpg")
@@ -127,10 +158,7 @@ def test_resource_errors_are_not_cached_as_bad_images(
                 source, ("1234",), observation
             )
     assert caught.value is failure
-    assert "gallery_image_check_failed" in caplog.text
-    assert f'gallery_folder="{folder}"' in caplog.text
-    assert 'file="001.jpg"' in caplog.text
-    assert "qualification=not_saved" in caplog.text
+    _assert_deferred_failure_diagnostic(caught.value, folder, caplog)
 
 
 def test_source_mutation_during_spooling_remains_retryable(
@@ -138,6 +166,7 @@ def test_source_mutation_during_spooling_remains_retryable(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="h2hdb_ingest.image_qualification")
     root = tmp_path / "source"
     folder = _gallery(root)
     Image.new("RGB", (8, 12), "blue").save(folder / "001.jpg")
@@ -157,10 +186,7 @@ def test_source_mutation_during_spooling_remains_retryable(
                 source, ("1234",), observation
             )
     assert caught.value is failure
-    assert "gallery_image_check_failed" in caplog.text
-    assert f'gallery_folder="{folder}"' in caplog.text
-    assert 'file="001.jpg"' in caplog.text
-    assert "qualification=not_saved" in caplog.text
+    _assert_deferred_failure_diagnostic(caught.value, folder, caplog)
 
 
 def test_growing_source_stops_at_observed_size_before_spooling_more_data(
@@ -168,6 +194,7 @@ def test_growing_source_stops_at_observed_size_before_spooling_more_data(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="h2hdb_ingest.image_qualification")
     root = tmp_path / "source"
     folder = _gallery(root)
     Image.new("RGB", (8, 12), "blue").save(folder / "001.jpg")
@@ -181,11 +208,11 @@ def test_growing_source_stops_at_observed_size_before_spooling_more_data(
     monkeypatch.setattr(FilesystemFileObservation, "content_parts", grow)
     with FilesystemSource(root) as source:
         observed = source.observe_gallery(("1234",))
-        with pytest.raises(FilesystemSourceChangedError, match="grew beyond"):
+        with pytest.raises(FilesystemSourceChangedError, match="grew beyond") as caught:
             ImageGalleryQualifier(ArtifactRenderPolicy(), workers=2)(
                 source, ("1234",), observed
             )
-    assert "qualification=not_saved" in caplog.text
+    _assert_deferred_failure_diagnostic(caught.value, folder, caplog)
     assert "gallery_image_rejected" not in caplog.text
 
 
@@ -266,6 +293,7 @@ def test_local_spool_failure_never_becomes_a_bad_source_fact(
     caplog: pytest.LogCaptureFixture,
     fault: str,
 ) -> None:
+    caplog.set_level(logging.DEBUG, logger="h2hdb_ingest.image_qualification")
     root = tmp_path / "source"
     folder = _gallery(root)
     Image.new("RGB", (8, 12), "red").save(folder / "001.jpg")
@@ -292,13 +320,12 @@ def test_local_spool_failure_never_becomes_a_bad_source_fact(
     monkeypatch.setattr(qualification_module, "SpooledTemporaryFile", broken_spool)
     with FilesystemSource(root) as source:
         observed = source.observe_gallery(("1234",))
-        with pytest.raises(OSError, match="qualification spool"):
+        with pytest.raises(OSError, match="qualification spool") as caught:
             ImageGalleryQualifier(ArtifactRenderPolicy(), workers=2)(
                 source, ("1234",), observed
             )
     assert streams and all(stream.closed for stream in streams)
-    assert "gallery_image_check_failed" in caplog.text
-    assert f'gallery_folder="{folder}"' in caplog.text
-    assert 'file="001.jpg"' in caplog.text
-    assert "qualification=not_saved" in caplog.text
+    if fault == "close_error":
+        assert any("secondary flush failure" in note for note in caught.value.__notes__)
+    _assert_deferred_failure_diagnostic(caught.value, folder, caplog)
     assert "gallery_image_rejected" not in caplog.text
