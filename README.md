@@ -22,8 +22,10 @@ ASCII case-insensitive `.avif`, `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`, or
 `.webp` suffix. Other regular files remain source observations but are not
 pages; they are never opened by the artifact renderer. Animated GIF input uses
 its first frame. Sources are streamed through libvips and are not rejected for
-pixel count or dimensions. Truncated or undecodable images still fail the
-artifact; source and rendered JPEG size remain limited to 32 MiB. A gallery
+pixel count, dimensions, or encoded file size. Source data is read in bounded
+chunks and spooled to disk above 4 MiB; larger files require temporary disk space,
+not an equally large Python byte buffer. Truncated or undecodable images still
+fail the artifact. Generated JPEG pages remain limited to 32 MiB, and a gallery
 may contain at most 4096 pages. The generated page fits within the configured
 short-side limit (768 pixels by default), an 8192-pixel long side, and
 40 megapixels, preserving aspect ratio without enlarging images.

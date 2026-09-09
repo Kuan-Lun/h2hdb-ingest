@@ -15,9 +15,7 @@ from typing import BinaryIO, cast
 from h2hdb import ArtifactFailureContext, VNextSourceQualification
 
 from .artifact import (
-    MAX_ENCODED_PAGE_BYTES,
     ArtifactRenderPolicy,
-    SourceImageSizeLimitError,
     load_source_page_image,
 )
 from .artifact_errors import attach_page_failure_context, format_artifact_failure
@@ -42,7 +40,6 @@ _SPOOL_READ_BYTES = 1024 * 1024
 class _PageFailure:
     member: FilesystemFileObservation
     error: Exception
-    reason_code: str
 
 
 def _is_decode_failure(error: BaseException) -> bool:
@@ -92,6 +89,10 @@ def _spool(member: FilesystemFileObservation, position: int) -> BinaryIO:
         for part in member.content_parts():
             expected_digest.update(part)
             expected_size += len(part)
+            if expected_size > member.stat.size_bytes:
+                raise FilesystemSourceChangedError(
+                    "qualification source grew beyond its observed size"
+                )
             if stream.write(part) != len(part):
                 raise OSError("qualification spool accepted a partial source write")
         if expected_size != member.stat.size_bytes:
@@ -141,13 +142,9 @@ def _decode_page(
                 source_name=member.name_bytes,
                 expected_size_bytes=member.stat.size_bytes,
             )
-            if isinstance(error, SourceImageSizeLimitError):
-                reason_code = "source_encoded_size_limit"
-            elif _is_decode_failure(error):
-                reason_code = "invalid_image"
-            else:
+            if not _is_decode_failure(error):
                 raise
-            return _PageFailure(member, error, reason_code)
+            return _PageFailure(member, error)
         finally:
             if work is not None:
                 work.advance("source_images_checked")
@@ -191,7 +188,6 @@ class ImageGalleryQualifier:
         )
         pending: deque[Future[_PageFailure | None]] = deque()
         failure: _PageFailure | None = None
-        oversized: _PageFailure | None = None
         try:
             with (
                 activity,
@@ -200,20 +196,6 @@ class ImageGalleryQualifier:
                 ) as executor,
             ):
                 for position, member in _pages(source, locator, observed):
-                    if member.stat.size_bytes > MAX_ENCODED_PAGE_BYTES:
-                        error = SourceImageSizeLimitError(member.stat.size_bytes)
-                        attach_page_failure_context(
-                            error,
-                            source_position=position,
-                            source_name=member.name_bytes,
-                            expected_size_bytes=member.stat.size_bytes,
-                        )
-                        oversized = _PageFailure(
-                            member, error, "source_encoded_size_limit"
-                        )
-                        if work is not None:
-                            work.advance("source_images_checked")
-                        break
                     stream = _spool(member, position)
                     try:
                         pending.append(
@@ -239,8 +221,6 @@ class ImageGalleryQualifier:
                     additional = future.result()
                     if failure is None:
                         failure = additional
-                if failure is None:
-                    failure = oversized
         except Exception as error:
             message = format_artifact_failure(
                 error,
@@ -269,13 +249,12 @@ class ImageGalleryQualifier:
             ),
         )
         logger.warning(
-            "%s reason_code=%s action=exclude_gallery_from_publication "
+            "%s reason_code=invalid_image action=exclude_gallery_from_publication "
             "retry=source_marker_or_render_policy_change other_galleries=continue",
             message,
-            failure.reason_code,
         )
         return VNextSourceQualification(
             accepted=False,
-            reason_code=failure.reason_code,
+            reason_code="invalid_image",
             source_name=failure.member.name_bytes,
         )

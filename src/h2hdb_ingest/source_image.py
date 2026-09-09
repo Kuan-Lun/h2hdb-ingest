@@ -1,6 +1,7 @@
 """Stream source images into bounded intermediate pixels before final resampling.
 
-The pixel ceiling belongs to the generated page, never to source eligibility.
+Pixel and encoded-byte ceilings belong to generated pages, never to source
+eligibility. Source bytes are read through fixed-size callbacks.
 Most codecs support sequential decoding; progressive JPEG and interlaced PNG
 still retain codec-owned full-image state, so those jobs run exclusively.
 """

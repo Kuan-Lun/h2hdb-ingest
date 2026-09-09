@@ -6,9 +6,10 @@ import struct
 import warnings
 from collections.abc import Buffer
 from datetime import UTC, datetime
-from hashlib import sha256
+from hashlib import file_digest, sha256
 from io import BytesIO
 from pathlib import Path
+from tempfile import SpooledTemporaryFile
 from threading import Barrier, Event, Lock, Thread
 from typing import BinaryIO, cast
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
@@ -25,6 +26,7 @@ from h2hdb import (
     VNextLibraryActivationItem,
     VNextSourceChangedError,
 )
+from image_fixtures import write_large_source_png
 from PIL import Image
 
 import h2hdb_ingest.artifact as artifact_module
@@ -1224,7 +1226,7 @@ def test_canonical_output_decompression_warning_is_a_hard_error(
         _rendered_page_bytes(adapter, source.getvalue())
 
 
-def test_encoded_page_limit_is_enforced_before_destination_write(
+def test_encoded_output_limit_is_enforced_before_destination_write(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1235,7 +1237,7 @@ def test_encoded_page_limit_is_enforced_before_destination_write(
     destination = BytesIO()
     monkeypatch.setattr(artifact_module, "MAX_ENCODED_PAGE_BYTES", 16)
 
-    with pytest.raises(PresentationImageError, match="encoded-size bound"):
+    with pytest.raises(PresentationImageError, match="encoded JPEG exceeds"):
         _rendered_page_bytes(
             adapter,
             source.getvalue(),
@@ -1904,3 +1906,127 @@ def test_every_worker_path_fails_identically_and_preserves_destination(
         assert destination.getvalue() == b"preserved"
 
     assert all(failure == failures[0] for failure in failures)
+
+
+@pytest.mark.parametrize(
+    "change_after_decode", ["none", "same_size", "shorter", "longer"]
+)
+def test_large_source_streams_to_spools_and_preserves_exact_byte_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change_after_decode: str,
+) -> None:
+    path = tmp_path / "large.png"
+    size = write_large_source_png(path)
+    assert size > MAX_ENCODED_PAGE_BYTES
+    spool_root = tmp_path / "spools"
+    spool_root.mkdir()
+    spools: list[BinaryIO] = []
+
+    def disk_spool(*, max_size: int, mode: str) -> BinaryIO:
+        del max_size
+        # Exercise real disk-backed temporary files even though this fixture's
+        # final JPEG is small, and prove every success/failure path closes them.
+        assert mode == "w+b"
+        stream = SpooledTemporaryFile(max_size=1, mode="w+b", dir=str(spool_root))
+        stream.rollover()
+        spools.append(cast(BinaryIO, stream))
+        return cast(BinaryIO, stream)
+
+    monkeypatch.setattr(artifact_module, "SpooledTemporaryFile", disk_spool)
+    original_render = artifact_module._render_page
+
+    def render_then_change(
+        source: BinaryIO,
+        destination: BinaryIO,
+        *,
+        policy: ArtifactRenderPolicy,
+    ) -> artifact_module.CanonicalImageEvidence:
+        evidence = original_render(source, destination, policy=policy)
+        if change_after_decode != "none":
+            with path.open("r+b") as changed:
+                if change_after_decode == "same_size":
+                    changed.seek(-1, 2)
+                    old = changed.read(1)
+                    changed.seek(-1, 2)
+                    changed.write(bytes((old[0] ^ 1,)))
+                elif change_after_decode == "shorter":
+                    changed.truncate(size - 1)
+                else:
+                    changed.seek(0, 2)
+                    changed.write(b"unexpected trailing byte")
+        return evidence
+
+    monkeypatch.setattr(artifact_module, "_render_page", render_then_change)
+    bytes_read = 0
+    with path.open("rb") as file:
+        digest = file_digest(file, "sha256").digest()
+        file.seek(0)
+
+        class BoundedSource:
+            def read(self, count: int = -1) -> bytes:
+                nonlocal bytes_read
+                assert 0 < count <= 1024 * 1024
+                chunk = file.read(count)
+                bytes_read += len(chunk)
+                return chunk
+
+            def seek(self, offset: int, whence: int = 0) -> int:
+                return file.seek(offset, whence)
+
+        member = ArtifactSourceMember(
+            position=1,
+            role=ArtifactSourceRole.PAGE,
+            source_name=b"large.png",
+            expected_sha256=digest,
+            expected_size_bytes=size,
+            source=cast(BinaryIO, BoundedSource()),
+        )
+        members = (
+            _source_member(
+                0,
+                ArtifactSourceRole.METADATA,
+                b"galleryinfo.txt",
+                b"Title: large image\n",
+            ),
+            member,
+        )
+        destination = BytesIO(b"preserved destination")
+        if change_after_decode == "none":
+            result = artifact_module.render_archive(
+                members,
+                destination,
+                gid=42,
+                policy=ArtifactRenderPolicy(),
+                page_render_workers=2,
+            )
+            assert len(result.pages) == 1
+            with ZipFile(BytesIO(destination.getvalue())) as archive:
+                assert archive.testzip() is None
+                page = archive.read("pages/0000.jpg")
+                assert len(page) < MAX_ENCODED_PAGE_BYTES
+                with Image.open(BytesIO(page)) as image:
+                    image.load()
+                    assert min(image.size) == 768
+            assert bytes_read >= size * 2
+        else:
+            messages = {
+                "same_size": "SHA-256 disagrees",
+                "shorter": "ended before its exact size",
+                "longer": "exceeds its exact size",
+            }
+            with pytest.raises(
+                VNextSourceChangedError, match=messages[change_after_decode]
+            ):
+                artifact_module.render_archive(
+                    members,
+                    destination,
+                    gid=42,
+                    policy=ArtifactRenderPolicy(),
+                    page_render_workers=2,
+                )
+            assert destination.getvalue() == b"preserved destination"
+        assert not file.closed
+    assert spools
+    assert all(stream.closed for stream in spools)
+    assert list(spool_root.iterdir()) == []

@@ -5,7 +5,7 @@ import struct
 import zlib
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
-from hashlib import sha256
+from hashlib import file_digest, sha256
 from io import BytesIO
 from pathlib import Path
 from shutil import rmtree
@@ -16,6 +16,9 @@ from zipfile import ZipFile
 
 import pytest
 from h2hdb import (
+    ArtifactArchiveRenderEvidence,
+    ArtifactSourceMember,
+    ArtifactSourceRole,
     CatalogDiscoveryQuery,
     CatalogPageCountRange,
     CatalogRevisionNotFoundError,
@@ -37,6 +40,7 @@ from h2hdb import (
     VNextResolvedIngestPolicy,
     VNextSourceQualification,
 )
+from image_fixtures import write_large_source_png
 from PIL import Image
 
 import h2hdb_ingest.runtime as runtime_module
@@ -1367,6 +1371,13 @@ def _assert_current_gallery_ids(
                 assert max(page.size) <= 8192
                 assert page.width * page.height <= 40_000_000
         assert publication.thumbnail is not None
+        thumbnail = publication.thumbnail.storage_object
+        thumbnail_path = library.joinpath("current", *thumbnail.key.segments)
+        assert sha256(thumbnail_path.read_bytes()).hexdigest() == thumbnail.sha256
+        with Image.open(thumbnail_path) as image:
+            image.load()
+            assert image.format == "JPEG"
+            assert max(image.size) <= 320
     assert runtime.database_admin.check().state == "READY"
     assert not (library / ".h2hdb-coordination" / "ACTIVATING").exists()
 
@@ -1507,3 +1518,71 @@ def test_all_invalid_source_publishes_empty_catalog_and_policy_change_rechecks(
         _synchronize_after_cleanup(restarted)
         _assert_current_gallery_ids(restarted, library, {4101})
         assert qualified == [4101, 4101, 4101]
+
+
+def test_large_encoded_source_publishes_from_empty_database(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuine >32 MiB source is qualified, sealed and published from scratch."""
+    source = tmp_path / "download"
+    _gallery(source, 4201, "large-input")
+    (source / "4201" / "001.jpg").unlink()
+    page_path = source / "4201" / "001.png"
+    source_size = write_large_source_png(page_path)
+    assert source_size > 32 * 1024 * 1024
+    with page_path.open("rb") as stream:
+        source_sha256 = file_digest(stream, "sha256").digest()
+    library = tmp_path / "library"
+    _provision_library_root(library)
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(
+            download_path=source, library_path=library, page_render_workers=2
+        ),
+        resident=ResidentConfig(lease_seconds=30, heartbeat_seconds=5),
+    )
+    qualified: list[int] = []
+    original_qualify = ImageGalleryQualifier.__call__
+    rendered_source_facts: list[tuple[bytes, int, bytes]] = []
+    original_render = ManagedFilesystemLibraryAdapter.render_archive
+
+    def qualify_current(
+        qualifier: ImageGalleryQualifier,
+        filesystem: FilesystemSource,
+        locator: tuple[str, ...],
+        observed: FilesystemGalleryObservation,
+    ) -> VNextSourceQualification:
+        qualified.append(observed.metadata.gid)
+        return original_qualify(qualifier, filesystem, locator, observed)
+
+    def render_current(
+        adapter: ManagedFilesystemLibraryAdapter,
+        members: tuple[ArtifactSourceMember, ...],
+        destination: BinaryIO,
+        *,
+        gid: int,
+    ) -> ArtifactArchiveRenderEvidence:
+        assert gid == 4201
+        # These expected facts were issued by core from the retained FILE seal,
+        # not calculated from adapter-local source observations for this assert.
+        rendered_source_facts.extend(
+            (member.source_name, member.expected_size_bytes, member.expected_sha256)
+            for member in members
+            if member.role is ArtifactSourceRole.PAGE
+        )
+        return original_render(adapter, members, destination, gid=gid)
+
+    monkeypatch.setattr(ImageGalleryQualifier, "__call__", qualify_current)
+    monkeypatch.setattr(
+        ManagedFilesystemLibraryAdapter, "render_archive", render_current
+    )
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
+        assert runtime.resident.process_available(periodic_scan=True)
+        _assert_current_gallery_ids(runtime, library, {4201})
+        assert qualified == [4201]
+        assert rendered_source_facts == [(b"001.png", source_size, source_sha256)]
+    assert page_path.stat().st_size == source_size

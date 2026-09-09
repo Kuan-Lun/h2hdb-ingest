@@ -11,7 +11,9 @@ import asyncio
 import importlib
 import json
 import os
+import struct
 import sys
+import zlib
 from contextlib import closing
 from dataclasses import dataclass
 from hashlib import sha256
@@ -92,6 +94,36 @@ def _gallery(
         with Image.new("RGB", (10, 10_000) if long_page else (20, 30), color) as image:
             image.save(page, format="PNG")
     return folder
+
+
+def _write_large_source_png(path: Path) -> int:
+    """Generate a valid >32 MiB PNG as rows, without padding or a full raster."""
+    width, height = 4096, 2816
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data))
+        )
+
+    compressor = zlib.compressobj(level=0)
+    with path.open("wb") as stream:
+        stream.write(b"\x89PNG\r\n\x1a\n")
+        stream.write(
+            chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        )
+        row = b"\0" + bytes((20, 80, 140)) * width
+        for _ in range(height):
+            encoded = compressor.compress(row)
+            if encoded:
+                stream.write(chunk(b"IDAT", encoded))
+        stream.write(chunk(b"IDAT", compressor.flush()))
+        stream.write(chunk(b"IEND", b""))
+    size = path.stat().st_size
+    assert size > 32 * 1024 * 1024
+    return size
 
 
 def _inspect(
@@ -209,6 +241,8 @@ def _run_pipeline(*, with_opds: bool) -> None:
         _gallery(source, 2001, color="red")
         _gallery(source, 2002, color="green", long_page=True)
         repair = _gallery(source, 2003, color=None)
+        large = _gallery(source, 2004, color="purple")
+        source_size = _write_large_source_png(large / "001.png")
         for relative in (
             "current/acquisitions",
             "current/artwork",
@@ -232,7 +266,7 @@ def _run_pipeline(*, with_opds: bool) -> None:
             runtime.database_admin.initialize()
             runtime.resident.initialize()
             assert runtime.resident.process_available(periodic_scan=True)
-            published = _inspect(runtime, library, {2001, 2002})
+            published = _inspect(runtime, library, {2001, 2002, 2004})
             first_revision = runtime.catalog.discover_publications().revision.revision
             if with_opds:
                 asyncio.run(_opds_probe(config.core, library, published))
@@ -241,7 +275,7 @@ def _run_pipeline(*, with_opds: bool) -> None:
         with build_runtime(config) as runtime:
             runtime.resident.initialize()
             assert runtime.resident.process_available(periodic_scan=True)
-            _inspect(runtime, library, {2001, 2002})
+            _inspect(runtime, library, {2001, 2002, 2004})
             with Image.new("RGB", (20, 30), "blue") as image:
                 image.save(repair / "001.png", format="PNG")
             marker = repair / "galleryinfo.txt"
@@ -254,13 +288,13 @@ def _run_pipeline(*, with_opds: bool) -> None:
             )
             for _attempt in range(32):
                 runtime.resident.process_available(periodic_scan=True)
-                if runtime.catalog.discover_publications().total == 3:
+                if runtime.catalog.discover_publications().total == 4:
                     break
             else:
                 raise AssertionError(
                     "repaired gallery did not publish within 32 bounded polls"
                 )
-            published = _inspect(runtime, library, {2001, 2002, 2003})
+            published = _inspect(runtime, library, {2001, 2002, 2003, 2004})
             final_revision = runtime.catalog.discover_publications().revision.revision
             assert final_revision > first_revision
             if with_opds:
@@ -269,8 +303,9 @@ def _run_pipeline(*, with_opds: bool) -> None:
             json.dumps(
                 {
                     "pipeline_behavior": "passed",
-                    "initial_publications": 2,
-                    "repaired_publications": 3,
+                    "initial_publications": 3,
+                    "repaired_publications": 4,
+                    "large_source_encoded_bytes": source_size,
                     "first_revision": first_revision,
                     "final_revision": final_revision,
                     "opds_http": "passed" if with_opds else "not requested",

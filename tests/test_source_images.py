@@ -10,6 +10,7 @@ from typing import BinaryIO, cast
 
 import pytest
 import pyvips  # type: ignore[import-untyped]  # pyvips 3.2 ships no PEP 561 marker.
+from image_fixtures import write_large_source_png
 from PIL import Image
 
 import h2hdb_ingest.source_image as source_module
@@ -18,7 +19,6 @@ from h2hdb_ingest.artifact import (
     ArtifactImageResampler,
     ArtifactRenderPolicy,
     PresentationImageError,
-    SourceImageSizeLimitError,
     artifact_policy_fingerprint_sha256,
     load_source_page_image,
 )
@@ -311,14 +311,6 @@ def test_resource_and_unknown_native_failures_are_not_invalid_source(
     assert caught.value is failure
 
 
-def test_source_byte_policy_error_has_explicit_size_and_limit() -> None:
-    error = SourceImageSizeLimitError(33 * 1024 * 1024)
-    assert error.size_bytes == 33 * 1024 * 1024
-    assert error.limit_bytes == 32 * 1024 * 1024
-    assert not isinstance(error, source_module.SourceImageDecodeError)
-    assert "source_bytes=34603008 limit_bytes=33554432" in str(error)
-
-
 def test_parallel_native_error_is_classified_only_after_exclusive_verification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -394,3 +386,28 @@ def test_parallel_healthy_corrupt_and_unknown_native_results_stay_distinct(
             uncertain.result(timeout=5)
         assert caught.value is unknown
     assert unknown_calls == 2
+
+
+def test_real_source_above_32_mib_decodes_through_bounded_reads(tmp_path: Path) -> None:
+    path = tmp_path / "large.png"
+    size = write_large_source_png(path)
+    assert size > 32 * 1024 * 1024
+    requests: list[int] = []
+    with path.open("rb") as file:
+
+        class BoundedSource:
+            def read(self, count: int = -1) -> bytes:
+                assert 0 < count <= 1024 * 1024
+                requests.append(count)
+                return file.read(count)
+
+            def seek(self, offset: int, whence: int = 0) -> int:
+                return file.seek(offset, whence)
+
+        with load_source_page_image(
+            cast(BinaryIO, BoundedSource()), policy=ArtifactRenderPolicy()
+        ) as image:
+            assert min(image.size) == 768
+            assert max(image.size) <= 8192
+            assert image.getpixel((0, 0)) == (49, 122, 195)
+    assert len(requests) > size // (1024 * 1024)

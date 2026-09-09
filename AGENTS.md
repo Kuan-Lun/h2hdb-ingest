@@ -241,9 +241,10 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
   path或第二份 persistent CBZ tree。
 - canonical archive必須是 closed-world `galleryinfo.txt`加dense
   `pages/{page_index:04d}.jpg`。Metadata固定DEFLATE；PAGE固定ZIP_STORED；flags、
-  comment、extra、data descriptor與ZIP64皆禁止。最多4096 PAGE、每個source/output
-  encoded page 32 MiB；source不得因pixel count或dimensions拒絕，須使用streaming
-  decode/shrink；output decoded最多40 MP、long side最多8192、aggregate archive
+  comment、extra、data descriptor與ZIP64皆禁止。最多4096 PAGE、每個output
+  encoded page 32 MiB；source不得因pixel count、dimensions或encoded file size拒絕，
+  須使用bounded reads、超過4 MiB時的disk spooling與streaming decode/shrink；
+  source前後仍須驗exact size與SHA-256。Output decoded最多40 MP、long side最多8192、aggregate archive
   2,147,483,647 bytes。Render policy預設page quality 90、thumbnail quality 85、
   optimize true與LANCZOS；所有byte-affecting選項都必須bounded、寫入policy
   fingerprint且由frozen config/domain傳遞。GIF只取frame zero；page zero是

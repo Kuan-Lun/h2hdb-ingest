@@ -24,7 +24,6 @@ __all__ = [
     "PreparedPageEvidence",
     "PreparedPresentationEvidence",
     "PresentationImageError",
-    "SourceImageSizeLimitError",
     "artifact_policy_fingerprint_sha256",
     "canonical_page_member_name",
     "inspect_presentation_archive",
@@ -93,6 +92,7 @@ ARTIFACT_ADAPTER_ID = b"managed-filesystem"
 ARTIFACT_WRITER_ID = b"h2hdb-ingest-presentation-v2"
 
 MAX_PAGE_COUNT = 4096
+# Generated canonical JPEG limit; source images have no encoded-byte ceiling.
 MAX_ENCODED_PAGE_BYTES = 32 * 1024 * 1024
 # v2 forbids ZIP64. This deliberately matches the standard library's safe
 # non-ZIP64 ceiling and is checked before a completed archive is exposed.
@@ -133,20 +133,6 @@ ImageFile.LOAD_TRUNCATED_IMAGES = False
 
 class PresentationImageError(ValueError):
     """Raised when a source cannot safely become a presentation-v2 image."""
-
-
-class SourceImageSizeLimitError(PresentationImageError):
-    """A source exceeds the retained encoded-byte policy, not a decode failure."""
-
-    def __init__(
-        self, size_bytes: int, limit_bytes: int = MAX_ENCODED_PAGE_BYTES
-    ) -> None:
-        self.size_bytes = size_bytes
-        self.limit_bytes = limit_bytes
-        super().__init__(
-            "artifact source exceeds its encoded-size bound: "
-            f"source_bytes={size_bytes} limit_bytes={limit_bytes}"
-        )
 
 
 class ArtifactImageResampler(StrEnum):
@@ -330,7 +316,7 @@ def artifact_policy_fingerprint_sha256(policy: ArtifactRenderPolicy) -> bytes:
         policy.resampler.value.encode("ascii"),
         str(THUMBNAIL_MAX_SIDE).encode("ascii"),
     )
-    framed = sha256(b"h2hdb-ingest-artifact-policy-v5\0")
+    framed = sha256(b"h2hdb-ingest-artifact-policy-v6\0")
     for value in fields:
         framed.update(len(value).to_bytes(4, "big"))
         framed.update(value)
@@ -502,10 +488,7 @@ def _render_archive(
                 allowZip64=False,
                 strict_timestamps=True,
             ) as archive:
-                _verify_source_stream(
-                    metadata,
-                    maximum_size=MAX_METADATA_BYTES,
-                )
+                _verify_source_stream(metadata)
                 _require_projected_archive_size(
                     staged.tell(),
                     member_names,
@@ -523,10 +506,7 @@ def _render_archive(
                     force_zip64=False,
                 ) as target:
                     _copy_exact_source(metadata, cast(BinaryIO, target))
-                _verify_source_stream(
-                    metadata,
-                    maximum_size=MAX_METADATA_BYTES,
-                )
+                _verify_source_stream(metadata)
                 member_names.append(_METADATA_MEMBER_NAME)
                 render_pages_started_ns = monotonic_ns()
                 if progress is not None:
@@ -688,13 +668,9 @@ def _render_page_member(
         SpooledTemporaryFile(max_size=4 * 1024 * 1024, mode="w+b"),
     )
     try:
-        if member.expected_size_bytes > MAX_ENCODED_PAGE_BYTES:
-            raise SourceImageSizeLimitError(
-                member.expected_size_bytes, MAX_ENCODED_PAGE_BYTES
-            )
-        _verify_source_stream(member, maximum_size=MAX_ENCODED_PAGE_BYTES)
+        _verify_source_stream(member)
         image = _render_page(member.source, stream, policy=policy)
-        _verify_source_stream(member, maximum_size=MAX_ENCODED_PAGE_BYTES)
+        _verify_source_stream(member)
         stream.seek(0)
         # Record completion in the worker: an earlier slow future must not hide
         # another page's successful render. The captured work fences late workers.
@@ -784,10 +760,6 @@ def _preflight_archive_members(
                 )
             metadata = member
             continue
-        if member.expected_size_bytes > MAX_ENCODED_PAGE_BYTES:
-            raise SourceImageSizeLimitError(
-                member.expected_size_bytes, MAX_ENCODED_PAGE_BYTES
-            )
         pages.append(member)
         if len(pages) > MAX_PAGE_COUNT:
             raise PresentationImageError("presentation exceeds 4096 pages")
@@ -813,13 +785,8 @@ def _validate_source_member(member: ArtifactSourceMember) -> ArtifactSourceRole:
     return member.role
 
 
-def _verify_source_stream(
-    member: ArtifactSourceMember,
-    *,
-    maximum_size: int,
-) -> None:
-    if member.expected_size_bytes > maximum_size:
-        raise PresentationImageError("artifact source exceeds its encoded-size bound")
+def _verify_source_stream(member: ArtifactSourceMember) -> None:
+    """Verify exact observed bytes in bounded reads, independent of input size."""
     member.source.seek(0)
     digest = sha256()
     remaining = member.expected_size_bytes

@@ -9,10 +9,11 @@ from typing import BinaryIO
 
 import pytest
 from h2hdb import VNextSourceQualification
+from image_fixtures import write_large_source_png
 from PIL import Image
 
 import h2hdb_ingest.image_qualification as qualification_module
-from h2hdb_ingest.artifact import ArtifactRenderPolicy
+from h2hdb_ingest.artifact import ArtifactRenderPolicy, load_source_page_image
 from h2hdb_ingest.core_source import VNextFilesystemSourceAdapter
 from h2hdb_ingest.filesystem import (
     FilesystemFileObservation,
@@ -162,6 +163,32 @@ def test_source_mutation_during_spooling_remains_retryable(
     assert "qualification=not_saved" in caplog.text
 
 
+def test_growing_source_stops_at_observed_size_before_spooling_more_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    root = tmp_path / "source"
+    folder = _gallery(root)
+    Image.new("RGB", (8, 12), "blue").save(folder / "001.jpg")
+    original = FilesystemFileObservation.content_parts
+
+    def grow(value: FilesystemFileObservation) -> Iterator[bytes]:
+        yield from original(value)
+        yield b"concurrent append"
+        raise AssertionError("a changed source must stop before reading more data")
+
+    monkeypatch.setattr(FilesystemFileObservation, "content_parts", grow)
+    with FilesystemSource(root) as source:
+        observed = source.observe_gallery(("1234",))
+        with pytest.raises(FilesystemSourceChangedError, match="grew beyond"):
+            ImageGalleryQualifier(ArtifactRenderPolicy(), workers=2)(
+                source, ("1234",), observed
+            )
+    assert "qualification=not_saved" in caplog.text
+    assert "gallery_image_rejected" not in caplog.text
+
+
 def test_metadata_only_adapter_does_not_decode_images(tmp_path: Path) -> None:
     root = tmp_path / "source"
     folder = _gallery(root)
@@ -174,40 +201,35 @@ def test_metadata_only_adapter_does_not_decode_images(tmp_path: Path) -> None:
         )
 
 
-def test_existing_encoded_size_limit_has_its_own_reason_and_diagnostic(
+def test_large_encoded_image_qualifies_from_disk_spool_and_closes_it(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "source"
     folder = _gallery(root)
-    path = folder / "001.jpg"
-    Image.new("RGB", (8, 12), "red").save(path)
-    size = 32 * 1024 * 1024 + 1
-    with path.open("r+b") as stream:
-        stream.truncate(size)
+    size = write_large_source_png(folder / "001.png")
+    decoded_streams: list[BinaryIO] = []
 
-    def unexpected(_source: BinaryIO, *, policy: ArtifactRenderPolicy) -> Image.Image:
-        del policy
-        raise AssertionError("encoded-size boundary should be checked before decoding")
+    def decode(source: BinaryIO, *, policy: ArtifactRenderPolicy) -> Image.Image:
+        # Check before fileno(): that API itself could force a memory spool to disk.
+        assert getattr(source, "_rolled", False) is True
+        assert source.seek(0, 2) == size
+        source.seek(0)
+        decoded_streams.append(source)
+        return load_source_page_image(source, policy=policy)
 
-    def no_spool(_member: FilesystemFileObservation, _position: int) -> BinaryIO:
-        raise AssertionError("known oversized source must not fill temporary storage")
-
-    monkeypatch.setattr(qualification_module, "load_source_page_image", unexpected)
-    monkeypatch.setattr(qualification_module, "_spool", no_spool)
+    monkeypatch.setattr(qualification_module, "load_source_page_image", decode)
     with FilesystemSource(root) as source:
         observed = source.observe_gallery(("1234",))
-        assert ImageGalleryQualifier(ArtifactRenderPolicy(), workers=2)(
-            source, ("1234",), observed
-        ) == VNextSourceQualification(
-            accepted=False,
-            reason_code="source_encoded_size_limit",
-            source_name=b"001.jpg",
+        assert (
+            ImageGalleryQualifier(ArtifactRenderPolicy(), workers=2)(
+                source, ("1234",), observed
+            )
+            == VNextSourceQualification()
         )
-    assert "reason_code=source_encoded_size_limit" in caplog.text
-    assert f"source_bytes={size}" in caplog.text
-    assert "SourceImageSizeLimitError" in caplog.text
+    assert len(decoded_streams) == 1 and decoded_streams[0].closed
+    assert "gallery_image_rejected" not in caplog.text
 
 
 def test_later_worker_resource_error_is_not_hidden_by_first_corrupt_image(
