@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import struct
 import zlib
@@ -44,6 +45,7 @@ from h2hdb import (
 from image_fixtures import write_large_source_png
 from PIL import Image
 
+import h2hdb_ingest.image_qualification as qualification_module
 import h2hdb_ingest.runtime as runtime_module
 from h2hdb_ingest import (
     ArtifactRenderPolicyConfig,
@@ -57,6 +59,7 @@ from h2hdb_ingest import (
     VNextIngestService,
     VNextIngestSynchronizationResult,
 )
+from h2hdb_ingest.artifact import ArtifactRenderPolicy, load_source_page_image
 from h2hdb_ingest.filesystem import (
     FilesystemFileObservation,
     FilesystemGalleryObservation,
@@ -1658,3 +1661,93 @@ def test_render_storage_pressure_preserves_gallery_and_publishes_after_retry(
             assert archive.testzip() is None
             assert archive.namelist() == ["galleryinfo.txt", "pages/0000.jpg"]
     assert len(cleanups) >= 3
+
+
+def test_repeated_qualification_storage_pressure_reports_once_and_retries_same_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A real SQLite batch retries qualification without flooding per-gallery errors."""
+    source = tmp_path / "download"
+    page = BytesIO()
+    with Image.new("RGB", (80, 40), "purple") as image:
+        image.save(page, format="PNG")
+    page_bytes = page.getvalue()
+    _gallery(source, 7002, "qualification-pressure", page_bytes=page_bytes)
+    folder = source / "7002"
+    marker = folder / "galleryinfo.txt"
+    original_marker = (marker.read_bytes(), marker.stat().st_mtime_ns)
+    library = tmp_path / "library"
+    _provision_library_root(library)
+    config = IngestConfig(
+        core=CoreConfig(
+            database=DatabaseConfig(
+                sql_type="sqlite", database=str(tmp_path / "catalog.sqlite3")
+            )
+        ),
+        paths=IngestPathsConfig(
+            download_path=source, library_path=library, page_render_workers=2
+        ),
+        resident=ResidentConfig(lease_seconds=30, heartbeat_seconds=5),
+    )
+    original_decode = load_source_page_image
+    pressured = True
+    attempts = 0
+
+    def decode(stream: BinaryIO, *, policy: ArtifactRenderPolicy) -> Image.Image:
+        nonlocal attempts
+        attempts += 1
+        if pressured:
+            raise OSError(errno.ENOSPC, "injected qualification storage exhaustion")
+        return original_decode(stream, policy=policy)
+
+    monkeypatch.setattr(qualification_module, "load_source_page_image", decode)
+    caplog.set_level(logging.INFO, logger="h2hdb_ingest")
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
+        for expected_attempts in range(1, 4):
+            for _ in range(32):
+                runtime.resident.process_available(periodic_scan=True)
+                if attempts == expected_attempts:
+                    break
+            else:
+                pytest.fail("qualification retry did not resume after bounded cleanup")
+            assert runtime.resident.last_synchronization_result is None
+            with pytest.raises(CatalogRevisionNotFoundError):
+                runtime.catalog.get_catalog_revision()
+            assert tuple((library / "current").rglob("*.cbz")) == ()
+            errors = [
+                record for record in caplog.records if record.levelno >= logging.ERROR
+            ]
+            warnings = [
+                record for record in caplog.records if record.levelno == logging.WARNING
+            ]
+            assert len(errors) == 1
+            assert len(warnings) == 1
+            diagnostic = errors[0].message
+            assert 'event="gallery_image_check_failed"' in diagnostic
+            assert f'gid=7002 gallery_folder="{folder}"' in diagnostic
+            assert 'file="001.jpg"' in diagnostic
+            assert f"source_bytes={len(page_bytes)} source_position=0" in diagnostic
+            assert "injected qualification storage exhaustion" in diagnostic
+            assert "action=abort_batch qualification=not_saved" in diagnostic
+            assert "Storage capacity exhausted" in warnings[0].message
+            assert "scratch_directory" in warnings[0].message
+            assert "gallery_image_rejected" not in caplog.text
+        pressured = False
+        for _ in range(32):
+            runtime.resident.process_available(periodic_scan=True)
+            if runtime.resident.last_synchronization_result is not None:
+                break
+        else:
+            pytest.fail(
+                "same-marker publication did not resume after capacity recovered"
+            )
+        _assert_current_gallery_ids(runtime, library, {7002})
+        assert runtime.database_admin.check().state == "READY"
+    assert attempts == 4
+    assert (marker.read_bytes(), marker.stat().st_mtime_ns) == original_marker
+    assert (folder / "001.jpg").read_bytes() == page_bytes
+    assert "gallery_image_rejected" not in caplog.text

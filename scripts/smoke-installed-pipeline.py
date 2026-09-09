@@ -28,7 +28,7 @@ from h2hdb import CatalogTagFilter, CoreConfig, DatabaseConfig, open_database
 from PIL import Image
 
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
-from h2hdb_ingest.runtime import IngestRuntime, build_runtime
+from h2hdb_ingest.runtime import IngestRuntime, build_runtime, configure_logging
 from h2hdb_ingest.scratch import DiskScratch
 
 
@@ -250,11 +250,13 @@ def _run_pipeline(*, with_opds: bool) -> None:
             ".h2hdb-coordination",
         ):
             (library / relative).mkdir(parents=True, exist_ok=True)
+        log_path = root / "ingest.log"
         config = IngestConfig(
             core=CoreConfig(
+                logger={"level": "INFO", "file": str(log_path)},
                 database=DatabaseConfig(
                     sql_type="sqlite", database=str(root / "catalog.sqlite3")
-                )
+                ),
             ),
             paths=IngestPathsConfig(
                 download_path=source, library_path=library, page_render_workers=2
@@ -263,6 +265,7 @@ def _run_pipeline(*, with_opds: bool) -> None:
                 publication_batch_galleries=10, lease_seconds=30, heartbeat_seconds=5
             ),
         )
+        configure_logging(config)
         with DiskScratch(library) as scratch:
             assert scratch.path.is_relative_to(library / ".h2hdb-state")
             with build_runtime(
@@ -311,10 +314,17 @@ def _run_pipeline(*, with_opds: bool) -> None:
                 if with_opds:
                     asyncio.run(_opds_probe(config.core, library, published))
             assert tuple(scratch.path.iterdir()) == ()
+        log_lines = log_path.read_text(encoding="utf-8").splitlines()
+        info_lines = [line for line in log_lines if "[INFO]" in line]
+        assert info_lines, "real INFO progress must remain visible"
+        assert all("VIPS:" not in line for line in info_lines)
+        assert all("ingest_metric" not in line for line in info_lines)
+        assert any("gallery_image_rejected" in line for line in log_lines)
         print(
             json.dumps(
                 {
                     "pipeline_behavior": "passed",
+                    "info_logging": "passed",
                     "disk_scratch": "passed",
                     "initial_publications": 3,
                     "repaired_publications": 4,
