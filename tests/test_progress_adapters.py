@@ -141,7 +141,10 @@ def test_completed_worker_is_visible_before_slow_first_page_and_zip_write(
         assert first_started.wait(5)
         assert second_completed.wait(5)
         assert _counters(progress) == {"pages_rendered": 1}
-        assert archive.getvalue() == b""
+        # Metadata may already be in borrowed scratch; no page has been
+        # serialized and no completed archive inspection may be published.
+        assert archive.getvalue().startswith(b"PK\x03\x04")
+        assert renderer._inspection is None
         if replace_work:
             work.finish(announce=False)
             progress.begin("next_batch", announce=False)
@@ -171,7 +174,26 @@ def test_failed_destination_never_counts_completed_archive() -> None:
     )
     with pytest.raises(PresentationImageError, match="made no progress"):
         renderer.render_archive(_members(), _ZeroWriter(), gid=42)
+    # The first metadata write fails before workers are started.
+    assert _counters(progress) == {}
+
+
+def test_failed_archive_finalization_never_counts_completed_archive() -> None:
+    class FailedFlush(BytesIO):
+        def flush(self) -> None:
+            raise OSError("scratch flush failed")
+
+    progress = IngestProgress(lambda _: None)
+    progress.begin("publication", announce=False)
+    renderer = ArtifactPreparationRenderer(
+        policy=_POLICY, page_render_workers=2, progress=progress
+    )
+    scratch = FailedFlush()
+    with pytest.raises(OSError, match="scratch flush failed"):
+        renderer.render_archive(_members(), scratch, gid=42)
     assert _counters(progress) == {"pages_rendered": 2, "pages_written": 2}
+    assert scratch.getvalue() == b""
+    assert renderer._inspection is None
 
 
 def _gallery(root: Path, gid: int) -> Path:
