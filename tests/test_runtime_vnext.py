@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+from collections.abc import Callable, Mapping
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
@@ -28,6 +30,7 @@ from h2hdb_ingest import (
 from h2hdb_ingest.artifact import ARTIFACT_ADAPTER_ID
 from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
 from h2hdb_ingest.page_workers import _CpuTopology, _DarwinTranslation
+from h2hdb_ingest.progress import IngestProgress
 from h2hdb_ingest.runtime import IngestRuntime, build_runtime
 from h2hdb_ingest.service import VNextIngestService
 
@@ -193,6 +196,98 @@ def test_runtime_close_failure_still_releases_other_facades_and_can_retry(
     runtime.close()
     runtime.close()
     assert closed == ["ingest-failed", "catalog", "admin", "ingest", "catalog", "admin"]
+
+
+def _observe_runtime_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    failures: Mapping[str, BaseException],
+) -> list[str]:
+    calls: list[str] = []
+    progress_close = IngestProgress.close
+    ingest_close = VNextIngestFacade.close
+    catalog_close = VNextCatalogFacade.close
+    admin_close = VNextDatabaseAdminFacade.close
+
+    def observed(name: str, close: Callable[[], None]) -> None:
+        close()
+        calls.append(name)
+        failure = failures.get(name)
+        if failure is not None:
+            raise failure
+
+    def close_progress(progress: IngestProgress) -> None:
+        observed("progress", lambda: progress_close(progress))
+
+    def close_ingest(facade: VNextIngestFacade) -> None:
+        observed("ingest", lambda: ingest_close(facade))
+
+    def close_catalog(facade: VNextCatalogFacade) -> None:
+        observed("catalog", lambda: catalog_close(facade))
+
+    def close_admin(facade: VNextDatabaseAdminFacade) -> None:
+        observed("admin", lambda: admin_close(facade))
+
+    monkeypatch.setattr(IngestProgress, "close", close_progress)
+    monkeypatch.setattr(VNextIngestFacade, "close", close_ingest)
+    monkeypatch.setattr(VNextCatalogFacade, "close", close_catalog)
+    monkeypatch.setattr(VNextDatabaseAdminFacade, "close", close_admin)
+    return calls
+
+
+def test_progress_close_failure_still_releases_all_facades_and_allows_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = build_runtime(
+        IngestConfig(paths=IngestPathsConfig(download_path=_source_root(tmp_path)))
+    )
+    failure = OSError(errno.EIO, "progress close failed")
+    failures: dict[str, BaseException] = {"progress": failure}
+    calls = _observe_runtime_cleanup(monkeypatch, failures)
+
+    with pytest.raises(OSError, match="progress close failed") as raised:
+        runtime.close()
+    assert raised.value is failure
+    assert calls == ["progress", "ingest", "catalog", "admin"]
+    failures.clear()
+    runtime.close()
+    runtime.close()
+    assert calls == ["progress", "ingest", "catalog", "admin"] * 2
+
+
+@pytest.mark.parametrize("body_failure", [False, True])
+def test_runtime_context_preserves_primary_error_and_reports_all_cleanup_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body_failure: bool,
+) -> None:
+    runtime = build_runtime(
+        IngestConfig(paths=IngestPathsConfig(download_path=_source_root(tmp_path)))
+    )
+    primary = OSError(errno.ENOSPC, "artifact could not be written")
+    progress_failure = OSError(errno.EIO, "progress close failed")
+    failures = {
+        "progress": progress_failure,
+        "ingest": OSError(errno.EIO, "ingest close failed"),
+        "catalog": OSError(errno.EIO, "catalog close failed"),
+    }
+    calls = _observe_runtime_cleanup(monkeypatch, failures)
+
+    with pytest.raises(OSError) as raised:
+        with runtime:
+            if body_failure:
+                raise primary
+    expected = primary if body_failure else progress_failure
+    assert raised.value is expected
+    assert calls == ["progress", "ingest", "catalog", "admin"]
+    notes = "\n".join(getattr(expected, "__notes__", ()))
+    assert "ingest close failed" in notes
+    assert "catalog close failed" in notes
+    if body_failure:
+        assert "progress close failed" in notes
+    failures.clear()
+    runtime.close()
+    assert calls == ["progress", "ingest", "catalog", "admin"] * 2
 
 
 def test_concurrent_runtime_close_waits_for_one_exact_facade_close(

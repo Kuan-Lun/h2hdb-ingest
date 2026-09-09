@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import struct
 import zlib
@@ -1586,3 +1587,74 @@ def test_large_encoded_source_publishes_from_empty_database(
         assert qualified == [4201]
         assert rendered_source_facts == [(b"001.png", source_size, source_sha256)]
     assert page_path.stat().st_size == source_size
+
+
+@pytest.mark.parametrize("capacity_errno", (errno.ENOSPC, errno.EDQUOT))
+def test_render_storage_pressure_preserves_gallery_and_publishes_after_retry(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capacity_errno: int,
+) -> None:
+    source = tmp_path / "download"
+    page = BytesIO()
+    Image.new("RGB", (80, 40), "purple").save(page, format="PNG")
+    _gallery(source, 7001, "capacity", page_bytes=page.getvalue())
+    library = tmp_path / "library"
+    _provision_library_root(library)
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(
+            download_path=source, library_path=library, page_render_workers=2
+        ),
+        resident=ResidentConfig(lease_seconds=30, heartbeat_seconds=5),
+    )
+    original = ManagedFilesystemLibraryAdapter.render_archive
+    pressured = True
+    attempts = 0
+
+    def render(
+        adapter: ManagedFilesystemLibraryAdapter,
+        members: tuple[ArtifactSourceMember, ...],
+        destination: BinaryIO,
+        *,
+        gid: int,
+    ) -> ArtifactArchiveRenderEvidence:
+        nonlocal attempts
+        attempts += 1
+        if pressured:
+            destination.write(b"incomplete archive")
+            raise OSError(capacity_errno, "injected archive storage exhaustion")
+        return original(adapter, members, destination, gid=gid)
+
+    monkeypatch.setattr(ManagedFilesystemLibraryAdapter, "render_archive", render)
+    cleanups: list[bool] = []
+    with build_runtime(
+        config, temporary_cleanup=lambda: cleanups.append(True)
+    ) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
+        assert not runtime.resident.process_available(periodic_scan=True)
+        assert attempts == 1
+        with pytest.raises(CatalogRevisionNotFoundError):
+            runtime.catalog.get_catalog_revision()
+        assert tuple((library / "current").rglob("*.cbz")) == ()
+        assert "Storage capacity exhausted" in caplog.text
+        assert "scratch_directory" in caplog.text
+        assert "gallery_image_rejected" not in caplog.text
+        pressured = False
+        for _ in range(32):
+            runtime.resident.process_available(periodic_scan=True)
+            if runtime.resident.last_synchronization_result is not None:
+                break
+        else:
+            pytest.fail("publication did not resume after storage capacity recovered")
+        assert runtime.catalog.get_catalog_revision().publication_count == 1
+        assert runtime.database_admin.check().state == "READY"
+        archives = tuple((library / "current").rglob("*.cbz"))
+        assert len(archives) == 1
+        with ZipFile(archives[0]) as archive:
+            assert archive.testzip() is None
+            assert archive.namelist() == ["galleryinfo.txt", "pages/0000.jpg"]
+    assert len(cleanups) >= 3

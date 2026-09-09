@@ -7,6 +7,7 @@ import logging
 import sqlite3
 import tempfile
 from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from threading import Event, Lock, Thread
 from time import monotonic
@@ -18,27 +19,31 @@ from .filesystem import (
     FilesystemSourceChangedError,
 )
 from .source_schedule import SourceScanSchedule
+from .storage_capacity import storage_capacity_error, storage_capacity_message
 
 logger = logging.getLogger(__name__)
 
 
 class CompletionMarkerProbe(Protocol):
-    """Yield a complete marker inventory without opening source images."""
+    """Own one complete marker inventory and close it in the consuming thread."""
 
     def __call__(
         self, checkpoint: Callable[[], None]
-    ) -> Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]: ...
+    ) -> AbstractContextManager[
+        Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]
+    ]: ...
 
 
 class FilesystemCompletionMarkerProbe:
     def __init__(self, source_root: Path) -> None:
         self._source_root = source_root
 
+    @contextmanager
     def __call__(
         self, checkpoint: Callable[[], None]
-    ) -> Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]:
+    ) -> Iterator[Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]]:
         with FilesystemSource(self._source_root, checkpoint=checkpoint) as source:
-            yield from source.iter_completion_markers()
+            yield source.iter_completion_markers()
 
 
 class _SourceProbeStopped(Exception):
@@ -49,11 +54,16 @@ class _MarkerIndex:
     """Own only disposable monitor state; never share an ingest DB connection."""
 
     def __init__(self, path: Path) -> None:
-        self._connection = sqlite3.connect(path)
-        self._connection.execute(
-            "CREATE TABLE marker (locator TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, "
-            "seen INTEGER NOT NULL) WITHOUT ROWID"
-        )
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute(
+                "CREATE TABLE marker (locator TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, "
+                "seen INTEGER NOT NULL) WITHOUT ROWID"
+            )
+        except BaseException:
+            connection.close()
+            raise
+        self._connection = connection
         self._generation = 0
 
     def close(self) -> None:
@@ -133,6 +143,7 @@ class SourceChangeMonitor:
         self._stop = Event()
         self._failure_lock = Lock()
         self._failure: BaseException | None = None
+        self._capacity_exhausted = False
         self._thread = Thread(target=self._run, name="h2hdb-source-monitor")
 
     def __enter__(self) -> Self:
@@ -156,30 +167,63 @@ class SourceChangeMonitor:
     def _changed(self) -> None:
         self._schedule.note_change(now=self._clock())
 
+    def _note_capacity_failure(self, error: BaseException) -> None:
+        if not self._capacity_exhausted:
+            logger.warning(
+                "%s",
+                storage_capacity_message(error, operation="source metadata probe"),
+            )
+        self._capacity_exhausted = True
+
+    def _note_probe_completed(self) -> None:
+        if self._capacity_exhausted:
+            logger.info(
+                "Source metadata probe recovered after storage capacity was exhausted"
+            )
+            self._capacity_exhausted = False
+
+    def _run_index(self, index: _MarkerIndex) -> None:
+        while not self._stop.is_set():
+            try:
+                with self._probe(self._checkpoint) as markers:
+                    index.reconcile(
+                        markers,
+                        changed=self._changed,
+                        checkpoint=self._checkpoint,
+                    )
+            except Exception as error:
+                if storage_capacity_error(error) is not None:
+                    self._note_capacity_failure(error)
+                elif isinstance(error, FilesystemSourceChangedError):
+                    # An incomplete pass cannot establish absence. Its
+                    # comparison transaction rolls back before the next probe.
+                    self._changed()
+                    logger.info("source changed during metadata probe; retrying")
+                else:
+                    raise
+            else:
+                self._note_probe_completed()
+            if self._stop.wait(self._interval_seconds):
+                break
+
     def _run(self) -> None:
         try:
-            with tempfile.TemporaryDirectory(prefix="h2hdb-source-monitor-") as folder:
-                index = _MarkerIndex(Path(folder) / "markers.sqlite3")
+            while not self._stop.is_set():
                 try:
-                    while not self._stop.is_set():
+                    with tempfile.TemporaryDirectory(
+                        prefix="h2hdb-source-monitor-"
+                    ) as folder:
+                        index = _MarkerIndex(Path(folder) / "markers.sqlite3")
                         try:
-                            index.reconcile(
-                                self._probe(self._checkpoint),
-                                changed=self._changed,
-                                checkpoint=self._checkpoint,
-                            )
-                        except FilesystemSourceChangedError:
-                            # An incomplete pass cannot establish absence. Its
-                            # comparison transaction rolls back, and both scan
-                            # and probe will retry without restarting the process.
-                            self._changed()
-                            logger.info(
-                                "source changed during metadata probe; retrying"
-                            )
-                        if self._stop.wait(self._interval_seconds):
-                            break
-                finally:
-                    index.close()
+                            self._run_index(index)
+                        finally:
+                            index.close()
+                except Exception as error:
+                    if storage_capacity_error(error) is None:
+                        raise
+                    self._note_capacity_failure(error)
+                if self._stop.wait(self._interval_seconds):
+                    break
         except _SourceProbeStopped:
             pass
         except BaseException as error:

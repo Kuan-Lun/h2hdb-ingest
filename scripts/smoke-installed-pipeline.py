@@ -29,6 +29,7 @@ from PIL import Image
 
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
 from h2hdb_ingest.runtime import IngestRuntime, build_runtime
+from h2hdb_ingest.scratch import DiskScratch
 
 
 @dataclass(frozen=True)
@@ -97,8 +98,8 @@ def _gallery(
 
 
 def _write_large_source_png(path: Path) -> int:
-    """Generate a valid >32 MiB PNG as rows, without padding or a full raster."""
-    width, height = 4096, 2816
+    """Generate a valid >64 MiB PNG as rows, without padding or a full raster."""
+    width, height = 4096, 5632
 
     def chunk(kind: bytes, data: bytes) -> bytes:
         return (
@@ -122,7 +123,7 @@ def _write_large_source_png(path: Path) -> int:
         stream.write(chunk(b"IDAT", compressor.flush()))
         stream.write(chunk(b"IEND", b""))
     size = path.stat().st_size
-    assert size > 32 * 1024 * 1024
+    assert size > 64 * 1024 * 1024
     return size
 
 
@@ -262,47 +263,59 @@ def _run_pipeline(*, with_opds: bool) -> None:
                 publication_batch_galleries=10, lease_seconds=30, heartbeat_seconds=5
             ),
         )
-        with build_runtime(config) as runtime:
-            runtime.database_admin.initialize()
-            runtime.resident.initialize()
-            assert runtime.resident.process_available(periodic_scan=True)
-            published = _inspect(runtime, library, {2001, 2002, 2004})
-            first_revision = runtime.catalog.discover_publications().revision.revision
-            if with_opds:
-                asyncio.run(_opds_probe(config.core, library, published))
-        # Re-open the real database and library before source repair. Rejection
-        # must survive process-style runtime replacement without losing good CBZs.
-        with build_runtime(config) as runtime:
-            runtime.resident.initialize()
-            assert runtime.resident.process_available(periodic_scan=True)
-            _inspect(runtime, library, {2001, 2002, 2004})
-            with Image.new("RGB", (20, 30), "blue") as image:
-                image.save(repair / "001.png", format="PNG")
-            marker = repair / "galleryinfo.txt"
-            previous = marker.stat()
-            marker.write_text(
-                marker.read_text().replace("04:05", "04:06"), encoding="utf-8"
-            )
-            os.utime(
-                marker, ns=(previous.st_atime_ns, previous.st_mtime_ns + 1_000_000)
-            )
-            for _attempt in range(32):
-                runtime.resident.process_available(periodic_scan=True)
-                if runtime.catalog.discover_publications().total == 4:
-                    break
-            else:
-                raise AssertionError(
-                    "repaired gallery did not publish within 32 bounded polls"
+        with DiskScratch(library) as scratch:
+            assert scratch.path.is_relative_to(library / ".h2hdb-state")
+            with build_runtime(
+                config, temporary_cleanup=scratch.cleanup_page
+            ) as runtime:
+                runtime.database_admin.initialize()
+                runtime.resident.initialize()
+                assert runtime.resident.process_available(periodic_scan=True)
+                published = _inspect(runtime, library, {2001, 2002, 2004})
+                first_revision = (
+                    runtime.catalog.discover_publications().revision.revision
                 )
-            published = _inspect(runtime, library, {2001, 2002, 2003, 2004})
-            final_revision = runtime.catalog.discover_publications().revision.revision
-            assert final_revision > first_revision
-            if with_opds:
-                asyncio.run(_opds_probe(config.core, library, published))
+                if with_opds:
+                    asyncio.run(_opds_probe(config.core, library, published))
+            # Re-open the real database and library before source repair. Rejection
+            # must survive process-style runtime replacement without losing good CBZs.
+            with build_runtime(
+                config, temporary_cleanup=scratch.cleanup_page
+            ) as runtime:
+                runtime.resident.initialize()
+                assert runtime.resident.process_available(periodic_scan=True)
+                _inspect(runtime, library, {2001, 2002, 2004})
+                with Image.new("RGB", (20, 30), "blue") as image:
+                    image.save(repair / "001.png", format="PNG")
+                marker = repair / "galleryinfo.txt"
+                previous = marker.stat()
+                marker.write_text(
+                    marker.read_text().replace("04:05", "04:06"), encoding="utf-8"
+                )
+                os.utime(
+                    marker, ns=(previous.st_atime_ns, previous.st_mtime_ns + 1_000_000)
+                )
+                for _attempt in range(32):
+                    runtime.resident.process_available(periodic_scan=True)
+                    if runtime.catalog.discover_publications().total == 4:
+                        break
+                else:
+                    raise AssertionError(
+                        "repaired gallery did not publish within 32 bounded polls"
+                    )
+                published = _inspect(runtime, library, {2001, 2002, 2003, 2004})
+                final_revision = (
+                    runtime.catalog.discover_publications().revision.revision
+                )
+                assert final_revision > first_revision
+                if with_opds:
+                    asyncio.run(_opds_probe(config.core, library, published))
+            assert tuple(scratch.path.iterdir()) == ()
         print(
             json.dumps(
                 {
                     "pipeline_behavior": "passed",
+                    "disk_scratch": "passed",
                     "initial_publications": 3,
                     "repaired_publications": 4,
                     "large_source_encoded_bytes": source_size,

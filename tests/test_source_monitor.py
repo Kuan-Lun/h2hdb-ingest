@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
@@ -164,11 +165,12 @@ def test_monitor_keeps_changes_detected_during_active_startup_scan() -> None:
     schedule = SourceScanSchedule(quiet_seconds=300, max_wait_seconds=1800, now=0)
     ticket = schedule.start_scan(now=0)
 
+    @contextmanager
     def probe(
         checkpoint: Callable[[], None],
-    ) -> Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]:
+    ) -> Iterator[Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]]:
         checkpoint()
-        yield ("gallery",), _marker()
+        yield iter([(("gallery",), _marker())])
         observed.set()
 
     with SourceChangeMonitor(
@@ -215,10 +217,12 @@ def test_raw_empty_partial_and_complete_markers_extend_the_same_quiet_window(
         ):
             now = observed_at
             marker.write_bytes(content)
-            index.reconcile(probe(_checkpoint), changed=changed, checkpoint=_checkpoint)
+            with probe(_checkpoint) as markers:
+                index.reconcile(markers, changed=changed, checkpoint=_checkpoint)
             assert schedule.next_scan_at() == deadline
         now = 300
-        index.reconcile(probe(_checkpoint), changed=changed, checkpoint=_checkpoint)
+        with probe(_checkpoint) as markers:
+            index.reconcile(markers, changed=changed, checkpoint=_checkpoint)
         assert schedule.next_scan_at() == 550
     finally:
         index.close()
@@ -231,15 +235,16 @@ def test_monitor_retries_transient_mutation_and_retains_dirty_generation() -> No
     ticket = schedule.start_scan(now=0)
     schedule.finish_scan(ticket, now=1, succeeded=True)
 
+    @contextmanager
     def probe(
         checkpoint: Callable[[], None],
-    ) -> Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]:
+    ) -> Iterator[Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]]:
         nonlocal attempts
         checkpoint()
         attempts += 1
         if attempts == 1:
             raise FilesystemSourceChangedError("marker changed")
-        yield ("gallery",), _marker()
+        yield iter([(("gallery",), _marker())])
         retried.set()
 
     with SourceChangeMonitor(
@@ -255,12 +260,16 @@ def test_monitor_reports_unsafe_source_as_fatal() -> None:
     attempted = Event()
     schedule = SourceScanSchedule(quiet_seconds=300, max_wait_seconds=1800, now=0)
 
+    @contextmanager
     def probe(
         checkpoint: Callable[[], None],
-    ) -> Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]:
-        checkpoint()
-        attempted.set()
-        raise FilesystemObservationError("unsafe source")
+    ) -> Iterator[Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]]:
+        def markers() -> Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]:
+            checkpoint()
+            attempted.set()
+            raise FilesystemObservationError("unsafe source")
+
+        yield markers()
 
     with SourceChangeMonitor(
         probe=probe, schedule=schedule, interval_seconds=30
@@ -275,16 +284,20 @@ def test_monitor_shutdown_interrupts_stream_and_closes_probe() -> None:
     closed = Event()
     schedule = SourceScanSchedule(quiet_seconds=300, max_wait_seconds=1800, now=0)
 
+    @contextmanager
     def probe(
         checkpoint: Callable[[], None],
-    ) -> Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]:
-        try:
+    ) -> Iterator[Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]]:
+        def markers() -> Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]:
             started.set()
             number = 0
             while True:
                 checkpoint()
                 yield (str(number),), _marker()
                 number += 1
+
+        try:
+            yield markers()
         finally:
             closed.set()
 

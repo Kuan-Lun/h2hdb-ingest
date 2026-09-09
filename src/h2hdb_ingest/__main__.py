@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import signal
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from threading import Event
 from types import FrameType
 
 from .config import load_config
 from .runtime import build_runtime, configure_logging
+from .scratch import DiskScratch
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -24,20 +25,33 @@ def main(argv: Sequence[str] | None = None) -> None:
     config = load_config(arguments.config)
     config.ensure_paths()
     configure_logging(config)
-    with build_runtime(config) as runtime:
-        with _stop_on_termination() as stop:
-            runtime.resident.initialize()
-            if arguments.once:
-                processed = runtime.resident.process_available(
-                    periodic_scan=True,
-                    should_stop=stop.is_set,
-                )
-                if stop.is_set():
+    scratch_context = (
+        nullcontext(None)
+        if config.paths.library_path is None
+        else DiskScratch(config.paths.library_path)
+    )
+    with scratch_context as scratch:
+        runtime_context = (
+            build_runtime(config)
+            if scratch is None
+            else build_runtime(config, temporary_cleanup=scratch.cleanup_page)
+        )
+        with runtime_context as runtime:
+            with _stop_on_termination() as stop:
+                runtime.resident.initialize()
+                if arguments.once:
+                    processed = runtime.resident.process_available(
+                        periodic_scan=True,
+                        should_stop=stop.is_set,
+                    )
+                    if stop.is_set():
+                        return
+                    if not processed:
+                        raise RuntimeError(
+                            "No gallery publication completed; check lease and storage-capacity diagnostics"
+                        )
                     return
-                if not processed:
-                    raise RuntimeError("No gallery ingest lease is currently available")
-                return
-            runtime.resident.run_forever(stop=stop)
+                runtime.resident.run_forever(stop=stop)
 
 
 @contextmanager

@@ -69,7 +69,10 @@ class _Runtime:
 
 
 def _cli_config(events: list[object]) -> SimpleNamespace:
-    return SimpleNamespace(ensure_paths=lambda: events.append("ensure-paths"))
+    return SimpleNamespace(
+        ensure_paths=lambda: events.append("ensure-paths"),
+        paths=SimpleNamespace(library_path=None),
+    )
 
 
 def test_once_checks_epoch_then_uses_one_periodic_session(
@@ -145,7 +148,7 @@ def test_once_reports_ordinary_claim_contention(
         lambda value: _Runtime(events, resident=resident),
     )
 
-    with pytest.raises(RuntimeError, match="No gallery ingest lease"):
+    with pytest.raises(RuntimeError, match="No gallery publication completed"):
         cli.main(["--config", str(tmp_path / "ingest.json"), "--once"])
 
     assert events[-1] == "runtime-close"

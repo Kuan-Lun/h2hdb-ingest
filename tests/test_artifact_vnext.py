@@ -66,6 +66,9 @@ class _ZeroWriter(BytesIO):
 
 
 class _NoReadWriter(BytesIO):
+    def readable(self) -> bool:
+        return False
+
     def read(self, size: int | None = -1) -> bytes:
         del size
         raise AssertionError("destination must never be read")
@@ -377,7 +380,7 @@ def test_default_policy_preserves_exact_archive_page_and_thumbnail_bytes(
     )
 
 
-def test_artifact_metrics_split_render_inspect_copy_and_thumbnail_phases(
+def test_artifact_metrics_split_render_inspect_finalize_and_thumbnail_phases(
     tmp_path: Path,
 ) -> None:
     metrics: list[IngestMetric] = []
@@ -395,7 +398,7 @@ def test_artifact_metrics_split_render_inspect_copy_and_thumbnail_phases(
     assert [value.name for value in metrics[0].phases_ns] == [
         "render_pages",
         "archive_inspect",
-        "archive_copy",
+        "archive_finalize",
     ]
     assert [value.name for value in metrics[1].phases_ns] == [
         "archive_inspect",
@@ -951,7 +954,7 @@ def test_archive_api_accepts_every_explicit_worker_override(workers: int) -> Non
     assert destination.getbuffer().nbytes == evidence.size_bytes
 
 
-def test_archive_writer_fails_closed_before_exposing_bounded_destination(
+def test_archive_writer_discards_partial_scratch_after_size_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -968,7 +971,7 @@ def test_archive_writer_fails_closed_before_exposing_bounded_destination(
     with pytest.raises(PresentationImageError, match="before member write"):
         adapter.render_archive((metadata,), destination, gid=42)
 
-    assert destination.getvalue() == b"preserved"
+    assert destination.getvalue() == b""
 
 
 def test_metadata_only_archive_has_empty_presentation_and_no_thumbnail(
@@ -1262,18 +1265,14 @@ def test_archive_writer_completes_short_destination_writes(tmp_path: Path) -> No
     assert rendered.startswith(b"\xff\xd8")
 
 
-def test_archive_destination_is_never_read(tmp_path: Path) -> None:
+def test_archive_rejects_a_write_only_scratch_destination(tmp_path: Path) -> None:
     adapter = _adapter(tmp_path, max_image_short_side=20)
     source = BytesIO()
     Image.new("RGB", (40, 20), "red").save(source, format="PNG")
-
-    rendered = _rendered_page_bytes(
-        adapter,
-        source.getvalue(),
-        destination=_NoReadWriter(),
-    )
-
-    assert rendered.startswith(b"\xff\xd8")
+    destination = _NoReadWriter(b"untouched")
+    with pytest.raises(TypeError, match="must be readable"):
+        _rendered_page_bytes(adapter, source.getvalue(), destination=destination)
+    assert destination.getvalue() == b"untouched"
 
 
 def test_archive_writer_rejects_zero_progress_destination(tmp_path: Path) -> None:
@@ -1903,7 +1902,7 @@ def test_every_worker_path_fails_identically_and_preserves_destination(
                 page_render_workers=workers,
             )
         failures.append((type(raised.value), str(raised.value)))
-        assert destination.getvalue() == b"preserved"
+        assert destination.getvalue() == b""
 
     assert all(failure == failures[0] for failure in failures)
 
@@ -2025,8 +2024,51 @@ def test_large_source_streams_to_spools_and_preserves_exact_byte_authority(
                     policy=ArtifactRenderPolicy(),
                     page_render_workers=2,
                 )
-            assert destination.getvalue() == b"preserved destination"
+            assert destination.getvalue() == b""
         assert not file.closed
     assert spools
     assert all(stream.closed for stream in spools)
     assert list(spool_root.iterdir()) == []
+
+
+def test_page_enospc_keeps_original_failure_when_all_spool_closes_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import errno
+
+    failure = OSError(errno.ENOSPC, "injected JPEG spool full")
+    spools: list[BytesIO] = []
+
+    class FailingSpool(BytesIO):
+        def write(self, content: Buffer, /) -> int:
+            del content
+            raise failure
+
+        def close(self) -> None:
+            super().close()
+            raise OSError(errno.EIO, "injected close failure")
+
+    def spool(*args: object, **kwargs: object) -> BytesIO:
+        del args, kwargs
+        stream = FailingSpool()
+        spools.append(stream)
+        return stream
+
+    monkeypatch.setattr(artifact_module, "SpooledTemporaryFile", spool)
+    image = BytesIO()
+    Image.new("RGB", (32, 32), "red").save(image, format="PNG")
+    destination = BytesIO()
+    with pytest.raises(OSError) as caught:
+        _rendered_page_bytes(
+            _adapter(tmp_path, max_image_short_side=20),
+            image.getvalue(),
+            destination=destination,
+        )
+    assert caught.value is failure
+    assert caught.value.errno == errno.ENOSPC
+    assert all(stream.closed for stream in spools)
+    assert len(spools) == 2
+    assert destination.getvalue() == b""
+    assert any("cleanup failed" in note for note in failure.__notes__)
+    assert any("Artifact page source" in note for note in failure.__notes__)

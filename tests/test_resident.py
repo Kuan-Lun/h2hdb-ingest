@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import errno
+import sqlite3
 from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Event
 from typing import cast
@@ -43,16 +46,18 @@ from h2hdb_ingest.maintenance import (
     _LibraryStagingSlotConflictError,
 )
 from h2hdb_ingest.resident import IngestSynchronizer, ResidentIngestor
+from h2hdb_ingest.scratch import ScratchSafetyError
 from h2hdb_ingest.service import VNextIngestSynchronizationResult
 from h2hdb_ingest.session import IngestSessionController
 from h2hdb_ingest.source_schedule import SourceScanSchedule
 
 
+@contextmanager
 def _empty_source_probe(
     checkpoint: Callable[[], None],
-) -> Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]:
+) -> Iterator[Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]]:
     checkpoint()
-    return iter(())
+    yield iter(())
 
 
 def _session() -> VNextIngestSession:
@@ -280,6 +285,7 @@ def _resident(
     service: IngestSynchronizer | None = None,
     artifact_release_adapters: Mapping[bytes, ArtifactReleaseAdapter] | None = None,
     facade: _Facade | None = None,
+    temporary_cleanup: Callable[[], object] | None = None,
 ) -> ResidentIngestor:
     facade = facade or _Facade(
         events,
@@ -288,6 +294,7 @@ def _resident(
     )
     return ResidentIngestor(
         source_probe=_empty_source_probe,
+        temporary_cleanup=temporary_cleanup,
         service=service or _Service(events),
         facade=cast(VNextIngestFacade, facade),
         database_admin=cast(VNextDatabaseAdminFacade, _Admin(events)),
@@ -1486,3 +1493,99 @@ def test_fatal_artifact_failure_logs_exact_context_and_preserves_error(
     assert 'file="002.jpg" source_bytes=123' in errors[0].message
     assert 'reason="render failed"' in errors[0].message
     assert resident.last_synchronization_result is None
+
+
+@pytest.mark.parametrize("stage", ["claim", "complete", "identity", "cleanup"])
+def test_storage_full_coordination_waits_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stage: str,
+) -> None:
+    events: list[object] = []
+    full = sqlite3.OperationalError("database or disk is full")
+    full.sqlite_errorcode = sqlite3.SQLITE_FULL
+    pressured = False
+
+    class CapacityFacade(_Facade):
+        def try_claim_ingest(
+            self, periodic: bool, lease_duration_microseconds: int
+        ) -> VNextIngestSession | None:
+            if pressured and stage == "claim":
+                raise full
+            return super().try_claim_ingest(periodic, lease_duration_microseconds)
+
+        def complete_ingest(
+            self, session: VNextIngestSession
+        ) -> VNextIngestCompletionReceipt:
+            if pressured and stage == "complete":
+                raise full
+            return super().complete_ingest(session)
+
+    class CapacityIdentity(_StorageIdentity):
+        def ensure_storage_identity(self) -> LibraryStorageIdentity:
+            if pressured and stage == "identity":
+                raise OSError(errno.ENOSPC, "identity volume full")
+            return super().ensure_storage_identity()
+
+    def cleanup() -> None:
+        if pressured and stage == "cleanup":
+            raise OSError(errno.EDQUOT, "scratch quota full")
+
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    resident = _resident(
+        events,
+        facade=CapacityFacade(events),
+        library_storage_identity=CapacityIdentity(
+            events, bytes.fromhex("00000000000040008000000000000001")
+        ),
+        temporary_cleanup=cleanup,
+    )
+    resident.initialize()
+    events.clear()
+    pressured = True
+    assert not resident.process_available(periodic_scan=True)
+    assert not resident.process_available(periodic_scan=True)
+    if stage != "complete":
+        assert "synchronize" not in events
+    assert caplog.text.count("Storage capacity exhausted:") == 1
+    assert "no gallery is rejected or published" not in caplog.text
+    pressured = False
+    assert resident.process_available(periodic_scan=True)
+    assert resident.last_synchronization_result is not None
+
+
+def test_unsafe_scratch_stops_before_claim_and_requires_reinitialization() -> None:
+    events: list[object] = []
+    unsafe = False
+    failure = ScratchSafetyError("scratch root was replaced")
+
+    def cleanup() -> None:
+        if unsafe:
+            raise failure
+
+    resident = _resident(events, temporary_cleanup=cleanup)
+    resident.initialize()
+    events.clear()
+    unsafe = True
+    with pytest.raises(ScratchSafetyError) as caught:
+        resident.process_available(periodic_scan=True)
+    assert caught.value is failure
+    assert not any(isinstance(event, tuple) and event[0] == "claim" for event in events)
+    with pytest.raises(RuntimeError, match="must initialize"):
+        resident.process_available(periodic_scan=True)
+
+
+def test_postflight_capacity_failure_is_fatal_and_releases_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    failure = OSError(errno.ENOSPC, "capture destination full")
+
+    def postflight() -> None:
+        raise failure
+
+    with pytest.raises(OSError) as caught:
+        _resident(events).process_available(periodic_scan=True, postflight=postflight)
+    assert caught.value is failure
+    assert events.count(("complete", 2)) == 1

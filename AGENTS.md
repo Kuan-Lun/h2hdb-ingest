@@ -253,8 +253,9 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
   再用Pillow套用config的final resampler；兩階段及native versions都進入fingerprint。
   Progressive/interlaced codecs仍可能持有full-image buffers，必須與其他source
   decode互斥，不得宣稱hard RSS上限或以pixel count拒絕合法來源。
-  Writer完成後必須重驗central/local header、CRC、SHA-256、size與page
-  extents，destination partial write必須fail closed。
+  Writer直接使用caller-owned、可讀寫及seek的private scratch，完成後必須重驗
+  central/local header、CRC、SHA-256、size與page extents；failure丟棄partial
+  destination，不保留原destination內容，也不得建立第二份完整CBZ暫存。
 - acquisition與thumbnail artifact必須先在同 filesystem 的 private staging以
   exact-prefix resumable temp完整寫入、驗證 SHA-256/size並fsync。activation先以
   atomic
@@ -292,6 +293,10 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
 - stage token 轉為 `INSTALLED` 並清除 inode authority，必須和
   `current_entries` authority 及 pending activation completion 在同一個 SQLite
   transaction 發生；不得留下兩個 transaction 間的 crash gap。
+- CLI的Python與native temporary I/O使用library private `scratch-v1`的leased
+  process workspace；不得把未知大小gallery的工作檔放入固定容量tmpfs。
+  Scratch cleanup只處理有exact ownership且無live lease的workspace，啟動、每輪
+  maintenance與結束皆有界推進；保留unknown/symlink/current及active owner。
 - resident 在每次 claim 前與 session 完成後各執行一次 library maintenance。
   `PROGRESSED` 立即重試；`BLOCKED`、`CONTENDED`、`DONE` 與 transient
   failure 回到正常 poll cadence。

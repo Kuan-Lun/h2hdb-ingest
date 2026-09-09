@@ -71,6 +71,7 @@ from PIL import Image, ImageFile, ImageOps, UnidentifiedImageError, features
 from PIL import __version__ as PILLOW_VERSION
 
 from ._limits import MAX_METADATA_BYTES
+from ._resource_cleanup import close_resources, owned_resource
 from .artifact_errors import attach_page_failure_context
 from .metrics import (
     IngestMetric,
@@ -447,6 +448,53 @@ def render_archive(
     )
 
 
+class _ArchiveScratch:
+    """Borrow one unpublished stream; discard partial bytes after any failure."""
+
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream = stream
+
+    def __enter__(self) -> _ArchiveScratch:
+        self._stream.seek(0)
+        self._stream.truncate(0)
+        return self
+
+    def __exit__(self, _type: object, error: BaseException | None, _tb: object) -> None:
+        if error is not None:
+            try:
+                self._stream.seek(0)
+                self._stream.truncate(0)
+            except BaseException as cleanup_error:
+                error.add_note(
+                    f"Discarding partial archive also failed: {cleanup_error!r}"
+                )
+
+    def read(self, size: int = -1) -> bytes:
+        return self._stream.read(size)
+
+    def write(self, content: bytes) -> int:
+        _write_all(self._stream, content, label="canonical archive scratch")
+        return len(content)
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._stream.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._stream.tell()
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def seekable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return True
+
+
 def _render_archive(
     members: tuple[ArtifactSourceMember, ...],
     destination: BinaryIO,
@@ -458,7 +506,7 @@ def _render_archive(
     preparation: ArtifactPreparationRenderer | None,
     progress: ProgressWork | None = None,
 ) -> ArtifactArchiveRenderEvidence:
-    """Render one closed-world non-ZIP64 CBZ before exposing destination bytes."""
+    """Render and verify one CBZ in caller-owned, unpublished scratch storage."""
 
     started_ns = monotonic_ns()
     if progress is not None:
@@ -471,22 +519,28 @@ def _render_archive(
     policy.__post_init__()
     workers = resolve_page_render_workers(page_render_workers)
     if not all(
-        hasattr(destination, method) for method in ("seek", "truncate", "write")
+        hasattr(destination, method) for method in ("read", "seek", "truncate", "write")
     ):
-        raise TypeError("destination must be a seekable writable binary stream")
+        raise TypeError(
+            "destination must be a readable, seekable, writable scratch stream"
+        )
+    if not destination.readable():
+        raise TypeError("archive scratch destination must be readable")
 
     metadata, pages = _preflight_archive_members(members)
     page_evidence: list[ArtifactRenderedPage] = []
     member_names: list[str] = []
-    with SpooledTemporaryFile(max_size=64 * 1024 * 1024, mode="w+b") as staged:
+    with _ArchiveScratch(destination) as staged:
         try:
-            with ZipFile(
-                staged,
-                mode="w",
-                compression=ZIP_DEFLATED,
-                compresslevel=9,
-                allowZip64=False,
-                strict_timestamps=True,
+            with owned_resource(
+                ZipFile(
+                    cast(BinaryIO, staged),
+                    mode="w",
+                    compression=ZIP_DEFLATED,
+                    compresslevel=9,
+                    allowZip64=False,
+                    strict_timestamps=True,
+                )
             ) as archive:
                 _verify_source_stream(metadata)
                 _require_projected_archive_size(
@@ -573,8 +627,7 @@ def _render_archive(
                                 if progress is not None:
                                     progress.advance("pages_written")
                         finally:
-                            for rendered in rendered_batch:
-                                rendered.close()
+                            close_resources(rendered_batch, error=sys.exception())
                 finally:
                     if executor is not None:
                         executor.shutdown(wait=True, cancel_futures=True)
@@ -603,23 +656,12 @@ def _render_archive(
                 "rendered archive inspection changed its byte authority"
             )
         archive_inspect_ns = monotonic_ns() - archive_inspect_started_ns
-        archive_copy_started_ns = monotonic_ns()
+        archive_finalize_started_ns = monotonic_ns()
         if progress is not None:
-            progress.operation("archive_copy")
+            progress.operation("archive_finalize")
+        staged.flush()
         staged.seek(0)
-        destination.seek(0)
-        destination.truncate(0)
-        _copy_exact_bytes(
-            cast(BinaryIO, staged),
-            destination,
-            size=size_bytes,
-            label="canonical presentation archive",
-        )
-        flush = getattr(destination, "flush", None)
-        if callable(flush):
-            flush()
-        destination.seek(0)
-        archive_copy_ns = monotonic_ns() - archive_copy_started_ns
+        archive_finalize_ns = monotonic_ns() - archive_finalize_started_ns
         if preparation is not None:
             preparation._remember(inspected)
     evidence = ArtifactArchiveRenderEvidence(
@@ -640,7 +682,7 @@ def _render_archive(
             phases_ns=(
                 IngestMetricValue("render_pages", render_pages_ns),
                 IngestMetricValue("archive_inspect", archive_inspect_ns),
-                IngestMetricValue("archive_copy", archive_copy_ns),
+                IngestMetricValue("archive_finalize", archive_finalize_ns),
             ),
             counters=(
                 IngestMetricValue("source_members", len(members)),
@@ -684,7 +726,7 @@ def _render_page_member(
             source_name=member.source_name,
             expected_size_bytes=member.expected_size_bytes,
         )
-        stream.close()
+        close_resources((stream,), error=error)
         raise
 
 
@@ -702,9 +744,8 @@ def _render_page_batch(
                 rendered_members.append(
                     _render_page_member(member, policy=policy, progress=progress)
                 )
-        except BaseException:
-            for rendered in rendered_members:
-                rendered.close()
+        except BaseException as error:
+            close_resources(rendered_members, error=error)
             raise
         return tuple(rendered_members)
 
@@ -714,19 +755,21 @@ def _render_page_batch(
     )
     try:
         return tuple(future.result() for future in futures)
-    except BaseException:
+    except BaseException as error:
         for future in futures:
             future.cancel()
         wait(futures)
         closed: set[int] = set()
+        completed: list[_RenderedPageBuffer] = []
         for future in futures:
             if future.cancelled() or future.exception() is not None:
                 continue
             rendered = future.result()
             identity = id(rendered)
             if identity not in closed:
-                rendered.close()
+                completed.append(rendered)
                 closed.add(identity)
+        close_resources(completed, error=error)
         raise
 
 
@@ -1567,7 +1610,9 @@ def _encode_jpeg(
     if type(optimize) is not bool:
         raise TypeError("JPEG optimize must be bool")
     _validate_dimensions(image.width, image.height, max_long_side=max_long_side)
-    with SpooledTemporaryFile(max_size=4 * 1024 * 1024, mode="w+b") as encoded:
+    with owned_resource(
+        SpooledTemporaryFile(max_size=4 * 1024 * 1024, mode="w+b")
+    ) as encoded:
         image.save(
             encoded,
             format="JPEG",

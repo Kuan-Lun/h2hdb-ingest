@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from contextlib import nullcontext
 from pathlib import Path
 
 from h2hdb import CatalogRevision, CatalogRevisionNotFoundError
 
 from .config import load_config
 from .runtime import build_runtime, configure_logging
+from .scratch import DiskScratch
 
 
 class _AlreadyPublished(RuntimeError):
@@ -32,58 +34,69 @@ def main(arguments: Sequence[str] | None = None) -> int:
             "publish an empty initial catalog.\n",
         )
     configure_logging(config)
-    with build_runtime(config) as runtime:
-        runtime.resident.initialize()
-        expected: CatalogRevision | None = None
-        captured: list[CatalogRevision] = []
+    scratch_context = (
+        nullcontext(None)
+        if config.paths.library_path is None
+        else DiskScratch(config.paths.library_path)
+    )
+    with scratch_context as scratch:
+        runtime_context = (
+            build_runtime(config)
+            if scratch is None
+            else build_runtime(config, temporary_cleanup=scratch.cleanup_page)
+        )
+        with runtime_context as runtime:
+            runtime.resident.initialize()
+            expected: CatalogRevision | None = None
+            captured: list[CatalogRevision] = []
 
-        def require_expected_catalog() -> None:
-            try:
-                current = runtime.catalog.get_catalog_revision()
-            except CatalogRevisionNotFoundError as error:
-                if error.revision == 0 and expected is None:
-                    return
-                raise
-            if current != expected:
-                raise _AlreadyPublished(str(current.revision))
+            def require_expected_catalog() -> None:
+                try:
+                    current = runtime.catalog.get_catalog_revision()
+                except CatalogRevisionNotFoundError as error:
+                    if error.revision == 0 and expected is None:
+                        return
+                    raise
+                if current != expected:
+                    raise _AlreadyPublished(str(current.revision))
 
-        def capture_published_catalog() -> None:
-            captured.append(runtime.catalog.get_catalog_revision())
+            def capture_published_catalog() -> None:
+                captured.append(runtime.catalog.get_catalog_revision())
 
-        while True:
-            captured.clear()
-            try:
-                processed = runtime.resident.process_available(
-                    periodic_scan=True,
-                    preflight=require_expected_catalog,
-                    postflight=capture_published_catalog,
-                )
-            except _AlreadyPublished as error:
-                parser.exit(
-                    2,
-                    "Initial catalog reconciliation found an unexpected publication: "
-                    f"current_revision={error}.\n",
-                )
-            if not processed:
-                parser.exit(
-                    2, "No gallery ingest or maintenance progress is available.\n"
-                )
-            if not captured:
-                continue
-            published = captured[0]
-            if published.publication_count > 0:
-                print(
-                    "Initial catalog reconciliation completed: "
-                    f"revision={published.revision} "
-                    f"publications={published.publication_count}."
-                )
-                break
-            if not runtime.resident.deferred_gallery_count:
-                parser.exit(
-                    1,
-                    "Initial reconciliation did not publish a non-empty catalog.\n",
-                )
-            expected = published
+            while True:
+                captured.clear()
+                try:
+                    processed = runtime.resident.process_available(
+                        periodic_scan=True,
+                        preflight=require_expected_catalog,
+                        postflight=capture_published_catalog,
+                    )
+                except _AlreadyPublished as error:
+                    parser.exit(
+                        2,
+                        "Initial catalog reconciliation found an unexpected publication: "
+                        f"current_revision={error}.\n",
+                    )
+                if not processed:
+                    parser.exit(
+                        2, "No gallery ingest or maintenance progress is available.\n"
+                    )
+                if not captured:
+                    continue
+                published = captured[0]
+                if published.publication_count > 0:
+                    print(
+                        "Initial catalog reconciliation completed: "
+                        f"revision={published.revision} "
+                        f"publications={published.publication_count}."
+                    )
+                    break
+                if not runtime.resident.deferred_gallery_count:
+                    parser.exit(
+                        1,
+                        "Initial reconciliation did not publish a non-empty catalog.\n",
+                    )
+                expected = published
     return 0
 
 

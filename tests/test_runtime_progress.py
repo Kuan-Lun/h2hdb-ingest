@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Barrier, Event, Lock, Thread, get_ident
@@ -274,11 +275,12 @@ class _FailingService:
         raise RuntimeError("broken synchronization")
 
 
+@contextmanager
 def _empty_probe(
     checkpoint: Callable[[], None],
-) -> Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]:
+) -> Iterator[Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]]:
     checkpoint()
-    return iter(())
+    yield iter(())
 
 
 def _resident(

@@ -396,6 +396,45 @@ Configuration rejects unknown fields. A complete string value such as
 `"${H2HDB_RW_DB_PASSWORD}"` is replaced from the environment before validation;
 a missing variable fails startup.
 
+## Disk scratch and interrupted work
+
+CBZ-enabled command-line runs automatically use
+`<library_path>/.h2hdb-state/scratch-v1/run-<id>/data` for Python and native
+working files. With the Compose library mount, this is on the comics disk,
+not the container's `/tmp` tmpfs. No extra configuration field is required.
+The process temporarily sets `TMPDIR` and Python's temporary-directory default;
+worker threads use the same private workspace. Embedded callers can wrap their
+runtime in `DiskScratch` from `h2hdb_ingest.scratch` and pass
+`scratch.cleanup_page` as `build_runtime(..., temporary_cleanup=...)`.
+
+Each workspace has a verified ownership record and an advisory lease. Startup,
+each resident maintenance cycle, and shutdown perform bounded cleanup of abandoned
+owned workspaces. Startup completes one scan in bounded pages before allocating new
+working storage. Live owners, unknown directories, symlinks and foreign hard
+links are preserved. Anonymous temporary files disappear when their handles
+close, including process termination; remaining owned directories are recovered
+after a crash. Cleanup never scans the published tree for arbitrary `.tmp` files.
+
+The renderer writes and verifies a CBZ directly in one unpublished scratch stream.
+Its destination must support read, write and seek; failures discard partial bytes
+instead of preserving prior destination contents. The final protected staging
+and atomic publication path continue to publish only complete, verified files.
+The complete verified source snapshot still occupies disk space while rendering,
+and completed output has its existing page and non-ZIP64 bounds. Sources have no
+64 MiB per-file or 4 GiB per-gallery policy limit.
+
+Storage exhaustion or quota errors preserve the gallery's eligibility and pending
+work. Resident processing waits for the normal poll cadence and retries, logging
+the scratch directory and observed free bytes; it does not publish a partial CBZ
+or mark a valid image as rejected. One-shot commands return an unsuccessful result
+when storage pressure prevents publication. Disk capacity is still finite: allow
+room for the verified source snapshot, one output CBZ, concurrent page spools and
+persistent publication staging.
+
+Custom source-monitor probes now return a context-managed iterator. The monitor
+opens, consumes and closes each probe in its own worker thread, including stop
+and error paths; callers must update old bare-generator probes.
+
 ## Run the service
 
 H2HDB core schema creation is a separate administrator action. Normal ingest

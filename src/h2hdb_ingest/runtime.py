@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from threading import Lock
+from types import TracebackType
 from typing import Self
 
 from h2hdb import (
@@ -21,6 +22,7 @@ from h2hdb import (
     VNextLibraryActivationItem,
 )
 
+from ._resource_cleanup import Closeable, close_resources
 from .config import IngestConfig
 from .image_qualification import ImageGalleryQualifier
 from .library import ManagedFilesystemLibraryAdapter
@@ -64,25 +66,14 @@ class IngestRuntime:
         with self._lifecycle_lock:
             if self._closed:
                 return
-            errors: list[BaseException] = []
+            resources: tuple[Closeable, ...] = (
+                self.facade,
+                self.catalog,
+                self.database_admin,
+            )
             if self._progress is not None:
-                self._progress.close()
-            for close in (
-                self.facade.close,
-                self.catalog.close,
-                self.database_admin.close,
-            ):
-                try:
-                    close()
-                except BaseException as error:
-                    errors.append(error)
-            if errors:
-                first_error = errors[0]
-                for additional_error in errors[1:]:
-                    first_error.add_note(
-                        f"Another facade failed to close: {additional_error!r}"
-                    )
-                raise first_error
+                resources = (self._progress, *resources)
+            close_resources(resources)
             object.__setattr__(self, "_closed", True)
 
     def __enter__(self) -> Self:
@@ -94,14 +85,31 @@ class IngestRuntime:
             object.__setattr__(self, "_entered", True)
         return self
 
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exception_type, traceback
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if exception is None:
+                raise
+            if cleanup_error is not exception:
+                exception.add_note(
+                    f"Runtime resource cleanup failed: {cleanup_error!r}"
+                )
+                for note in getattr(cleanup_error, "__notes__", ()):
+                    exception.add_note(note)
 
 
 def build_runtime(
     config: IngestConfig,
     *,
     event_logger: Callable[[str], None] | None = None,
+    temporary_cleanup: Callable[[], object] | None = None,
 ) -> IngestRuntime:
     """Build the sole supported source-to-publication runtime."""
 
@@ -189,6 +197,7 @@ def build_runtime(
             config=config.resident,
             database_type=config.core.database.sql_type,
             artifact_release_adapters=finalization_adapters,
+            temporary_cleanup=temporary_cleanup,
             event_logger=runtime_event_logger,
             progress=progress,
         )

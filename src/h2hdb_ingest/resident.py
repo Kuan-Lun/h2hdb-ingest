@@ -18,6 +18,7 @@ from h2hdb import (
     VNextCurrentOnlyMaintenanceOutcome,
     VNextDatabaseAdminFacade,
     VNextIngestFacade,
+    VNextIngestSession,
     VNextSourceChangedError,
     VNextSourceManifestMismatchError,
 )
@@ -36,10 +37,12 @@ from .maintenance import (
     _LibraryStagingSlotConflictError,
 )
 from .progress import IngestProgress, ProgressWork
+from .scratch import ScratchSafetyError
 from .service import VNextIngestSynchronizationResult, _IngestStopRequested
 from .session import IngestLeaseHeartbeat, IngestSessionController
 from .source_monitor import CompletionMarkerProbe, SourceChangeMonitor
 from .source_schedule import SourceScanSchedule, SourceScanTicket
+from .storage_capacity import storage_capacity_error, storage_capacity_message
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +89,7 @@ class ResidentIngestor:
         artifact_release_adapters: Mapping[bytes, ArtifactReleaseAdapter],
         event_logger: Callable[[str], None] | None = None,
         progress: IngestProgress | None = None,
+        temporary_cleanup: Callable[[], object] | None = None,
     ) -> None:
         self._service = service
         self._source_probe = source_probe
@@ -118,6 +122,8 @@ class ResidentIngestor:
         self._database_type = database_type.casefold()
         self._event_logger = event_logger or logger.info
         self._progress = progress
+        self._temporary_cleanup = temporary_cleanup
+        self._capacity_waiting = False
         self._progress_pending = False
         self._scheduled_progress = False
         self._progress_wait_reason = "waiting_for_ingest_lease"
@@ -257,49 +263,18 @@ class ResidentIngestor:
         should_stop: Callable[[], bool] | None = None,
         on_scan_started: Callable[[], None] | None = None,
     ) -> _ResidentCycleOutcome:
-        if should_stop is not None and should_stop():
+        try:
+            claimed = self._claim_after_maintenance(
+                periodic_scan=periodic_scan, should_stop=should_stop
+            )
+        except Exception as error:
+            if storage_capacity_error(error) is None:
+                raise
+            self._wait_for_storage_capacity(error, operation="ingest coordination")
             return _ResidentCycleOutcome.IDLE
-        self._progress_operation("inspect_storage")
-        self._require_current_storage_identity()
+        if isinstance(claimed, _ResidentCycleOutcome):
+            return claimed
         lease_duration = self._config.lease_seconds * 1_000_000
-        # A previous bounded sweep may have lost its response, contended on the
-        # EXCLUSIVE gate, or remained blocked by a live predecessor.  Retrying
-        # once before every claim also provides progress while ingest is idle.
-        library_maintenance = self._try_library_maintenance()
-        self._progress_pending |= (
-            library_maintenance is not LibraryMaintenanceOutcome.DONE
-        )
-        if library_maintenance is not LibraryMaintenanceOutcome.DONE:
-            self._progress_wait_reason = "waiting_for_library_cleanup"
-        if should_stop is not None and should_stop():
-            return _ResidentCycleOutcome.IDLE
-        if library_maintenance is LibraryMaintenanceOutcome.PROGRESSED:
-            return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
-        database_maintenance = self._try_current_only_maintenance(lease_duration)
-        self._progress_pending |= (
-            database_maintenance is not VNextCurrentOnlyMaintenanceOutcome.DONE
-        )
-        if database_maintenance is not VNextCurrentOnlyMaintenanceOutcome.DONE:
-            self._progress_wait_reason = "waiting_for_catalog_cleanup"
-        if should_stop is not None and should_stop():
-            return _ResidentCycleOutcome.IDLE
-        if database_maintenance is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED:
-            return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
-        self._require_current_storage_identity()
-        if should_stop is not None and should_stop():
-            return _ResidentCycleOutcome.IDLE
-        self._progress_operation("claim_ingest")
-        claimed = self._facade.try_claim_ingest(periodic_scan, lease_duration)
-        if (
-            claimed is None
-            and periodic_scan
-            and (should_stop is None or not should_stop())
-        ):
-            # A due source scan requires a quiescent downloader. A pending
-            # durable handoff must still be claimable while it blocks that path.
-            claimed = self._facade.try_claim_ingest(False, lease_duration)
-        if claimed is None:
-            return _ResidentCycleOutcome.IDLE
         work = self._current_progress()
         if work is not None:
             work.phase("ingest")
@@ -454,14 +429,45 @@ class ResidentIngestor:
                 )
             raise
         except Exception as error:
+            if storage_capacity_error(error) is not None:
+                self._wait_for_storage_capacity(error, operation="ingest")
+                # Heartbeat and local render resources have already stopped.
+                # Release the exact lease so bounded cleanup can reclaim stale
+                # work, while retaining source facts for a later retry.
+                try:
+                    session.complete()
+                except BaseException as completion_error:
+                    error.add_note(
+                        "Releasing the ingest lease after storage pressure also failed: "
+                        f"{completion_error!r}"
+                    )
+                    if storage_capacity_error(completion_error) is None:
+                        raise error from completion_error
+                    # A full SQLite volume can prevent even lease release.
+                    # Its durable expiry still fences the next claimant.
+                return _ResidentCycleOutcome.IDLE
             diagnostic = format_artifact_failure(error)
             if diagnostic is not None:
                 logger.error("%s", diagnostic)
             raise
-        completion = session.complete()
+        try:
+            completion = session.complete()
+        except Exception as error:
+            if storage_capacity_error(error) is None:
+                raise
+            self._wait_for_storage_capacity(error, operation="ingest lease completion")
+            return _ResidentCycleOutcome.IDLE
+        self._capacity_waiting = False
         self._last_synchronization_result = outcome
-        self._try_library_maintenance()
-        self._try_current_only_maintenance(lease_duration)
+        try:
+            self._try_library_maintenance()
+            self._try_current_only_maintenance(lease_duration)
+        except Exception as error:
+            if storage_capacity_error(error) is None:
+                raise
+            # Publication and lease completion are already durable. Report
+            # cleanup pressure without claiming that this batch rolled back.
+            self._wait_for_storage_capacity(error, operation="completed batch cleanup")
         self._event_logger(
             "vNext ingest session completed: "
             f"generation={completion.ingest_generation} "
@@ -472,6 +478,68 @@ class ResidentIngestor:
             if outcome.deferred_gallery_count
             else _ResidentCycleOutcome.INGESTED
         )
+
+    def _claim_after_maintenance(
+        self,
+        *,
+        periodic_scan: bool,
+        should_stop: Callable[[], bool] | None,
+    ) -> VNextIngestSession | _ResidentCycleOutcome:
+        if should_stop is not None and should_stop():
+            return _ResidentCycleOutcome.IDLE
+        self._progress_operation("inspect_storage")
+        self._require_current_storage_identity()
+        lease_duration = self._config.lease_seconds * 1_000_000
+        # A previous bounded sweep may have lost its response, contended on the
+        # EXCLUSIVE gate, or remained blocked by a live predecessor.  Retrying
+        # once before every claim also provides progress while ingest is idle.
+        library_maintenance = self._try_library_maintenance()
+        self._progress_pending |= (
+            library_maintenance is not LibraryMaintenanceOutcome.DONE
+        )
+        if library_maintenance is not LibraryMaintenanceOutcome.DONE:
+            self._progress_wait_reason = "waiting_for_library_cleanup"
+        if should_stop is not None and should_stop():
+            return _ResidentCycleOutcome.IDLE
+        if library_maintenance is LibraryMaintenanceOutcome.PROGRESSED:
+            return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
+        database_maintenance = self._try_current_only_maintenance(lease_duration)
+        self._progress_pending |= (
+            database_maintenance is not VNextCurrentOnlyMaintenanceOutcome.DONE
+        )
+        if database_maintenance is not VNextCurrentOnlyMaintenanceOutcome.DONE:
+            self._progress_wait_reason = "waiting_for_catalog_cleanup"
+        if should_stop is not None and should_stop():
+            return _ResidentCycleOutcome.IDLE
+        if database_maintenance is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED:
+            return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
+        self._require_current_storage_identity()
+        if should_stop is not None and should_stop():
+            return _ResidentCycleOutcome.IDLE
+        self._progress_operation("claim_ingest")
+        claimed = self._facade.try_claim_ingest(periodic_scan, lease_duration)
+        if (
+            claimed is None
+            and periodic_scan
+            and (should_stop is None or not should_stop())
+        ):
+            # A due source scan requires a quiescent downloader. A pending
+            # durable handoff must still be claimable while it blocks that path.
+            claimed = self._facade.try_claim_ingest(False, lease_duration)
+        return _ResidentCycleOutcome.IDLE if claimed is None else claimed
+
+    def _wait_for_storage_capacity(
+        self, error: BaseException, *, operation: str
+    ) -> None:
+        self._progress_pending = True
+        self._progress_wait_reason = "waiting_for_disk_capacity"
+        self._progress_operation("waiting_for_disk_capacity")
+        if not self._capacity_waiting:
+            diagnostic = format_artifact_failure(error)
+            if diagnostic is not None:
+                logger.error("%s", diagnostic)
+            logger.warning("%s", storage_capacity_message(error, operation=operation))
+        self._capacity_waiting = True
 
     def _require_current_storage_identity(self) -> None:
         """Fail before work if the configured library root changed identity."""
@@ -485,8 +553,9 @@ class ResidentIngestor:
             raise RuntimeError("library storage instance has not been bound")
         try:
             observed = provider.ensure_storage_identity()
-        except Exception:
-            self._storage_instance_ready = False
+        except Exception as error:
+            if storage_capacity_error(error) is None:
+                self._storage_instance_ready = False
             raise
         if observed != expected:
             self._storage_instance_ready = False
@@ -507,14 +576,18 @@ class ResidentIngestor:
                 if work is not None:
                     work.advance("library_cleanup_steps")
             return outcome
-        except LibraryStorageIdentityMismatchError:
+        except LibraryStorageIdentityMismatchError, ScratchSafetyError:
             self._storage_instance_ready = False
             raise
-        except Exception:
+        except Exception as error:
+            if storage_capacity_error(error) is not None:
+                raise
             logger.exception("library maintenance attempt failed")
             return None
 
     def _run_library_maintenance(self) -> LibraryMaintenanceOutcome:
+        if self._temporary_cleanup is not None:
+            self._temporary_cleanup()
         outcome = self._library_maintenance.maintain_cleanup()
         if not isinstance(outcome, LibraryMaintenanceOutcome):
             raise TypeError("library maintenance returned an invalid outcome")
@@ -540,10 +613,12 @@ class ResidentIngestor:
                 if work is not None:
                     work.advance("catalog_cleanup_steps")
             return outcome
-        except LibraryStorageIdentityMismatchError:
+        except LibraryStorageIdentityMismatchError, ScratchSafetyError:
             self._storage_instance_ready = False
             raise
-        except Exception:
+        except Exception as error:
+            if storage_capacity_error(error) is not None:
+                raise
             # The ingest receipt is already durable when this is called after
             # completion.  Maintenance is response-loss safe and the resident
             # retries on the next poll, so a transient failure must not make a
