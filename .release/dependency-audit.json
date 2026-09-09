@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-09T00:34:19+00:00",
-  "manifest_sha256": "318afc530a2cd49236ffeeb47812e60b15219282c5fee306d6a55897d8599ea2",
+  "checked_at": "2026-09-09T09:53:23+00:00",
+  "manifest_sha256": "21c560c77afa3dd84363b7f0b087a8381a8dec6663ef3a55928605f028929e3c",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.20.0",
+  "project_version": "0.21.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,9 +30,9 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.36.0,<0.37.0",
+      "declared": "h2hdb>=0.36.1,<0.37.0",
       "group": "runtime",
-      "latest": "0.35.5",
+      "latest": "0.36.0",
       "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Requeried all direct build, runtime, optional development and Node registry dependencies for 0.20.0. Dependency declarations, all 16 Python group records, the Node candidate and Python 3.14 metadata are unchanged from the reviewed 0.19.0 release, so its official release-note compatibility conclusions remain applicable; local third-party versions match these latest candidates. This release removes the source encoded-byte ceiling and SourceImageSizeLimitError without adding or changing dependencies. Source reads, disk spooling, exact source size/SHA256 verification and generated output bounds remain enforced. Genuine 34,621,850-byte PNG qualification and full publication from an empty database passed on SQLite and MariaDB 10.11.11, with decoder and source-mutation regressions passing. No old-database migration, schema fallback or size-rejection compatibility branch was introduced. PyPI h2hdb latest remains 0.35.5, below the intentional 0.36 minimum; validation uses the locally built and installed core 0.36.0 wheel, not a claim that it is published. Final release-gate evidence is separate. Previously reviewed upstream references: https://github.com/libvips/pyvips/blob/master/CHANGELOG.rst ; https://github.com/libvips/libvips/releases/tag/v8.18.6 ; https://github.com/kleisauke/pyvips-binary/releases/tag/v8.18.6 ; https://github.com/pydantic/pydantic/releases/tag/v2.13.5 ; https://github.com/pypa/build/releases/tag/1.6.0 ; https://hypothesis.readthedocs.io/en/latest/changelog.html#v6-168-0 ; https://github.com/astral-sh/ruff/releases/tag/0.16.6 ; https://github.com/pypa/packaging/blob/main/CHANGELOG.md ; https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/main/CHANGELOG.md .",
+    "note": "Reviewed all direct build, runtime, optional, development and Node candidates against the prior receipt. External candidates are unchanged from that review and remain compatible with Python 3.14 and existing bounds. Registry h2hdb 0.36.0 does not satisfy the intentionally raised minimum: this cross-repository release is validated with the explicit h2hdb 0.36.1 wheel, whose full SQLite and MariaDB smoke gate passed. Ingest storage recovery also passed real SQLite and MariaDB integration tests with ENOSPC and EDQUOT. Publish h2hdb 0.36.1 before h2hdb-ingest 0.21.0; this receipt does not claim the unpublished core is already on PyPI.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
