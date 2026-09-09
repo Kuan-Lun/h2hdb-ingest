@@ -59,7 +59,9 @@ def _assert_capacity_logs(caplog: pytest.LogCaptureFixture, *, recovered: bool) 
     assert detail["scratch_directory"] == tempfile.gettempdir()
     assert detail["scratch_free_bytes"] is None or detail["scratch_free_bytes"] >= 0
     assert detail["reason"]
-    assert detail["action"] == "wait and retry; no gallery is rejected or published"
+    assert detail["action"] == (
+        "preserve gallery eligibility and retry durable work when space is available"
+    )
     resumed = [record for record in records if "probe recovered" in record.getMessage()]
     assert len(resumed) == int(recovered)
     assert all(record.levelno == logging.INFO for record in resumed)
