@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-09T09:53:23+00:00",
+  "checked_at": "2026-09-09T11:22:16+00:00",
   "manifest_sha256": "21c560c77afa3dd84363b7f0b087a8381a8dec6663ef3a55928605f028929e3c",
   "node": [
     {
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.21.0",
+  "project_version": "0.21.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -32,8 +32,8 @@
     {
       "declared": "h2hdb>=0.36.1,<0.37.0",
       "group": "runtime",
-      "latest": "0.36.0",
-      "latest_satisfies": false,
+      "latest": "0.36.1",
+      "latest_satisfies": true,
       "name": "h2hdb",
       "python_3_14": true,
       "url": "https://pypi.org/project/h2hdb/"
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all direct build, runtime, optional, development and Node candidates against the prior receipt. External candidates are unchanged from that review and remain compatible with Python 3.14 and existing bounds. Registry h2hdb 0.36.0 does not satisfy the intentionally raised minimum: this cross-repository release is validated with the explicit h2hdb 0.36.1 wheel, whose full SQLite and MariaDB smoke gate passed. Ingest storage recovery also passed real SQLite and MariaDB integration tests with ENOSPC and EDQUOT. Publish h2hdb 0.36.1 before h2hdb-ingest 0.21.0; this receipt does not claim the unpublished core is already on PyPI.",
+    "note": "Reviewed all direct build, runtime, optional, development and Node candidates against the prior receipt and the installed Python 3.14 environment. External candidates and bounds are unchanged; the only registry change is h2hdb 0.36.1, which now satisfies the existing minimum and is the same core release already reviewed and validated by the previous cross-repository task. This logging change uses that installed 0.36.1 wheel. Fresh-process SQLite and native pyvips INFO/DEBUG tests passed, including parallel console/file logging and valid CBZ/artwork publication. Manual MariaDB 10.11.11 resident lifecycle validation passed all four cases. All latest direct candidates support Python 3.14 and satisfy the existing bounds; no dependency manifest changes are needed.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
