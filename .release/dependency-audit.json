@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-10T08:11:58+00:00",
+  "checked_at": "2026-09-10T17:24:22+00:00",
   "manifest_sha256": "21c560c77afa3dd84363b7f0b087a8381a8dec6663ef3a55928605f028929e3c",
   "node": [
     {
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.21.2",
+  "project_version": "0.22.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all direct build, runtime, optional/development and Node dependencies against fresh PyPI/npm discovery, the prior receipt and the installed Python 3.14 environment. The only new candidate is build 1.6.1. Reviewed https://github.com/pypa/build/blob/1.6.1/CHANGELOG.rst and https://github.com/pypa/build/compare/1.6.0...1.6.1: the Windows isolated-venv symlink fix is outside our --no-isolation path, while explicit editable/sdist/wheel dispatch preserves our supported sdist/wheel calls. PyPI metadata requires Python >=3.10 and explicitly supports 3.14. Upgraded local build from 1.6.0 to 1.6.1 and successfully built the 0.21.2 sdist and wheel using .venv/bin/python -m build --no-isolation --outdir /private/tmp/h2hdb-ingest-build-1.6.1. Every other latest candidate is unchanged and matches the installed environment. All candidates satisfy existing bounds and Python candidates support 3.14; no dependency manifest changes are needed. Targeted CLI/process logging, storage/maintenance and real EXIF warning regressions passed; filter on/off preserves CBZ bytes, evidence, source hashes and policy fingerprint with one and four page workers. Native candidate diagnostics cover the complete 16-worker bound. Manual H2HDB_TEST_MARIADB=1 .venv/bin/pytest -o addopts= --strict-markers -m \"mariadb and deep\" -n 0 -q tests/test_runtime_process_lifecycle.py passed all four MariaDB 10.11.11 cases. API/config/schema/exit codes, qualification and retry behavior remain compatible; whole-line log parsers must permit added fields. The merge gate separately validates the final candidate and installed-wheel smoke.",
+    "note": "Reviewed every direct build, runtime, optional development and Node registry candidate, including candidates outside declared upper bounds. All current latest releases satisfy existing ranges and Python 3.14; no dependency manifest change is needed. Validation environment already contains build 1.6.1, hypothesis 6.168.0, packaging 26.3, ruff 0.16.6 and pydantic 2.13.5. Reviewed official release notes: https://github.com/pypa/build/releases/tag/1.6.1 and its 1.6.0 changelog (new CLI features and removed BuildBackendException.exc_info are not used here); https://hypothesis.readthedocs.io/en/latest/changelog.html (date generation and shrink/cache fixes); https://github.com/pypa/packaging/releases/tag/26.3 (specifier and metadata handling); https://github.com/astral-sh/ruff/releases/tag/0.16.6 (lint fixes); https://github.com/pydantic/pydantic/releases/tag/v2.13.5 (validator GC and smart union fixes). Repository fast gate passes with these installed versions. Relocation, standalone no-site-packages executable and version contract targets passed; explicit MariaDB 10.11.11 resident, relocated-library reuse and gallery-removal E2E passed (3 cases). The integration gate will additionally run bounded offline pytest, Lean, finite small TLC, sdist/wheel build and installed CLI/pipeline smoke. Existing upper bounds remain the tested major or compatibility lanes; no workaround or new pin was introduced.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
