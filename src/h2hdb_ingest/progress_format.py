@@ -121,6 +121,8 @@ def format_progress(
     if label is None:
         label = _describe_operation(name)
     parts = [f"{lead}: {label}"]
+    if event == "work_finished" and status == "retry":
+        parts.append("this synchronization attempt did not complete")
     if snapshot.operation_completed is not None:
         unit = snapshot.operation_unit or "items"
         if snapshot.operation_total is None:

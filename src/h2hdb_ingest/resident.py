@@ -24,6 +24,7 @@ from h2hdb import (
 )
 
 from ._log_recovery import RecoveryLog
+from ._retry_diagnostics import RetryDiagnostic, retry_diagnostic
 from .artifact_errors import format_artifact_failure
 from .config import ResidentConfig
 from .filesystem import FilesystemSourceChangedError
@@ -135,6 +136,7 @@ class ResidentIngestor:
         self._database_type = database_type.casefold()
         self._event_logger = event_logger or logger.info
         self._progress = progress
+        self._retry_failure: RetryDiagnostic | None = None
         self._temporary_cleanup = temporary_cleanup
         self._capacity_waiting = False
         self._progress_pending = False
@@ -227,6 +229,7 @@ class ResidentIngestor:
         should_stop: Callable[[], bool] | None = None,
         on_scan_started: Callable[[], None] | None = None,
     ) -> _ResidentCycleOutcome:
+        self._retry_failure = None
         if self._progress_stop_requested(should_stop):
             self._finish_progress("stopped", announce=False)
             return _ResidentCycleOutcome.IDLE
@@ -414,6 +417,9 @@ class ResidentIngestor:
             # A changed completion marker invalidates this attempt, not the
             # resident process. Heartbeat has stopped before releasing its
             # exact session and allowing bounded cleanup to make progress.
+            failure = retry_diagnostic(
+                error, None if self._progress is None else self._progress.snapshot()
+            )
             try:
                 session.complete()
                 self._try_library_maintenance()
@@ -424,7 +430,7 @@ class ResidentIngestor:
                     f"mutation: {completion_error!r}"
                 )
                 raise error from completion_error
-            logger.debug("source changed during synchronization; retry pending")
+            self._retry_failure = failure
             return _ResidentCycleOutcome.SOURCE_CHANGED
         except VNextSourceManifestMismatchError as error:
             # The mismatch has already abandoned the exact build.  Completing
@@ -658,9 +664,20 @@ class ResidentIngestor:
             work.operation(name)
 
     def _finish_progress(self, status: str, *, announce: bool = True) -> None:
+        failure = self._retry_failure if status == "retry" else None
+        self._retry_failure = None
         work = self._current_progress()
         if work is not None:
-            work.finish(status, announce=announce)
+            work.finish(status, announce=announce, failure=failure)
+        elif failure is not None and announce:
+            try:
+                logger.warning(
+                    "Ingest work will be retried: source synchronization did not complete; %s",
+                    failure.detail,
+                )
+            except Exception:
+                # Diagnostic delivery cannot change the completed session's retry.
+                pass
 
     def _progress_stop_requested(self, should_stop: Callable[[], bool] | None) -> bool:
         try:

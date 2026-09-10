@@ -46,6 +46,7 @@ from h2hdb_ingest.maintenance import (
     LibraryMaintenanceOutcome,
     _LibraryStagingSlotConflictError,
 )
+from h2hdb_ingest.progress import IngestProgress
 from h2hdb_ingest.resident import IngestSynchronizer, ResidentIngestor
 from h2hdb_ingest.scratch import ScratchSafetyError
 from h2hdb_ingest.service import VNextIngestSynchronizationResult
@@ -1474,9 +1475,131 @@ def test_transient_source_mutation_completes_after_heartbeat_shutdown(
         ("complete", 2),
         ("current-only", 10_000_000),
     ]
-    assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
-        (logging.DEBUG, "source changed during synchronization; retry pending")
-    ]
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert record.levelno == logging.WARNING
+    assert "Ingest work will be retried" in record.getMessage()
+    assert f'error_type="{source_error.__name__}"' in record.getMessage()
+    assert 'reason="marker changed"' in record.getMessage()
+
+
+@pytest.mark.parametrize("failure_stage", ["complete", "cleanup"])
+def test_source_retry_does_not_announce_success_when_completion_or_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_stage: str,
+) -> None:
+    events: list[object] = []
+    original = FilesystemSourceChangedError("incomplete marker at /source/1001")
+
+    class _ChangingService(_Service):
+        def synchronize_once(
+            self,
+            session: IngestSessionController,
+            *,
+            should_stop: Callable[[], bool] | None = None,
+        ) -> VNextIngestSynchronizationResult:
+            del session, should_stop
+            raise original
+
+    class _FailingFacade(_Facade):
+        def complete_ingest(
+            self, session: VNextIngestSession
+        ) -> VNextIngestCompletionReceipt:
+            if failure_stage == "complete":
+                raise RuntimeError("completion failed")
+            return super().complete_ingest(session)
+
+        def drain_current_only_maintenance(
+            self,
+            lease_duration_microseconds: int,
+            *,
+            artifact_release_adapters: object,
+        ) -> VNextCurrentOnlyMaintenanceOutcome:
+            if failure_stage == "cleanup" and ("complete", 2) in events:
+                raise ScratchSafetyError("cleanup authority changed")
+            return super().drain_current_only_maintenance(
+                lease_duration_microseconds,
+                artifact_release_adapters=artifact_release_adapters,
+            )
+
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    resident = _resident(
+        events, facade=_FailingFacade(events), service=_ChangingService(events)
+    )
+    with pytest.raises(FilesystemSourceChangedError) as caught:
+        resident.process_available(periodic_scan=True)
+    assert caught.value is original
+    assert original.__cause__ is not None
+    assert any("could not be completed" in note for note in original.__notes__)
+    assert not any(
+        "will be retried" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_retry_warning_delivery_failure_preserves_retry_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+
+    class _ChangingService(_Service):
+        def synchronize_once(
+            self,
+            session: IngestSessionController,
+            *,
+            should_stop: Callable[[], bool] | None = None,
+        ) -> VNextIngestSynchronizationResult:
+            del session, should_stop
+            raise FilesystemSourceChangedError("incomplete marker")
+
+    def unavailable_logger(*_args: object, **_kwargs: object) -> None:
+        raise OSError("log sink unavailable")
+
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    monkeypatch.setattr(resident_module.logger, "warning", unavailable_logger)
+    resident = _resident(events, service=_ChangingService(events))
+    assert not resident.process_available(periodic_scan=True)
+    assert ("complete", 2) in events
+
+
+@pytest.mark.parametrize(
+    "unavailable_attribute",
+    ["_h2hdb_ingest_failure_snapshot", "__notes__", "__cause__"],
+)
+def test_unavailable_retry_metadata_does_not_prevent_session_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    unavailable_attribute: str,
+) -> None:
+    events: list[object] = []
+
+    class _MetadataError(FilesystemSourceChangedError):
+        def __getattribute__(self, name: str) -> object:
+            if name == unavailable_attribute:
+                raise ValueError("optional diagnostic metadata unavailable")
+            return super().__getattribute__(name)
+
+    class _ChangingService(_Service):
+        def synchronize_once(
+            self,
+            session: IngestSessionController,
+            *,
+            should_stop: Callable[[], bool] | None = None,
+        ) -> VNextIngestSynchronizationResult:
+            del session, should_stop
+            raise _MetadataError("incomplete /source/1001/galleryinfo.txt")
+
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    resident = _resident(events, service=_ChangingService(events))
+    resident._progress = IngestProgress(lambda _: None)
+    assert not resident.process_available(periodic_scan=True)
+    assert ("complete", 2) in events
+    assert len(caplog.records) == 1
+    warning = caplog.records[0]
+    assert warning.levelno == logging.WARNING
+    assert 'error_type="_MetadataError"' in warning.getMessage()
+    assert 'reason="incomplete /source/1001/galleryinfo.txt"' in warning.getMessage()
+    assert "diagnostic_context=unavailable" in warning.getMessage()
 
 
 def test_run_forever_retries_mutation_after_quiet_period_without_process_restart(

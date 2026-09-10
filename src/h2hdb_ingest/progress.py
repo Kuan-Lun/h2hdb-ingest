@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from threading import Event, Lock, Thread, current_thread
 from time import monotonic
 
+from ._retry_diagnostics import RetryDiagnostic, capture_failure_snapshot
 from .progress_format import format_diagnostics, format_progress
 
 MAX_PROGRESS_COUNTERS = 64
@@ -42,6 +43,7 @@ class ProgressSnapshot:
     operation_completed: int | None = None
     operation_total: int | None = None
     operation_unit: str | None = None
+    work_identity: object | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,7 @@ class _ProgressState:
             operation_completed=completed,
             operation_total=None if operation is None else operation.total,
             operation_unit=unit,
+            work_identity=self.work._identity,
         )
 
 
@@ -116,6 +119,7 @@ class ProgressWork:
     def __init__(self, owner: IngestProgress, generation: int) -> None:
         self._owner = owner
         self._generation = generation
+        self._identity = object()
 
     @property
     def generation(self) -> int:
@@ -154,12 +158,20 @@ class ProgressWork:
 
         Scopes belong to the orchestration thread, not concurrent workers.
         A phase transition or replacement work fences restoration of old state.
+        Escaping errors retain their innermost measured activity for diagnostics.
         """
         checkpoint = self._owner._operation(
             self, name, completed=completed, total=total, unit=unit, scoped=True
         )
         try:
             yield
+        except BaseException as error:
+            try:
+                self._owner._capture_failure(self, error)
+            except Exception:
+                # Diagnostics must not replace the activity's original error.
+                pass
+            raise
         finally:
             if checkpoint is not None:
                 self._owner._restore_activity(self, checkpoint)
@@ -170,8 +182,14 @@ class ProgressWork:
     def set_counter(self, counter: str, value: int) -> None:
         self._owner._counter(self, counter, value, additive=False)
 
-    def finish(self, status: str = "completed", *, announce: bool = True) -> None:
-        self._owner._finish(self, status, announce=announce)
+    def finish(
+        self,
+        status: str = "completed",
+        *,
+        announce: bool = True,
+        failure: RetryDiagnostic | None = None,
+    ) -> None:
+        self._owner._finish(self, status, announce=announce, failure=failure)
 
 
 class IngestProgress:
@@ -374,7 +392,22 @@ class IngestProgress:
             if old != new:
                 state.last_progress_at = self._clock()
 
-    def _finish(self, work: ProgressWork, status: str, *, announce: bool) -> None:
+    def _capture_failure(self, work: ProgressWork, error: BaseException) -> None:
+        with self._lock:
+            state = self._state
+            if state is None or state.work is not work:
+                return
+            snapshot = state.snapshot(self._clock())
+        capture_failure_snapshot(error, snapshot)
+
+    def _finish(
+        self,
+        work: ProgressWork,
+        status: str,
+        *,
+        announce: bool,
+        failure: RetryDiagnostic | None,
+    ) -> None:
         _require_name(status)
         with self._emission_lock:
             with self._lock:
@@ -382,10 +415,19 @@ class IngestProgress:
                 if state is None or state.work is not work:
                     return
                 snapshot = state.snapshot(self._clock())
+                if (
+                    failure is not None
+                    and failure.snapshot is not None
+                    and failure.snapshot.generation == work.generation
+                    and failure.snapshot.work_identity is work._identity
+                ):
+                    snapshot = failure.snapshot
                 self._state = None
                 self._wake.set()
             if announce:
-                self._emit_snapshot("work_finished", snapshot, status=status)
+                self._emit_snapshot(
+                    "work_finished", snapshot, status=status, failure=failure
+                )
 
     def _run(self) -> None:
         while True:
@@ -426,11 +468,17 @@ class IngestProgress:
         snapshot: ProgressSnapshot,
         *,
         status: str | None = None,
+        failure: RetryDiagnostic | None = None,
     ) -> None:
         message = format_progress(event, snapshot, self._last_emitted, status=status)
+        if failure is not None:
+            message += "; " + failure.detail
         self._last_emitted = snapshot
+        emit_status = (
+            logging.getLogger(__name__).warning if status == "retry" else self._emit
+        )
         for emit, text in (
-            (self._emit, message),
+            (emit_status, message),
             (self._emit_debug, format_diagnostics(event, snapshot, status=status)),
         ):
             try:
