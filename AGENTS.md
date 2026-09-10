@@ -226,7 +226,22 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
   其他類型都必須在修改 private state 前 fail closed；不得 migrate、fallback
   或接納舊 coordination layout。
 - Legacy `current/hash-v1`與 activation journal format v1/v2必須明確 fail
-  closed並要求 fresh rebuild；不得自動刪除、migrate或和v3 journal混合啟動。
+  closed並要求 fresh rebuild；不得自動刪除、migrate或和v4 journal混合啟動。
+  Normal runtime只接受journal v4。使用者明確執行的一次性搬移工具可接納
+  released v3的exact schema並原子升級；不得保留v3 runtime或自動fallback。
+  完整library搬移保留既有UUID與core binding，以獨立durable relocation session
+  保存目的地、進度與驗證結果，不得覆寫publication phase、receipt或cursor。
+  搬移期間阻擋normal publication與cleanup；每批最多128個logical resources，
+  byte I/O在SQLite transaction外，重新hash並驗證穩定的path/type/link/stat後，
+  以短transaction一致更新所有相關authority。未完成、未知或模糊bytes須保留，
+  不得以最終artifact digest冒充partial temporary已完成的證據。
+  搬移工具須在停止ingest、readers與其他可能修改library的程序後離線執行。
+  每步持有publication exclusive lock與state lock，先durable保存session，
+  再以reader-visible `ACTIVATING` fence保護authority更新；既有publication
+  marker須保留原bytes。若session明確記錄原本沒有marker，只允許續寫該
+  session自建marker之expected payload的exact prefix；須重驗regular file、
+  single link、descriptor/path identity並fsync。Foreign prefix須保留並拒絕，
+  不得把這個control-file例外延伸為接納partial artifact。
 - `library_path` parent、`.h2hdb-state/` 與 `.h2hdb-coordination/` 是
   ingest-owned single-writer namespace；其他程序即使使用相同 UID 也不得
   mutate。Komga只能 read-only mount `current/acquisitions/`；OPDS read-only mount
@@ -282,7 +297,7 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
   receipt、journal、marker、digest 與 stat identity 繼續，不得要求 rollback。
 - 只能 capture/install/delete journal 記錄為 managed 且 exact authority 相符的
   path。unknown path、中間 symlink、name/inode/link/content authority變更一律
-  fail closed。唯一 partial-content 例外是 durable `WRITING` token 所綁定的
+  fail closed。Artifact 的唯一 partial-content 例外是 durable `WRITING` token 所綁定的
   deterministic private temp；terminal release 必須先 durable tombstone，再
   捕獲其實際 digest/stat identity 後 descriptor-relative delete。
 - terminal `RELEASED` protection token tombstone 永久保留並 fence delayed

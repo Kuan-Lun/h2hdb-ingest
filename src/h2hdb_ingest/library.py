@@ -42,6 +42,10 @@ from h2hdb import (
     VNextSourceChangedError,
 )
 
+from ._library_journal import FORMAT_VERSION as _JOURNAL_FORMAT_VERSION
+from ._library_journal import create_fresh_journal as _create_fresh_journal
+from ._library_journal import require_exact_schema as _require_exact_journal_schema
+from ._library_journal import require_no_relocation as _require_no_relocation
 from ._library_layout import (
     COORDINATION_DIRECTORY_NAME as _COORDINATION_DIRECTORY_NAME,
 )
@@ -3233,6 +3237,7 @@ class ManagedFilesystemLibraryAdapter:
         with self._storage_identity_lock:
             self._require_pinned_storage_identity()
             validate_precreated_library_layout(self._root, durable=False)
+            self._require_existing_journal_available()
             root_before = self._storage_root_identity()
             validate_precreated_library_layout(self._root, durable=True)
             self._require_storage_root_identity(
@@ -3293,6 +3298,59 @@ class ManagedFilesystemLibraryAdapter:
                 )
             self._pin_or_require_storage_identity(identity, root_after)
             self._require_pinned_storage_identity()
+
+    def _require_existing_journal_available(self) -> None:
+        """Refuse old formats or unfinished relocation before private layout I/O."""
+
+        try:
+            with _open_directory_chain(
+                self._root,
+                (_STATE_DIRECTORY_NAME, _JOURNAL_DIRECTORY_NAME),
+                create=False,
+            ) as (root_descriptor, parent_descriptor):
+                value = _lstat_at(parent_descriptor, _DATABASE_NAME)
+                if value is None or value.st_size == 0:
+                    return
+                if value.st_nlink != 1:
+                    raise RuntimeError("library journal has an unsafe link count")
+                connection = sqlite3.connect(
+                    self._database_path.as_uri() + "?mode=rw", uri=True
+                )
+                try:
+                    row = connection.execute(
+                        "SELECT format_version FROM library_state WHERE singleton = 1"
+                    ).fetchone()
+                    _require_runtime_journal_format(row)
+                    _require_no_relocation(connection)
+                    relocation = connection.execute(
+                        "SELECT root_device, root_inode FROM library_relocation_session "
+                        "WHERE singleton = 1"
+                    ).fetchone()
+                    root_identity = os.fstat(root_descriptor)
+                    if relocation is not None and tuple(relocation) != (
+                        root_identity.st_dev.to_bytes(8, "big"),
+                        root_identity.st_ino.to_bytes(8, "big"),
+                    ):
+                        raise RuntimeError(
+                            "library moved after its last relocation verification; "
+                            "rerun the library relocation tool for this destination"
+                        )
+                    named = _lstat_at(parent_descriptor, _DATABASE_NAME)
+                    if named is None or (named.st_dev, named.st_ino) != (
+                        value.st_dev,
+                        value.st_ino,
+                    ):
+                        raise RuntimeError("library journal changed during startup")
+                    _require_chain_identity(
+                        self._root,
+                        (_STATE_DIRECTORY_NAME, _JOURNAL_DIRECTORY_NAME),
+                        root_descriptor,
+                        parent_descriptor,
+                    )
+                finally:
+                    connection.close()
+        except FileNotFoundError:
+            return
 
     def _storage_root_identity(self) -> tuple[int, int]:
         flags = (
@@ -3588,19 +3646,16 @@ class ManagedFilesystemLibraryAdapter:
                         "unsupported library activation journal; a fresh library "
                         "root is required"
                     ) from error
-                if existing_version != (3,):
-                    raise RuntimeError(
-                        "unsupported library activation journal format; a fresh "
-                        "library root is required"
-                    )
+                _require_runtime_journal_format(existing_version)
                 _require_exact_journal_schema(connection)
             else:
                 _create_fresh_journal(connection, uuid4().bytes)
                 _require_exact_journal_schema(connection)
             if connection.execute(
                 "SELECT format_version FROM library_state WHERE singleton = 1"
-            ).fetchone() != (3,):
+            ).fetchone() != (_JOURNAL_FORMAT_VERSION,):
                 raise RuntimeError("unsupported library activation journal format")
+            _require_no_relocation(connection)
             identity = _read_storage_identity(connection)
             self._require_pinned_storage_uuid(identity)
             connection.commit()
@@ -3620,47 +3675,15 @@ def _storage_key(value: StorageObjectKey) -> StorageObjectKey:
     return validate_storage_key(value)
 
 
-def _require_exact_journal_schema(connection: sqlite3.Connection) -> None:
-    """Reject every journal table/index shape outside the v3 closed world."""
-
-    def signature(database: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
-        return tuple(
-            database.execute(
-                "SELECT type, name, tbl_name, sql FROM sqlite_master "
-                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
-            ).fetchall()
-        )
-
-    reference = sqlite3.connect(":memory:")
-    try:
-        _create_fresh_journal(
-            reference,
-            bytes.fromhex("00000000000040008000000000000001"),
-        )
-        expected = signature(reference)
-    finally:
-        reference.close()
-    if signature(connection) != expected:
-        raise RuntimeError(
-            "unsupported library activation journal shape; a fresh library "
-            "root is required"
-        )
-
-
-def _create_fresh_journal(
-    connection: sqlite3.Connection,
-    storage_instance_uuid: bytes,
-) -> None:
-    """Create the complete v3 journal and identity in one transaction."""
-
-    identity = LibraryStorageIdentity(storage_instance_uuid)
-    script = (
-        "BEGIN IMMEDIATE;\n" + _SCHEMA + "\nINSERT INTO library_storage_identity "
-        "(singleton, storage_instance_uuid) VALUES "
-        f"(1, X'{identity.storage_instance_uuid.hex()}');\n"
-        "COMMIT;\n"
+def _require_runtime_journal_format(row: object) -> None:
+    if row == (_JOURNAL_FORMAT_VERSION,):
+        return
+    guidance = (
+        "use the standalone relocation tool with --upgrade-v3 for this v3 library"
+        if row == (3,)
+        else "a fresh library root is required"
     )
-    connection.executescript(script)
+    raise RuntimeError(f"unsupported library activation journal format; {guidance}")
 
 
 def _read_storage_identity(
@@ -4203,7 +4226,14 @@ def _require_regular_authority_at(
 
     value = _lstat_at(descriptor, leaf)
     if value is None or value.st_size != expected_size or value.st_nlink != 1:
-        raise RuntimeError(f"{label} changed durable inode authority")
+        details = (
+            "missing"
+            if value is None
+            else f"size={value.st_size}, expected_size={expected_size}, links={value.st_nlink}"
+        )
+        raise RuntimeError(
+            f"{label} changed durable inode authority: leaf={leaf!r}, {details}"
+        )
     observed = _Signature.from_stat(value)
     matches = (
         _same_content_identity(observed, expected_signature)
@@ -4211,7 +4241,15 @@ def _require_regular_authority_at(
         else observed == expected_signature
     )
     if not matches:
-        raise RuntimeError(f"{label} changed durable inode authority")
+        fields = ("device", "inode", "size_bytes", "modified_ns", "changed_ns")
+        changed = ", ".join(
+            f"{field}: {getattr(expected_signature, field)!r} -> {getattr(observed, field)!r}"
+            for field in fields
+            if getattr(expected_signature, field) != getattr(observed, field)
+        )
+        raise RuntimeError(
+            f"{label} changed durable inode authority: leaf={leaf!r}; {changed}"
+        )
     return observed
 
 
@@ -4897,114 +4935,3 @@ def _quarantine_leaf(storage_path: str, digest: bytes) -> str:
     framed.update(b"\0")
     framed.update(digest)
     return f"{framed.hexdigest()}{_storage_suffix(key)}"
-
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS library_state (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    format_version INTEGER NOT NULL CHECK (format_version = 3),
-    current_revision INTEGER NULL,
-    current_receipt_id BLOB NULL,
-    pending_revision INTEGER NULL,
-    pending_receipt_id BLOB NULL,
-    phase TEXT NOT NULL CHECK (
-        phase IN ('IDLE', 'OPEN', 'SEALED', 'ACTIVATING', 'READY')
-    ),
-    last_cursor BLOB NULL CHECK (
-        last_cursor IS NULL OR length(last_cursor) = 33
-    )
-);
-INSERT OR IGNORE INTO library_state
-    (singleton, format_version, phase) VALUES (1, 3, 'IDLE');
-CREATE TABLE IF NOT EXISTS library_storage_identity (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    storage_instance_uuid BLOB NOT NULL CHECK (length(storage_instance_uuid) = 16)
-);
-CREATE TABLE IF NOT EXISTS protection_tokens (
-    token BLOB PRIMARY KEY CHECK (length(token) = 32),
-    storage_codec TEXT NOT NULL,
-    storage_path TEXT NOT NULL,
-    object_sha256 BLOB NOT NULL CHECK (length(object_sha256) = 32),
-    size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
-    published_modified_at TEXT NULL CHECK (
-        published_modified_at IS NULL OR length(published_modified_at) > 0
-    ),
-    state TEXT NOT NULL CHECK (
-        state IN ('WRITING', 'STAGED', 'INSTALLED', 'RELEASED')
-    ),
-    staging_leaf TEXT NULL,
-    device BLOB NULL,
-    inode BLOB NULL,
-    modified_ns INTEGER NULL,
-    changed_ns INTEGER NULL
-);
-CREATE INDEX IF NOT EXISTS protection_object_idx ON protection_tokens (
-    storage_codec, storage_path, object_sha256, size_bytes,
-    published_modified_at, state
-);
-CREATE UNIQUE INDEX IF NOT EXISTS protection_one_active_stage_idx
-    ON protection_tokens(storage_path)
-    WHERE state IN ('WRITING', 'STAGED');
-CREATE TABLE IF NOT EXISTS current_entries (
-    publication_key BLOB NOT NULL CHECK (length(publication_key) = 32),
-    resource_kind TEXT NOT NULL CHECK (
-        resource_kind IN ('acquisition', 'thumbnail')
-    ),
-    storage_path TEXT NOT NULL UNIQUE,
-    storage_codec TEXT NOT NULL,
-    gid INTEGER NOT NULL,
-    object_sha256 BLOB NOT NULL CHECK (length(object_sha256) = 32),
-    size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
-    published_modified_at TEXT NOT NULL CHECK (length(published_modified_at) > 0),
-    device BLOB NOT NULL CHECK (length(device) = 8),
-    inode BLOB NOT NULL CHECK (length(inode) = 8),
-    modified_ns INTEGER NOT NULL,
-    changed_ns INTEGER NOT NULL,
-    PRIMARY KEY (publication_key, resource_kind),
-    UNIQUE (gid, resource_kind)
-);
-CREATE TABLE IF NOT EXISTS pending_entries (
-    activation_revision INTEGER NOT NULL,
-    publication_key BLOB NOT NULL CHECK (length(publication_key) = 32),
-    gid INTEGER NOT NULL,
-    resource_kind TEXT NOT NULL CHECK (
-        resource_kind IN ('acquisition', 'thumbnail')
-    ),
-    storage_codec TEXT NOT NULL,
-    storage_path TEXT NOT NULL,
-    object_sha256 BLOB NOT NULL CHECK (length(object_sha256) = 32),
-    size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
-    published_modified_at TEXT NOT NULL CHECK (length(published_modified_at) > 0),
-    operation_started INTEGER NOT NULL CHECK (operation_started IN (0, 1)),
-    activated INTEGER NOT NULL CHECK (activated IN (0, 1)),
-    device BLOB NULL,
-    inode BLOB NULL,
-    modified_ns INTEGER NULL,
-    changed_ns INTEGER NULL,
-    PRIMARY KEY (activation_revision, publication_key, resource_kind),
-    UNIQUE (activation_revision, gid, resource_kind),
-    UNIQUE (activation_revision, storage_path)
-);
-CREATE INDEX IF NOT EXISTS pending_entries_activation_idx
-    ON pending_entries(
-        activation_revision, activated, publication_key, resource_kind
-    );
-CREATE TABLE IF NOT EXISTS pending_removals (
-    activation_revision INTEGER NOT NULL,
-    publication_key BLOB NOT NULL CHECK (length(publication_key) = 32),
-    resource_kind TEXT NOT NULL CHECK (
-        resource_kind IN ('acquisition', 'thumbnail')
-    ),
-    storage_codec TEXT NOT NULL,
-    storage_path TEXT NOT NULL,
-    object_sha256 BLOB NOT NULL CHECK (length(object_sha256) = 32),
-    size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
-    device BLOB NOT NULL CHECK (length(device) = 8),
-    inode BLOB NOT NULL CHECK (length(inode) = 8),
-    modified_ns INTEGER NOT NULL,
-    changed_ns INTEGER NOT NULL,
-    operation_started INTEGER NOT NULL CHECK (operation_started IN (0, 1)),
-    PRIMARY KEY (activation_revision, publication_key, resource_kind),
-    UNIQUE (activation_revision, storage_path)
-);
-"""

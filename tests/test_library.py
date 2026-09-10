@@ -29,6 +29,7 @@ from h2hdb import (
 
 import h2hdb_ingest.artifact as artifact_module
 import h2hdb_ingest.library as library_module
+from h2hdb_ingest._library_journal import create_fresh_journal
 from h2hdb_ingest._library_layout import validate_precreated_library_layout
 from h2hdb_ingest.artifact import ArtifactRenderPolicy
 from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
@@ -254,7 +255,7 @@ def test_storage_identity_is_created_once_and_replayed_after_reopen(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT format_version FROM library_state WHERE singleton = 1"
-        ).fetchone() == (3,)
+        ).fetchone() == (4,)
         assert connection.execute(
             "SELECT singleton, storage_instance_uuid FROM library_storage_identity"
         ).fetchall() == [(1, created.storage_instance_uuid)]
@@ -382,7 +383,7 @@ def test_storage_identity_replays_a_lost_fresh_commit_response(
 ) -> None:
     root = tmp_path / "library"
     _provision_library_root(root)
-    original_create = library_module._create_fresh_journal
+    original_create = create_fresh_journal
     interrupted = False
 
     def commit_then_interrupt(
@@ -4233,7 +4234,7 @@ def test_release_rejects_stage_suffix_swapped_in_journal(tmp_path: Path) -> None
     assert staged.read_bytes() == payload
 
 
-def test_journal_rejects_extra_v3_schema_surface(tmp_path: Path) -> None:
+def test_journal_rejects_extra_v4_schema_surface(tmp_path: Path) -> None:
     root = tmp_path / "library"
     adapter = _adapter(root)
     adapter._ensure_layout()
@@ -4246,7 +4247,7 @@ def test_journal_rejects_extra_v3_schema_surface(tmp_path: Path) -> None:
         _adapter(root)._ensure_layout()
 
 
-def test_journal_rejects_missing_v3_schema_without_repairing_it(
+def test_journal_rejects_missing_v4_schema_without_repairing_it(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "library"

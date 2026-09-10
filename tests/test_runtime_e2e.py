@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from hashlib import file_digest, sha256
 from io import BytesIO
 from pathlib import Path
-from shutil import rmtree
+from shutil import copytree, rmtree
 from time import time_ns
 from typing import BinaryIO, cast
 from unittest.mock import patch
@@ -67,6 +67,7 @@ from h2hdb_ingest.filesystem import (
     FilesystemSource,
 )
 from h2hdb_ingest.image_qualification import ImageGalleryQualifier
+from h2hdb_ingest.library_relocation import relocate_library
 from h2hdb_ingest.runtime import IngestRuntime, build_runtime
 from h2hdb_ingest.source_monitor import FilesystemCompletionMarkerProbe
 
@@ -1182,6 +1183,79 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
         assert restarted.database_admin.check().state == "READY"
     finally:
         restarted.close()
+
+
+def test_complete_library_relocation_keeps_catalog_and_reuses_artifact(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "download"
+    _gallery(source, 2501, "artist")
+    Image.new("RGB", (8, 12), "red").save(source / "2501" / "001.jpg")
+    library_root = tmp_path / "library"
+    _provision_library_root(library_root)
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(
+            download_path=source,
+            library_path=library_root,
+            page_render_workers=1,
+        ),
+        resident=ResidentConfig(lease_seconds=30, heartbeat_seconds=5),
+    )
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
+        assert runtime.resident.process_available(periodic_scan=True)
+        revision = runtime.catalog.get_catalog_revision()
+        publications = runtime.catalog.discover_publications().publications
+        assert len(publications) == 1
+        artifact = publications[0].artifacts[0]
+        segments = artifact.storage_object.key.segments
+        original = library_root.joinpath("current", *segments)
+        original_bytes = original.read_bytes()
+        original_inode = original.stat().st_ino
+
+    moved_root = tmp_path / "moved-library"
+    copytree(library_root, moved_root)
+    moved_archive = moved_root.joinpath("current", *segments)
+    assert moved_archive.stat().st_ino != original_inode
+    assert relocate_library(moved_root, batch_size=1).complete
+    verified_stat = moved_archive.stat()
+
+    def unexpected_render(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("unchanged source must reuse the relocated archive")
+
+    monkeypatch.setattr(
+        ManagedFilesystemLibraryAdapter, "render_archive", unexpected_render
+    )
+    relocated_config = config.model_copy(
+        update={"paths": config.paths.model_copy(update={"library_path": moved_root})}
+    )
+    with build_runtime(relocated_config) as restarted:
+        restarted.resident.initialize()
+        assert restarted.catalog.get_catalog_revision() == revision
+        assert restarted.catalog.discover_publications().publications == publications
+        assert restarted.resident.process_available(periodic_scan=True)
+        assert restarted.catalog.get_catalog_revision() == revision
+        assert restarted.catalog.discover_publications().publications == publications
+        assert restarted.database_admin.check().state == "READY"
+    assert moved_archive.read_bytes() == original_bytes
+    after = moved_archive.stat()
+    assert (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) == (
+        verified_stat.st_dev,
+        verified_stat.st_ino,
+        verified_stat.st_size,
+        verified_stat.st_mtime_ns,
+        verified_stat.st_ctime_ns,
+    )
 
 
 def test_deleted_gallery_reconciles_catalog_library_and_historical_cleanup(

@@ -31,6 +31,7 @@ classifiers = [
 [project.scripts]
 h2hdb-ingest = "h2hdb_ingest.__main__:main"
 h2hdb-ingest-bootstrap = "h2hdb_ingest.bootstrap:main"
+h2hdb-ingest-relocate = "h2hdb_ingest.relocate:main"
 
 [project.optional-dependencies]
 dev = [

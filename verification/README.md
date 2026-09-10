@@ -27,6 +27,10 @@ This directory contains executable specifications owned by filesystem ingest.
   premise, that caller digests are accepted only after independent
   recomputation, and that released/replaced journal facts reject stale exact
   fences.
+- `lean/LibraryRelocation.lean` proves that explicit, exact-session rebinding
+  preserves the library UUID, resource key and independently verified digest;
+  inactive sessions, stale journal rows, changed bytes and unstable observations
+  cannot authorize rebinding. An active relocation blocks normal runtime work.
 - `lean/ArchiveInspectionReuse.lean` proves that a single-use inspection slot
   agrees with full inspection when the actual rehashed bytes match, under an
   explicit collision-free-at-the-inspected-bytes assumption. It also proves
@@ -57,6 +61,10 @@ This directory contains executable specifications owned by filesystem ingest.
   activation entry. Its single-object `PROTECT` gate corresponds to one
   bounded runtime token-lock stripe; unrelated stripes remain concurrent and
   are outside this model.
+- `tla/LibraryRelocation.tla` model-checks the atomic journal upgrade/session
+  boundary, reader fencing before rebinding, bounded resource commits and a
+  complete second audit, crash loss of uncommitted observations, original-marker
+  restoration and normal-runtime exclusion during unfinished maintenance.
 - `tla/PytestProcessSupervision.tla` model-checks the repository test runner's
   start gate, ownership-before-start ordering, normal exit with a surviving
   descendant, timeout and interruption cleanup, termination and `taskkill`
@@ -200,6 +208,24 @@ reservation and terminalization code refines the model. The TLA+ gate and
 filesystem steps are abstract atomic transitions; its finite success is not an
 unbounded proof. Fault/restart, same-adapter concurrency, exact-byte, traversal,
 and state-lock tests remain required refinement evidence.
+
+The relocation proofs use independently computed digest equality, stable
+descriptor/name observations, complete journal-directed inventory, exact session/row comparison
+and atomic updates as explicit premises. One modeled resource includes all
+journal references that must change together. The two-resource Small profile
+does not prove SHA-256 collision resistance, SQLite or filesystem durability,
+POSIX exclusion, safe ownership of unknown paths, or arbitrary concurrent
+external modification. `tests/test_library_relocation.py` supplies separate
+runtime evidence using complete copied v3 journals, current acquisition and
+thumbnail bytes, staged resources, WRITING partial files, pending activation
+replay, more than one page of retained released tokens, obsolete pending history,
+hash/stat tampering and injected durable-boundary response loss. Its
+fixtures preserve the original UUID and publication receipts; they never use
+private source data or production libraries. The existing activation models
+continue to describe normal same-inode replay. Explicit relocation authority
+does not broaden that normal-runtime rule. The inventory covers journal-owned
+resources and their authorized candidate names. Unreferenced extra files are
+preserved; successful relocation does not certify them.
 
 ## New-gallery invalidation
 

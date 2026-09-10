@@ -117,7 +117,7 @@ library/
 ```
 
 Do not pre-create `.h2hdb-state`; ingest creates and owns it. After operation,
-the private version-3 journal contains one immutable UUIDv4 for this library
+the private version-4 journal contains one immutable UUIDv4 for this library
 root. Startup stores the same UUID in h2hdb before any cleanup or ingest work;
 an exact restart is idempotent, while pairing the database with another root
 fails closed. Within one process, the filesystem adapter pins both that UUID
@@ -128,8 +128,10 @@ claiming work. A replacement observed at one of those boundaries is a fatal
 at the guard, the adapter does not create a private layout there. This is not a
 continuously held mount lock and does not claim to stop an external actor
 swapping the path between one passed guard and its immediately following POSIX
-syscall. There is no journal v2 migration or automatic database rebind; use a
-fresh database and rebuild when intentionally replacing the storage instance.
+syscall. There is no journal v2 migration or automatic database rebind. Moving
+the complete existing library preserves its UUID; the explicit relocation tool
+revalidates the files before adopting their new filesystem identities. A new
+unrelated storage UUID still requires a fresh database and rebuild.
 
 After operation,
 the complete layout is:
@@ -143,7 +145,7 @@ library/
 │       └── hash-v2/<2 hex>/<1 hex>/h2h-<gid>/thumbnail-320.jpg
 ├── .h2hdb-coordination/
 │   ├── publication.lock
-│   └── ACTIVATING                 # present only during an unfinished cutover
+│   └── ACTIVATING                 # unfinished publication or relocation
 └── .h2hdb-state/                  # ingest-private; never mount into a reader
     ├── staging/
     ├── quarantine/
@@ -544,6 +546,63 @@ batches. Normal resident mode continues the remaining collection afterward.
 
 ## Crash and restart behavior
 
+To move an existing library, stop ingest and readers, move the entire library
+including `.h2hdb-state` and `.h2hdb-coordination`, and update every reader and
+writer mount consistently. Keep the existing core database and library files.
+This is offline maintenance: keep ingest, readers, and every process that could
+modify the library stopped until verification completes. Run the maintenance
+tool with the new library root mounted, using Python 3.14 or newer:
+
+```bash
+python3 h2hdb-library-relocate.pyz --library /hentai/library --upgrade-v3
+```
+
+The standalone executable uses only Python's standard library. It does not
+require installing the new ingest package into the old container. Build it
+from this checkout with:
+
+```bash
+.venv/bin/python scripts/build-relocation-tool.py --output /tmp/h2hdb-library-relocate.pyz
+```
+
+Alternatively, an installed release provides the same command:
+
+```bash
+h2hdb-ingest-relocate --library /hentai/library --upgrade-v3
+```
+
+`--upgrade-v3` explicitly converts the exact released v3 journal in place;
+normal ingest accepts only v4 and never silently upgrades it. The tool retains
+the library UUID, catalog publication receipts, resource paths and artifact
+contents. Its independent durable relocation session blocks normal ingest
+until verification finishes. SHA-256 and size are verified before file
+identities are updated; source galleries are not reprocessed and the core
+database is not rebuilt. Batches contain at most 128 logical resources. A
+stopped or failed run is resumed with the same command and the same destination.
+The one-time schema transaction also builds indexes over existing journal
+tables; its duration depends on journal history size. The 128-resource bound
+applies to the subsequent verification pages, not to SQLite index creation.
+Incomplete or ambiguous files are preserved and reported rather than accepted
+as complete artifacts. Verification covers journal-managed resources and their
+authorized staging/quarantine names; unreferenced files are not adopted or
+removed. A normal startup also refuses a different root identity after a
+completed relocation, before beginning source processing.
+
+The tool holds the publication and state locks during each step and durably
+fences readers with `ACTIVATING` before updating artifact identities. It retains
+an existing publication marker unchanged. When the relocation session created
+its own marker, an interrupted write can resume only if the retained bytes are
+an exact prefix of that session's expected marker payload; a foreign prefix is
+preserved and rejected. This control-file recovery does not treat incomplete
+artifact bytes as a completed CBZ or thumbnail. The original publication marker
+is retained at completion; a marker created only for relocation is removed.
+
+Restart ingest and readers only after the tool reports completion, using an
+ingest release that supports v4. The old v3 runtime cannot open the upgraded
+journal. On later moves of a v4 library, omit `--upgrade-v3`. An unfinished
+catalog publication resumes its original receipt after relocation; the
+maintenance operation does not replace its publication phase or cursor.
+
 Ingest first writes complete candidates into private staging and verifies their
 size and SHA-256. It activates acquisitions and thumbnails in bounded pages of
 at most 128 resources while holding the publication fence. Files move into
@@ -593,10 +652,14 @@ activation reconciliation.
 - **`download_path is empty`**: check that the download volume is mounted.
 - **`must be a pre-existing real directory`**: create the required library
   directories before starting the container; symlinks are not accepted.
-- **`unsupported legacy ... fresh library root`**: keep the old tree as a
-  backup and configure an empty v3 journal root for a full artifact rebuild.
+- **`unsupported legacy ... fresh library root`**: v1/v2 journals and the old
+  artifact layout still require a fresh v4 library. An exact v3 journal uses the
+  explicit relocation command above and retains its existing data.
+- **`library relocation is unfinished`**: keep the original library and rerun
+  the relocation command against the same destination to resume verification.
 - **`library ... changed identity`**: another process modified a managed path;
-  stop all writers and inspect the mount before retrying.
+  stop all writers and inspect the mount before retrying. After an intentional
+  complete-library move, use the relocation command to validate the new files.
 - **database is not READY**: use the H2HDB administrator command to initialize
   a new empty database or resume its matching interrupted initialization.
   An older or drifted schema requires a fresh database and catalog rebuild.
