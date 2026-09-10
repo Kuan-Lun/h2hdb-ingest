@@ -304,10 +304,11 @@ Qualification also identifies the complete gallery folder; archive rendering
 includes the source SHA-256 because its public input is an immutable source spool,
 which does not carry the original gallery folder. `source_attribution=exact`
 identifies the current Python page worker. A libvips background thread may have no
-Python worker context: `source_attribution=active_candidates` then lists up to eight
-active source candidates and the count omitted, without claiming any candidate is
-the confirmed source. Unknown native diagnostics outside active image work retain
-their original message with the configured process locations.
+Python worker context: `source_attribution=active_candidates` then lists active
+source candidates up to the page-worker limit (currently 16), plus the count
+omitted, without claiming any candidate is the confirmed source. This covers an
+entire supported worker batch. Unknown native diagnostics outside active image
+work retain their original message with the configured process locations.
 
 For example, `unknown EXIF resolution unit` remains a warning and does not by
 itself exclude a gallery or prevent CBZ creation. Actual image rejection still

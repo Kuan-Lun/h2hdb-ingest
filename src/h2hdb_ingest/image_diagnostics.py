@@ -11,9 +11,12 @@ from itertools import islice
 from threading import Lock
 
 from ._log_fields import quote_log_field
+from .page_workers import MAX_PAGE_RENDER_WORKERS
 
 _MAXIMUM_FIELD_CHARACTERS = 1024
-_MAXIMUM_SOURCE_CANDIDATES = 8
+# Retain every page of a supported production worker batch. Independent callers
+# may exceed that bound; report their omitted count without guessing a source.
+_MAXIMUM_SOURCE_CANDIDATES = MAX_PAGE_RENDER_WORKERS
 
 
 @dataclass(frozen=True, slots=True)

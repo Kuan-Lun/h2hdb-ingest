@@ -32,6 +32,7 @@ from h2hdb_ingest.image_diagnostics import (
     native_image_log_scope,
 )
 from h2hdb_ingest.image_qualification import ImageGalleryQualifier
+from h2hdb_ingest.page_workers import MAX_PAGE_RENDER_WORKERS
 
 
 def _jpeg_with_unknown_resolution_unit() -> bytes:
@@ -222,12 +223,15 @@ def test_parallel_real_exif_qualification_warnings_name_the_correct_gallery(
     assert seen == {1234, 5678}
 
 
+@pytest.mark.parametrize("extra_sources", [0, 4])
 def test_native_thread_without_context_reports_bounded_candidates_and_no_stale_source(
     caplog: pytest.LogCaptureFixture,
+    extra_sources: int,
 ) -> None:
     logger = logging.getLogger("pyvips")
+    source_count = MAX_PAGE_RENDER_WORKERS + extra_sources
     with ExitStack() as stack:
-        for index in range(12):
+        for index in range(source_count):
             stack.enter_context(
                 image_log_scope(
                     SourceImageLogContext(
@@ -250,13 +254,15 @@ def test_native_thread_without_context_reports_bounded_candidates_and_no_stale_s
     message = _warnings(caplog)[0].getMessage()
     assert "source_attribution=active_candidates" in message
     assert "source_attribution=exact" not in message
-    assert "active_source_count=12" in message
-    assert "omitted_source_candidates=4" in message
-    assert message.count("gallery_folder=") == 8
+    assert f"active_source_count={source_count}" in message
+    assert f"omitted_source_candidates={extra_sources}" in message
+    assert message.count("gallery_folder=") == MAX_PAGE_RENDER_WORKERS
+    for gid in range(MAX_PAGE_RENDER_WORKERS):
+        assert f"gid={gid} " in message
     assert "\\n" in message and "\\u202e" in message
     assert "\n" not in message and "\u202e" not in message
     assert "...[truncated]" in message
-    assert len(message) < 12000
+    assert len(message) < MAX_PAGE_RENDER_WORKERS * 1500
     logger.warning("outside native decode")
     assert _warnings(caplog)[-1].getMessage() == "outside native decode"
     assert current_image_log_context() is None
