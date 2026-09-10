@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-10T17:24:22+00:00",
+  "checked_at": "2026-09-10T18:45:30+00:00",
   "manifest_sha256": "21c560c77afa3dd84363b7f0b087a8381a8dec6663ef3a55928605f028929e3c",
   "node": [
     {
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.22.0",
+  "project_version": "0.23.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -140,7 +140,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.16.6",
+      "latest": "0.16.7",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed every direct build, runtime, optional development and Node registry candidate, including candidates outside declared upper bounds. All current latest releases satisfy existing ranges and Python 3.14; no dependency manifest change is needed. Validation environment already contains build 1.6.1, hypothesis 6.168.0, packaging 26.3, ruff 0.16.6 and pydantic 2.13.5. Reviewed official release notes: https://github.com/pypa/build/releases/tag/1.6.1 and its 1.6.0 changelog (new CLI features and removed BuildBackendException.exc_info are not used here); https://hypothesis.readthedocs.io/en/latest/changelog.html (date generation and shrink/cache fixes); https://github.com/pypa/packaging/releases/tag/26.3 (specifier and metadata handling); https://github.com/astral-sh/ruff/releases/tag/0.16.6 (lint fixes); https://github.com/pydantic/pydantic/releases/tag/v2.13.5 (validator GC and smart union fixes). Repository fast gate passes with these installed versions. Relocation, standalone no-site-packages executable and version contract targets passed; explicit MariaDB 10.11.11 resident, relocated-library reuse and gallery-removal E2E passed (3 cases). The integration gate will additionally run bounded offline pytest, Lean, finite small TLC, sdist/wheel build and installed CLI/pipeline smoke. Existing upper bounds remain the tested major or compatibility lanes; no workaround or new pin was introduced.",
+    "note": "Re-audited all direct build, runtime, optional development and Node registry candidates, including releases outside upper bounds. All latest candidates satisfy the unchanged declarations and Python 3.14. Compared the complete inventory with the reviewed 0.22.0 receipt: only Ruff advanced from 0.16.6 to 0.16.7. Reviewed its official release notes at https://github.com/astral-sh/ruff/releases/tag/0.16.7 through the GitHub release API: preview receiver and re.prefixmatch rules remain opt-in; stable changes include nested-format quotation and pyupgrade typing fixes. Installed Ruff 0.16.7 in the repository-local environment and passed the complete fast gate without rule relaxations or source formatting changes. Other candidates retain the prior reviewed versions and release-note conclusions. Current-v4 relocation and CLI tests passed (46 cases), journal/runtime relocation targets passed (20 cases), and explicit temporary MariaDB 10.11.11 resident plus library-relocation E2E passed (2 cases). The integration gate also requires bounded offline pytest, Lean, finite small TLC, sdist/wheel build and installed CLI/pipeline smoke. No dependency pin, compatibility shim, schema change or production data migration is introduced.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
