@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-10T18:45:30+00:00",
+  "checked_at": "2026-09-10T22:03:06+00:00",
   "manifest_sha256": "21c560c77afa3dd84363b7f0b087a8381a8dec6663ef3a55928605f028929e3c",
   "node": [
     {
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.23.0",
+  "project_version": "0.23.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Re-audited all direct build, runtime, optional development and Node registry candidates, including releases outside upper bounds. All latest candidates satisfy the unchanged declarations and Python 3.14. Compared the complete inventory with the reviewed 0.22.0 receipt: only Ruff advanced from 0.16.6 to 0.16.7. Reviewed its official release notes at https://github.com/astral-sh/ruff/releases/tag/0.16.7 through the GitHub release API: preview receiver and re.prefixmatch rules remain opt-in; stable changes include nested-format quotation and pyupgrade typing fixes. Installed Ruff 0.16.7 in the repository-local environment and passed the complete fast gate without rule relaxations or source formatting changes. Other candidates retain the prior reviewed versions and release-note conclusions. Current-v4 relocation and CLI tests passed (46 cases), journal/runtime relocation targets passed (20 cases), and explicit temporary MariaDB 10.11.11 resident plus library-relocation E2E passed (2 cases). The integration gate also requires bounded offline pytest, Lean, finite small TLC, sdist/wheel build and installed CLI/pipeline smoke. No dependency pin, compatibility shim, schema change or production data migration is introduced.",
+    "note": "Re-audited all direct build, runtime, optional development and Node dependencies against official registry candidates, including versions outside current bounds. The complete inventory and dependency manifest are unchanged from the reviewed 0.23.0 receipt; all latest candidates satisfy the existing declarations and Python 3.14, and all 15 installed Python direct packages match those candidates. No new upstream release requires additional release-note review. The change only makes interrupted source synchronization retries visible as one WARNING with bounded original failure context; source qualification, lease completion, publication, schema and configuration semantics remain unchanged. Targeted regression validation passed 126 cases, including a real stable invalid gallery with SQLite and unchanged source stat/hash across retries. Independent diagnostic robustness checks passed 14 cases. Explicit H2HDB_TEST_MARIADB=1 resident lifecycle validation against disposable MariaDB 10.11.11 passed one fresh-epoch source/analysis/publication case. The integration gate additionally runs bounded offline pytest, Lean, finite small TLC, distribution build and installed-wheel smoke. No dependency changes, migration or compatibility shim are introduced.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
