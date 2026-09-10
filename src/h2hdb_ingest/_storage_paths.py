@@ -1,4 +1,4 @@
-"""Canonical storage paths shared by runtime and the standalone maintenance tool."""
+"""Canonical storage paths shared by runtime and the relocation command."""
 
 from __future__ import annotations
 
