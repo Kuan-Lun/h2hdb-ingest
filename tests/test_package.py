@@ -27,6 +27,8 @@ def test_distribution_commands_target_vnext_entry_points() -> None:
     assert project["scripts"] == {
         "h2hdb-ingest": "h2hdb_ingest.__main__:main",
         "h2hdb-ingest-bootstrap": "h2hdb_ingest.bootstrap:main",
+        "h2hdb-ingest-relocate": "h2hdb_ingest.relocate:main",
     }
     assert callable(import_module("h2hdb_ingest.__main__").main)
     assert callable(import_module("h2hdb_ingest.bootstrap").main)
+    assert callable(import_module("h2hdb_ingest.relocate").main)
