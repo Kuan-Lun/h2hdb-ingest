@@ -3,6 +3,7 @@ import Std
 /-!
 # Explicit library relocation authority
 
+The current-format journal is an input assumption throughout this model.
 The immutable UUID, resource key and independently computed digest identify
 the logical artifact. A relocation session may replace physical observations
 only after a new, stable byte traversal agrees with that digest and the exact
@@ -12,8 +13,7 @@ blocked while that durable maintenance session is active.
 The predicates below explicitly assume successful independent hashing and
 stable descriptor/name observations. They do not prove collision resistance,
 POSIX locks, filesystem durability, SQLite isolation, complete journal-directed
-inventory, or
-that production code establishes those premises. The finite TLA+ model and
+inventory, or that production code establishes those premises. The finite TLA+ model and
 runtime fault, tamper, lock and replay tests supply separate evidence.
 -/
 

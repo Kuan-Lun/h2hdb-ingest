@@ -3678,12 +3678,9 @@ def _storage_key(value: StorageObjectKey) -> StorageObjectKey:
 def _require_runtime_journal_format(row: object) -> None:
     if row == (_JOURNAL_FORMAT_VERSION,):
         return
-    guidance = (
-        "use the standalone relocation tool with --upgrade-v3 for this v3 library"
-        if row == (3,)
-        else "a fresh library root is required"
+    raise RuntimeError(
+        "unsupported library activation journal format; a fresh library root is required"
     )
-    raise RuntimeError(f"unsupported library activation journal format; {guidance}")
 
 
 def _read_storage_identity(

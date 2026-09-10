@@ -98,7 +98,7 @@ Startup rejects these known legacy states without deleting them:
 
 - `current/hash-v1`;
 - `.h2hdb-state/coordination`;
-- a version-1 or version-2 activation journal.
+- a version-1, version-2, or version-3 activation journal.
 
 Rebuild artifacts into a fresh library root. This prevents old and new paths
 from silently coexisting under one reader mount.
@@ -128,10 +128,11 @@ claiming work. A replacement observed at one of those boundaries is a fatal
 at the guard, the adapter does not create a private layout there. This is not a
 continuously held mount lock and does not claim to stop an external actor
 swapping the path between one passed guard and its immediately following POSIX
-syscall. There is no journal v2 migration or automatic database rebind. Moving
-the complete existing library preserves its UUID; the explicit relocation tool
-revalidates the files before adopting their new filesystem identities. A new
-unrelated storage UUID still requires a fresh database and rebuild.
+syscall. Only format-v4 journals are accepted; there is no automatic database
+rebind. Moving the complete existing library preserves its UUID; the explicit
+relocation tool revalidates files before adopting their new filesystem
+identities. A new unrelated storage UUID still requires a fresh database and
+rebuild.
 
 After operation,
 the complete layout is:
@@ -551,39 +552,21 @@ including `.h2hdb-state` and `.h2hdb-coordination`, and update every reader and
 writer mount consistently. Keep the existing core database and library files.
 This is offline maintenance: keep ingest, readers, and every process that could
 modify the library stopped until verification completes. Run the maintenance
-tool with the new library root mounted, using Python 3.14 or newer:
+command from an installed release with the new library root mounted:
 
 ```bash
-python3 h2hdb-library-relocate.pyz --library /hentai/library --upgrade-v3
+h2hdb-ingest-relocate --library /hentai/library
 ```
 
-The standalone executable uses only Python's standard library. It does not
-require installing the new ingest package into the old container. Build it
-from this checkout with:
-
-```bash
-.venv/bin/python scripts/build-relocation-tool.py --output /tmp/h2hdb-library-relocate.pyz
-```
-
-Alternatively, an installed release provides the same command:
-
-```bash
-h2hdb-ingest-relocate --library /hentai/library --upgrade-v3
-```
-
-`--upgrade-v3` explicitly converts the exact released v3 journal in place;
-normal ingest accepts only v4 and never silently upgrades it. The tool retains
-the library UUID, catalog publication receipts, resource paths and artifact
-contents. Its independent durable relocation session blocks normal ingest
-until verification finishes. SHA-256 and size are verified before file
-identities are updated; source galleries are not reprocessed and the core
-database is not rebuilt. Batches contain at most 128 logical resources. A
-stopped or failed run is resumed with the same command and the same destination.
-The one-time schema transaction also builds indexes over existing journal
-tables; its duration depends on journal history size. The 128-resource bound
-applies to the subsequent verification pages, not to SQLite index creation.
-Incomplete or ambiguous files are preserved and reported rather than accepted
-as complete artifacts. Verification covers journal-managed resources and their
+The command accepts only the current format-v4 journal. It retains the library
+UUID, catalog publication receipts, resource paths and artifact contents. Its
+independent durable relocation session blocks normal ingest until verification
+finishes. SHA-256 and size are verified before file identities are updated;
+source galleries are not reprocessed and the core database is not rebuilt.
+Batches contain at most 128 logical resources. A stopped or failed run is
+resumed with the same command and the same destination. Incomplete or ambiguous
+files are preserved and reported rather than accepted as complete artifacts.
+Verification covers journal-managed resources and their
 authorized staging/quarantine names; unreferenced files are not adopted or
 removed. A normal startup also refuses a different root identity after a
 completed relocation, before beginning source processing.
@@ -597,11 +580,9 @@ preserved and rejected. This control-file recovery does not treat incomplete
 artifact bytes as a completed CBZ or thumbnail. The original publication marker
 is retained at completion; a marker created only for relocation is removed.
 
-Restart ingest and readers only after the tool reports completion, using an
-ingest release that supports v4. The old v3 runtime cannot open the upgraded
-journal. On later moves of a v4 library, omit `--upgrade-v3`. An unfinished
-catalog publication resumes its original receipt after relocation; the
-maintenance operation does not replace its publication phase or cursor.
+Restart ingest and readers only after the command reports completion. An
+unfinished catalog publication resumes its original receipt after relocation;
+the maintenance operation does not replace its publication phase or cursor.
 
 Ingest first writes complete candidates into private staging and verifies their
 size and SHA-256. It activates acquisitions and thumbnails in bounded pages of
@@ -652,9 +633,9 @@ activation reconciliation.
 - **`download_path is empty`**: check that the download volume is mounted.
 - **`must be a pre-existing real directory`**: create the required library
   directories before starting the container; symlinks are not accepted.
-- **`unsupported legacy ... fresh library root`**: v1/v2 journals and the old
-  artifact layout still require a fresh v4 library. An exact v3 journal uses the
-  explicit relocation command above and retains its existing data.
+- **`unsupported legacy ... fresh library root`**: older journals and the old
+  artifact layout require a fresh v4 library. Both normal ingest and the
+  relocation command reject journals outside the exact current format.
 - **`library relocation is unfinished`**: keep the original library and rerun
   the relocation command against the same destination to resume verification.
 - **`library ... changed identity`**: another process modified a managed path;

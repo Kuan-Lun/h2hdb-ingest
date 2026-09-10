@@ -32,7 +32,6 @@ _TABLES = (
     "protection_tokens",
 )
 _TYPE = Callable[[str], None]
-_Upgrade = Callable[[sqlite3.Connection], bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +80,6 @@ def relocate_library(
     batch_size: int = _MAX_BATCH,
     progress: _TYPE | None = None,
     fault: _TYPE | None = None,
-    _upgrade: _Upgrade | None = None,
 ) -> RelocationResult:
     """Verify every authority in bounded steps; rerun after interruption."""
     first_step = True
@@ -91,7 +89,6 @@ def relocate_library(
             batch_size=batch_size,
             progress=progress,
             fault=fault,
-            _upgrade=_upgrade,
             _restart_complete=first_step,
             _restart_audit=first_step,
         )
@@ -106,7 +103,6 @@ def relocate_library_step(
     batch_size: int = _MAX_BATCH,
     progress: _TYPE | None = None,
     fault: _TYPE | None = None,
-    _upgrade: _Upgrade | None = None,
     _restart_complete: bool = False,
     _restart_audit: bool = False,
 ) -> RelocationResult:
@@ -118,6 +114,7 @@ def relocate_library_step(
     if type(batch_size) is not int or not 1 <= batch_size <= _MAX_BATCH:
         raise ValueError("relocation batch_size must be between 1 and 128")
     with _locked_library(root) as (files, connection):
+        require_exact_schema(connection)
         session = _session(connection)
         if session is None or (
             session.phase == "COMPLETE"
@@ -127,10 +124,8 @@ def relocate_library_step(
                 or session.root_inode != unsigned(files.identity.st_ino)
             )
         ):
-            session = _begin(files, connection, _upgrade)
+            session = _begin(files, connection)
             _notify(fault, "session_committed")
-        else:
-            require_exact_schema(connection)
         _require_session_root(files, connection, session)
         if _restart_audit and session.phase in {"AUDIT", "FINALIZING"}:
             _ensure_marker(files, session)
@@ -246,11 +241,6 @@ def _locked_library(root: Path) -> Iterator[tuple[LibraryFiles, sqlite3.Connecti
 
 
 def _session(connection: sqlite3.Connection) -> _Session | None:
-    exists = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'library_relocation_session'"
-    ).fetchone()
-    if exists is None:
-        return None
     row = connection.execute(
         "SELECT session_id, storage_instance_uuid, root_device, root_inode, "
         "phase, cursor, verified_files, original_marker FROM library_relocation_session "
@@ -287,9 +277,7 @@ def _storage_uuid(value: object) -> bytes:
     return value
 
 
-def _begin(
-    files: LibraryFiles, connection: sqlite3.Connection, upgrade: _Upgrade | None
-) -> _Session:
+def _begin(files: LibraryFiles, connection: sqlite3.Connection) -> _Session:
     identity_row = connection.execute(
         "SELECT storage_instance_uuid FROM library_storage_identity WHERE singleton = 1"
     ).fetchone()
@@ -316,9 +304,6 @@ def _begin(
     )
     connection.execute("BEGIN IMMEDIATE")
     try:
-        if upgrade is not None:
-            upgrade(connection)
-        require_exact_schema(connection)
         connection.execute(
             "INSERT OR REPLACE INTO library_relocation_session "
             "(singleton, session_id, storage_instance_uuid, root_device, root_inode, phase, cursor, verified_files, original_marker) "

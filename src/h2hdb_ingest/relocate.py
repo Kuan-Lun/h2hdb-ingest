@@ -8,7 +8,6 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from .journal_upgrade import upgrade_v3
 from .library_relocation import relocate_library
 
 
@@ -23,11 +22,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     parser.add_argument("--library", required=True, type=Path)
     parser.add_argument(
-        "--upgrade-v3",
-        action="store_true",
-        help="explicitly upgrade the released v3 SQLite journal to v4 before verification",
-    )
-    parser.add_argument(
         "--batch-size", type=int, default=128, help="resources per checkpoint (1..128)"
     )
     arguments = parser.parse_args(argv)
@@ -39,7 +33,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             arguments.library,
             batch_size=arguments.batch_size,
             progress=lambda message: print(message, flush=True),
-            _upgrade=upgrade_v3 if arguments.upgrade_v3 else None,
         )
     except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
         print(

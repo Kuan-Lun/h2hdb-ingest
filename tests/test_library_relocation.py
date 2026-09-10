@@ -21,8 +21,8 @@ from h2hdb import (
 )
 
 import h2hdb_ingest.library as library_module
+from h2hdb_ingest._library_journal import create_fresh_journal
 from h2hdb_ingest.artifact import ArtifactRenderPolicy
-from h2hdb_ingest.journal_upgrade import V3_SCHEMA, upgrade_v3
 from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
 from h2hdb_ingest.library_relocation import (
     relocate_library,
@@ -78,12 +78,7 @@ def _target(root: Path, key: StorageObjectKey) -> Path:
     return root / "current" / Path(*key.segments)
 
 
-def _legacy_root(
-    root: Path,
-    *,
-    count: int = 1,
-    thumbnail: bool = False,
-) -> tuple[VNextLibraryActivationItem, ...]:
+def _provision_root(root: Path) -> None:
     for relative in (
         "current/acquisitions",
         "current/artwork",
@@ -96,12 +91,18 @@ def _legacy_root(
         (root / relative).mkdir(parents=True, exist_ok=True)
     (root / ".h2hdb-coordination" / "publication.lock").touch()
     (root / ".h2hdb-state" / "locks" / "state.lock").touch()
+
+
+def _library_root(
+    root: Path,
+    *,
+    count: int = 1,
+    thumbnail: bool = False,
+) -> tuple[VNextLibraryActivationItem, ...]:
+    _provision_root(root)
     items: list[VNextLibraryActivationItem] = []
     with sqlite3.connect(_journal(root)) as connection:
-        connection.executescript(V3_SCHEMA)
-        connection.execute(
-            "INSERT INTO library_storage_identity VALUES (1, ?)", (_STORAGE_UUID,)
-        )
+        create_fresh_journal(connection, _STORAGE_UUID)
         connection.execute(
             "UPDATE library_state SET current_revision = 1, current_receipt_id = ?",
             (_RECEIPT,),
@@ -140,12 +141,6 @@ def _adapter(root: Path) -> ManagedFilesystemLibraryAdapter:
         source_root=source,
         render_policy=ArtifactRenderPolicy(),
     )
-
-
-def _upgrade(root: Path) -> None:
-    with sqlite3.connect(_journal(root)) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        assert upgrade_v3(connection)
 
 
 def _assert_current_authority(root: Path) -> None:
@@ -212,17 +207,17 @@ def _activate(
         adapter.complete(2, b"s" * 16)
 
 
-def test_relocation_upgrades_complete_v3_copy_preserving_catalog_and_bytes(
+def test_relocation_verifies_complete_v4_copy_preserving_catalog_and_bytes(
     tmp_path: Path,
 ) -> None:
     original = tmp_path / "original"
-    items = _legacy_root(original, count=2, thumbnail=True)
+    items = _library_root(original, count=2, thumbnail=True)
     moved = tmp_path / "moved"
     copytree(original, moved)
     first = items[0].storage_object.key
     assert _stat_values(_target(original, first)) != _stat_values(_target(moved, first))
 
-    result = relocate_library(moved, batch_size=2, _upgrade=upgrade_v3)
+    result = relocate_library(moved, batch_size=2)
 
     assert result.complete
     assert result.verified_files == len(items)
@@ -247,14 +242,27 @@ def test_relocation_upgrades_complete_v3_copy_preserving_catalog_and_bytes(
         )
 
 
-def test_normal_runtime_rejects_v3_without_implicitly_upgrading(tmp_path: Path) -> None:
+@pytest.mark.parametrize("entrypoint", ("runtime", "relocation"))
+def test_current_entrypoints_reject_old_journal_without_mutation(
+    tmp_path: Path,
+    entrypoint: str,
+) -> None:
     root = tmp_path / "library"
-    _legacy_root(root)
+    _provision_root(root)
+    with sqlite3.connect(_journal(root)) as connection:
+        connection.execute(
+            "CREATE TABLE library_state "
+            "(singleton INTEGER PRIMARY KEY, format_version INTEGER NOT NULL)"
+        )
+        connection.execute("INSERT INTO library_state VALUES (1, 3)")
     original_database = _journal(root).read_bytes()
     original_paths = tuple(sorted(path.relative_to(root) for path in root.rglob("*")))
 
-    with pytest.raises(RuntimeError, match=r"journal|format|upgrade"):
-        _adapter(root).ensure_storage_identity()
+    with pytest.raises(RuntimeError, match=r"journal|format"):
+        if entrypoint == "runtime":
+            _adapter(root).ensure_storage_identity()
+        else:
+            relocate_library(root)
 
     with sqlite3.connect(_journal(root)) as connection:
         assert connection.execute(
@@ -271,8 +279,7 @@ def test_relocation_accepts_ctime_only_change_after_hash_verification(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "library"
-    (item,) = _legacy_root(root)
-    _upgrade(root)
+    (item,) = _library_root(root)
     target = _target(root, item.storage_object.key)
     before = target.stat()
     target.chmod(0o600 if before.st_mode & 0o777 != 0o600 else 0o644)
@@ -309,7 +316,7 @@ def test_relocation_reopens_after_durable_boundary_response_loss(
     checkpoint: str,
 ) -> None:
     original = tmp_path / "original"
-    _legacy_root(original, count=2)
+    _library_root(original, count=2)
     moved = tmp_path / "moved"
     copytree(original, moved)
 
@@ -318,10 +325,9 @@ def test_relocation_reopens_after_durable_boundary_response_loss(
             moved,
             batch_size=1,
             fault=_fail_once(checkpoint),
-            _upgrade=upgrade_v3,
         )
 
-    result = relocate_library(moved, batch_size=1, _upgrade=upgrade_v3)
+    result = relocate_library(moved, batch_size=1)
 
     assert result.complete
     _assert_current_authority(moved)
@@ -333,7 +339,7 @@ def test_relocation_reopens_after_durable_boundary_response_loss(
 
 def test_relocation_step_bounds_verified_resources_and_resumes(tmp_path: Path) -> None:
     original = tmp_path / "original"
-    _legacy_root(original, count=5)
+    _library_root(original, count=5)
     moved = tmp_path / "moved"
     copytree(original, moved)
     observed: list[str] = []
@@ -342,7 +348,6 @@ def test_relocation_step_bounds_verified_resources_and_resumes(tmp_path: Path) -
         moved,
         batch_size=2,
         fault=observed.append,
-        _upgrade=upgrade_v3,
     )
 
     assert not first.complete
@@ -354,9 +359,7 @@ def test_relocation_step_bounds_verified_resources_and_resumes(tmp_path: Path) -
     maximum_verified = 0
     while not completed.complete:
         observed.clear()
-        completed = relocate_library_step(
-            moved, batch_size=2, fault=observed.append, _upgrade=upgrade_v3
-        )
+        completed = relocate_library_step(moved, batch_size=2, fault=observed.append)
         maximum_verified = max(maximum_verified, observed.count("resource_verified"))
         assert observed.count("resource_verified") <= 2
         assert observed.count("audit_verified") <= 2
@@ -372,15 +375,15 @@ def test_relocation_rejects_batch_outside_hard_cap(
     batch_size: int,
 ) -> None:
     root = tmp_path / "library"
-    _legacy_root(root)
+    _library_root(root)
 
     with pytest.raises((TypeError, ValueError), match=r"batch|128|limit"):
-        relocate_library_step(root, batch_size=batch_size, _upgrade=upgrade_v3)
+        relocate_library_step(root, batch_size=batch_size)
 
     with sqlite3.connect(_journal(root)) as connection:
         assert connection.execute(
             "SELECT format_version FROM library_state"
-        ).fetchone() == (3,)
+        ).fetchone() == (4,)
 
 
 @pytest.mark.parametrize("corruption", ("bytes", "size", "symlink", "missing", "link"))
@@ -389,7 +392,7 @@ def test_relocation_preserves_unverified_or_unsafe_current(
     corruption: str,
 ) -> None:
     original = tmp_path / "original"
-    (item,) = _legacy_root(original)
+    (item,) = _library_root(original)
     moved = tmp_path / "moved"
     copytree(original, moved)
     target = _target(moved, item.storage_object.key)
@@ -411,7 +414,7 @@ def test_relocation_preserves_unverified_or_unsafe_current(
     before_bytes = None if corruption == "missing" else target.read_bytes()
 
     with pytest.raises(RuntimeError):
-        relocate_library(moved, _upgrade=upgrade_v3)
+        relocate_library(moved)
 
     assert outside.read_bytes() == payload
     if before is None:
@@ -444,7 +447,7 @@ def test_relocation_detects_change_between_hash_and_journal_commit(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "library"
-    (item,) = _legacy_root(root)
+    (item,) = _library_root(root)
     target = _target(root, item.storage_object.key)
     changed = False
 
@@ -455,7 +458,7 @@ def test_relocation_detects_change_between_hash_and_journal_commit(
             target.write_bytes(b"x" * item.storage_object.size_bytes)
 
     with pytest.raises(RuntimeError):
-        relocate_library(root, fault=mutate_after_hash, _upgrade=upgrade_v3)
+        relocate_library(root, fault=mutate_after_hash)
 
     assert changed
     assert target.read_bytes() == b"x" * item.storage_object.size_bytes
@@ -467,12 +470,12 @@ def test_relocation_preserves_unreferenced_files_without_certifying_them(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "library"
-    _legacy_root(root)
+    _library_root(root)
     unknown = root / "current" / "acquisitions" / "operator-file.cbz"
     unknown.write_bytes(b"unreferenced file outside journal authority")
     before = _stat_values(unknown)
 
-    result = relocate_library(root, _upgrade=upgrade_v3)
+    result = relocate_library(root)
 
     assert result.complete
     assert result.verified_files == 1
@@ -492,8 +495,7 @@ def test_normal_runtime_still_rejects_byte_identical_foreign_inode(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "library"
-    (item,) = _legacy_root(root)
-    _upgrade(root)
+    (item,) = _library_root(root)
     adapter = _adapter(root)
     adapter.ensure_storage_identity()
     target = _target(root, item.storage_object.key)
@@ -512,8 +514,7 @@ def test_relocation_rebinds_staged_authority_before_normal_activation(
     tmp_path: Path,
 ) -> None:
     original = tmp_path / "original"
-    (existing,) = _legacy_root(original)
-    _upgrade(original)
+    (existing,) = _library_root(original)
     adapter = _adapter(original)
     payload = b"new staged acquisition"
     staged = _item(2, payload)
@@ -553,8 +554,7 @@ def test_relocation_preserves_writing_partial_without_sealing_it(
     tmp_path: Path,
 ) -> None:
     original = tmp_path / "original"
-    _legacy_root(original)
-    _upgrade(original)
+    _library_root(original)
     adapter = _adapter(original)
     payload = b"incomplete staged acquisition"
     staged = _item(2, payload)
@@ -598,8 +598,7 @@ def test_relocation_preserves_pending_install_receipt_and_resumes_rename_loss(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original = tmp_path / "original"
-    _legacy_root(original)
-    _upgrade(original)
+    _library_root(original)
     adapter = _adapter(original)
     payload = b"replacement whose rename was committed"
     replacement = _item(1, payload)
@@ -637,50 +636,50 @@ def test_relocation_rechecks_files_after_finalization_process_loss(
     checkpoint: str,
 ) -> None:
     root = tmp_path / "library"
-    (item,) = _legacy_root(root)
+    (item,) = _library_root(root)
     with pytest.raises(RuntimeError, match=f"fault: {checkpoint}"):
-        relocate_library(root, fault=_fail_once(checkpoint), _upgrade=upgrade_v3)
+        relocate_library(root, fault=_fail_once(checkpoint))
     target = _target(root, item.storage_object.key)
     changed = b"q" * item.storage_object.size_bytes
     target.write_bytes(changed)
 
     with pytest.raises(RuntimeError):
-        relocate_library(root, _upgrade=upgrade_v3)
+        relocate_library(root)
 
     assert target.read_bytes() == changed
     with pytest.raises(RuntimeError, match="relocat"):
         _adapter(root).ensure_storage_identity()
 
 
-def test_relocation_rejects_contended_publication_lock_before_journal_upgrade(
+def test_relocation_rejects_contended_publication_lock_before_session_start(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "library"
-    _legacy_root(root)
+    _library_root(root)
     with (root / ".h2hdb-coordination" / "publication.lock").open("rb") as reader:
         fcntl.flock(reader.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
         try:
             with pytest.raises(BlockingIOError):
-                relocate_library(root, _upgrade=upgrade_v3)
+                relocate_library(root)
         finally:
             fcntl.flock(reader.fileno(), fcntl.LOCK_UN)
     with sqlite3.connect(_journal(root)) as connection:
         assert connection.execute(
             "SELECT format_version FROM library_state"
-        ).fetchone() == (3,)
+        ).fetchone() == (4,)
 
 
 def test_relocation_refuses_replaced_root_during_unfinished_session(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "library"
-    _legacy_root(root)
-    assert not relocate_library_step(root, _upgrade=upgrade_v3).complete
+    _library_root(root)
+    assert not relocate_library_step(root).complete
     replacement = tmp_path / "another-root"
     copytree(root, replacement)
 
     with pytest.raises(RuntimeError, match=r"root|identity"):
-        relocate_library_step(replacement, _upgrade=upgrade_v3)
+        relocate_library_step(replacement)
 
 
 def test_relocation_rebinds_quarantined_pending_removal_and_resumes_cleanup(
@@ -688,8 +687,7 @@ def test_relocation_rebinds_quarantined_pending_removal_and_resumes_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     original = tmp_path / "original"
-    (item,) = _legacy_root(original)
-    _upgrade(original)
+    (item,) = _library_root(original)
     adapter = _adapter(original)
 
     def stop_before_unlink(*_args: object, **_kwargs: object) -> None:
@@ -727,8 +725,7 @@ def test_relocation_preserves_ambiguous_staging_publish_duplicate(
     tmp_path: Path,
 ) -> None:
     original = tmp_path / "original"
-    _legacy_root(original)
-    _upgrade(original)
+    _library_root(original)
     payload = b"ambiguous staging candidate"
     item = _item(2, payload)
     token = b"d" * 32
@@ -750,7 +747,7 @@ def test_relocation_does_not_treat_completed_pending_history_as_current(
     tmp_path: Path,
 ) -> None:
     original = tmp_path / "original"
-    (item,) = _legacy_root(original)
+    (item,) = _library_root(original)
     target = _target(original, item.storage_object.key)
     with sqlite3.connect(_journal(original)) as connection:
         connection.execute("UPDATE library_state SET current_revision = 3")
@@ -778,7 +775,7 @@ def test_relocation_does_not_treat_completed_pending_history_as_current(
     moved = tmp_path / "moved"
     copytree(original, moved)
 
-    assert relocate_library(moved, _upgrade=upgrade_v3).complete
+    assert relocate_library(moved).complete
 
     _assert_current_authority(moved)
     with sqlite3.connect(_journal(moved)) as connection:
@@ -794,7 +791,7 @@ def test_relocation_pages_retained_released_tokens_for_one_storage_path(
     tmp_path: Path,
 ) -> None:
     original = tmp_path / "original"
-    (item,) = _legacy_root(original)
+    (item,) = _library_root(original)
     payload = b"retained released staging bytes"
     count = 129
     with sqlite3.connect(_journal(original)) as connection:
@@ -820,7 +817,7 @@ def test_relocation_pages_retained_released_tokens_for_one_storage_path(
     moved = tmp_path / "moved"
     copytree(original, moved)
 
-    result = relocate_library(moved, batch_size=32, _upgrade=upgrade_v3)
+    result = relocate_library(moved, batch_size=32)
 
     assert result.complete
     with sqlite3.connect(_journal(moved)) as connection:
@@ -839,8 +836,8 @@ def test_relocation_pages_retained_released_tokens_for_one_storage_path(
 
 def test_relocation_session_rejects_changed_storage_uuid(tmp_path: Path) -> None:
     root = tmp_path / "library"
-    _legacy_root(root)
-    assert not relocate_library_step(root, _upgrade=upgrade_v3).complete
+    _library_root(root)
+    assert not relocate_library_step(root).complete
     with sqlite3.connect(_journal(root)) as connection:
         connection.execute(
             "UPDATE library_storage_identity SET storage_instance_uuid = ?",
@@ -848,15 +845,15 @@ def test_relocation_session_rejects_changed_storage_uuid(tmp_path: Path) -> None
         )
 
     with pytest.raises(RuntimeError, match="UUID"):
-        relocate_library_step(root, _upgrade=upgrade_v3)
+        relocate_library_step(root)
 
 
 def test_explicit_relocation_revalidates_after_completed_session(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "library"
-    (item,) = _legacy_root(root)
-    first = relocate_library(root, _upgrade=upgrade_v3)
+    (item,) = _library_root(root)
+    first = relocate_library(root)
     target = _target(root, item.storage_object.key)
     target.chmod(0o600 if target.stat().st_mode & 0o777 != 0o600 else 0o644)
 
@@ -872,8 +869,8 @@ def test_runtime_rejects_active_relocation_before_private_layout_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "library"
-    _legacy_root(root)
-    assert not relocate_library_step(root, _upgrade=upgrade_v3).complete
+    _library_root(root)
+    assert not relocate_library_step(root).complete
 
     def reject_layout_mutation(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("active relocation must fence layout writes")
@@ -889,8 +886,7 @@ def test_relocation_cannot_cross_protect_io_after_state_lock_is_released(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "library"
-    _legacy_root(root)
-    _upgrade(root)
+    _library_root(root)
     adapter = _adapter(root)
     payload = b"writer retains publication lock while source I/O runs"
     item = _item(2, payload)
@@ -959,12 +955,12 @@ def test_relocation_cannot_cross_protect_io_after_state_lock_is_released(
     ),
     ids=("nil", "version-five", "invalid-variant"),
 )
-def test_relocation_rejects_invalid_storage_uuid_before_upgrading(
+def test_relocation_rejects_invalid_storage_uuid_before_authorizing(
     tmp_path: Path,
     invalid_uuid: bytes,
 ) -> None:
     root = tmp_path / "library"
-    _legacy_root(root)
+    _library_root(root)
     with sqlite3.connect(_journal(root)) as connection:
         connection.execute(
             "UPDATE library_storage_identity SET storage_instance_uuid = ?",
@@ -973,10 +969,10 @@ def test_relocation_rejects_invalid_storage_uuid_before_upgrading(
     original_database = _journal(root).read_bytes()
 
     with pytest.raises(RuntimeError, match="UUIDv4"):
-        relocate_library(root, _upgrade=upgrade_v3)
+        relocate_library(root)
 
     assert _journal(root).read_bytes() == original_database
     with sqlite3.connect(_journal(root)) as connection:
         assert connection.execute(
             "SELECT format_version FROM library_state"
-        ).fetchone() == (3,)
+        ).fetchone() == (4,)

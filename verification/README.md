@@ -61,10 +61,11 @@ This directory contains executable specifications owned by filesystem ingest.
   activation entry. Its single-object `PROTECT` gate corresponds to one
   bounded runtime token-lock stripe; unrelated stripes remain concurrent and
   are outside this model.
-- `tla/LibraryRelocation.tla` model-checks the atomic journal upgrade/session
-  boundary, reader fencing before rebinding, bounded resource commits and a
-  complete second audit, crash loss of uncommitted observations, original-marker
-  restoration and normal-runtime exclusion during unfinished maintenance.
+- `tla/LibraryRelocation.tla` starts from a current-format journal and model-checks
+  durable session creation, reader fencing before rebinding, bounded resource
+  commits and a complete second audit, crash loss of uncommitted observations,
+  original-marker restoration and normal-runtime exclusion during unfinished
+  maintenance.
 - `tla/PytestProcessSupervision.tla` model-checks the repository test runner's
   start gate, ownership-before-start ordering, normal exit with a surviving
   descendant, timeout and interruption cleanup, termination and `taskkill`
@@ -216,16 +217,17 @@ journal references that must change together. The two-resource Small profile
 does not prove SHA-256 collision resistance, SQLite or filesystem durability,
 POSIX exclusion, safe ownership of unknown paths, or arbitrary concurrent
 external modification. `tests/test_library_relocation.py` supplies separate
-runtime evidence using complete copied v3 journals, current acquisition and
-thumbnail bytes, staged resources, WRITING partial files, pending activation
-replay, more than one page of retained released tokens, obsolete pending history,
-hash/stat tampering and injected durable-boundary response loss. Its
-fixtures preserve the original UUID and publication receipts; they never use
-private source data or production libraries. The existing activation models
-continue to describe normal same-inode replay. Explicit relocation authority
-does not broaden that normal-runtime rule. The inventory covers journal-owned
-resources and their authorized candidate names. Unreferenced extra files are
-preserved; successful relocation does not certify them.
+runtime evidence using complete copied current-format v4 journals, current
+acquisition and thumbnail bytes, staged resources, WRITING partial files,
+pending activation replay, more than one page of retained released tokens,
+obsolete pending history, hash/stat tampering and injected durable-boundary
+response loss. Its fixtures preserve the original UUID and publication
+receipts; they never use private source data or production libraries. The
+existing activation models continue to describe normal same-inode replay.
+Explicit relocation authority does not broaden that normal-runtime rule. The
+inventory covers journal-owned resources and their authorized candidate names.
+Unreferenced extra files are preserved; successful relocation does not certify
+them.
 
 ## New-gallery invalidation
 

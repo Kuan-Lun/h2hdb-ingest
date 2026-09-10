@@ -225,10 +225,10 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
 - Legacy `.h2hdb-state/coordination` entry 無論為 directory、symlink 或
   其他類型都必須在修改 private state 前 fail closed；不得 migrate、fallback
   或接納舊 coordination layout。
-- Legacy `current/hash-v1`與 activation journal format v1/v2必須明確 fail
+- Legacy `current/hash-v1`與 activation journal format v1/v2/v3必須明確 fail
   closed並要求 fresh rebuild；不得自動刪除、migrate或和v4 journal混合啟動。
-  Normal runtime只接受journal v4。使用者明確執行的一次性搬移工具可接納
-  released v3的exact schema並原子升級；不得保留v3 runtime或自動fallback。
+  Normal runtime與搬移CLI都只接受journal v4的exact schema；不得保留舊格式
+  reader、升級工具或自動fallback。
   完整library搬移保留既有UUID與core binding，以獨立durable relocation session
   保存目的地、進度與驗證結果，不得覆寫publication phase、receipt或cursor。
   搬移期間阻擋normal publication與cleanup；每批最多128個logical resources，
