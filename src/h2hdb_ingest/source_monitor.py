@@ -144,6 +144,7 @@ class SourceChangeMonitor:
         self._failure_lock = Lock()
         self._failure: BaseException | None = None
         self._capacity_exhausted = False
+        self._index_path: Path | None = None
         self._thread = Thread(target=self._run, name="h2hdb-source-monitor")
 
     def __enter__(self) -> Self:
@@ -171,7 +172,14 @@ class SourceChangeMonitor:
         if not self._capacity_exhausted:
             logger.warning(
                 "%s",
-                storage_capacity_message(error, operation="source metadata probe"),
+                storage_capacity_message(
+                    error,
+                    operation="source metadata probe",
+                    working_directory=(
+                        None if self._index_path is None else self._index_path.parent
+                    ),
+                    index_path=self._index_path,
+                ),
             )
         self._capacity_exhausted = True
 
@@ -209,11 +217,13 @@ class SourceChangeMonitor:
     def _run(self) -> None:
         try:
             while not self._stop.is_set():
+                self._index_path = None
                 try:
                     with tempfile.TemporaryDirectory(
                         prefix="h2hdb-source-monitor-"
                     ) as folder:
-                        index = _MarkerIndex(Path(folder) / "markers.sqlite3")
+                        self._index_path = Path(folder) / "markers.sqlite3"
+                        index = _MarkerIndex(self._index_path)
                         try:
                             self._run_index(index)
                         finally:

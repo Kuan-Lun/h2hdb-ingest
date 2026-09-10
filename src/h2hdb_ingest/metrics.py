@@ -119,12 +119,20 @@ class _MetricSinkDiagnostics:
             clock=clock,
         )
 
-    def failed(self, sink: IngestMetricSink, error: BaseException) -> None:
+    def failed(
+        self, sink: IngestMetricSink, error: BaseException, metric: IngestMetric
+    ) -> None:
         with self._lock:
             if sink is not self._owner:
                 self._reporter.reset()
                 self._owner = sink
-            self._reporter.log_failure(error)
+            self._reporter.log_failure(
+                error,
+                context={
+                    "metric_scope": metric.scope,
+                    "metric_operation": metric.operation,
+                },
+            )
 
     def succeeded(self, sink: IngestMetricSink) -> None:
         with self._lock:
@@ -182,7 +190,7 @@ def emit_ingest_metric(
     try:
         sink(metric)
     except Exception as error:
-        _sink_failures.failed(sink, error)
+        _sink_failures.failed(sink, error, metric)
     else:
         _sink_failures.succeeded(sink)
 

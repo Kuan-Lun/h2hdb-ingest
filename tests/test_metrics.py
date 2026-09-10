@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
@@ -105,6 +106,10 @@ def test_repeated_metric_sink_failure_is_bounded_and_recovers(
     assert len(caplog.records) == 1
     assert caplog.records[0].levelno == logging.ERROR
     assert caplog.records[0].exc_info is not None
+    assert 'metric_scope="artifact"' in caplog.records[0].message
+    assert 'metric_operation="render_archive"' in caplog.records[0].message
+    assert 'error_type="RuntimeError"' in caplog.records[0].message
+    assert 'reason="observer unavailable"' in caplog.records[0].message
     clock[0] = 30
     emit_ingest_metric(deliver, metric)
     assert len(caplog.records) == 2
@@ -150,6 +155,62 @@ def test_successful_other_sink_does_not_reset_repeated_failures(
     assert len(caplog.records) == 2
     assert caplog.records[-1].levelno == logging.INFO
     assert "suppressed_repeats=2" in caplog.records[-1].message
+
+
+def test_different_metric_context_preserves_existing_failure_coalescing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    now = [0.0]
+    monkeypatch.setattr(
+        metrics_module,
+        "_sink_failures",
+        metrics_module._MetricSinkDiagnostics(
+            interval_seconds=30, clock=lambda: now[0]
+        ),
+    )
+
+    def fail(_metric: IngestMetric) -> None:
+        raise RuntimeError("sink unavailable")
+
+    emit_ingest_metric(fail, IngestMetric("artifact", "render_archive", 1))
+    emit_ingest_metric(fail, IngestMetric("publication", "prepare", 1))
+    assert len(caplog.records) == 1
+    assert 'metric_scope="artifact"' in caplog.records[0].message
+    now[0] = 30
+    emit_ingest_metric(fail, IngestMetric("publication", "prepare\n\u202e", 1))
+    assert len(caplog.records) == 2
+    message = caplog.records[1].getMessage()
+    assert "suppressed_repeats=1" in message
+    assert 'metric_scope="publication"' in message
+    assert 'metric_operation="prepare\\n\\u202e"' in message
+    assert "\n" not in message
+    assert "\u202e" not in message
+
+
+def test_recovery_failure_first_line_contains_original_cause_and_target(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    reporter = RecoveryLog(
+        metrics_module.logger, operation="library_cleanup", interval_seconds=30
+    )
+    cause = OSError(errno.EIO, "damaged\nentry\u202e", "/library/damaged-entry")
+    failure = RuntimeError("cleanup wrapper for /library/private/journal.sqlite3")
+    failure.__cause__ = cause
+    reporter.log_failure(failure)
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    message = record.getMessage()
+    assert 'error_type="OSError"' in message
+    assert 'outer_error_type="RuntimeError"' in message
+    assert (
+        'outer_reason="cleanup wrapper for /library/private/journal.sqlite3"' in message
+    )
+    assert "/library/damaged-entry" in message
+    assert "damaged\\nentry\\u202e" in message
+    assert "\n" not in message
+    assert "\u202e" not in message
+    assert record.exc_info is not None
+    assert record.exc_info[1] is failure
 
 
 def test_different_failing_sink_replaces_only_diagnostic_owner_without_false_recovery(

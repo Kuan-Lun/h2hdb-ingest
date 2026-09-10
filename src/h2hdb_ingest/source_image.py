@@ -21,6 +21,7 @@ import pyvips  # type: ignore[import-untyped]  # pyvips 3.2 ships no PEP 561 mar
 from PIL import Image
 
 from .artifact_errors import attach_image_dimensions
+from .image_diagnostics import native_image_log_scope
 
 # Page workers already bound parallelism. A second native pool per page would
 # oversubscribe the machine, while an operation cache retains unrelated galleries.
@@ -249,6 +250,24 @@ def load_source_image(
     ``max_pixels`` and side bounds apply to intermediate and output images.
     """
 
+    with native_image_log_scope():
+        return _load_source_image(
+            source,
+            max_short_side=max_short_side,
+            max_long_side=max_long_side,
+            max_pixels=max_pixels,
+            resampler=resampler,
+        )
+
+
+def _load_source_image(
+    source: BinaryIO,
+    *,
+    max_short_side: int,
+    max_long_side: int,
+    max_pixels: int,
+    resampler: Image.Resampling,
+) -> Image.Image:
     bridge = _SourceBridge(source)
     header: _SourceHeader | None = None
     try:

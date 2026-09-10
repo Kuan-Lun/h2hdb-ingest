@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import errno
+import json
 import sqlite3
+import tempfile
+from pathlib import Path
 
 import pytest
 
-from h2hdb_ingest.storage_capacity import storage_capacity_error
+from h2hdb_ingest.storage_capacity import (
+    storage_capacity_error,
+    storage_capacity_message,
+)
 
 
 @pytest.mark.parametrize("code", (errno.ENOSPC, errno.EDQUOT))
@@ -42,3 +48,65 @@ def test_cyclic_causes_do_not_block_failure_classification() -> None:
     first.__cause__ = second
     second.__cause__ = first
     assert storage_capacity_error(first) is None
+
+
+def test_capacity_diagnostic_identifies_both_exception_paths_without_assuming_scratch(
+    tmp_path: Path,
+) -> None:
+    source = str(tmp_path / "source" / "原始\n\u202epage.jpg")
+    destination = str(tmp_path / "library" / "gallery.cbz")
+    cause = OSError(errno.ENOSPC, "out of space\n\u202e", source, None, destination)
+    wrapper = RuntimeError(f"artifact staging failed for source {source}")
+    wrapper.__cause__ = cause
+
+    message = storage_capacity_message(wrapper, operation="stage artifact")
+    detail = json.loads(message.removeprefix("Storage capacity exhausted: "))
+    assert detail["error_type"] == "OSError"
+    assert detail["errno"] == errno.ENOSPC
+    assert detail["failed_path"] == source
+    assert detail["failed_path2"] == destination
+    assert detail["error_has_filename"] is True
+    assert detail["scratch_directory"] == tempfile.gettempdir()
+    assert detail["scratch_directory"] not in (source, destination)
+    assert detail["reason"] == str(cause)
+    assert detail["outer_error_type"] == "RuntimeError"
+    assert detail["outer_reason"] == str(wrapper)
+    assert "\n" not in message
+    assert "\u202e" not in message
+    assert "原始" in message
+
+
+def test_sqlite_capacity_diagnostic_keeps_index_context_separate_from_error_identity(
+    tmp_path: Path,
+) -> None:
+    cause = sqlite3.OperationalError("database or disk is full")
+    cause.sqlite_errorcode = sqlite3.SQLITE_FULL
+    index_path = tmp_path / "markers.sqlite3"
+    message = storage_capacity_message(
+        cause,
+        operation="source metadata probe",
+        working_directory=tmp_path,
+        index_path=index_path,
+    )
+    detail = json.loads(message.removeprefix("Storage capacity exhausted: "))
+    assert detail["error_type"] == "OperationalError"
+    assert detail["sqlite_errorcode"] == sqlite3.SQLITE_FULL
+    assert detail["index_path"] == str(index_path)
+    assert detail["working_directory"] == str(tmp_path)
+    assert detail["error_has_filename"] is False
+    assert "failed_path" not in detail
+    assert "errno" not in detail
+    assert "outer_reason" not in detail
+
+
+def test_capacity_diagnostic_survives_unprintable_oserror() -> None:
+    class UnprintableError(OSError):
+        def __str__(self) -> str:
+            raise ValueError("broken diagnostic")
+
+    message = storage_capacity_message(
+        UnprintableError(errno.ENOSPC, "full"), operation="ingest"
+    )
+    detail = json.loads(message.removeprefix("Storage capacity exhausted: "))
+    assert detail["error_type"] == "UnprintableError"
+    assert detail["reason"] == "<diagnostic text unavailable>"

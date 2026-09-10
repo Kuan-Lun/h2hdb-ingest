@@ -11,14 +11,13 @@ __all__ = [
     "get_page_failure_context",
 ]
 
-import json
 from dataclasses import dataclass
-from unicodedata import category
 
 from h2hdb import ArtifactFailureContext, get_artifact_failure_context
 
+from ._log_fields import quote_log_field
+
 _MAXIMUM_ERROR_CHAIN = 32
-_MAXIMUM_FIELD_CHARACTERS = 4096
 _PAGE_CONTEXT_ATTRIBUTE = "_h2hdb_ingest_page_failure_context"
 _DIMENSIONS_ATTRIBUTE = "_h2hdb_ingest_image_dimensions"
 _QUALIFICATION_ATTRIBUTE = "_h2hdb_ingest_qualification_failure_context"
@@ -112,7 +111,7 @@ def attach_page_failure_context(
     setattr(error, _PAGE_CONTEXT_ATTRIBUTE, context)
     error.add_note(
         "Artifact page source: "
-        f"file={_quoted(source_name.decode('utf-8', errors='backslashreplace'))} "
+        f"file={quote_log_field(source_name.decode('utf-8', errors='backslashreplace'))} "
         f"source_bytes={expected_size_bytes}"
     )
 
@@ -125,20 +124,6 @@ def get_page_failure_context(error: BaseException) -> PageFailureContext | None:
         if isinstance(context, PageFailureContext):
             return context
     return None
-
-
-def _quoted(value: str) -> str:
-    if len(value) > _MAXIMUM_FIELD_CHARACTERS:
-        value = value[:_MAXIMUM_FIELD_CHARACTERS] + "...[truncated]"
-    # Keep human-readable Unicode names, but escape all control, directionality
-    # and line-separator characters so source names cannot forge log lines.
-    encoded = json.dumps(value, ensure_ascii=False)
-    return "".join(
-        json.dumps(character, ensure_ascii=True)[1:-1]
-        if category(character) in {"Cc", "Cf", "Zl", "Zp", "Cs"}
-        else character
-        for character in encoded
-    )
 
 
 def format_artifact_failure(
@@ -167,10 +152,10 @@ def format_artifact_failure(
     )
     cause = _error_chain(error)[-1]
     fields = [
-        f"event={_quoted(event)}",
+        f"event={quote_log_field(event)}",
         f"gid={source.gid}",
         "gallery_folder="
-        + _quoted(
+        + quote_log_field(
             "/"
             + "/".join(
                 (*source.source_root_components, *source.gallery_locator_components)
@@ -179,14 +164,15 @@ def format_artifact_failure(
     ]
     if source_name is not None:
         fields.append(
-            "file=" + _quoted(source_name.decode("utf-8", errors="backslashreplace"))
+            "file="
+            + quote_log_field(source_name.decode("utf-8", errors="backslashreplace"))
         )
     if source_size is not None:
         fields.append(f"source_bytes={source_size}")
     if page is not None:
         fields.append(f"source_position={page.source_position}")
         if page.source_kind is not None:
-            fields.append(f"source_kind={_quoted(page.source_kind)}")
+            fields.append(f"source_kind={quote_log_field(page.source_kind)}")
         if page.width is not None and page.height is not None:
             fields.extend(
                 (
@@ -197,8 +183,8 @@ def format_artifact_failure(
             )
     fields.extend(
         (
-            f"error_type={_quoted(type(cause).__name__)}",
-            f"reason={_quoted(str(cause))}",
+            f"error_type={quote_log_field(type(cause).__name__)}",
+            f"reason={quote_log_field(str(cause))}",
         )
     )
     if failed_qualification:

@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from hashlib import sha256
 from logging import Logger
 from threading import RLock
 from time import monotonic
 
+from ._log_fields import diagnostic_text, quote_log_field
 
-def _diagnostic_text(value: object) -> str:
-    try:
-        return str(value)
-    except Exception:
-        # Error reporting must survive an exception with a broken __str__.
-        # KeyboardInterrupt/SystemExit still keep their cancellation semantics.
-        return "<diagnostic text unavailable>"
+
+def _failure_cause(error: BaseException) -> BaseException:
+    current = error
+    visited = {id(current)}
+    while current.__cause__ is not None and len(visited) < 32:
+        cause = current.__cause__
+        if id(cause) in visited:
+            break
+        visited.add(id(cause))
+        current = cause
+    return current
 
 
 def _failure_signature(error: BaseException) -> bytes:
@@ -29,11 +34,11 @@ def _failure_signature(error: BaseException) -> bytes:
         error_type = type(current)
         fields = (
             f"{error_type.__module__}.{error_type.__qualname__}",
-            _diagnostic_text(current),
+            diagnostic_text(current),
             *getattr(current, "__notes__", ()),
         )
         for field in fields:
-            encoded = _diagnostic_text(field).encode("utf-8", errors="backslashreplace")
+            encoded = diagnostic_text(field).encode("utf-8", errors="backslashreplace")
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
         current = current.__cause__ or (
@@ -71,7 +76,9 @@ class RecoveryLog:
             self._suppressed_since_report = 0
             self._suppressed_total = 0
 
-    def log_failure(self, error: BaseException) -> None:
+    def log_failure(
+        self, error: BaseException, *, context: Mapping[str, str] | None = None
+    ) -> None:
         try:
             signature = _failure_signature(error)
             with self._lock:
@@ -87,11 +94,27 @@ class RecoveryLog:
                 self._signature = signature
                 self._last_reported_at = now
                 self._suppressed_since_report = 0
+                cause = _failure_cause(error)
+                detail = "".join(
+                    f" {name}={quote_log_field(value)}"
+                    for name, value in (context or {}).items()
+                )
+                if cause is not error:
+                    detail += (
+                        " outer_error_type="
+                        + quote_log_field(type(error).__name__)
+                        + " outer_reason="
+                        + quote_log_field(diagnostic_text(error))
+                    )
                 self._logger.error(
-                    "Operation failed: operation=%s suppressed_repeats=%d; "
+                    "Operation failed: operation=%s suppressed_repeats=%d "
+                    "error_type=%s reason=%s%s; "
                     "further identical failures are summarized",
                     self._operation,
                     suppressed,
+                    quote_log_field(type(cause).__name__),
+                    quote_log_field(diagnostic_text(cause)),
+                    detail,
                     exc_info=error,
                 )
         except Exception:

@@ -54,6 +54,7 @@ from .artifact import (
     ArtifactRenderPolicy,
     artifact_policy_fingerprint_sha256,
 )
+from .image_diagnostics import SourceImageLogContext, image_log_scope
 from .library_identity import (
     LibraryStorageIdentity,
     LibraryStorageIdentityMismatchError,
@@ -442,11 +443,18 @@ class ManagedFilesystemLibraryAdapter:
     ) -> ArtifactArchiveRenderEvidence:
         """Own the complete canonical CBZ serialization contract."""
 
-        return self._artifact_renderer.render_archive(
-            members,
-            destination,
-            gid=gid,
-        )
+        with image_log_scope(
+            SourceImageLogContext(
+                operation="archive_render",
+                gid=gid,
+                source_root_components=self._source_root_components,
+            )
+        ):
+            return self._artifact_renderer.render_archive(
+                members,
+                destination,
+                gid=gid,
+            )
 
     def protect(
         self,

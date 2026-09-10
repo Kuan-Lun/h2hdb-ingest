@@ -38,7 +38,7 @@ import warnings
 import zlib
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from hashlib import sha256
 from io import BytesIO
@@ -73,6 +73,11 @@ from PIL import __version__ as PILLOW_VERSION
 from ._limits import MAX_METADATA_BYTES
 from ._resource_cleanup import close_resources, owned_resource
 from .artifact_errors import attach_page_failure_context
+from .image_diagnostics import (
+    SourceImageLogContext,
+    current_image_log_context,
+    image_log_scope,
+)
 from .metrics import (
     IngestMetric,
     IngestMetricSink,
@@ -580,6 +585,7 @@ def _render_archive(
                         batch = pages[batch_start : batch_start + workers]
                         rendered_batch = _render_page_batch(
                             batch,
+                            gid=gid,
                             policy=policy,
                             executor=executor,
                             progress=progress,
@@ -736,13 +742,21 @@ def _render_page_batch(
     policy: ArtifactRenderPolicy,
     executor: ThreadPoolExecutor | None,
     progress: ProgressWork | None = None,
+    gid: int | None = None,
 ) -> tuple[_RenderedPageBuffer, ...]:
+    context = replace(
+        current_image_log_context() or SourceImageLogContext("archive_render"),
+        operation="archive_render",
+        gid=gid,
+    )
     if executor is None:
         rendered_members: list[_RenderedPageBuffer] = []
         try:
             for member in members:
                 rendered_members.append(
-                    _render_page_member(member, policy=policy, progress=progress)
+                    _render_contextual_page_member(
+                        member, policy=policy, progress=progress, context=context
+                    )
                 )
         except BaseException as error:
             close_resources(rendered_members, error=error)
@@ -750,7 +764,13 @@ def _render_page_batch(
         return tuple(rendered_members)
 
     futures: tuple[Future[_RenderedPageBuffer], ...] = tuple(
-        executor.submit(_render_page_member, member, policy=policy, progress=progress)
+        executor.submit(
+            _render_contextual_page_member,
+            member,
+            policy=policy,
+            progress=progress,
+            context=context,
+        )
         for member in members
     )
     try:
@@ -771,6 +791,25 @@ def _render_page_batch(
                 closed.add(identity)
         close_resources(completed, error=error)
         raise
+
+
+def _render_contextual_page_member(
+    member: ArtifactSourceMember,
+    *,
+    policy: ArtifactRenderPolicy,
+    progress: ProgressWork | None,
+    context: SourceImageLogContext,
+) -> _RenderedPageBuffer:
+    with image_log_scope(
+        replace(
+            context,
+            source_name=member.source_name,
+            source_position=member.position,
+            expected_size_bytes=member.expected_size_bytes,
+            source_sha256=member.expected_sha256,
+        )
+    ):
+        return _render_page_member(member, policy=policy, progress=progress)
 
 
 def _preflight_archive_members(

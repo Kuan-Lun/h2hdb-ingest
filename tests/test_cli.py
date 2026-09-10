@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from h2hdb import CatalogRevisionNotFoundError
+from h2hdb import CatalogRevisionNotFoundError, CoreConfig
 
 import h2hdb_ingest.__main__ as cli
 import h2hdb_ingest.bootstrap as bootstrap
@@ -71,7 +71,8 @@ class _Runtime:
 def _cli_config(events: list[object]) -> SimpleNamespace:
     return SimpleNamespace(
         ensure_paths=lambda: events.append("ensure-paths"),
-        paths=SimpleNamespace(library_path=None),
+        paths=SimpleNamespace(library_path=None, download_path=Path("/source")),
+        core=CoreConfig(),
     )
 
 

@@ -30,6 +30,7 @@ from .filesystem import (
     FilesystemSource,
     FilesystemSourceChangedError,
 )
+from .image_diagnostics import SourceImageLogContext, image_log_scope
 from .page_workers import MAX_PAGE_RENDER_WORKERS
 from .progress import IngestProgress, ProgressWork
 from .source_image import SourceImageDecodeError
@@ -134,8 +135,9 @@ def _decode_page(
     position: int,
     policy: ArtifactRenderPolicy,
     work: ProgressWork | None,
+    context: SourceImageLogContext,
 ) -> _PageFailure | None:
-    with stream:
+    with stream, image_log_scope(context):
         try:
             with load_source_page_image(stream, policy=policy):
                 pass
@@ -210,6 +212,15 @@ class ImageGalleryQualifier:
                                 position,
                                 self._policy,
                                 work,
+                                SourceImageLogContext(
+                                    operation="source_image_qualification",
+                                    gid=observed.metadata.gid,
+                                    source_root_components=source.source_root_components,
+                                    gallery_locator_components=locator,
+                                    source_name=member.name_bytes,
+                                    source_position=position,
+                                    expected_size_bytes=member.stat.size_bytes,
+                                ),
                             )
                         )
                     except BaseException:

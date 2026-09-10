@@ -293,6 +293,38 @@ application's DEBUG mode. Explicit `configure_logging` replaces and closes the
 previous process handlers, so reconfiguration neither ignores settings nor
 duplicates console/file output.
 
+WARNING, ERROR and CRITICAL output includes the logger/thread, configured source
+and library roots, and the SQLite path or MariaDB host/port/database. These are
+resource locations, not a claim that every failure concerns all listed resources;
+database usernames and passwords are never added to this context. CLI failures
+also identify the configuration file while retaining their original exit behavior.
+
+Image decoder diagnostics include an operation, GID, source filename and position.
+Qualification also identifies the complete gallery folder; archive rendering
+includes the source SHA-256 because its public input is an immutable source spool,
+which does not carry the original gallery folder. `source_attribution=exact`
+identifies the current Python page worker. A libvips background thread may have no
+Python worker context: `source_attribution=active_candidates` then lists up to eight
+active source candidates and the count omitted, without claiming any candidate is
+the confirmed source. Unknown native diagnostics outside active image work retain
+their original message with the configured process locations.
+
+For example, `unknown EXIF resolution unit` remains a warning and does not by
+itself exclude a gallery or prevent CBZ creation. Actual image rejection still
+uses `gallery_image_rejected` with `action=exclude_gallery_from_publication`.
+Diagnostic fields escape control characters and bound long text. Human log text
+gains fields; API, configuration, retry/qualification rules, rendering policy and
+CBZ bytes are unchanged. Consumers that compare entire log lines must accommodate
+the additional fields.
+
+Storage-capacity diagnostics retain the operation, capacity error type/code,
+exception filenames when available, and the original wrapper reason. Scratch free
+space describes only the scratch filesystem; it does not prove which volume is
+full. The source monitor also identifies its owned working directory and marker
+index when available. Cleanup failures put the operation and cause on the first
+line as well as retaining the traceback; metric delivery failures identify the
+metric scope and operation.
+
 Repeated failures of each maintenance operation or metric delivery are summarized
 using bounded in-memory state: the first failure and a changed error retain their
 traceback, identical failures are counted until the configured interval, and one

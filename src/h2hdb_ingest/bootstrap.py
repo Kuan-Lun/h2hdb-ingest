@@ -9,6 +9,8 @@ from pathlib import Path
 
 from h2hdb import CatalogRevision, CatalogRevisionNotFoundError
 
+from ._diagnostic_logging import command_diagnostics, diagnostic_targets
+from ._log_fields import quote_log_field
 from .config import load_config
 from .runtime import build_runtime, configure_logging
 from .scratch import DiskScratch
@@ -25,79 +27,91 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, required=True)
     parsed = parser.parse_args(arguments)
 
-    config = load_config(parsed.config)
-    config.ensure_paths()
-    if next(config.paths.download_path.rglob("galleryinfo.txt"), None) is None:
-        parser.exit(
-            2,
-            "No galleryinfo.txt was found below download_path; refusing to "
-            "publish an empty initial catalog.\n",
+    with command_diagnostics(parsed.config):
+        config = load_config(parsed.config)
+    with command_diagnostics(parsed.config, config):
+        config.ensure_paths()
+        failure_context = (
+            " config_file="
+            + quote_log_field(str(parsed.config.absolute()))
+            + " "
+            + diagnostic_targets(config)
+            + "\n"
         )
-    configure_logging(config)
-    scratch_context = (
-        nullcontext(None)
-        if config.paths.library_path is None
-        else DiskScratch(config.paths.library_path)
-    )
-    with scratch_context as scratch:
-        runtime_context = (
-            build_runtime(config)
-            if scratch is None
-            else build_runtime(config, temporary_cleanup=scratch.cleanup_page)
+        if next(config.paths.download_path.rglob("galleryinfo.txt"), None) is None:
+            parser.exit(
+                2,
+                "No galleryinfo.txt was found below download_path; refusing to "
+                "publish an empty initial catalog." + failure_context,
+            )
+        configure_logging(config)
+        scratch_context = (
+            nullcontext(None)
+            if config.paths.library_path is None
+            else DiskScratch(config.paths.library_path)
         )
-        with runtime_context as runtime:
-            runtime.resident.initialize()
-            expected: CatalogRevision | None = None
-            captured: list[CatalogRevision] = []
+        with scratch_context as scratch:
+            runtime_context = (
+                build_runtime(config)
+                if scratch is None
+                else build_runtime(config, temporary_cleanup=scratch.cleanup_page)
+            )
+            with runtime_context as runtime:
+                runtime.resident.initialize()
+                expected: CatalogRevision | None = None
+                captured: list[CatalogRevision] = []
 
-            def require_expected_catalog() -> None:
-                try:
-                    current = runtime.catalog.get_catalog_revision()
-                except CatalogRevisionNotFoundError as error:
-                    if error.revision == 0 and expected is None:
-                        return
-                    raise
-                if current != expected:
-                    raise _AlreadyPublished(str(current.revision))
+                def require_expected_catalog() -> None:
+                    try:
+                        current = runtime.catalog.get_catalog_revision()
+                    except CatalogRevisionNotFoundError as error:
+                        if error.revision == 0 and expected is None:
+                            return
+                        raise
+                    if current != expected:
+                        raise _AlreadyPublished(str(current.revision))
 
-            def capture_published_catalog() -> None:
-                captured.append(runtime.catalog.get_catalog_revision())
+                def capture_published_catalog() -> None:
+                    captured.append(runtime.catalog.get_catalog_revision())
 
-            while True:
-                captured.clear()
-                try:
-                    processed = runtime.resident.process_available(
-                        periodic_scan=True,
-                        preflight=require_expected_catalog,
-                        postflight=capture_published_catalog,
-                    )
-                except _AlreadyPublished as error:
-                    parser.exit(
-                        2,
-                        "Initial catalog reconciliation found an unexpected publication: "
-                        f"current_revision={error}.\n",
-                    )
-                if not processed:
-                    parser.exit(
-                        2, "No gallery ingest or maintenance progress is available.\n"
-                    )
-                if not captured:
-                    continue
-                published = captured[0]
-                if published.publication_count > 0:
-                    print(
-                        "Initial catalog reconciliation completed: "
-                        f"revision={published.revision} "
-                        f"publications={published.publication_count}."
-                    )
-                    break
-                if not runtime.resident.deferred_gallery_count:
-                    parser.exit(
-                        1,
-                        "Initial reconciliation did not publish a non-empty catalog.\n",
-                    )
-                expected = published
-    return 0
+                while True:
+                    captured.clear()
+                    try:
+                        processed = runtime.resident.process_available(
+                            periodic_scan=True,
+                            preflight=require_expected_catalog,
+                            postflight=capture_published_catalog,
+                        )
+                    except _AlreadyPublished as error:
+                        parser.exit(
+                            2,
+                            "Initial catalog reconciliation found an unexpected publication: "
+                            f"current_revision={error}." + failure_context,
+                        )
+                    if not processed:
+                        parser.exit(
+                            2,
+                            "No gallery ingest or maintenance progress is available."
+                            + failure_context,
+                        )
+                    if not captured:
+                        continue
+                    published = captured[0]
+                    if published.publication_count > 0:
+                        print(
+                            "Initial catalog reconciliation completed: "
+                            f"revision={published.revision} "
+                            f"publications={published.publication_count}."
+                        )
+                        break
+                    if not runtime.resident.deferred_gallery_count:
+                        parser.exit(
+                            1,
+                            "Initial reconciliation did not publish a non-empty catalog."
+                            + failure_context,
+                        )
+                    expected = published
+        return 0
 
 
 if __name__ == "__main__":

@@ -244,8 +244,17 @@ def test_dependency_and_real_rejection_diagnostics_remain_visible_with_context(
 ) -> None:
     for logs in process_logs.values():
         for name in ("pyvips", "mysql.connector"):
-            assert f"{name} warning retained" in logs.messages("WARNING")
-            assert f"{name} error retained" in logs.messages("ERROR")
+            for level in ("WARNING", "ERROR"):
+                message = next(
+                    line
+                    for line in logs.messages(level)
+                    if line.startswith(f"{name} {level.lower()} retained")
+                )
+                assert f'logger="{name}"' in message
+                assert 'source_root="' in message
+                assert 'library_root="' in message
+                assert 'database_backend="sqlite"' in message
+                assert 'database_path="' in message
         rejected = [
             line
             for line in logs.messages("WARNING")
@@ -346,8 +355,19 @@ def test_reconfiguration_replaces_handlers_and_applies_all_severity_thresholds(
         ):
             if severity >= threshold:
                 expected.append(f"{name} {logging.getLevelName(severity)} diagnostic")
-    messages = [line.split("] ", 1)[1] for line in logs.file.splitlines()]
+    messages = [
+        line.split("] ", 1)[1].split(" | logger=", 1)[0]
+        for line in logs.file.splitlines()
+    ]
     assert messages == expected
+    for line in logs.file.splitlines():
+        if any(f"[{level}]" in line for level in ("WARNING", "ERROR", "CRITICAL")):
+            assert 'source_root="' in line
+            assert 'database_backend="mariadb"' in line
+            assert 'database_host="localhost"' in line
+            assert "database_port=3306" in line
+            assert 'database_name="h2h"' in line
+            assert line.count(" | logger=") == 1
 
 
 if __name__ == "__main__":

@@ -45,7 +45,9 @@ def _monitor(root: Path, *, interval_seconds: float = 0.001) -> SourceChangeMoni
     )
 
 
-def _assert_capacity_logs(caplog: pytest.LogCaptureFixture, *, recovered: bool) -> None:
+def _assert_capacity_logs(
+    caplog: pytest.LogCaptureFixture, *, recovered: bool, index_known: bool = True
+) -> None:
     records = [
         record for record in caplog.records if record.name == monitor_module.__name__
     ]
@@ -59,6 +61,16 @@ def _assert_capacity_logs(caplog: pytest.LogCaptureFixture, *, recovered: bool) 
     assert detail["scratch_directory"] == tempfile.gettempdir()
     assert detail["scratch_free_bytes"] is None or detail["scratch_free_bytes"] >= 0
     assert detail["reason"]
+    assert detail["error_type"] in ("OSError", "OperationalError")
+    assert detail["error_has_filename"] is False
+    if index_known:
+        index_path = Path(detail["index_path"])
+        assert index_path.name == "markers.sqlite3"
+        assert index_path.parent.name.startswith("h2hdb-source-monitor-")
+        assert detail["working_directory"] == str(index_path.parent)
+    else:
+        assert "index_path" not in detail
+        assert "working_directory" not in detail
     assert detail["action"] == (
         "preserve gallery eligibility and retry durable work when space is available"
     )
@@ -187,7 +199,7 @@ def test_initial_capacity_failure_rebuilds_index_and_then_probes(
     assert attempts == 2
     assert len(checked_closed_threads) == int(stage == "sqlite_schema")
     assert all(owner != get_ident() for owner in checked_closed_threads)
-    _assert_capacity_logs(caplog, recovered=True)
+    _assert_capacity_logs(caplog, recovered=True, index_known=stage == "sqlite_schema")
 
 
 def test_capacity_wait_is_interrupted_by_stop_without_another_probe(

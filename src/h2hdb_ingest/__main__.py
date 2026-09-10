@@ -9,6 +9,7 @@ from contextlib import contextmanager, nullcontext
 from threading import Event
 from types import FrameType
 
+from ._diagnostic_logging import command_diagnostics
 from .config import load_config
 from .runtime import build_runtime, configure_logging
 from .scratch import DiskScratch
@@ -22,36 +23,38 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--once", action="store_true")
     arguments = parser.parse_args(argv)
 
-    config = load_config(arguments.config)
-    config.ensure_paths()
-    configure_logging(config)
-    scratch_context = (
-        nullcontext(None)
-        if config.paths.library_path is None
-        else DiskScratch(config.paths.library_path)
-    )
-    with scratch_context as scratch:
-        runtime_context = (
-            build_runtime(config)
-            if scratch is None
-            else build_runtime(config, temporary_cleanup=scratch.cleanup_page)
+    with command_diagnostics(arguments.config):
+        config = load_config(arguments.config)
+    with command_diagnostics(arguments.config, config):
+        config.ensure_paths()
+        configure_logging(config)
+        scratch_context = (
+            nullcontext(None)
+            if config.paths.library_path is None
+            else DiskScratch(config.paths.library_path)
         )
-        with runtime_context as runtime:
-            with _stop_on_termination() as stop:
-                runtime.resident.initialize()
-                if arguments.once:
-                    processed = runtime.resident.process_available(
-                        periodic_scan=True,
-                        should_stop=stop.is_set,
-                    )
-                    if stop.is_set():
-                        return
-                    if not processed:
-                        raise RuntimeError(
-                            "No gallery publication completed; check lease and storage-capacity diagnostics"
+        with scratch_context as scratch:
+            runtime_context = (
+                build_runtime(config)
+                if scratch is None
+                else build_runtime(config, temporary_cleanup=scratch.cleanup_page)
+            )
+            with runtime_context as runtime:
+                with _stop_on_termination() as stop:
+                    runtime.resident.initialize()
+                    if arguments.once:
+                        processed = runtime.resident.process_available(
+                            periodic_scan=True,
+                            should_stop=stop.is_set,
                         )
-                    return
-                runtime.resident.run_forever(stop=stop)
+                        if stop.is_set():
+                            return
+                        if not processed:
+                            raise RuntimeError(
+                                "No gallery publication completed; check lease and storage-capacity diagnostics"
+                            )
+                        return
+                    runtime.resident.run_forever(stop=stop)
 
 
 @contextmanager

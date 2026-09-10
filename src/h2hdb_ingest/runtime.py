@@ -22,6 +22,7 @@ from h2hdb import (
     VNextLibraryActivationItem,
 )
 
+from ._diagnostic_logging import DiagnosticFormatter
 from ._resource_cleanup import Closeable, close_resources
 from .config import IngestConfig
 from .image_qualification import ImageGalleryQualifier
@@ -243,9 +244,11 @@ def configure_logging(config: IngestConfig) -> None:
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    formatter = DiagnosticFormatter(config)
+    for handler in handlers:
+        handler.setFormatter(formatter)
     logging.basicConfig(
         level=level,
-        format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=handlers,
         force=True,
     )
