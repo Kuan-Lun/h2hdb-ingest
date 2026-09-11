@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-10T22:03:06+00:00",
-  "manifest_sha256": "21c560c77afa3dd84363b7f0b087a8381a8dec6663ef3a55928605f028929e3c",
+  "checked_at": "2026-09-11T04:46:55+00:00",
+  "manifest_sha256": "201a22042d6d4122e7ed72e247e0d62479b188bb4e0a1dbb1b263ee53271cda0",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.23.1",
+  "project_version": "0.24.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,10 +30,10 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.36.1,<0.37.0",
+      "declared": "h2hdb>=0.37.0,<0.38.0",
       "group": "runtime",
       "latest": "0.36.1",
-      "latest_satisfies": true,
+      "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
       "url": "https://pypi.org/project/h2hdb/"
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Re-audited all direct build, runtime, optional development and Node dependencies against official registry candidates, including versions outside current bounds. The complete inventory and dependency manifest are unchanged from the reviewed 0.23.0 receipt; all latest candidates satisfy the existing declarations and Python 3.14, and all 15 installed Python direct packages match those candidates. No new upstream release requires additional release-note review. The change only makes interrupted source synchronization retries visible as one WARNING with bounded original failure context; source qualification, lease completion, publication, schema and configuration semantics remain unchanged. Targeted regression validation passed 126 cases, including a real stable invalid gallery with SQLite and unchanged source stat/hash across retries. Independent diagnostic robustness checks passed 14 cases. Explicit H2HDB_TEST_MARIADB=1 resident lifecycle validation against disposable MariaDB 10.11.11 passed one fresh-epoch source/analysis/publication case. The integration gate additionally runs bounded offline pytest, Lean, finite small TLC, distribution build and installed-wheel smoke. No dependency changes, migration or compatibility shim are introduced.",
+    "note": "Re-audited every direct build, runtime, optional development and Node dependency, including registry candidates outside current bounds. Third-party candidates are unchanged from the reviewed 0.23.1 receipt and installed direct Python packages match those latest candidates. The intentional exception is h2hdb: the registry currently supplies 0.36.1, below the new >=0.37.0,<0.38.0 requirement. This coordinated task builds and installs the h2hdb 0.37.0 wheel directly and validates its new mandatory source existence/discard lifecycle; no sibling path is a committed build input. The upper bound is the tested pre-1.0 core compatibility lane. Latest candidates support Python 3.14; no third-party bound changes or new releases require additional upstream review. Full fast checks and 72 focused filesystem/snapshot/progress cases passed. Real SQLite publication/restart tests verify deferred gallery retention, admission quotas, equal timestamps, immutable turn snapshots and eventual marker convergence; the global-spam artifact retry regression preserves the exact prior publication when old source bytes are unavailable and succeeds after source completion and restart. Existing schema, observation codec and CBZ layout are unchanged; no data conversion, rebuild or compatibility shim is required. Final exact-tree bounded offline pytest, Lean, finite TLC and installed-wheel checks are recorded separately by the release gate; manual live MariaDB evidence is reported separately.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
