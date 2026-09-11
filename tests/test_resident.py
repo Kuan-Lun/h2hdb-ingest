@@ -340,7 +340,7 @@ def test_startup_only_checks_existing_epoch_and_processes_one_session(
         (
             "log",
             "vNext ingest publication batch completed: deferred_galleries=0 "
-            "known_galleries=1",
+            "waiting_galleries=0 known_galleries=1",
         ),
     ]
     assert events[6] == ("complete", 2)
@@ -1211,7 +1211,7 @@ def test_maintenance_failure_does_not_undo_completed_ingest(
     assert (
         "log",
         "vNext ingest publication batch completed: deferred_galleries=0 "
-        "known_galleries=1",
+        "waiting_galleries=0 known_galleries=1",
     ) in events
 
 
