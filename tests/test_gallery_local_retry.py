@@ -82,7 +82,7 @@ def _synchronize(runtime: IngestRuntime) -> None:
     pytest.fail("small gallery fixture did not finish its maintenance and publication")
 
 
-def test_incomplete_first_gallery_does_not_consume_new_gallery_quota(
+def test_markerless_new_gallery_does_not_consume_quota_or_force_retries(
     tmp_path: Path,
 ) -> None:
     config = _config(tmp_path, batch=1)
@@ -98,12 +98,33 @@ def test_incomplete_first_gallery_does_not_consume_new_gallery_quota(
         runtime.resident.initialize()
         _synchronize(runtime)
         assert runtime.catalog.get_catalog_revision().publication_count == 1
+        assert runtime.resident.last_synchronization_result is not None
+        assert runtime.resident.last_synchronization_result.waiting_gallery_count == 0
         _synchronize(runtime)
         assert runtime.catalog.get_catalog_revision().publication_count == 2
-        assert any("waiting_galleries=1" in message for message in events)
+        assert all("waiting_galleries=1" not in message for message in events)
         _marker(source / "1000", stamp=10)
         _synchronize(runtime)
         assert runtime.catalog.get_catalog_revision().publication_count == 3
+        runtime.database_admin.check()
+
+
+def test_numeric_collection_does_not_create_a_permanent_waiting_gallery(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    gallery = config.paths.download_path / "2024" / "1001"
+    _page(gallery, "red", stamp=10)
+    _marker(gallery, stamp=10)
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
+        _synchronize(runtime)
+        assert runtime.catalog.get_catalog_revision().publication_count == 1
+        result = runtime.resident.last_synchronization_result
+        assert result is not None
+        assert result.waiting_gallery_count == 0
+        assert result.deferred_gallery_count == 0
         runtime.database_admin.check()
 
 

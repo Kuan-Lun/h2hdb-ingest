@@ -228,6 +228,9 @@ total work or its number of resulting books.
 
 Every batch takes a fresh inventory of gallery candidates. New folders, including
 names preceding an earlier scan position, are eligible in subsequent batches.
+New folders without a completion marker are not candidates yet; the monitor
+schedules them when their marker appears. Collection folders do not create
+permanent retries merely because their names resemble gallery IDs.
 A missing inventory entry is removed only after a fresh existence check confirms
 its absence. An incomplete or changing gallery waits for another turn: an existing
 gallery retains its compatible published observation, and a new gallery does not
@@ -382,8 +385,9 @@ and uses no core database connection.
 filesystem latency also contributes to detection delay. The quiet and maximum
 waits use observed changes, not an unavailable writer timestamp. Transient
 source changes during observation defer that gallery until a later turn.
-Missing or empty markers and metadata missing required fields are treated as
-incomplete writes, including on startup. Images newer than the completion marker
+An existing gallery whose marker disappears retains its last published observation.
+Empty markers and metadata missing required fields are treated as incomplete
+writes, including on startup. Images newer than the completion marker
 also defer the gallery; equal timestamps are accepted. Full observation checks
 the complete gallery inventory and marker before and after reading the source
 bytes. A detected change discards that gallery's temporary copies. Changes to

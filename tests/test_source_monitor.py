@@ -229,6 +229,44 @@ def test_raw_empty_partial_and_complete_markers_extend_the_same_quiet_window(
         index.close()
 
 
+def test_new_download_schedules_a_scan_only_when_its_first_marker_appears(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "download"
+    gallery = root / "2024" / "1001"
+    gallery.mkdir(parents=True)
+    image = gallery / "001.jpg"
+    image.write_bytes(b"new download in progress")
+    probe = FilesystemCompletionMarkerProbe(root)
+    index = _MarkerIndex(tmp_path / "markers.sqlite3")
+    schedule = SourceScanSchedule(quiet_seconds=300, max_wait_seconds=1800, now=0)
+    startup = schedule.start_scan(now=0)
+    schedule.finish_scan(startup, now=1, succeeded=True)
+    now = 100
+
+    def changed() -> None:
+        schedule.note_change(now=now)
+
+    try:
+        for observed_at in (100, 200):
+            now = observed_at
+            image.write_bytes(f"still downloading at {now}".encode())
+            with probe(_checkpoint) as markers:
+                index.reconcile(markers, changed=changed, checkpoint=_checkpoint)
+            assert schedule.next_scan_at() is None
+        now = 300
+        (gallery / "galleryinfo.txt").write_bytes(b"producer completion marker")
+        with probe(_checkpoint) as markers:
+            index.reconcile(markers, changed=changed, checkpoint=_checkpoint)
+        assert schedule.next_scan_at() == 600
+        now = 400
+        with probe(_checkpoint) as markers:
+            index.reconcile(markers, changed=changed, checkpoint=_checkpoint)
+        assert schedule.next_scan_at() == 600
+    finally:
+        index.close()
+
+
 def test_monitor_retries_transient_mutation_and_retains_dirty_generation(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

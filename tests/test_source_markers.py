@@ -401,7 +401,7 @@ def test_marker_iterator_pages_without_building_gallery_payloads(
         )
 
 
-def test_missing_markers_remain_candidates_without_blocking_other_marker_probes(
+def test_new_gallery_without_marker_is_absent_from_discovery_and_marker_probes(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "source"
@@ -412,13 +412,10 @@ def test_missing_markers_remain_candidates_without_blocking_other_marker_probes(
     with FilesystemSource(root) as source:
         assert source.list_gallery_locators(after_locator=None, limit=128).items == (
             ("collection", "1001"),
-            ("collection", "H@H download [1002]"),
         )
         assert tuple(
             locator for locator, _marker in source.iter_completion_markers()
         ) == (("collection", "1001"),)
-        with pytest.raises(FilesystemSourceChangedError):
-            source.observe_gallery(("collection", "H@H download [1002]"))
 
 
 def test_numeric_collection_without_marker_does_not_hide_completed_descendants(
@@ -428,12 +425,31 @@ def test_numeric_collection_without_marker_does_not_hide_completed_descendants(
     _gallery(root, "2024/1001")
     with FilesystemSource(root) as source:
         assert source.list_gallery_locators(after_locator=None, limit=128).items == (
-            ("2024",),
             ("2024", "1001"),
         )
         assert tuple(
             locator for locator, _marker in source.iter_completion_markers()
         ) == (("2024", "1001"),)
+
+
+def test_published_locator_probe_retains_markerless_gallery_in_the_attempt(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source"
+    folder = _gallery(root, "2024/1001")
+    (folder / "galleryinfo.txt").unlink()
+    with FilesystemSource(root) as source:
+        assert source.list_gallery_locators(after_locator=None, limit=128).items == ()
+        # Core invokes this independent probe for authoritative published
+        # locators missing from inventory. Missing completion is not deletion.
+        assert source.gallery_exists(("2024", "1001"))
+        assert source.list_gallery_locators(after_locator=None, limit=128).items == (
+            ("2024", "1001"),
+        )
+        with pytest.raises(FilesystemSourceChangedError):
+            source.observe_completion_marker(("2024", "1001"))
+        with pytest.raises(FilesystemSourceChangedError):
+            source.observe_gallery(("2024", "1001"))
 
 
 def test_existing_gallery_missing_from_initial_inventory_is_observed_on_probe(

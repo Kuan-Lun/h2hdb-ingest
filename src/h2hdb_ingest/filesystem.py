@@ -1336,10 +1336,10 @@ class FilesystemSource:
     ) -> Iterator[tuple[tuple[str, ...], FilesystemStat]]:
         """Spill candidates without requiring a quiescent collection tree.
 
-        H@H gallery names identify incomplete candidates before their marker
-        exists. Such candidates remain in the plan so existing observations can
-        be retained while their replacements download. Without a marker we
-        still descend, because numeric collection names can also match a GID.
+        Only a completion marker identifies a gallery boundary. Markerless
+        directories may be collections or new downloads and remain traversal
+        nodes. Published locators missing from discovery are reconciled by the
+        independent gallery_exists probe before the core decides deletion.
         """
 
         self._checkpoint()
@@ -1394,9 +1394,6 @@ class FilesystemSource:
                     raise FilesystemObservationError(
                         f"gallery metadata is not a regular file: {metadata_path}"
                     )
-            if metadata is not None or (
-                directory != self._root and _is_gallery_directory(directory)
-            ):
                 relative = directory.relative_to(self._root)
                 if not relative.parts:
                     raise FilesystemObservationError(
@@ -1406,7 +1403,7 @@ class FilesystemSource:
                     tuple(_strict_component(part) for part in relative.parts),
                     expected_directory,
                 )
-            if metadata is None:
+            else:
                 try:
                     with os.scandir(directory) as entries:
                         for entry in entries:
@@ -1700,13 +1697,6 @@ def _parse_galleryinfo_content(
 
 def _same_directory_identity(first: FilesystemStat, second: FilesystemStat) -> bool:
     return (first.device, first.inode) == (second.device, second.inode)
-
-
-def _is_gallery_directory(directory: Path) -> bool:
-    try:
-        return parse_gid(directory) >= 0
-    except ValueError:
-        return False
 
 
 def _insert_discovery_directory(
