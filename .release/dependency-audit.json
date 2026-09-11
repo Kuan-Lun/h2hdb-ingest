@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-11T04:46:55+00:00",
+  "checked_at": "2026-09-11T05:00:13+00:00",
   "manifest_sha256": "201a22042d6d4122e7ed72e247e0d62479b188bb4e0a1dbb1b263ee53271cda0",
   "node": [
     {
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.24.0",
+  "project_version": "0.24.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Re-audited every direct build, runtime, optional development and Node dependency, including registry candidates outside current bounds. Third-party candidates are unchanged from the reviewed 0.23.1 receipt and installed direct Python packages match those latest candidates. The intentional exception is h2hdb: the registry currently supplies 0.36.1, below the new >=0.37.0,<0.38.0 requirement. This coordinated task builds and installs the h2hdb 0.37.0 wheel directly and validates its new mandatory source existence/discard lifecycle; no sibling path is a committed build input. The upper bound is the tested pre-1.0 core compatibility lane. Latest candidates support Python 3.14; no third-party bound changes or new releases require additional upstream review. Full fast checks and 72 focused filesystem/snapshot/progress cases passed. Real SQLite publication/restart tests verify deferred gallery retention, admission quotas, equal timestamps, immutable turn snapshots and eventual marker convergence; the global-spam artifact retry regression preserves the exact prior publication when old source bytes are unavailable and succeeds after source completion and restart. Existing schema, observation codec and CBZ layout are unchanged; no data conversion, rebuild or compatibility shim is required. Final exact-tree bounded offline pytest, Lean, finite TLC and installed-wheel checks are recorded separately by the release gate; manual live MariaDB evidence is reported separately.",
+    "note": "Re-audited all direct build, runtime, optional development and Node dependencies for the markerless-discovery correction. The dependency manifest and every registry candidate are unchanged from the reviewed 0.24.0 receipt. Third-party latest candidates satisfy declarations and support Python 3.14. The documented coordinated-core exception remains: registry h2hdb 0.36.1 is below the >=0.37.0,<0.38.0 requirement, and validation uses the locally built h2hdb 0.37.0 wheel without a committed sibling path. No new third-party release requires another release-note review. The compatible fix removes numeric-name inference: new markerless folders remain traversal nodes until a marker appears; existing published locators still receive fresh existence checks and retain published observations while incomplete. This avoids perpetual waiting on numeric collection directories. Full fast checks, 86 focused filesystem/marker/monitor/snapshot tests and seven real SQLite publication/restart/retry tests passed. No schema, observation codec, library format, dependency contract or compatibility shim changes. The exact-tree gate separately records bounded offline pytest, Lean, finite TLC and installed-wheel validation; live MariaDB results are separate manual evidence.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
