@@ -81,6 +81,7 @@ def test_real_bad_page_rejects_whole_gallery_with_exact_folder_and_filename(
     messages: list[str] = []
     progress = IngestProgress(messages.append, interval_seconds=3600)
     work = progress.begin("source")
+    (folder / "galleryinfo.txt").touch()
     with FilesystemSource(source_root) as source:
         adapter = VNextFilesystemSourceAdapter(
             source,
@@ -122,6 +123,7 @@ def test_valid_source_longer_than_old_limit_is_fully_qualified(tmp_path: Path) -
     folder = _gallery(root)
     with Image.new("RGB", (32, 10000), "green") as image:
         image.save(folder / "001.png")
+    (folder / "galleryinfo.txt").touch()
     with FilesystemSource(root) as source:
         observation = source.observe_gallery(("1234",))
         assert (
@@ -151,6 +153,7 @@ def test_resource_errors_are_not_cached_as_bad_images(
         raise failure
 
     monkeypatch.setattr(qualification_module, "load_source_page_image", fail)
+    (folder / "galleryinfo.txt").touch()
     with FilesystemSource(root) as source:
         observation = source.observe_gallery(("1234",))
         with pytest.raises(type(failure)) as caught:
@@ -179,6 +182,7 @@ def test_source_mutation_during_spooling_remains_retryable(
             raise failure
 
     monkeypatch.setattr(FilesystemFileObservation, "content_parts", fail)
+    (folder / "galleryinfo.txt").touch()
     with FilesystemSource(root) as source:
         observation = source.observe_gallery(("1234",))
         with pytest.raises(FilesystemSourceChangedError) as caught:
@@ -206,6 +210,7 @@ def test_growing_source_stops_at_observed_size_before_spooling_more_data(
         raise AssertionError("a changed source must stop before reading more data")
 
     monkeypatch.setattr(FilesystemFileObservation, "content_parts", grow)
+    (folder / "galleryinfo.txt").touch()
     with FilesystemSource(root) as source:
         observed = source.observe_gallery(("1234",))
         with pytest.raises(FilesystemSourceChangedError, match="grew beyond") as caught:
@@ -220,6 +225,7 @@ def test_metadata_only_adapter_does_not_decode_images(tmp_path: Path) -> None:
     root = tmp_path / "source"
     folder = _gallery(root)
     (folder / "001.jpg").write_bytes(b"not an image")
+    (folder / "galleryinfo.txt").touch()
     with FilesystemSource(root) as source:
         assert (
             VNextFilesystemSourceAdapter(source)
@@ -247,6 +253,7 @@ def test_large_encoded_image_qualifies_from_disk_spool_and_closes_it(
         return load_source_page_image(source, policy=policy)
 
     monkeypatch.setattr(qualification_module, "load_source_page_image", decode)
+    (folder / "galleryinfo.txt").touch()
     with FilesystemSource(root) as source:
         observed = source.observe_gallery(("1234",))
         assert (
@@ -277,6 +284,7 @@ def test_later_worker_resource_error_is_not_hidden_by_first_corrupt_image(
         raise failure
 
     monkeypatch.setattr(qualification_module, "load_source_page_image", decode)
+    (folder / "galleryinfo.txt").touch()
     with FilesystemSource(root) as source:
         observed = source.observe_gallery(("1234",))
         with pytest.raises(OSError) as caught:
@@ -318,6 +326,7 @@ def test_local_spool_failure_never_becomes_a_bad_source_fact(
         return stream
 
     monkeypatch.setattr(qualification_module, "SpooledTemporaryFile", broken_spool)
+    (folder / "galleryinfo.txt").touch()
     with FilesystemSource(root) as source:
         observed = source.observe_gallery(("1234",))
         with pytest.raises(OSError, match="qualification spool") as caught:

@@ -226,18 +226,22 @@ their changes and confirmed deletions are applied in the same synchronization
 and do not consume this quota. A batch is therefore not a fixed limit on its
 total work or its number of resulting books.
 
-Every batch takes a fresh complete inventory of gallery completion markers.
-New folders, including names preceding an earlier scan position, are eligible
-in subsequent batches. Missing folders are removed only after this complete
-inventory proves their absence. Incomplete or changing observations fail the
-attempt rather than treating an interrupted scan as evidence of deletion.
-Unchanged markers reuse verified source observations without rereading image
-bytes. Metadata discovery, analysis, catalog indexes, and library reconciliation
-still contribute work; the first batch must finish the full metadata inventory.
+Every batch takes a fresh inventory of gallery candidates. New folders, including
+names preceding an earlier scan position, are eligible in subsequent batches.
+A missing inventory entry is removed only after a fresh existence check confirms
+its absence. An incomplete or changing gallery waits for another turn: an existing
+gallery retains its compatible published observation, and a new gallery does not
+consume admission quota. Other complete galleries continue through the batch.
+Unchanged published markers reuse verified source observations without rereading
+image bytes. Unpublished observations are read again when artifacts are required,
+so an interrupted attempt never depends on discarded temporary source bytes.
+Metadata discovery, analysis, catalog indexes, and library reconciliation still
+contribute work; the first batch must finish the full metadata inventory.
 
-After a batch publishes, the resident immediately continues any deferred new
-galleries, with bounded maintenance and a fresh ingest claim between batches.
-It does not wait for another source change or the quiet period. Each published
+After a batch publishes, the resident immediately continues new galleries deferred
+by admission quota, with bounded maintenance and a fresh ingest claim between
+batches. Galleries waiting for source completion instead use the quiet/maximum
+wait schedule, including when no new marker event is observed. Each published
 batch is complete and downloadable through the current catalog while later
 batches are prepared. OPDS serves only that current publication; activation
 retains its existing publication fence. New evidence can change deduplication
@@ -377,12 +381,29 @@ and uses no core database connection.
 `source_probe_interval_seconds` is the pause between completed metadata passes;
 filesystem latency also contributes to detection delay. The quiet and maximum
 waits use observed changes, not an unavailable writer timestamp. Transient
-source changes during observation retain a retry after the quiet period.
-Empty markers and metadata missing required fields are treated as incomplete
-writes, including on startup: they are never published and retry after the
-quiet period. Marker probes only hash bytes; full observation still rejects
+source changes during observation defer that gallery until a later turn.
+Missing or empty markers and metadata missing required fields are treated as
+incomplete writes, including on startup. Images newer than the completion marker
+also defer the gallery; equal timestamps are accepted. Full observation checks
+the complete gallery inventory and marker before and after reading the source
+bytes. A detected change discards that gallery's temporary copies. Changes to
+unrelated folders or to collection-directory timestamps do not invalidate the
+batch. Marker probes only hash bytes; full observation still rejects
 invalid UTF-8, invalid dates, unsafe paths, and metadata larger than 1 MiB.
 Downloader handoffs and bounded cleanup remain eligible between source scans.
+
+This protocol deliberately accepts eventual consistency with the downloader.
+Equal timestamps may describe an intermediate source version; a later marker
+stat or content change causes another observation. Newly observed images and
+metadata are copied to this turn's owned scratch and rendered from those verified
+bytes even if the originals subsequently change. Existing observations normally
+reuse their published artifacts. If global spam or duplicate selection changes
+and an older observation needs a new artifact whose source bytes are no longer
+available, the dependent publication attempt retains the current publication and
+retries after the quiet period. It never substitutes different bytes for a sealed
+source hash. INFO summaries count waiting galleries; DEBUG records their individual
+deferral reasons. A source failure requiring a whole publication retry still emits
+a WARNING with its original context.
 
 JPEG qualities are strict integers from 0 through 95. Supported resamplers are
 `nearest`, `box`, `bilinear`, `hamming`, `bicubic`, and `lanczos`. An explicit
@@ -485,7 +506,10 @@ The renderer writes and verifies a CBZ directly in one unpublished scratch strea
 Its destination must support read, write and seek; failures discard partial bytes
 instead of preserving prior destination contents. The final protected staging
 and atomic publication path continue to publish only complete, verified files.
-The complete verified source snapshot still occupies disk space while rendering,
+Temporary copies for newly observed galleries occupy disk until the source turn
+finishes; they are discarded rather than resumed after interruption. Existing
+durable artifact staging keeps its normal recovery protocol. The complete verified
+source snapshot still occupies disk space while rendering,
 and completed output has its existing page and non-ZIP64 bounds. Sources have no
 64 MiB per-file or 4 GiB per-gallery policy limit.
 
@@ -500,6 +524,13 @@ persistent publication staging.
 Custom source-monitor probes now return a context-managed iterator. The monitor
 opens, consumes and closes each probe in its own worker thread, including stop
 and error paths; callers must update old bare-generator probes.
+
+The source adapter protocol requires `gallery_exists` to confirm missing inventory
+entries and `discard_gallery_observation` to release a rejected attempt's local
+resources. Custom adapters must implement both; there is no legacy fallback.
+Upgrade ingest and its core dependency together. Database schema, observation
+codec and published CBZ layout are unchanged: existing databases and library
+folders are retained without a conversion tool or manual rebuild.
 
 ## Run the service
 

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ._log_fields import diagnostic_text, quote_log_field
+from .artifact_errors import format_artifact_failure
 
 if TYPE_CHECKING:
     from .progress import ProgressSnapshot
@@ -112,10 +113,16 @@ def _retry_diagnostic(
 
 
 def _exception_fields(error: BaseException) -> Iterator[str]:
+    artifact = format_artifact_failure(error, event="artifact_source_retry")
     for position, cause in enumerate(_error_chain(error)):
         prefix = "" if position == 0 else f"cause.{position}."
         yield prefix + "error_type=" + quote_log_field(type(cause).__name__)
         yield prefix + "reason=" + quote_log_field(diagnostic_text(cause))
+        if position == 0 and artifact is not None:
+            # Primary classification comes first; optional context cannot consume
+            # its output budget. Member identity remains separate from causes.
+            yield "artifact_context=" + quote_log_field(artifact)
+            yield "retry_scope=publication_candidate"
         notes = getattr(cause, "__notes__", ())
         if isinstance(notes, (tuple, list)):
             yield from (

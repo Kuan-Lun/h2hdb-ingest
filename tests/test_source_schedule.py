@@ -103,6 +103,31 @@ def test_failed_publication_cannot_acknowledge_pending_batch() -> None:
     assert schedule.next_scan_at() == 400
 
 
+def test_unstable_galleries_retry_without_marker_change_or_busy_loop() -> None:
+    schedule = _schedule()
+    first = schedule.start_scan(now=0)
+    schedule.finish_scan(first, now=100, succeeded=True, waiting_galleries=True)
+    assert schedule.next_scan_at() == 400
+    second = schedule.start_scan(now=400)
+    schedule.finish_scan(second, now=450, succeeded=True, waiting_galleries=True)
+    assert schedule.next_scan_at() == 750
+    third = schedule.start_scan(now=750)
+    schedule.finish_scan(third, now=800, succeeded=True)
+    assert schedule.next_scan_at() is None
+
+
+def test_new_gallery_backlog_continues_before_unstable_gallery_retry() -> None:
+    schedule = _schedule()
+    first = schedule.start_scan(now=0)
+    schedule.finish_scan(
+        first, now=100, succeeded=True, pending_batch=True, waiting_galleries=True
+    )
+    assert schedule.next_scan_at() == 100
+    second = schedule.start_scan(now=100)
+    schedule.finish_scan(second, now=200, succeeded=True, waiting_galleries=True)
+    assert schedule.next_scan_at() == 500
+
+
 def test_downloader_handoff_can_start_a_clean_or_debouncing_scan() -> None:
     schedule = _clean_schedule()
     clean_ticket = schedule.start_scan(now=20)

@@ -13,7 +13,7 @@ __all__ = [
 ]
 
 from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic_ns
@@ -29,7 +29,6 @@ from h2hdb import (
     VNextIngestSourceReceipt,
     VNextLibraryActivationAdapter,
     VNextResolvedIngestPolicy,
-    VNextSourcePreparationOperation,
     VNextSourcePreparationProgress,
 )
 
@@ -44,6 +43,7 @@ from .metrics import (
 )
 from .progress import IngestProgress, ProgressWork
 from .session import IngestSessionController
+from .source_snapshot import SourceSnapshotStore
 
 _ANALYSIS_SNAPSHOT_STAGE = b"snapshot_manifest"
 
@@ -73,6 +73,7 @@ class VNextIngestSourceSynchronizationResult:
 
     receipt: VNextIngestSourceReceipt
     deferred_gallery_count: int
+    waiting_gallery_count: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.receipt, VNextIngestSourceReceipt):
@@ -81,6 +82,7 @@ class VNextIngestSourceSynchronizationResult:
         if not self.receipt.sealed:
             raise ValueError("synchronization source receipt must be sealed")
         _require_deferred_gallery_count(self.deferred_gallery_count)
+        _require_deferred_gallery_count(self.waiting_gallery_count)
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,9 +93,11 @@ class VNextIngestSynchronizationResult:
     analysis: VNextAnalysisAdvanceResult
     publication: VNextIngestAdvanceResult
     deferred_gallery_count: int
+    waiting_gallery_count: int = 0
 
     def __post_init__(self) -> None:
         _require_deferred_gallery_count(self.deferred_gallery_count)
+        _require_deferred_gallery_count(self.waiting_gallery_count)
         if not isinstance(self.source, VNextIngestSourceReceipt):
             raise TypeError("source must be VNextIngestSourceReceipt")
         self.source.__post_init__()
@@ -129,6 +133,10 @@ class VNextIngestService:
         library_activation: VNextLibraryActivationAdapter,
         publication_guard: Callable[[], AbstractContextManager[None]],
         qualify_gallery: SourceGalleryQualifier | None = None,
+        source_snapshot_context: Callable[
+            [], AbstractContextManager[SourceSnapshotStore | None]
+        ]
+        | None = None,
         metrics_sink: IngestMetricSink | None = None,
         progress: IngestProgress | None = None,
     ) -> None:
@@ -156,6 +164,7 @@ class VNextIngestService:
         if metrics_sink is not None and not callable(metrics_sink):
             raise TypeError("metrics_sink must be callable")
         self._qualify_gallery = qualify_gallery
+        self._source_snapshot_context = source_snapshot_context
         self._source_root = source_root
         self._policy = policy
         self._max_rows = max_rows
@@ -173,7 +182,25 @@ class VNextIngestService:
         *,
         should_stop: Callable[[], bool] | None = None,
     ) -> VNextIngestSynchronizationResult:
-        """Publish one cumulative batch from a fresh complete source inventory."""
+        """Publish a batch using source bytes captured before global analysis."""
+
+        context = (
+            nullcontext(None)
+            if self._source_snapshot_context is None
+            else self._source_snapshot_context()
+        )
+        with context as snapshot:
+            return self._synchronize_once(
+                session, should_stop=should_stop, snapshot=snapshot
+            )
+
+    def _synchronize_once(
+        self,
+        session: IngestSessionController,
+        *,
+        should_stop: Callable[[], bool] | None,
+        snapshot: SourceSnapshotStore | None,
+    ) -> VNextIngestSynchronizationResult:
 
         if not isinstance(session, IngestSessionController):
             raise TypeError("session must be IngestSessionController")
@@ -212,7 +239,7 @@ class VNextIngestService:
                 session,
                 resolved,
                 VNextFilesystemSourceAdapter(
-                    source, qualify_gallery=self._qualify_gallery
+                    source, qualify_gallery=self._qualify_gallery, snapshot=snapshot
                 ),
                 max_new_galleries=self._publication_batch_galleries,
                 should_stop=stop_requested,
@@ -222,6 +249,7 @@ class VNextIngestService:
         if work is not None:
             work.set_counter("source_galleries", source_receipt.staged_galleries)
             work.set_counter("deferred_galleries", source_result.deferred_gallery_count)
+            work.set_counter("waiting_galleries", source_result.waiting_gallery_count)
             work.phase("analysis")
         analysis = synchronize_analysis(
             session,
@@ -252,6 +280,7 @@ class VNextIngestService:
             analysis,
             publication,
             source_result.deferred_gallery_count,
+            source_result.waiting_gallery_count,
         )
 
 
@@ -516,11 +545,6 @@ def synchronize_source(
             total=update.total,
             unit="galleries",
         )
-        if (
-            update.operation is VNextSourcePreparationOperation.SOURCE_FREEZE
-            and update.total is not None
-        ):
-            progress.set_counter("batch_selected_galleries", update.total)
 
     prepared = session.outside_session(
         lambda facade: facade.prepare_source(
@@ -531,7 +555,9 @@ def synchronize_source(
         )
     )
     if progress is not None:
+        progress.set_counter("batch_selected_galleries", prepared.gallery_count)
         progress.set_counter("deferred_galleries", prepared.deferred_gallery_count)
+        progress.set_counter("waiting_galleries", prepared.waiting_gallery_count)
     with prepared:
         while True:
             _raise_if_stopping(should_stop)
@@ -575,6 +601,7 @@ def synchronize_source(
             return VNextIngestSourceSynchronizationResult(
                 source_receipt,
                 prepared.deferred_gallery_count,
+                prepared.waiting_gallery_count,
             )
 
 

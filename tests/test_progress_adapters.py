@@ -207,6 +207,7 @@ def _gallery(root: Path, gid: int) -> Path:
         encoding="utf-8",
     )
     (folder / "one.jpg").write_bytes(b"image bytes")
+    (folder / "galleryinfo.txt").touch()
     return folder
 
 

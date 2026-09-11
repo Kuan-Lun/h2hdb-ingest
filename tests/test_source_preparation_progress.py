@@ -24,8 +24,11 @@ from h2hdb import (
 from PIL import Image
 
 import h2hdb_ingest.runtime as runtime_module
+import h2hdb_ingest.service as service_module
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
-from h2hdb_ingest.progress import IngestProgress, ProgressSnapshot
+from h2hdb_ingest.progress import IngestProgress, ProgressSnapshot, ProgressWork
+from h2hdb_ingest.service import VNextIngestSourceSynchronizationResult
+from h2hdb_ingest.session import IngestSessionController
 
 
 @dataclass
@@ -156,7 +159,7 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
                 update.operation
                 not in (
                     VNextSourcePreparationOperation.DISCOVERY_TRANSFER,
-                    VNextSourcePreparationOperation.BATCH_SELECTION,
+                    VNextSourcePreparationOperation.SOURCE_FREEZE,
                 )
                 or update.completed == 0
             ):
@@ -200,14 +203,38 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
         if observer_errors:
             prepared.close()
             raise observer_errors[0]
-        snapshot = tracker.snapshot()
-        assert snapshot is not None
-        frozen.append(snapshot)
         assert prepared.deferred_gallery_count == galleries - 10
         return prepared
 
+    original_synchronize = service_module.synchronize_source
+
+    def synchronize_source(
+        session: IngestSessionController,
+        policy: VNextResolvedIngestPolicy,
+        adapter: VNextIngestSourceAdapter,
+        *,
+        max_new_galleries: int | None = None,
+        should_stop: Callable[[], bool],
+        progress: ProgressWork | None = None,
+    ) -> VNextIngestSourceSynchronizationResult:
+        result = original_synchronize(
+            session,
+            policy,
+            adapter,
+            max_new_galleries=max_new_galleries,
+            should_stop=should_stop,
+            progress=progress,
+        )
+        # Admission skips updating galleries without consuming a batch slot.
+        # Its final selected count is known once source preparation finishes.
+        snapshot = tracked[0].snapshot()
+        assert snapshot is not None
+        frozen.append(snapshot)
+        return result
+
     monkeypatch.setattr(runtime_module, "IngestProgress", progress_factory)
     monkeypatch.setattr(VNextIngestFacade, "prepare_source", prepare_source)
+    monkeypatch.setattr(service_module, "synchronize_source", synchronize_source)
     with runtime_module.build_runtime(config, event_logger=emit) as runtime:
         runtime.database_admin.initialize()
         runtime.resident.initialize()
@@ -227,15 +254,15 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
     assert "archives_rendered" not in counters
     assert set(stages) == {
         VNextSourcePreparationOperation.DISCOVERY_TRANSFER,
-        VNextSourcePreparationOperation.BATCH_SELECTION,
+        VNextSourcePreparationOperation.SOURCE_FREEZE,
     }
     assert (
         "Copying the gallery inventory into the batch plan"
         in stages[VNextSourcePreparationOperation.DISCOVERY_TRANSFER][1]
     )
     assert (
-        "Selecting existing and new galleries for this batch"
-        in stages[VNextSourcePreparationOperation.BATCH_SELECTION][1]
+        "Checking gallery completion and preparing source observations"
+        in stages[VNextSourcePreparationOperation.SOURCE_FREEZE][1]
     )
     assert all("source_discovery" not in message for _, message in stages.values())
     assert all(

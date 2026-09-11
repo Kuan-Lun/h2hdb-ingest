@@ -39,6 +39,7 @@ from .progress import IngestProgress
 from .resident import ResidentIngestor
 from .service import VNextIngestService
 from .source_monitor import FilesystemCompletionMarkerProbe
+from .source_snapshot import SourceSnapshotStore
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,9 @@ def build_runtime(
         library_maintenance: LibraryMaintenanceAdapter
         publication_guard: Callable[[], AbstractContextManager[None]]
         qualify_gallery: ImageGalleryQualifier | None = None
+        source_snapshot_context: (
+            Callable[[], AbstractContextManager[SourceSnapshotStore | None]] | None
+        ) = None
         if config.paths.library_path is None:
             disabled_library = _DisabledLibraryActivationAdapter()
             library_activation = disabled_library
@@ -178,6 +182,7 @@ def build_runtime(
             library_storage_identity = library
             library_maintenance = library
             publication_guard = library.publication_guard
+            source_snapshot_context = library.source_snapshot_context
 
         service = VNextIngestService(
             source_root=config.paths.download_path,
@@ -189,6 +194,7 @@ def build_runtime(
             library_activation=library_activation,
             publication_guard=publication_guard,
             qualify_gallery=qualify_gallery,
+            source_snapshot_context=source_snapshot_context,
             metrics_sink=metrics_sink,
             progress=progress,
         )

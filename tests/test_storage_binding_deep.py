@@ -85,6 +85,7 @@ def test_live_mariadb_restart_replays_uuid_after_process_loss(
         encoding="utf-8",
     )
     Image.new("RGB", (8, 12), "red").save(gallery / "001.jpg")
+    (gallery / "galleryinfo.txt").touch()
     library_root = tmp_path / "library"
     _provision_library_root(library_root)
     config = IngestConfig(

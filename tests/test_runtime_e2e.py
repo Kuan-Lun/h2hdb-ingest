@@ -123,7 +123,8 @@ def _rewrite_completion_marker(folder: Path) -> None:
     marker = folder / "galleryinfo.txt"
     previous = marker.stat()
     marker.write_bytes(marker.read_bytes())
-    os.utime(marker, ns=(previous.st_atime_ns, previous.st_mtime_ns + 1_000_000))
+    modified_ns = max(marker.stat().st_mtime_ns, previous.st_mtime_ns + 1_000_000)
+    os.utime(marker, ns=(previous.st_atime_ns, modified_ns))
 
 
 def _synchronize_after_cleanup(runtime: IngestRuntime) -> None:
@@ -478,6 +479,12 @@ def test_completion_marker_change_reloads_only_the_affected_gallery(
             assert marker.read_bytes() == original_metadata
             assert marker.stat().st_mtime_ns != original_stat.st_mtime_ns
         else:
+            # Model a coarse timestamp bucket: image and marker mtimes can
+            # remain equal while the marker's new bytes trigger observation.
+            os.utime(
+                folder / "001.jpg",
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
             marker.write_bytes(
                 original_metadata.replace(b"integration", b"replacement")
             )
@@ -667,8 +674,10 @@ def test_incomplete_completion_marker_retries_without_publishing_partial_source(
         _synchronize_after_cleanup(runtime)
         original = runtime.catalog.get_catalog_revision()
         marker.write_bytes(incomplete)
-        assert not runtime.resident.process_available(periodic_scan=True)
+        assert runtime.resident.process_available(periodic_scan=True)
         assert runtime.catalog.get_catalog_revision() == original
+        result = runtime.resident.last_synchronization_result
+        assert result is not None and result.waiting_gallery_count == 1
         (source / "1001" / "001.jpg").write_bytes(b"completed replacement gallery")
         marker.write_bytes(complete)
         _synchronize_after_cleanup(runtime)
@@ -676,7 +685,7 @@ def test_incomplete_completion_marker_retries_without_publishing_partial_source(
         assert runtime.database_admin.check().state == "READY"
 
 
-def test_artifact_source_mutation_retries_with_current_publication_and_cleanup_intact(
+def test_artifact_render_uses_frozen_source_then_observes_the_later_marker(
     tmp_path: Path,
     runtime_core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
@@ -731,18 +740,24 @@ def test_artifact_source_mutation_retries_with_current_publication_and_cleanup_i
         for _attempt in range(32):
             progressed = runtime.resident.process_available(periodic_scan=True)
             if changed:
-                assert not progressed
+                assert progressed
                 break
             assert progressed
         else:
             pytest.fail("artifact preparation never observed the changed source")
-        assert runtime.catalog.get_catalog_revision() == baseline
-        assert (
-            next((library / "current").rglob("*.cbz")).read_bytes() == original_archive
-        )
+        captured = runtime.catalog.get_catalog_revision()
+        assert captured.revision == baseline.revision + 1
+        captured_archive = next((library / "current").rglob("*.cbz")).read_bytes()
+        assert captured_archive != original_archive
+        with (
+            ZipFile(BytesIO(captured_archive)) as archive,
+            Image.open(BytesIO(archive.read("pages/0000.jpg"))) as image,
+        ):
+            red, green, blue = cast(tuple[int, int, int], image.getpixel((0, 0)))
+            assert blue > red + green
         for _attempt in range(32):
             assert runtime.resident.process_available(periodic_scan=True)
-            if runtime.catalog.get_catalog_revision() != baseline:
+            if runtime.catalog.get_catalog_revision() != captured:
                 break
         else:
             pytest.fail(
@@ -772,6 +787,7 @@ def test_fresh_artifact_runtime_publishes_one_current_cbz(
     source = tmp_path / "download"
     _gallery(source, 2001, "artist")
     Image.new("RGB", (8, 12), "red").save(source / "2001" / "001.jpg")
+    _rewrite_completion_marker(source / "2001")
     library_root = tmp_path / "library"
     _provision_library_root(library_root)
     current_root = library_root / "current"
@@ -903,6 +919,7 @@ def test_restart_recovers_durable_publication_before_applying_new_policy(
     )
     image.save(source / "2101" / "001.png")
     (source / "2101" / "001.jpg").unlink()
+    _rewrite_completion_marker(source / "2101")
     library_root = tmp_path / "library"
     _provision_library_root(library_root)
     database = str(tmp_path / "catalog.sqlite3")
@@ -1017,6 +1034,7 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
     source = tmp_path / "download"
     _gallery(source, 1901, "artist")
     Image.new("RGB", (8, 12), "red").save(source / "1901" / "001.jpg")
+    _rewrite_completion_marker(source / "1901")
     library_root = tmp_path / "library"
     _provision_library_root(library_root)
     current_root = library_root / "current"
@@ -1193,6 +1211,7 @@ def test_complete_library_relocation_keeps_catalog_and_reuses_artifact(
     source = tmp_path / "download"
     _gallery(source, 2501, "artist")
     Image.new("RGB", (8, 12), "red").save(source / "2501" / "001.jpg")
+    _rewrite_completion_marker(source / "2501")
     library_root = tmp_path / "library"
     _provision_library_root(library_root)
     config = IngestConfig(
@@ -1265,6 +1284,7 @@ def test_deleted_gallery_reconciles_catalog_library_and_historical_cleanup(
     source = tmp_path / "download"
     _gallery(source, 2501, "artist")
     Image.new("RGB", (8, 12), "red").save(source / "2501" / "001.jpg")
+    _rewrite_completion_marker(source / "2501")
     library_root = tmp_path / "library"
     _provision_library_root(library_root)
     current_root = library_root / "current"
@@ -1338,6 +1358,7 @@ def test_many_replacements_keep_one_stable_current_file_per_gid(
         Image.new("RGB", (8, 12), (offset * 11, 0, 255)).save(
             source / str(gid) / "001.jpg"
         )
+        _rewrite_completion_marker(source / str(gid))
     config = IngestConfig(
         core=CoreConfig(
             database=DatabaseConfig(
@@ -1479,6 +1500,8 @@ def test_progressive_mixed_images_publish_restart_repair_and_remove_rejected_gal
     (source / "4002" / "001.jpg").write_bytes(b"invalid image input")
     (source / "4003" / "001.jpg").unlink()
     _large_monochrome_png(source / "4003" / "001.png")
+    for gid in (4001, 4002, 4003):
+        _rewrite_completion_marker(source / str(gid))
     library = tmp_path / "library"
     _provision_library_root(library)
     config = IngestConfig(
@@ -1609,6 +1632,7 @@ def test_large_encoded_source_publishes_from_empty_database(
     (source / "4201" / "001.jpg").unlink()
     page_path = source / "4201" / "001.png"
     source_size = write_large_source_png(page_path)
+    _rewrite_completion_marker(source / "4201")
     assert source_size > 32 * 1024 * 1024
     with page_path.open("rb") as stream:
         source_sha256 = file_digest(stream, "sha256").digest()

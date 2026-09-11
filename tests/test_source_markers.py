@@ -30,6 +30,7 @@ def _gallery(root: Path, locator: str = "1001") -> Path:
         encoding="utf-8",
     )
     (folder / "001.jpg").write_bytes(b"source page")
+    (folder / "galleryinfo.txt").touch()
     return folder
 
 
@@ -398,3 +399,125 @@ def test_marker_iterator_pages_without_building_gallery_payloads(
         assert connection.execute("SELECT count(*) FROM gallery_audits").fetchone() == (
             0,
         )
+
+
+def test_missing_markers_remain_candidates_without_blocking_other_marker_probes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source"
+    _gallery(root, "collection/1001")
+    incomplete = root / "collection" / "H@H download [1002]"
+    incomplete.mkdir()
+    (incomplete / "001.jpg").write_bytes(b"downloading")
+    with FilesystemSource(root) as source:
+        assert source.list_gallery_locators(after_locator=None, limit=128).items == (
+            ("collection", "1001"),
+            ("collection", "H@H download [1002]"),
+        )
+        assert tuple(
+            locator for locator, _marker in source.iter_completion_markers()
+        ) == (("collection", "1001"),)
+        with pytest.raises(FilesystemSourceChangedError):
+            source.observe_gallery(("collection", "H@H download [1002]"))
+
+
+def test_numeric_collection_without_marker_does_not_hide_completed_descendants(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source"
+    _gallery(root, "2024/1001")
+    with FilesystemSource(root) as source:
+        assert source.list_gallery_locators(after_locator=None, limit=128).items == (
+            ("2024",),
+            ("2024", "1001"),
+        )
+        assert tuple(
+            locator for locator, _marker in source.iter_completion_markers()
+        ) == (("2024", "1001"),)
+
+
+def test_existing_gallery_missing_from_initial_inventory_is_observed_on_probe(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source"
+    root.mkdir()
+    with FilesystemSource(root) as source:
+        assert source.list_gallery_locators(after_locator=None, limit=128).items == ()
+        _gallery(root)
+        assert source.gallery_exists(("1001",))
+        assert source.observe_gallery(("1001",)).metadata.gid == 1001
+        assert not source.gallery_exists(("1002",))
+        (root / "1001" / "galleryinfo.txt").unlink()
+        assert source.gallery_exists(("1001",))
+
+
+def test_gallery_existence_refuses_symlink_and_permission_uncertainty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "source"
+    folder = _gallery(root)
+    source = FilesystemSource(root)
+    source.list_gallery_locators(after_locator=None, limit=128)
+    original_stat = os.stat
+
+    def denied_stat(
+        path: str, *, dir_fd: int | None = None, follow_symlinks: bool = True
+    ) -> os.stat_result:
+        if path == "1001":
+            raise PermissionError("source is unavailable")
+        return original_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "stat", denied_stat)
+        with pytest.raises(FilesystemObservationError, match="unavailable"):
+            source.gallery_exists(("1001",))
+    moved = tmp_path / "moved"
+    folder.rename(moved)
+    folder.symlink_to(moved, target_is_directory=True)
+    with pytest.raises(FilesystemObservationError, match="non-directory"):
+        source.gallery_exists(("1001",))
+    source.close()
+
+
+def test_gallery_existence_refuses_replaced_root_before_confirming_deletion(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "source"
+    _gallery(root)
+    with FilesystemSource(root) as source:
+        source.list_gallery_locators(after_locator=None, limit=128)
+        root.rename(tmp_path / "moved")
+        root.mkdir()
+        with pytest.raises(FilesystemObservationError, match="root identity changed"):
+            source.gallery_exists(("1001",))
+
+
+@pytest.mark.parametrize("replacement", ("directory", "symlink"))
+@pytest.mark.parametrize("operation", ("marker", "gallery", "files"))
+def test_root_replacement_after_discovery_fails_before_reading_a_gallery(
+    tmp_path: Path, replacement: str, operation: str
+) -> None:
+    root = tmp_path / "source"
+    _gallery(root)
+    with FilesystemSource(root) as source:
+        source.list_gallery_locators(after_locator=None, limit=128)
+        if operation == "files":
+            source.observe_gallery(("1001",))
+        moved = tmp_path / "moved"
+        root.rename(moved)
+        if replacement == "symlink":
+            root.symlink_to(moved, target_is_directory=True)
+        else:
+            # Keep the original gallery inode and all its exact file facts.
+            # Only pinning the root can distinguish this replacement tree.
+            root.mkdir()
+            (moved / "1001").rename(root / "1001")
+        with pytest.raises(FilesystemObservationError) as caught:
+            adapter = VNextFilesystemSourceAdapter(source)
+            if operation == "marker":
+                adapter.observe_completion_marker(("1001",))
+            elif operation == "gallery":
+                adapter.observe_gallery(("1001",))
+            else:
+                source.list_files(("1001",), after_name=None, limit=128)
+        assert not isinstance(caught.value, FilesystemSourceChangedError)

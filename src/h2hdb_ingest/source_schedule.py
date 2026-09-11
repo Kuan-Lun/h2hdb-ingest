@@ -89,6 +89,7 @@ class SourceScanSchedule:
         now: float,
         succeeded: bool,
         pending_batch: bool = False,
+        waiting_galleries: bool = False,
     ) -> None:
         """Acknowledge only this scan; newer changes survive its completion.
 
@@ -98,10 +99,11 @@ class SourceScanSchedule:
         continuously mutating source cannot cause an immediate retry loop.
         A published batch with deferred galleries continues immediately, even
         when the completion-marker monitor observed no further source changes.
+        Unstable galleries retain a delayed retry even if no marker changes.
         """
 
         self._validate_time(now)
-        if pending_batch and not succeeded:
+        if (pending_batch or waiting_galleries) and not succeeded:
             raise ValueError(
                 "only a successful publication can schedule its next batch"
             )
@@ -113,7 +115,7 @@ class SourceScanSchedule:
             if pending_batch:
                 self._last_change_at = now
                 self._hard_deadline = now
-            elif not succeeded:
+            elif not succeeded or waiting_galleries:
                 self._last_change_at = now
             if not pending_batch and self._last_change_at is not None:
                 self._hard_deadline = now + self._max_wait_seconds

@@ -5,7 +5,7 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
-from h2hdb import CatalogRevisionNotFoundError, CoreConfig, DatabaseConfig
+from h2hdb import CoreConfig, DatabaseConfig
 from PIL import Image
 
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
@@ -33,7 +33,7 @@ def _source_snapshot(
     return snapshot
 
 
-def test_stable_invalid_gallery_retries_with_original_source_diagnostic(
+def test_incomplete_gallery_waits_with_original_diagnostic_and_releases_its_lease(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -77,39 +77,50 @@ def test_stable_invalid_gallery_retries_with_original_source_diagnostic(
         resident=ResidentConfig(lease_seconds=30, heartbeat_seconds=5),
     )
     events: list[str] = []
-    caplog.set_level(logging.WARNING, logger="h2hdb_ingest")
+    caplog.set_level(logging.DEBUG, logger="h2hdb_ingest")
     with build_runtime(config, event_logger=events.append) as runtime:
         runtime.database_admin.initialize()
         runtime.resident.initialize()
         for _attempt in range(2):
             caplog.clear()
             events.clear()
-            assert not runtime.resident.process_available(periodic_scan=True)
+            previous = runtime.resident.last_synchronization_result
+            for _maintenance_step in range(128):
+                assert runtime.resident.process_available(periodic_scan=True)
+                if runtime.resident.last_synchronization_result is not previous:
+                    break
+            else:
+                pytest.fail("gallery retry did not finish bounded maintenance")
+            result = runtime.resident.last_synchronization_result
+            assert result is not None and result.waiting_gallery_count == 1
             warnings = [
                 record.getMessage()
                 for record in caplog.records
                 if record.levelno == logging.WARNING
             ]
-            assert len(warnings) == 1
-            diagnostic = warnings[0]
+            assert warnings == []
+            diagnostics = [
+                record.getMessage()
+                for record in caplog.records
+                if record.levelno == logging.DEBUG
+                and "Gallery source deferred" in record.getMessage()
+            ]
+            assert len(diagnostics) == 1
+            diagnostic = diagnostics[0]
             for expected in (
-                "Ingest work will be retried",
-                "FilesystemSourceChangedError",
                 "missing required fields",
                 str(gallery),
-                'phase="source"',
-                'operation="source_gallery_observation"',
+                "observe_gallery",
             ):
                 assert expected in diagnostic
-            assert "source_source_freeze" not in diagnostic
-            assert "catalog_cleanup" not in diagnostic
-            assert "Cleaning up unused database records" not in diagnostic
             assert not any("Ingest work will be retried" in event for event in events)
+            assert any(
+                "galleries waiting for source completion 1" in event for event in events
+            )
             assert runtime.database_admin.check().state == "READY"
-            with pytest.raises(CatalogRevisionNotFoundError):
-                runtime.catalog.get_catalog_revision()
+            assert runtime.catalog.get_catalog_revision().publication_count == 0
             assert _source_snapshot(source) == original_source
-        # The failed observation releases its real lease on every retry, so
+        # The deferred observation releases its real lease on every retry, so
         # another claimant need not wait for its 30 second expiration.
         session = runtime.facade.try_claim_ingest(True, 30_000_000)
         assert session is not None

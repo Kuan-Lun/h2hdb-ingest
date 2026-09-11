@@ -178,6 +178,7 @@ def test_parallel_real_exif_qualification_warnings_name_the_correct_gallery(
             encoding="utf-8",
         )
         (folder / f"{gid}.jpg").write_bytes(page)
+        (folder / "galleryinfo.txt").touch()
     rendezvous = Barrier(2)
     original = source_module._read_header
 

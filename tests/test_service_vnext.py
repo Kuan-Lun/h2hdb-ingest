@@ -58,6 +58,7 @@ class _PreparedSource:
     def __init__(self, events: list[object]) -> None:
         self._events = events
         self.deferred_gallery_count = 7
+        self.waiting_gallery_count = 0
 
     def __enter__(self) -> _PreparedSource:
         self._events.append("enter")
@@ -976,8 +977,11 @@ def test_complete_service_recovers_before_source_and_guards_publication(
         events.append("publication")
         return publication
 
-    def fake_adapter(source: object, *, qualify_gallery: object) -> object:
+    def fake_adapter(
+        source: object, *, qualify_gallery: object, snapshot: object
+    ) -> object:
         assert qualify_gallery is None
+        assert snapshot is None
         events.append("adapter")
         return source
 
@@ -1085,8 +1089,11 @@ def test_complete_service_stop_during_source_preparation_closes_without_success(
             events.append("ensure-policy")
             return resolved
 
-    def fake_adapter(source: object, *, qualify_gallery: object) -> object:
+    def fake_adapter(
+        source: object, *, qualify_gallery: object, snapshot: object
+    ) -> object:
         assert qualify_gallery is None
+        assert snapshot is None
         events.append("adapter")
         return source
 

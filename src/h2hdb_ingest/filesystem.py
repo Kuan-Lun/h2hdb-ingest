@@ -254,7 +254,7 @@ class FilesystemPage[PageItemT]:
 
 
 class FilesystemSource:
-    """Discover collection trees with completed galleries as terminal leaves."""
+    """Discover bounded gallery candidates within a concurrently changing source."""
 
     def __init__(
         self,
@@ -319,7 +319,7 @@ class FilesystemSource:
         after_locator: tuple[str, ...] | None,
         limit: int,
     ) -> FilesystemPage[tuple[str, ...]]:
-        """Return one keyset page from this session's disk-backed snapshot."""
+        """Return one keyset page from this session's disk-backed inventory."""
 
         self._checkpoint()
         bound = _page_limit(limit)
@@ -328,11 +328,13 @@ class FilesystemSource:
         expected_root = self._discovery_root_stat
         if expected_root is None:  # pragma: no cover - established with the index
             raise RuntimeError("filesystem discovery index lacks its root audit")
-        if self._directory_stat(self._root) != expected_root:
+        if not _same_directory_identity(
+            self._directory_stat(self._root), expected_root
+        ):
             raise FilesystemSourceChangedError(
                 f"source root changed after discovery snapshot: {self._root}"
             )
-        columns = "payload, device, inode, size_bytes, modified_ns, changed_ns"
+        columns = "payload"
         if after is None:
             rows = connection.execute(
                 f"SELECT {columns} FROM locators ORDER BY payload LIMIT ?",
@@ -348,11 +350,6 @@ class FilesystemSource:
         for row in rows[:bound]:
             self._checkpoint()
             locator = _decode_locator(bytes(row[0]))
-            current = self._directory_stat(self._gallery_path(locator))
-            if current != _stat_from_row(row[1:]):
-                raise FilesystemSourceChangedError(
-                    f"gallery locator changed after discovery snapshot: {locator!r}"
-                )
             items.append(locator)
         return FilesystemPage(tuple(items), len(rows) <= bound)
 
@@ -369,7 +366,12 @@ class FilesystemSource:
         while True:
             page = self.list_gallery_locators(after_locator=after, limit=128)
             for locator in page.items:
-                observed = self.observe_completion_marker(locator)
+                try:
+                    observed = self.observe_completion_marker(locator)
+                except FilesystemSourceChangedError:
+                    # This candidate is downloading or changed during this probe.
+                    # Every fresh watcher probe retries it independently.
+                    continue
                 digest = observed.expected_sha256
                 if digest is None:  # pragma: no cover - exact snapshot below
                     raise RuntimeError("completion marker lacks its content digest")
@@ -377,6 +379,77 @@ class FilesystemSource:
             if page.terminal:
                 return
             after = page.items[-1]
+
+    def gallery_exists(self, locator_components: tuple[str, ...]) -> bool:
+        """Confirm one published locator independently of the moving inventory.
+
+        Missing completion markers do not imply deletion. A present baseline
+        gallery missed during discovery joins this attempt's private locator
+        index so its current contents can subsequently be observed normally.
+        """
+
+        self._require_open()
+        self._checkpoint()
+        payload = _encode_locator(locator_components)
+        components = tuple(_strict_component(part) for part in locator_components)
+        directories: list[int] = []
+        directory_flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        current = self._root
+        try:
+            directories.append(os.open(self._root, directory_flags))
+            root_stat = FilesystemStat.from_os_stat(os.fstat(directories[0]))
+            self._require_root_identity(root_stat)
+            observed = root_stat
+            for component in components:
+                self._checkpoint()
+                current /= component
+                try:
+                    value = os.stat(
+                        component, dir_fd=directories[-1], follow_symlinks=False
+                    )
+                    if not stat.S_ISDIR(value.st_mode):
+                        raise FilesystemObservationError(
+                            f"gallery locator crosses a non-directory: {current}"
+                        )
+                    directories.append(
+                        os.open(component, directory_flags, dir_fd=directories[-1])
+                    )
+                except FileNotFoundError:
+                    self._require_directory_bindings(components, directories)
+                    return False
+                opened = os.fstat(directories[-1])
+                observed = FilesystemStat.from_os_stat(opened)
+                if not _same_directory_identity(
+                    observed, FilesystemStat.from_os_stat(value)
+                ):
+                    raise FilesystemSourceChangedError(
+                        f"gallery locator changed during existence probe: {current}"
+                    )
+            self._require_directory_bindings(components, directories)
+        except OSError as error:
+            raise _source_io_error(
+                f"unable to inspect gallery locator {current}: {error}", error
+            ) from error
+        finally:
+            for descriptor in reversed(directories):
+                os.close(descriptor)
+        connection = self._discovery_connection
+        if connection is not None:
+            with connection:
+                connection.execute(
+                    "INSERT OR IGNORE INTO locators VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        payload,
+                        observed.device.to_bytes(8, "big"),
+                        observed.inode.to_bytes(8, "big"),
+                        observed.size_bytes,
+                        observed.modified_ns,
+                        observed.changed_ns,
+                    ),
+                )
+        return True
 
     def observe_completion_marker(
         self,
@@ -420,6 +493,9 @@ class FilesystemSource:
         )
         try:
             directories.append(os.open(self._root, directory_flags))
+            self._require_root_identity(
+                FilesystemStat.from_os_stat(os.fstat(directories[0]))
+            )
             for component in components:
                 self._checkpoint()
                 directories.append(
@@ -460,25 +536,7 @@ class FilesystemSource:
                 raise FilesystemSourceChangedError(
                     f"gallery metadata changed during completion probe: {path}"
                 )
-            for index, directory in enumerate(directories):
-                self._checkpoint()
-                named = (
-                    self._root.lstat()
-                    if index == 0
-                    else os.stat(
-                        components[index - 1],
-                        dir_fd=directories[index - 1],
-                        follow_symlinks=False,
-                    )
-                )
-                opened = os.fstat(directory)
-                if not stat.S_ISDIR(named.st_mode) or (
-                    named.st_dev,
-                    named.st_ino,
-                ) != (opened.st_dev, opened.st_ino):
-                    raise FilesystemSourceChangedError(
-                        f"gallery locator changed during completion probe: {folder}"
-                    )
+            self._require_directory_bindings(components, directories)
             return FilesystemFileObservation(
                 folder=folder,
                 name_bytes=GALLERY_INFO_NAME.encode("ascii"),
@@ -499,6 +557,36 @@ class FilesystemSource:
             for directory in reversed(directories):
                 os.close(directory)
 
+    def _require_directory_bindings(
+        self, components: tuple[str, ...], directories: list[int]
+    ) -> None:
+        for index, directory in enumerate(directories):
+            self._checkpoint()
+            named = (
+                self._root.lstat()
+                if index == 0
+                else os.stat(
+                    components[index - 1],
+                    dir_fd=directories[index - 1],
+                    follow_symlinks=False,
+                )
+            )
+            opened = os.fstat(directory)
+            if index == 0:
+                self._require_root_identity(FilesystemStat.from_os_stat(opened))
+            if not stat.S_ISDIR(named.st_mode) or (
+                named.st_dev,
+                named.st_ino,
+            ) != (opened.st_dev, opened.st_ino):
+                if index == 0:
+                    raise FilesystemObservationError(
+                        f"source root identity changed during probe: {self._root}"
+                    )
+                raise FilesystemSourceChangedError(
+                    "gallery locator changed during probe: "
+                    f"{self._root.joinpath(*components)}"
+                )
+
     def observe_gallery(
         self,
         locator_components: tuple[str, ...],
@@ -508,6 +596,24 @@ class FilesystemSource:
         if not created:
             self._require_gallery_unchanged(index)
         return index.observation
+
+    def revalidate_observed_gallery(self, locator_components: tuple[str, ...]) -> None:
+        """Close an existing full observation with a fresh complete entry audit.
+
+        Marker-only probes have no full observation and remain metadata-only.
+        The spill index is private to this attempt and is discarded on restart.
+        """
+
+        self._require_open()
+        connection = self._discovery_connection
+        if connection is None:
+            return
+        observed = connection.execute(
+            "SELECT 1 FROM gallery_audits WHERE payload = ?",
+            (_encode_locator(locator_components),),
+        ).fetchone()
+        if observed is not None:
+            self.observe_gallery(locator_components)
 
     def list_files(
         self,
@@ -767,7 +873,9 @@ class FilesystemSource:
                     ) from error
                 if self._progress is not None:
                     self._progress.advance("galleries_discovered")
-            if self._directory_stat(self._root) != expected_root:
+            if not _same_directory_identity(
+                self._directory_stat(self._root), expected_root
+            ):
                 raise FilesystemSourceChangedError(
                     f"source root changed during discovery snapshot: {self._root}"
                 )
@@ -800,7 +908,7 @@ class FilesystemSource:
             raise FilesystemObservationError(
                 f"gallery is outside the discovery snapshot: {locator_components!r}"
             )
-        if _stat_from_row(discovered) != directory_stat:
+        if not _same_directory_identity(_stat_from_row(discovered), directory_stat):
             raise FilesystemSourceChangedError(
                 f"gallery changed after discovery snapshot: {locator_components!r}"
             )
@@ -975,11 +1083,17 @@ class FilesystemSource:
                         digest.update(file_type.to_bytes(1, "big"))
                         entry_count += 1
                         regular_count += int(file_type == FilesystemEntryType.REGULAR)
-                        page_count += int(
+                        is_page = (
                             file_type == FilesystemEntryType.REGULAR
                             and _artifact_source_role(name)
                             is FilesystemArtifactSourceRole.PAGE
                         )
+                        page_count += int(is_page)
+                        if is_page and int(row[4]) > metadata_stat.modified_ns:
+                            raise FilesystemSourceChangedError(
+                                "source page is newer than its completion marker: "
+                                f"{folder / os.fsdecode(name)}"
+                            )
                 if regular_count < 1:
                     raise FilesystemObservationError(
                         f"gallery contains no regular metadata file: {folder}"
@@ -1085,6 +1199,7 @@ class FilesystemSource:
         ).fetchone()
         if persisted is None:  # pragma: no cover - inserted in the transaction above
             raise RuntimeError("filesystem gallery index lacks its snapshot")
+        self._require_root_identity()
         if self._progress is not None:
             self._progress.advance("gallery_indexes_built")
         return self._gallery_index_from_row(
@@ -1139,6 +1254,7 @@ class FilesystemSource:
 
     def _require_gallery_unchanged(self, index: _FilesystemGalleryIndex) -> None:
         self._checkpoint()
+        self._require_root_identity()
         connection = self._discovery_index()
         before = self._directory_stat(index.folder)
         if before != index.directory_stat:
@@ -1207,6 +1323,7 @@ class FilesystemSource:
             raise _gallery_changed(index.folder) from error
         if metadata_digest != index.metadata_sha256:
             raise _gallery_changed(index.folder)
+        self._require_root_identity()
 
     def _require_open(self) -> None:
         if self._closed:
@@ -1217,7 +1334,13 @@ class FilesystemSource:
         directory: Path,
         connection: sqlite3.Connection,
     ) -> Iterator[tuple[tuple[str, ...], FilesystemStat]]:
-        """Spill collection traversal; a completion marker makes a gallery a leaf."""
+        """Spill candidates without requiring a quiescent collection tree.
+
+        H@H gallery names identify incomplete candidates before their marker
+        exists. Such candidates remain in the plan so existing observations can
+        be retained while their replacements download. Without a marker we
+        still descend, because numeric collection names can also match a GID.
+        """
 
         self._checkpoint()
         _insert_discovery_directory(
@@ -1235,10 +1358,23 @@ class FilesystemSource:
             self._checkpoint()
             directory = Path(row[1])
             expected_directory = _stat_from_row(row[2:])
-            if self._directory_stat(directory) != expected_directory:
-                raise FilesystemSourceChangedError(
-                    f"directory changed during gallery discovery: {directory}"
+            visited += 1
+            if self._progress is not None:
+                self._progress.advance("discovery_directories")
+            try:
+                current_directory = self._directory_stat(directory)
+            except FilesystemSourceChangedError:
+                connection.execute(
+                    "UPDATE discovery_directories SET visited = 1 WHERE ordinal = ?",
+                    (row[0],),
                 )
+                continue
+            if not _same_directory_identity(current_directory, expected_directory):
+                connection.execute(
+                    "UPDATE discovery_directories SET visited = 1 WHERE ordinal = ?",
+                    (row[0],),
+                )
+                continue
             metadata_path = directory / GALLERY_INFO_NAME
             try:
                 metadata = metadata_path.lstat()
@@ -1258,6 +1394,9 @@ class FilesystemSource:
                     raise FilesystemObservationError(
                         f"gallery metadata is not a regular file: {metadata_path}"
                     )
+            if metadata is not None or (
+                directory != self._root and _is_gallery_directory(directory)
+            ):
                 relative = directory.relative_to(self._root)
                 if not relative.parts:
                     raise FilesystemObservationError(
@@ -1267,7 +1406,7 @@ class FilesystemSource:
                     tuple(_strict_component(part) for part in relative.parts),
                     expected_directory,
                 )
-            else:
+            if metadata is None:
                 try:
                     with os.scandir(directory) as entries:
                         for entry in entries:
@@ -1276,31 +1415,32 @@ class FilesystemSource:
                                 self._progress.advance("discovery_entries")
                             if entry.is_dir(follow_symlinks=False):
                                 _strict_component(entry.name)
-                                _insert_discovery_directory(
-                                    connection,
-                                    Path(entry.path),
-                                    FilesystemStat.from_os_stat(
-                                        entry.stat(follow_symlinks=False)
-                                    ),
-                                )
+                                try:
+                                    observed = entry.stat(follow_symlinks=False)
+                                except FileNotFoundError:
+                                    continue
+                                if stat.S_ISDIR(observed.st_mode):
+                                    _insert_discovery_directory(
+                                        connection,
+                                        Path(entry.path),
+                                        FilesystemStat.from_os_stat(observed),
+                                    )
+                except FileNotFoundError:
+                    # A collection removed during discovery is retried from a
+                    # fresh inventory; already discovered candidates stay pinned.
+                    pass
                 except OSError as error:
                     raise _source_io_error(
                         f"unable to discover galleries below {directory}: {error}",
                         error,
                     ) from error
-            if self._directory_stat(directory) != expected_directory:
-                raise FilesystemSourceChangedError(
-                    f"directory changed during gallery discovery: {directory}"
-                )
             connection.execute(
                 "UPDATE discovery_directories SET visited = 1 WHERE ordinal = ?",
                 (row[0],),
             )
-            visited += 1
-            if self._progress is not None:
-                self._progress.advance("discovery_directories")
-        # Revalidate collection ancestry without retaining a Python tree or
-        # leaving a recursively open scandir descriptor for every tree level.
+        # Revalidate path types without requiring stable directory mtimes or
+        # retaining a Python tree. Gallery identity is checked when observed;
+        # disappearance/replacement of one candidate cannot abort its siblings.
         if self._progress is not None:
             self._progress.operation(
                 "source_discovery_verify",
@@ -1314,10 +1454,10 @@ class FilesystemSource:
         )
         for verified, row in enumerate(rows, start=1):
             self._checkpoint()
-            if self._directory_stat(Path(row[0])) != _stat_from_row(row[1:]):
-                raise FilesystemSourceChangedError(
-                    f"directory changed during gallery discovery: {row[0]}"
-                )
+            try:
+                self._directory_stat(Path(row[0]))
+            except FilesystemSourceChangedError:
+                pass
             if self._progress is not None:
                 self._progress.advance("discovery_directories_verified")
                 self._progress.operation(
@@ -1335,6 +1475,7 @@ class FilesystemSource:
             raise FilesystemObservationError(
                 "gallery locator must be a nonempty exact tuple"
             )
+        self._require_root_identity()
         current = self._root
         for component in locator_components:
             self._checkpoint()
@@ -1349,7 +1490,22 @@ class FilesystemSource:
                 raise FilesystemObservationError(
                     f"gallery locator crosses a non-directory: {current}"
                 )
+        self._require_root_identity()
         return current
+
+    def _require_root_identity(self, observed: FilesystemStat | None = None) -> None:
+        if observed is None:
+            try:
+                observed = self._directory_stat(self._root)
+            except FilesystemSourceChangedError as error:
+                raise FilesystemObservationError(
+                    f"source root is unavailable: {self._root}"
+                ) from error
+        expected = self._discovery_root_stat
+        if expected is not None and not _same_directory_identity(observed, expected):
+            raise FilesystemObservationError(
+                f"source root identity changed after discovery snapshot: {self._root}"
+            )
 
     @staticmethod
     def _directory_stat(path: Path) -> FilesystemStat:
@@ -1540,6 +1696,17 @@ def _parse_galleryinfo_content(
         download_time=download_time,
         tags=tags,
     )
+
+
+def _same_directory_identity(first: FilesystemStat, second: FilesystemStat) -> bool:
+    return (first.device, first.inode) == (second.device, second.inode)
+
+
+def _is_gallery_directory(directory: Path) -> bool:
+    try:
+        return parse_gid(directory) >= 0
+    except ValueError:
+        return False
 
 
 def _insert_discovery_directory(

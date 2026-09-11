@@ -342,6 +342,7 @@ class ResidentIngestor:
                 self._event_logger(
                     "vNext ingest publication batch completed: "
                     f"deferred_galleries={outcome.deferred_gallery_count} "
+                    f"waiting_galleries={outcome.waiting_gallery_count} "
                     f"known_galleries={outcome.source.staged_galleries}"
                 )
         except _PostflightFailed as error:
@@ -744,6 +745,16 @@ class ResidentIngestor:
                             _ResidentCycleOutcome.BATCH_PUBLISHED,
                         ),
                         pending_batch=outcome is _ResidentCycleOutcome.BATCH_PUBLISHED,
+                        waiting_galleries=(
+                            outcome
+                            in (
+                                _ResidentCycleOutcome.INGESTED,
+                                _ResidentCycleOutcome.BATCH_PUBLISHED,
+                            )
+                            and self._last_synchronization_result is not None
+                            and self._last_synchronization_result.waiting_gallery_count
+                            > 0
+                        ),
                     )
                 if outcome in (
                     _ResidentCycleOutcome.INGESTED,

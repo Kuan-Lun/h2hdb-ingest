@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 from h2h_galleryinfo_parser import parse_galleryinfo
-from h2hdb import VNextIngestSourceAdapter
+from h2hdb import VNextIngestSourceAdapter, VNextSourceDeferredError
 
 import h2hdb_ingest.filesystem as filesystem_module
 from h2hdb_ingest.artifact import MAX_METADATA_BYTES
@@ -20,7 +20,9 @@ from h2hdb_ingest.filesystem import (
     FilesystemEntryType,
     FilesystemObservationError,
     FilesystemSource,
+    FilesystemSourceChangedError,
 )
+from h2hdb_ingest.progress import IngestProgress
 
 type _OpenPath = str | bytes | os.PathLike[str] | os.PathLike[bytes]
 
@@ -45,6 +47,7 @@ def _gallery(root: Path, name: str = "nested/1001") -> Path:
     )
     (folder / "002.jpg").write_bytes(b"second")
     (folder / "001.jpg").write_bytes(b"first")
+    (folder / "galleryinfo.txt").touch()
     return folder
 
 
@@ -177,6 +180,7 @@ def test_artifact_roles_and_page_count_are_adapter_owned(tmp_path: Path) -> None
     folder = _gallery(root, "1004")
     (folder / "003.GIF").write_bytes(b"gif")
     (folder / "notes.json").write_bytes(b"not a page")
+    (folder / "galleryinfo.txt").touch()
 
     source = FilesystemSource(root)
     observation, page = source.list_files(("1004",), after_name=None, limit=256)
@@ -364,6 +368,7 @@ def test_file_stream_checkpoint_interrupts_between_chunks_and_closes_descriptors
     root = tmp_path / "download"
     folder = _gallery(root, "1009")
     (folder / "001.jpg").write_bytes(b"x" * (5 * 1024 * 1024))
+    (folder / "galleryinfo.txt").touch()
     stop = _StopOnceAt(3)
     source = FilesystemSource(root, checkpoint=stop)
     _observation, page = source.list_files(("1009",), after_name=None, limit=256)
@@ -586,6 +591,7 @@ def test_gallery_index_keeps_only_one_payload_and_rebuilds_against_fixed_audit(
     first = _gallery(root, "1006")
     second = _gallery(root, "1007")
     (second / "only-second.webp").write_bytes(b"second gallery only")
+    (second / "galleryinfo.txt").touch()
     source = FilesystemSource(root)
     source.list_gallery_locators(after_locator=None, limit=2)
 
@@ -614,7 +620,7 @@ def test_gallery_index_keeps_only_one_payload_and_rebuilds_against_fixed_audit(
 
     with pytest.raises(
         FilesystemObservationError,
-        match="changed between bounded pages",
+        match="newer than its completion marker",
     ):
         source.observe_gallery(("1006",))
 
@@ -732,3 +738,169 @@ def test_public_adapter_exposes_only_keyset_pages(tmp_path: Path) -> None:
     ]
     assert final_tag_page.next_after is None
     assert final_tag_page.terminal
+
+
+@pytest.mark.parametrize("image_offset_ns", (-1, 0, 1))
+def test_completion_timestamp_accepts_equal_and_defers_only_newer_images(
+    tmp_path: Path, image_offset_ns: int
+) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "1001")
+    marker_ns = 1_700_000_000_000_000_000
+    for image in (folder / "001.jpg", folder / "002.jpg"):
+        image_ns = marker_ns + image_offset_ns
+        os.utime(image, ns=(image_ns, image_ns))
+    os.utime(folder / "galleryinfo.txt", ns=(marker_ns, marker_ns))
+    with FilesystemSource(root) as source:
+        adapter = VNextFilesystemSourceAdapter(source)
+        if image_offset_ns > 0:
+            with pytest.raises(
+                VNextSourceDeferredError, match="newer than its completion marker"
+            ):
+                adapter.observe_gallery(("1001",))
+        else:
+            observed = adapter.observe_gallery(("1001",))
+            assert observed.metadata.page_count == 2
+            assert observed.metadata.scan_observation_version == 3
+            assert adapter.observe_completion_marker(("1001",)).file.modified_ns == (
+                marker_ns
+            )
+
+
+def test_newer_non_image_does_not_block_completed_gallery(tmp_path: Path) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "1001")
+    notes = folder / "notes.txt"
+    notes.write_bytes(b"downloader bookkeeping")
+    newer_ns = (folder / "galleryinfo.txt").stat().st_mtime_ns + 1
+    os.utime(notes, ns=(newer_ns, newer_ns))
+    with FilesystemSource(root) as source:
+        assert source.observe_gallery(("1001",)).metadata.page_count == 2
+
+
+@pytest.mark.parametrize("mutation", ("add", "remove", "replace", "mtime", "bytes"))
+def test_final_marker_probe_revalidates_the_entire_observed_entry_set(
+    tmp_path: Path, mutation: str
+) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "1001")
+    with FilesystemSource(root) as source:
+        adapter = VNextFilesystemSourceAdapter(source)
+        adapter.observe_gallery(("1001",))
+        target = folder / "002.jpg"
+        if mutation == "add":
+            (folder / "003.jpg").write_bytes(b"new page")
+        elif mutation == "remove":
+            target.unlink()
+        elif mutation == "replace":
+            replacement = folder / "replacement"
+            replacement.write_bytes(target.read_bytes())
+            replacement.replace(target)
+        elif mutation == "mtime":
+            value = target.stat()
+            os.utime(target, ns=(value.st_atime_ns, value.st_mtime_ns - 1))
+        else:
+            target.write_bytes(b"third!")
+        with pytest.raises(VNextSourceDeferredError):
+            adapter.observe_completion_marker(("1001",))
+
+
+def test_discovery_allows_root_and_gallery_changes_between_pages(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "download"
+    first = _gallery(root, "1001")
+    _gallery(root, "1002")
+    with FilesystemSource(root) as source:
+        page = source.list_gallery_locators(after_locator=None, limit=1)
+        assert page.items == (("1001",),)
+        _gallery(root, "1003")
+        (first / "003.jpg").write_bytes(b"in progress")
+        second = source.list_gallery_locators(after_locator=page.items[-1], limit=1)
+        assert second.items == (("1002",),)
+        assert second.terminal
+        assert source.observe_gallery(("1002",)).metadata.gid == 1002
+        with pytest.raises(FilesystemSourceChangedError, match="newer"):
+            source.observe_gallery(("1001",))
+    with FilesystemSource(root) as restarted:
+        assert restarted.list_gallery_locators(after_locator=None, limit=128).items == (
+            ("1001",),
+            ("1002",),
+            ("1003",),
+        )
+
+
+def test_discovery_accepts_completed_gallery_changes_while_traversing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "collection/1001")
+    original_stat = FilesystemSource._directory_stat
+    updated = False
+
+    def updating_stat(path: Path) -> filesystem_module.FilesystemStat:
+        nonlocal updated
+        if path == folder and not updated:
+            updated = True
+            (folder / "003.jpg").write_bytes(b"new page")
+            (folder / "galleryinfo.txt").touch()
+            (root / "download-in-progress").mkdir()
+        return original_stat(path)
+
+    monkeypatch.setattr(
+        FilesystemSource, "_directory_stat", staticmethod(updating_stat)
+    )
+    with FilesystemSource(root) as source:
+        assert source.list_gallery_locators(after_locator=None, limit=128).items == (
+            ("collection", "1001"),
+        )
+        assert source.observe_gallery(("collection", "1001")).metadata.page_count == 3
+    assert updated
+
+
+def test_restart_discards_the_private_gallery_snapshot_and_observes_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "1001")
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    with FilesystemSource(root) as source:
+        source.observe_gallery(("1001",))
+        assert tuple(tmp_path.glob("h2hdb-ingest-discovery-*"))
+        (folder / "001.jpg").write_bytes(b"changed during terminated attempt")
+        with pytest.raises(FilesystemSourceChangedError):
+            source.revalidate_observed_gallery(("1001",))
+    assert tuple(tmp_path.glob("h2hdb-ingest-discovery-*")) == ()
+    (folder / "galleryinfo.txt").touch()
+    with FilesystemSource(root) as restarted:
+        _observed, page = restarted.list_files(("1001",), after_name=None, limit=128)
+        image = next(item for item in page.items if item.name_bytes == b"001.jpg")
+        assert b"".join(image.content_parts()) == b"changed during terminated attempt"
+    assert tuple(tmp_path.glob("h2hdb-ingest-discovery-*")) == ()
+
+
+def test_disappearing_gallery_during_discovery_does_not_abort_its_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "download"
+    first = _gallery(root, "1001")
+    _gallery(root, "1002")
+    original_stat = FilesystemSource._directory_stat
+    moved = False
+
+    def moving_stat(path: Path) -> filesystem_module.FilesystemStat:
+        nonlocal moved
+        if path == first and not moved:
+            moved = True
+            first.rename(tmp_path / "removed-gallery")
+        return original_stat(path)
+
+    monkeypatch.setattr(FilesystemSource, "_directory_stat", staticmethod(moving_stat))
+    progress = IngestProgress(lambda _message: None)
+    work = progress.begin("source")
+    with FilesystemSource(root, progress=work) as source:
+        assert source.list_gallery_locators(after_locator=None, limit=128).items == (
+            ("1002",),
+        )
+        assert source.observe_gallery(("1002",)).metadata.gid == 1002
+    work.finish()

@@ -43,7 +43,7 @@ _OPERATION_LABELS = {
     "source_batch_selection": "Selecting existing and new galleries for this batch",
     "source_batch_order": "Sorting the selected galleries",
     "source_discovery_cleanup": "Removing the temporary gallery inventory",
-    "source_source_freeze": "Freezing the selected gallery observations",
+    "source_source_freeze": "Checking gallery completion and preparing source observations",
     "source_freeze": "Freezing the selected gallery observations",
     "source_completion_marker": "Checking whether gallery metadata has changed",
     "source_gallery_observation": "Reading gallery metadata and indexing its files",
@@ -256,6 +256,11 @@ def _results(snapshot: ProgressSnapshot) -> list[str]:
         parts.append(
             f"galleries excluded due to image failures {counts['source_galleries_rejected']:,} "
             "(see gallery_image_rejected warnings for folders and files)"
+        )
+    if counts.get("waiting_galleries", 0):
+        parts.append(
+            f"galleries waiting for source completion {counts['waiting_galleries']:,} "
+            "(other galleries continue)"
         )
     if counts.get("cbz_enabled") or "archives_rendered" in counts:
         parts.append(f"CBZs rendered this work {counts.get('archives_rendered', 0):,}")

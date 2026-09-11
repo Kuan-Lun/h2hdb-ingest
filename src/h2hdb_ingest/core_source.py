@@ -4,7 +4,10 @@ from __future__ import annotations
 
 __all__ = ["VNextFilesystemSourceAdapter"]
 
+import logging
 from collections.abc import Callable
+from functools import wraps
+from typing import Concatenate, cast
 
 from h2hdb import (
     ArtifactSourceRole,
@@ -17,11 +20,13 @@ from h2hdb import (
     VNextIngestGalleryObservation,
     VNextIngestPage,
     VNextSourceCompletionMarker,
+    VNextSourceDeferredError,
     VNextSourceQualification,
 )
 
 from .filesystem import (
     FILESYSTEM_OBSERVATION_VERSION,
+    FilesystemArtifactSourceRole,
     FilesystemDirectoryObservation,
     FilesystemFileObservation,
     FilesystemGalleryMetadata,
@@ -29,11 +34,46 @@ from .filesystem import (
     FilesystemSource,
     FilesystemSourceChangedError,
 )
+from .source_snapshot import SourceSnapshotStore
+
+logger = logging.getLogger(__name__)
 
 SourceGalleryQualifier = Callable[
     [FilesystemSource, tuple[str, ...], FilesystemGalleryObservation],
     VNextSourceQualification,
 ]
+
+
+def _defer_source_changes[**Parameters, Result](
+    operation: Callable[Concatenate[VNextFilesystemSourceAdapter, Parameters], Result],
+) -> Callable[Concatenate[VNextFilesystemSourceAdapter, Parameters], Result]:
+    @wraps(operation)
+    def call(
+        adapter: VNextFilesystemSourceAdapter,
+        /,
+        *args: Parameters.args,
+        **kwargs: Parameters.kwargs,
+    ) -> Result:
+        try:
+            return operation(adapter, *args, **kwargs)
+        except FilesystemSourceChangedError as error:
+            # All wrapped methods take a locator or its immutable observation.
+            target = (
+                args[0]
+                if args
+                else kwargs.get("locator_components", kwargs.get("observation"))
+            )
+            adapter._discard_snapshot(
+                cast("tuple[str, ...] | VNextIngestGalleryObservation", target)
+            )
+            logger.debug(
+                "Gallery source deferred: operation=%s reason=%s",
+                operation.__name__,
+                error,
+            )
+            raise VNextSourceDeferredError(str(error)) from error
+
+    return call
 
 
 class VNextFilesystemSourceAdapter:
@@ -44,9 +84,27 @@ class VNextFilesystemSourceAdapter:
         source: FilesystemSource,
         *,
         qualify_gallery: SourceGalleryQualifier | None = None,
+        snapshot: SourceSnapshotStore | None = None,
     ) -> None:
         self._source = source
         self._qualify_gallery = qualify_gallery
+        self._snapshot = snapshot
+
+    def _discard_snapshot(
+        self, target: tuple[str, ...] | VNextIngestGalleryObservation
+    ) -> None:
+        """Drop this turn's bytes when any stage defers the gallery."""
+        if self._snapshot is not None:
+            self._snapshot.discard_gallery(
+                target.locator_components
+                if isinstance(target, VNextIngestGalleryObservation)
+                else target
+            )
+
+    def discard_gallery_observation(self, locator_components: tuple[str, ...]) -> None:
+        """Release rejected attempt bytes even when the core detects the change."""
+        if self._snapshot is not None:
+            self._snapshot.discard_gallery(locator_components)
 
     @property
     def source_root_components(self) -> tuple[str, ...]:
@@ -68,6 +126,11 @@ class VNextFilesystemSourceAdapter:
             page.terminal,
         )
 
+    @_defer_source_changes
+    def gallery_exists(self, locator_components: tuple[str, ...]) -> bool:
+        return self._source.gallery_exists(locator_components)
+
+    @_defer_source_changes
     def observe_gallery(
         self,
         locator_components: tuple[str, ...],
@@ -83,16 +146,19 @@ class VNextFilesystemSourceAdapter:
             ),
         )
 
+    @_defer_source_changes
     def observe_completion_marker(
         self,
         locator_components: tuple[str, ...],
     ) -> VNextSourceCompletionMarker:
         observed = self._source.observe_completion_marker(locator_components)
+        self._source.revalidate_observed_gallery(locator_components)
         return VNextSourceCompletionMarker(
             file=_file(observed),
             observation_version=FILESYSTEM_OBSERVATION_VERSION,
         )
 
+    @_defer_source_changes
     def list_file_observations(
         self,
         observation: VNextIngestGalleryObservation,
@@ -106,13 +172,25 @@ class VNextFilesystemSourceAdapter:
             limit=limit,
         )
         self._require_metadata(observation, observed)
-        items = tuple(_file(item) for item in page.items)
+        items = tuple(
+            _file(
+                item,
+                content=(
+                    self._snapshot.capture(observation.locator_components, item)
+                    if self._snapshot is not None
+                    and item.artifact_role is not FilesystemArtifactSourceRole.OTHER
+                    else None
+                ),
+            )
+            for item in page.items
+        )
         return VNextIngestPage(
             items,
             None if page.terminal else items[-1].name_bytes,
             page.terminal,
         )
 
+    @_defer_source_changes
     def list_directory_observations(
         self,
         observation: VNextIngestGalleryObservation,
@@ -133,6 +211,7 @@ class VNextFilesystemSourceAdapter:
             page.terminal,
         )
 
+    @_defer_source_changes
     def list_tag_observations(
         self,
         observation: VNextIngestGalleryObservation,
@@ -184,8 +263,11 @@ def _metadata(value: FilesystemGalleryMetadata) -> GalleryObservationMetadata:
     )
 
 
-def _file(value: FilesystemFileObservation) -> FileObservation:
-    content = FileContentReceipt.from_parts(value.content_parts())
+def _file(
+    value: FilesystemFileObservation, *, content: FileContentReceipt | None = None
+) -> FileObservation:
+    if content is None:
+        content = FileContentReceipt.from_parts(value.content_parts())
     source_stat = value.stat
     return FileObservation(
         name_bytes=value.name_bytes,
