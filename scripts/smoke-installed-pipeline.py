@@ -77,6 +77,12 @@ def _gallery(
 ) -> Path:
     folder = root / str(gid)
     folder.mkdir(parents=True)
+    page = folder / "001.png"
+    if color is None:
+        page.write_bytes(b"deliberately invalid image bytes")
+    else:
+        with Image.new("RGB", (10, 10_000) if long_page else (20, 30), color) as image:
+            image.save(page, format="PNG")
     (folder / "galleryinfo.txt").write_text(
         f"Title: Installed wheel fixture {gid}\n"
         "Upload Time: 2024-01-02 03:04\n"
@@ -88,12 +94,6 @@ def _gallery(
         "Downloaded from E-Hentai Galleries by the Hentai@Home Downloader <3\n",
         encoding="utf-8",
     )
-    page = folder / "001.png"
-    if color is None:
-        page.write_bytes(b"deliberately invalid image bytes")
-    else:
-        with Image.new("RGB", (10, 10_000) if long_page else (20, 30), color) as image:
-            image.save(page, format="PNG")
     return folder
 
 
@@ -244,6 +244,7 @@ def _run_pipeline(*, with_opds: bool) -> None:
         repair = _gallery(source, 2003, color=None)
         large = _gallery(source, 2004, color="purple")
         source_size = _write_large_source_png(large / "001.png")
+        (large / "galleryinfo.txt").touch()
         for relative in (
             "current/acquisitions",
             "current/artwork",
@@ -296,7 +297,13 @@ def _run_pipeline(*, with_opds: bool) -> None:
                     marker.read_text().replace("04:05", "04:06"), encoding="utf-8"
                 )
                 os.utime(
-                    marker, ns=(previous.st_atime_ns, previous.st_mtime_ns + 1_000_000)
+                    marker,
+                    ns=(
+                        previous.st_atime_ns,
+                        max(
+                            marker.stat().st_mtime_ns, previous.st_mtime_ns + 1_000_000
+                        ),
+                    ),
                 )
                 for _attempt in range(32):
                     runtime.resident.process_available(periodic_scan=True)

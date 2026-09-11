@@ -88,10 +88,10 @@ def _build_source(root: Path, gallery_count: int) -> None:
         gid = _FIRST_GID + offset
         gallery = root / str(gid)
         gallery.mkdir()
-        (gallery / "galleryinfo.txt").write_bytes(_metadata(gid))
         # A trailing decoder-safe discriminator prevents global duplicate-hash
         # policy from classifying all synthetic pages as one repeated source.
         (gallery / "001.jpg").write_bytes(base_page + gid.to_bytes(8, "big"))
+        (gallery / "galleryinfo.txt").write_bytes(_metadata(gid))
 
 
 def _provision_library(root: Path) -> None:
