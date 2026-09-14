@@ -625,6 +625,21 @@ at most 128 resources while holding the publication fence. Files move into
 `current/` with same-filesystem, no-replace renames; they are never copied or
 hard-linked into a second persistent tree.
 
+Each reconciliation page reserves at most 128 exact install or removal
+operations in one durable journal transaction. File verification, rename,
+removal and directory fsync then run outside that transaction while the
+publication fence remains held. One final transaction validates every reserved
+operation again and commits token/current/pending authority together with the
+page cursor. A stopped process can replay the page from its durable per-resource
+facts; no completed cursor is visible before the entire page commits. This
+reduces repeated journal connections and commits without relaxing synchronous
+writes, byte/identity checks or fsync requirements.
+
+The journal remains format v4 and CBZ, storage-key and reader-fencing formats are
+unchanged. Existing libraries need no conversion or rebuild for this change.
+The supported core range includes 0.38: ingest still uses `check()` for a full
+startup audit and does not rely on `initialize()` returning an audit report.
+
 The H2HDB reader head advances only after the library journal reaches `READY`.
 An interrupted rename, journal update, or marker update is replayed from exact
 digest and filesystem identity evidence on restart. Unknown files, symlinks,

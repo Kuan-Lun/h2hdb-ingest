@@ -89,6 +89,11 @@ _PROTECTION_LOCK_PREFIX = "protection-"
 _ACTIVATING_MARKER_NAME = "ACTIVATING"
 _MARKER_FORMAT = "h2hdb-library-activation-v2"
 _MAX_PAGE_ITEMS = 128
+_PENDING_REMOVALS_QUERY = (
+    "SELECT publication_key, resource_kind, storage_codec, storage_path, "
+    "object_sha256, size_bytes, device, inode, modified_ns, changed_ns, "
+    "operation_started FROM pending_removals "
+)
 _MAX_CLEANUP_ITEMS = 8
 _MAX_JOURNAL_CLEANUP_ITEMS = 128
 _PRIVATE_DIRECTORY_CREATION_MODE = 0o700
@@ -178,6 +183,37 @@ class _PendingInstall:
     current_digest: bytes | None
     current_size: int | None
     current_signature: _Signature | None
+
+
+@dataclass(frozen=True, slots=True)
+class _InstalledPending:
+    plan: _PendingInstall
+    signature: _Signature
+    terminal_token: bytes | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingRemoval:
+    publication_key: bytes
+    resource_kind: str
+    key: StorageObjectKey
+    digest: bytes
+    signature: _Signature
+    fresh_authorization: bool
+
+    def authority(self) -> tuple[bytes | str | int, ...]:
+        return (
+            self.publication_key,
+            self.resource_kind,
+            self.key.codec,
+            _key_text(self.key),
+            self.digest,
+            self.signature.size_bytes,
+            self.signature.device,
+            self.signature.inode,
+            self.signature.modified_ns,
+            self.signature.changed_ns,
+        )
 
 
 class ManagedFilesystemLibraryAdapter:
@@ -1254,19 +1290,13 @@ class ManagedFilesystemLibraryAdapter:
             else:
                 self._verify_marker(target, receipt)
 
-        install_cursor = self._activate_pending(
+        installed = self._activate_pending(
             revision=target,
             receipt=receipt,
             limit=limit,
         )
-        if install_cursor is not None:
-            with self._exclusive_state() as connection:
-                return self._record_reconcile_cursor(
-                    connection,
-                    revision=target,
-                    receipt=receipt,
-                    cursor=install_cursor,
-                )
+        if installed is not None:
+            return installed
 
         with self._exclusive_state() as connection:
             state = _journal_state(connection)
@@ -1308,19 +1338,13 @@ class ManagedFilesystemLibraryAdapter:
                     connection.rollback()
                     raise
 
-        removal_cursor = self._remove_stale(
+        removed = self._remove_stale(
             revision=target,
             receipt=receipt,
             limit=limit,
         )
-        if removal_cursor is not None:
-            with self._exclusive_state() as connection:
-                return self._record_reconcile_cursor(
-                    connection,
-                    revision=target,
-                    receipt=receipt,
-                    cursor=removal_cursor,
-                )
+        if removed is not None:
+            return removed
 
         with self._exclusive_state() as connection:
             state = _journal_state(connection)
@@ -1366,7 +1390,7 @@ class ManagedFilesystemLibraryAdapter:
             )
 
     @staticmethod
-    def _record_reconcile_cursor(
+    def _record_reconcile_cursor_in_transaction(
         connection: sqlite3.Connection,
         *,
         revision: int,
@@ -1374,20 +1398,14 @@ class ManagedFilesystemLibraryAdapter:
         cursor: VNextLibraryActivationCursor,
     ) -> LibraryActivationCheckpoint:
         encoded_cursor = cursor.to_bytes()
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            affected = connection.execute(
-                "UPDATE library_state SET last_cursor = ? WHERE singleton = 1 "
-                "AND pending_revision = ? AND pending_receipt_id = ? "
-                "AND phase = 'ACTIVATING'",
-                (encoded_cursor, revision, receipt),
-            ).rowcount
-            if affected != 1:
-                raise RuntimeError("library reconcile cursor lost its activation")
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
+        affected = connection.execute(
+            "UPDATE library_state SET last_cursor = ? WHERE singleton = 1 "
+            "AND pending_revision = ? AND pending_receipt_id = ? "
+            "AND phase = 'ACTIVATING'",
+            (encoded_cursor, revision, receipt),
+        ).rowcount
+        if affected != 1:
+            raise RuntimeError("library reconcile cursor lost its activation")
         return LibraryActivationCheckpoint(
             revision,
             receipt,
@@ -1551,131 +1569,140 @@ class ManagedFilesystemLibraryAdapter:
         revision: int,
         receipt: bytes,
         limit: int,
-    ) -> VNextLibraryActivationCursor | None:
-        with self._exclusive_state() as connection:
-            state = _journal_state(connection)
-            if (
-                state.pending_revision != revision
-                or state.pending_receipt != receipt
-                or state.phase != "ACTIVATING"
-            ):
-                raise RuntimeError("library activation changed before installation")
-            rows = connection.execute(
-                "SELECT publication_key, resource_kind FROM pending_entries "
-                "WHERE activation_revision = ? AND activated = 0 "
-                "ORDER BY publication_key, resource_kind LIMIT ?",
-                (revision, limit),
-            ).fetchall()
-
-        last_cursor: VNextLibraryActivationCursor | None = None
+    ) -> LibraryActivationCheckpoint | None:
+        plans = self._reserve_pending_installs(
+            revision=revision, receipt=receipt, limit=limit
+        )
+        if not plans:
+            return None
         progress = None if self._progress is None else self._progress.current()
-        for publication_key, resource_kind in rows:
-            plan = self._claim_pending_install(
-                revision=revision,
-                receipt=receipt,
-                publication_key=bytes(publication_key),
-                resource_kind=str(resource_kind),
-            )
+        outcomes = []
+        for plan in plans:
             if progress is not None:
                 progress.operation("library_install")
-            signature, terminal_token = self._perform_pending_install(plan)
-            self._commit_pending_install(
-                plan,
-                signature=signature,
-                terminal_token=terminal_token,
-            )
-            if progress is not None:
-                progress.advance("library_resources_reconciled")
-            last_cursor = _activation_cursor_from_fields(
-                plan.publication_key,
-                plan.resource_kind,
-            )
-        return last_cursor
+            signature, token = self._perform_pending_install(plan)
+            outcomes.append(_InstalledPending(plan, signature, token))
+        checkpoint = self._commit_pending_installs(tuple(outcomes))
+        if progress is not None:
+            progress.advance("library_resources_reconciled", len(outcomes))
+        return checkpoint
 
-    def _claim_pending_install(
+    @staticmethod
+    def _require_reconciling(
+        connection: sqlite3.Connection, revision: int, receipt: bytes
+    ) -> None:
+        state = _journal_state(connection)
+        if (
+            state.pending_revision != revision
+            or state.pending_receipt != receipt
+            or state.phase != "ACTIVATING"
+        ):
+            raise RuntimeError("library activation changed during reconciliation")
+
+    def _reserve_pending_installs(
+        self, *, revision: int, receipt: bytes, limit: int
+    ) -> tuple[_PendingInstall, ...]:
+        """Persist one bounded page before any of its filesystem effects.
+
+        A crash may leave untouched and already installed resources reserved in
+        the same page. Re-reading operation_started makes both take the replay
+        path; fresh authorizations exist only in the current call's plans.
+        """
+        with self._exclusive_state() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._require_reconciling(connection, revision, receipt)
+                rows = connection.execute(
+                    "SELECT publication_key, resource_kind FROM pending_entries "
+                    "WHERE activation_revision = ? AND activated = 0 "
+                    "ORDER BY publication_key, resource_kind LIMIT ?",
+                    (revision, limit),
+                ).fetchall()
+                plans = tuple(
+                    self._reserve_pending_install_in_transaction(
+                        connection,
+                        revision=revision,
+                        receipt=receipt,
+                        publication_key=bytes(publication_key),
+                        resource_kind=str(resource_kind),
+                    )
+                    for publication_key, resource_kind in rows
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return plans
+
+    def _reserve_pending_install_in_transaction(
         self,
+        connection: sqlite3.Connection,
         *,
         revision: int,
         receipt: bytes,
         publication_key: bytes,
         resource_kind: str,
     ) -> _PendingInstall:
-        """Durably reserve one exact pending row in a short state transaction."""
-
-        with self._exclusive_state() as connection:
-            state = _journal_state(connection)
-            if (
-                state.pending_revision != revision
-                or state.pending_receipt != receipt
-                or state.phase != "ACTIVATING"
-            ):
-                raise RuntimeError("library activation changed before reservation")
-            row = connection.execute(
-                "SELECT p.storage_codec, p.storage_path, p.object_sha256, "
-                "p.size_bytes, p.operation_started, p.activated, p.device, p.inode, "
-                "p.modified_ns, p.changed_ns, c.storage_path, c.object_sha256, "
-                "c.size_bytes, c.device, c.inode, c.modified_ns, c.changed_ns, "
-                "p.published_modified_at "
-                "FROM pending_entries AS p LEFT JOIN current_entries AS c "
-                "ON c.publication_key = p.publication_key "
-                "AND c.resource_kind = p.resource_kind "
-                "WHERE p.activation_revision = ? AND p.publication_key = ? "
-                "AND p.resource_kind = ?",
-                (revision, publication_key, resource_kind),
-            ).fetchone()
-            if row is None or bool(row[5]):
-                raise RuntimeError("pending library activation changed")
-            if any(value is not None for value in row[6:10]):
-                raise RuntimeError("pending library activation authority is corrupt")
-            key = _key_from_row(str(row[0]), str(row[1]))
-            digest = bytes(row[2])
-            size_bytes = int(row[3])
-            modified_text = str(row[17])
-            current_exists = row[10] is not None
-            current_digest = bytes(row[11]) if current_exists else None
-            current_size = int(row[12]) if current_exists else None
-            current_signature = (
-                _storage_signature(row[13:17], size=int(row[12]))
-                if current_exists
-                else None
-            )
-            staged = self._staged_candidate_authority(
-                connection,
-                key=key,
-                digest=digest,
-                size=size_bytes,
-                modified_text=modified_text,
-            )
-            fresh_authorization = not bool(row[4])
-            if fresh_authorization:
-                connection.execute("BEGIN IMMEDIATE")
-                try:
-                    affected = connection.execute(
-                        "UPDATE pending_entries SET operation_started = 1 "
-                        "WHERE activation_revision = ? AND publication_key = ? "
-                        "AND resource_kind = ? AND storage_codec = ? "
-                        "AND storage_path = ? AND object_sha256 = ? "
-                        "AND size_bytes = ? AND published_modified_at = ? "
-                        "AND operation_started = 0 AND activated = 0 "
-                        "AND device IS NULL AND inode IS NULL "
-                        "AND modified_ns IS NULL AND changed_ns IS NULL",
-                        (
-                            revision,
-                            publication_key,
-                            resource_kind,
-                            key.codec,
-                            _key_text(key),
-                            digest,
-                            size_bytes,
-                            modified_text,
-                        ),
-                    ).rowcount
-                    if affected != 1:
-                        raise RuntimeError("library activation authorization changed")
-                    connection.commit()
-                except BaseException:
-                    connection.rollback()
-                    raise
+        row = connection.execute(
+            "SELECT p.storage_codec, p.storage_path, p.object_sha256, "
+            "p.size_bytes, p.operation_started, p.activated, p.device, p.inode, "
+            "p.modified_ns, p.changed_ns, c.storage_path, c.object_sha256, "
+            "c.size_bytes, c.device, c.inode, c.modified_ns, c.changed_ns, "
+            "p.published_modified_at "
+            "FROM pending_entries AS p LEFT JOIN current_entries AS c "
+            "ON c.publication_key = p.publication_key "
+            "AND c.resource_kind = p.resource_kind "
+            "WHERE p.activation_revision = ? AND p.publication_key = ? "
+            "AND p.resource_kind = ?",
+            (revision, publication_key, resource_kind),
+        ).fetchone()
+        if row is None or bool(row[5]):
+            raise RuntimeError("pending library activation changed")
+        if any(value is not None for value in row[6:10]):
+            raise RuntimeError("pending library activation authority is corrupt")
+        key = _key_from_row(str(row[0]), str(row[1]))
+        digest = bytes(row[2])
+        size_bytes = int(row[3])
+        modified_text = str(row[17])
+        current_exists = row[10] is not None
+        current_digest = bytes(row[11]) if current_exists else None
+        current_size = int(row[12]) if current_exists else None
+        current_signature = (
+            _storage_signature(row[13:17], size=int(row[12]))
+            if current_exists
+            else None
+        )
+        staged = self._staged_candidate_authority(
+            connection,
+            key=key,
+            digest=digest,
+            size=size_bytes,
+            modified_text=modified_text,
+        )
+        fresh_authorization = not bool(row[4])
+        if fresh_authorization:
+            affected = connection.execute(
+                "UPDATE pending_entries SET operation_started = 1 "
+                "WHERE activation_revision = ? AND publication_key = ? "
+                "AND resource_kind = ? AND storage_codec = ? "
+                "AND storage_path = ? AND object_sha256 = ? "
+                "AND size_bytes = ? AND published_modified_at = ? "
+                "AND operation_started = 0 AND activated = 0 "
+                "AND device IS NULL AND inode IS NULL "
+                "AND modified_ns IS NULL AND changed_ns IS NULL",
+                (
+                    revision,
+                    publication_key,
+                    resource_kind,
+                    key.codec,
+                    _key_text(key),
+                    digest,
+                    size_bytes,
+                    modified_text,
+                ),
+            ).rowcount
+            if affected != 1:
+                raise RuntimeError("library activation authorization changed")
 
         return _PendingInstall(
             revision=revision,
@@ -1761,127 +1788,153 @@ class ManagedFilesystemLibraryAdapter:
             raise RuntimeError("activation current lost its staged inode authority")
         return durable, terminal_token
 
-    def _commit_pending_install(
-        self,
-        plan: _PendingInstall,
-        *,
-        signature: _Signature,
-        terminal_token: bytes | None,
-    ) -> None:
-        """Fence one filesystem outcome into the exact reserved journal row."""
+    def _commit_pending_installs(
+        self, outcomes: tuple[_InstalledPending, ...]
+    ) -> LibraryActivationCheckpoint:
+        """Atomically publish a page's durable outcomes and its replay cursor.
 
+        Keep all path checks outside state.lock and the SQLite transaction. The
+        publication lock stays exclusive throughout reservation, I/O and commit.
+        A failed transaction retains every reserved row and STAGED identity for
+        replay, even when some or all current names already contain new bytes.
+        """
+        self._require_publication_lock()
+        if not 1 <= len(outcomes) <= _MAX_PAGE_ITEMS:
+            raise ValueError("library install commit requires a bounded nonempty page")
+        first = outcomes[0].plan
+        verified = []
+        for outcome in outcomes:
+            plan = outcome.plan
+            if (plan.revision, plan.receipt) != (first.revision, first.receipt):
+                raise RuntimeError("library install page mixes activation receipts")
+            signature = self._require_current_authority(
+                plan.key,
+                expected_size=plan.size_bytes,
+                expected_signature=outcome.signature,
+                label="activation terminal library artifact",
+            )
+            verified.append(_InstalledPending(plan, signature, outcome.terminal_token))
         with self._exclusive_state() as connection:
-            state = _journal_state(connection)
-            if (
-                state.pending_revision != plan.revision
-                or state.pending_receipt != plan.receipt
-                or state.phase != "ACTIVATING"
-            ):
-                raise RuntimeError("library activation changed before terminalization")
-            pending = connection.execute(
-                "SELECT storage_codec, storage_path, object_sha256, size_bytes, "
-                "published_modified_at, operation_started, activated, device, inode, "
-                "modified_ns, changed_ns FROM pending_entries "
-                "WHERE activation_revision = ? AND publication_key = ? "
-                "AND resource_kind = ?",
-                (plan.revision, plan.publication_key, plan.resource_kind),
-            ).fetchone()
-            expected_pending = (
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._require_reconciling(connection, first.revision, first.receipt)
+                for outcome in verified:
+                    self._terminalize_pending_install_in_transaction(
+                        connection, outcome
+                    )
+                last = outcomes[-1].plan
+                checkpoint = self._record_reconcile_cursor_in_transaction(
+                    connection,
+                    revision=first.revision,
+                    receipt=first.receipt,
+                    cursor=_activation_cursor_from_fields(
+                        last.publication_key, last.resource_kind
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return checkpoint
+
+    def _terminalize_pending_install_in_transaction(
+        self, connection: sqlite3.Connection, outcome: _InstalledPending
+    ) -> None:
+        plan = outcome.plan
+        exact_signature = outcome.signature
+        terminal_token = outcome.terminal_token
+        pending = connection.execute(
+            "SELECT storage_codec, storage_path, object_sha256, size_bytes, "
+            "published_modified_at, operation_started, activated, device, inode, "
+            "modified_ns, changed_ns FROM pending_entries "
+            "WHERE activation_revision = ? AND publication_key = ? "
+            "AND resource_kind = ?",
+            (plan.revision, plan.publication_key, plan.resource_kind),
+        ).fetchone()
+        expected_pending = (
+            plan.key.codec,
+            _key_text(plan.key),
+            plan.digest,
+            plan.size_bytes,
+            plan.modified_text,
+            1,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        if pending is None or tuple(pending) != expected_pending:
+            raise RuntimeError("pending library activation changed")
+        if terminal_token is not None:
+            if plan.staged is None:
+                raise RuntimeError("activation terminal token lacks authority")
+            self._terminalize_stage_in_transaction(
+                connection,
+                terminal_token,
+                key=plan.key,
+                digest=plan.digest,
+                size=plan.size_bytes,
+                modified_text=plan.modified_text,
+                staged=plan.staged,
+            )
+        connection.execute(
+            "INSERT INTO current_entries "
+            "(publication_key, resource_kind, storage_path, storage_codec, "
+            "gid, object_sha256, size_bytes, published_modified_at, device, "
+            "inode, modified_ns, changed_ns) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(publication_key, resource_kind) DO UPDATE SET "
+            "storage_path = excluded.storage_path, "
+            "storage_codec = excluded.storage_codec, gid = excluded.gid, "
+            "object_sha256 = excluded.object_sha256, "
+            "size_bytes = excluded.size_bytes, "
+            "published_modified_at = excluded.published_modified_at, "
+            "device = excluded.device, inode = excluded.inode, "
+            "modified_ns = excluded.modified_ns, "
+            "changed_ns = excluded.changed_ns",
+            (
+                plan.publication_key,
+                plan.resource_kind,
+                _key_text(plan.key),
+                plan.key.codec,
+                _gid_from_key(plan.key),
+                plan.digest,
+                plan.size_bytes,
+                plan.modified_text,
+                exact_signature.device,
+                exact_signature.inode,
+                exact_signature.modified_ns,
+                exact_signature.changed_ns,
+            ),
+        )
+        affected = connection.execute(
+            "UPDATE pending_entries SET activated = 1, device = ?, "
+            "inode = ?, modified_ns = ?, changed_ns = ? "
+            "WHERE activation_revision = ? AND publication_key = ? "
+            "AND resource_kind = ? AND storage_codec = ? "
+            "AND storage_path = ? AND object_sha256 = ? "
+            "AND size_bytes = ? AND published_modified_at = ? "
+            "AND operation_started = 1 AND activated = 0 "
+            "AND device IS NULL AND inode IS NULL "
+            "AND modified_ns IS NULL AND changed_ns IS NULL",
+            (
+                exact_signature.device,
+                exact_signature.inode,
+                exact_signature.modified_ns,
+                exact_signature.changed_ns,
+                plan.revision,
+                plan.publication_key,
+                plan.resource_kind,
                 plan.key.codec,
                 _key_text(plan.key),
                 plan.digest,
                 plan.size_bytes,
                 plan.modified_text,
-                1,
-                0,
-                None,
-                None,
-                None,
-                None,
-            )
-            if pending is None or tuple(pending) != expected_pending:
-                raise RuntimeError("pending library activation changed")
-            exact_signature = self._require_current_authority(
-                plan.key,
-                expected_size=plan.size_bytes,
-                expected_signature=signature,
-                label="activation terminal library artifact",
-            )
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                if terminal_token is not None:
-                    if plan.staged is None:
-                        raise RuntimeError("activation terminal token lacks authority")
-                    self._terminalize_stage_in_transaction(
-                        connection,
-                        terminal_token,
-                        key=plan.key,
-                        digest=plan.digest,
-                        size=plan.size_bytes,
-                        modified_text=plan.modified_text,
-                        staged=plan.staged,
-                    )
-                connection.execute(
-                    "INSERT INTO current_entries "
-                    "(publication_key, resource_kind, storage_path, storage_codec, "
-                    "gid, object_sha256, size_bytes, published_modified_at, device, "
-                    "inode, modified_ns, changed_ns) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(publication_key, resource_kind) DO UPDATE SET "
-                    "storage_path = excluded.storage_path, "
-                    "storage_codec = excluded.storage_codec, gid = excluded.gid, "
-                    "object_sha256 = excluded.object_sha256, "
-                    "size_bytes = excluded.size_bytes, "
-                    "published_modified_at = excluded.published_modified_at, "
-                    "device = excluded.device, inode = excluded.inode, "
-                    "modified_ns = excluded.modified_ns, "
-                    "changed_ns = excluded.changed_ns",
-                    (
-                        plan.publication_key,
-                        plan.resource_kind,
-                        _key_text(plan.key),
-                        plan.key.codec,
-                        _gid_from_key(plan.key),
-                        plan.digest,
-                        plan.size_bytes,
-                        plan.modified_text,
-                        exact_signature.device,
-                        exact_signature.inode,
-                        exact_signature.modified_ns,
-                        exact_signature.changed_ns,
-                    ),
-                )
-                affected = connection.execute(
-                    "UPDATE pending_entries SET activated = 1, device = ?, "
-                    "inode = ?, modified_ns = ?, changed_ns = ? "
-                    "WHERE activation_revision = ? AND publication_key = ? "
-                    "AND resource_kind = ? AND storage_codec = ? "
-                    "AND storage_path = ? AND object_sha256 = ? "
-                    "AND size_bytes = ? AND published_modified_at = ? "
-                    "AND operation_started = 1 AND activated = 0 "
-                    "AND device IS NULL AND inode IS NULL "
-                    "AND modified_ns IS NULL AND changed_ns IS NULL",
-                    (
-                        exact_signature.device,
-                        exact_signature.inode,
-                        exact_signature.modified_ns,
-                        exact_signature.changed_ns,
-                        plan.revision,
-                        plan.publication_key,
-                        plan.resource_kind,
-                        plan.key.codec,
-                        _key_text(plan.key),
-                        plan.digest,
-                        plan.size_bytes,
-                        plan.modified_text,
-                    ),
-                ).rowcount
-                if affected != 1:
-                    raise RuntimeError("pending library activation changed")
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
+            ),
+        ).rowcount
+        if affected != 1:
+            raise RuntimeError("pending library activation changed")
 
     def _install_staged(
         self,
@@ -2359,49 +2412,51 @@ class ManagedFilesystemLibraryAdapter:
         revision: int,
         receipt: bytes,
         limit: int,
-    ) -> VNextLibraryActivationCursor | None:
-        query = (
-            "SELECT publication_key, resource_kind, storage_codec, storage_path, "
-            "object_sha256, size_bytes, device, inode, modified_ns, changed_ns, "
-            "operation_started FROM pending_removals "
+    ) -> LibraryActivationCheckpoint | None:
+        plans = self._reserve_pending_removals(
+            revision=revision, receipt=receipt, limit=limit
         )
-        with self._exclusive_state() as connection:
-            state = _journal_state(connection)
-            if (
-                state.pending_revision != revision
-                or state.pending_receipt != receipt
-                or state.phase != "ACTIVATING"
-            ):
-                raise RuntimeError("library activation changed before removal")
-            rows = connection.execute(
-                query + "WHERE activation_revision = ? "
-                "ORDER BY publication_key, resource_kind LIMIT ?",
-                (revision, limit),
-            ).fetchall()
-
-        last_cursor: VNextLibraryActivationCursor | None = None
+        if not plans:
+            return None
         progress = None if self._progress is None else self._progress.current()
-        for row in rows:
-            with self._exclusive_state() as connection:
-                state = _journal_state(connection)
-                if (
-                    state.pending_revision != revision
-                    or state.pending_receipt != receipt
-                    or state.phase != "ACTIVATING"
-                ):
-                    raise RuntimeError(
-                        "library activation changed before removal claim"
+        for plan in plans:
+            if progress is not None:
+                progress.operation("library_remove_stale")
+            self._perform_pending_removal(plan)
+        checkpoint = self._commit_pending_removals(
+            revision=revision, receipt=receipt, plans=plans
+        )
+        if progress is not None:
+            progress.advance("library_resources_removed", len(plans))
+        return checkpoint
+
+    def _reserve_pending_removals(
+        self, *, revision: int, receipt: bytes, limit: int
+    ) -> tuple[_PendingRemoval, ...]:
+        with self._exclusive_state() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._require_reconciling(connection, revision, receipt)
+                rows = connection.execute(
+                    _PENDING_REMOVALS_QUERY + "WHERE activation_revision = ? "
+                    "ORDER BY publication_key, resource_kind LIMIT ?",
+                    (revision, limit),
+                ).fetchall()
+                plans = tuple(
+                    _PendingRemoval(
+                        publication_key=bytes(row[0]),
+                        resource_kind=str(row[1]),
+                        key=_key_from_row(str(row[2]), str(row[3])),
+                        digest=bytes(row[4]),
+                        signature=_Signature.from_row(
+                            (row[6], row[7], row[5], row[8], row[9])
+                        ),
+                        fresh_authorization=not bool(row[10]),
                     )
-                current_row = connection.execute(
-                    query + "WHERE activation_revision = ? AND publication_key = ? "
-                    "AND resource_kind = ?",
-                    (revision, bytes(row[0]), str(row[1])),
-                ).fetchone()
-                if current_row is None or tuple(current_row) != tuple(row):
-                    raise RuntimeError("pending library removal changed")
-                if not bool(row[10]):
-                    connection.execute("BEGIN IMMEDIATE")
-                    try:
+                    for row in rows
+                )
+                for plan in plans:
+                    if plan.fresh_authorization:
                         affected = connection.execute(
                             "UPDATE pending_removals SET operation_started = 1 "
                             "WHERE activation_revision = ? AND publication_key = ? "
@@ -2410,135 +2465,157 @@ class ManagedFilesystemLibraryAdapter:
                             "AND size_bytes = ? AND device = ? AND inode = ? "
                             "AND modified_ns = ? AND changed_ns = ? "
                             "AND operation_started = 0",
-                            (revision, *row[:10]),
+                            (revision, *plan.authority()),
                         ).rowcount
                         if affected != 1:
                             raise RuntimeError("library removal authorization changed")
-                        connection.commit()
-                    except BaseException:
-                        connection.rollback()
-                        raise
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return plans
 
-            if progress is not None:
-                progress.operation("library_remove_stale")
-            key = _key_from_row(str(row[2]), str(row[3]))
-            digest = bytes(row[4])
-            size_bytes = int(row[5])
-            expected_signature = _Signature.from_row(
-                (row[6], row[7], row[5], row[8], row[9])
-            )
-            target = self._target(key)
-            quarantine = self._quarantine / _quarantine_leaf(str(row[3]), digest)
-            target_value = self._current_lstat(key)
-            quarantine_value = _safe_lstat(quarantine)
-            if not bool(row[10]):
-                if (
-                    target_value is None
-                    or _Signature.from_stat(target_value) != expected_signature
-                    or quarantine_value is not None
-                ):
-                    raise RuntimeError(f"stale library path changed: {target}")
-            if target_value is not None:
-                if quarantine_value is not None:
-                    self._heal_recovered_capture_duplicate(
-                        key,
-                        quarantine.name,
-                        digest=digest,
-                        size=size_bytes,
-                        expected_signature=expected_signature,
-                        label="recoverable stale library artifact capture",
-                    )
-                    target_value = None
-                else:
-                    if _Signature.from_stat(target_value) != expected_signature:
-                        raise RuntimeError(f"stale library path changed: {target}")
-                    self._quarantine_current(
-                        key,
-                        quarantine.name,
-                        expected_sha256=digest,
-                        expected_size=size_bytes,
-                        expected_signature=expected_signature,
-                        reuse_verified_digest=not bool(row[10]),
-                    )
-            quarantine_value = _safe_lstat(quarantine)
-            if quarantine_value is None and not bool(row[10]):
-                raise RuntimeError("stale library path vanished before authorization")
-            if target_value is None:
-                self._fsync_recovered_capture(
+    def _perform_pending_removal(self, plan: _PendingRemoval) -> None:
+        """Remove one reserved resource without a state lock or transaction."""
+        key = plan.key
+        digest = plan.digest
+        size_bytes = plan.signature.size_bytes
+        expected_signature = plan.signature
+        target = self._target(key)
+        quarantine = self._quarantine / _quarantine_leaf(_key_text(key), digest)
+        target_value = self._current_lstat(key)
+        quarantine_value = _safe_lstat(quarantine)
+        if plan.fresh_authorization:
+            if (
+                target_value is None
+                or _Signature.from_stat(target_value) != expected_signature
+                or quarantine_value is not None
+            ):
+                raise RuntimeError(f"stale library path changed: {target}")
+        if target_value is not None:
+            if quarantine_value is not None:
+                self._heal_recovered_capture_duplicate(
                     key,
                     quarantine.name,
                     digest=digest,
                     size=size_bytes,
                     expected_signature=expected_signature,
-                    quarantine_present=quarantine_value is not None,
-                    label="recoverable quarantined stale library artifact",
+                    label="recoverable stale library artifact capture",
                 )
-            self._unlink_quarantined(
+                target_value = None
+            else:
+                if _Signature.from_stat(target_value) != expected_signature:
+                    raise RuntimeError(f"stale library path changed: {target}")
+                self._quarantine_current(
+                    key,
+                    quarantine.name,
+                    expected_sha256=digest,
+                    expected_size=size_bytes,
+                    expected_signature=expected_signature,
+                    reuse_verified_digest=plan.fresh_authorization,
+                )
+        quarantine_value = _safe_lstat(quarantine)
+        if quarantine_value is None and plan.fresh_authorization:
+            raise RuntimeError("stale library path vanished before authorization")
+        if target_value is None:
+            self._fsync_recovered_capture(
+                key,
                 quarantine.name,
                 digest=digest,
                 size=size_bytes,
                 expected_signature=expected_signature,
-                label="quarantined stale library artifact",
-                reuse_verified_digest=not bool(row[10]),
+                quarantine_present=quarantine_value is not None,
+                label="recoverable quarantined stale library artifact",
             )
-            with self._exclusive_state() as connection:
-                state = _journal_state(connection)
-                if (
-                    state.pending_revision != revision
-                    or state.pending_receipt != receipt
-                    or state.phase != "ACTIVATING"
-                ):
-                    raise RuntimeError(
-                        "library activation changed before removal terminalization"
+        self._unlink_quarantined(
+            quarantine.name,
+            digest=digest,
+            size=size_bytes,
+            expected_signature=expected_signature,
+            label="quarantined stale library artifact",
+            reuse_verified_digest=plan.fresh_authorization,
+        )
+
+    def _commit_pending_removals(
+        self, *, revision: int, receipt: bytes, plans: tuple[_PendingRemoval, ...]
+    ) -> LibraryActivationCheckpoint:
+        self._require_publication_lock()
+        if not 1 <= len(plans) <= _MAX_PAGE_ITEMS:
+            raise ValueError("library removal commit requires a bounded nonempty page")
+        # An earlier outcome can wait for the rest of the page. Recheck its
+        # namespace before discarding the durable authority for those absences.
+        for plan in plans:
+            quarantine = self._quarantine / _quarantine_leaf(
+                _key_text(plan.key), plan.digest
+            )
+            if (
+                self._current_lstat(plan.key) is not None
+                or _safe_lstat(quarantine) is not None
+            ):
+                raise RuntimeError("removed library path reappeared before commit")
+        with self._exclusive_state() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._require_reconciling(connection, revision, receipt)
+                for plan in plans:
+                    self._terminalize_pending_removal_in_transaction(
+                        connection, revision=revision, plan=plan
                     )
-                pending = connection.execute(
-                    query + "WHERE activation_revision = ? AND publication_key = ? "
-                    "AND resource_kind = ?",
-                    (revision, bytes(row[0]), str(row[1])),
-                ).fetchone()
-                expected_pending = (*row[:10], 1)
-                if pending is None or tuple(pending) != expected_pending:
-                    raise RuntimeError("pending library removal changed")
-                current = connection.execute(
-                    "SELECT storage_codec, storage_path, object_sha256, size_bytes, "
-                    "device, inode, modified_ns, changed_ns FROM current_entries "
-                    "WHERE publication_key = ? AND resource_kind = ?",
-                    (bytes(row[0]), str(row[1])),
-                ).fetchone()
-                if current is None or tuple(current) != tuple(row[2:10]):
-                    raise RuntimeError("current library removal authority changed")
-                connection.execute("BEGIN IMMEDIATE")
-                try:
-                    removed_pending = connection.execute(
-                        "DELETE FROM pending_removals WHERE activation_revision = ? "
-                        "AND publication_key = ? AND resource_kind = ? "
-                        "AND storage_codec = ? AND storage_path = ? "
-                        "AND object_sha256 = ? AND size_bytes = ? "
-                        "AND device = ? AND inode = ? AND modified_ns = ? "
-                        "AND changed_ns = ? AND operation_started = 1",
-                        (revision, *row[:10]),
-                    ).rowcount
-                    removed_current = connection.execute(
-                        "DELETE FROM current_entries WHERE publication_key = ? "
-                        "AND resource_kind = ? AND storage_codec = ? "
-                        "AND storage_path = ? AND object_sha256 = ? "
-                        "AND size_bytes = ? AND device = ? AND inode = ? "
-                        "AND modified_ns = ? AND changed_ns = ?",
-                        tuple(row[:10]),
-                    ).rowcount
-                    if removed_pending != 1 or removed_current != 1:
-                        raise RuntimeError("library removal terminalization changed")
-                    connection.commit()
-                except BaseException:
-                    connection.rollback()
-                    raise
-            last_cursor = _activation_cursor_from_fields(
-                bytes(row[0]),
-                str(row[1]),
-            )
-            if progress is not None:
-                progress.advance("library_resources_removed")
-        return last_cursor
+                last = plans[-1]
+                checkpoint = self._record_reconcile_cursor_in_transaction(
+                    connection,
+                    revision=revision,
+                    receipt=receipt,
+                    cursor=_activation_cursor_from_fields(
+                        last.publication_key, last.resource_kind
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return checkpoint
+
+    @staticmethod
+    def _terminalize_pending_removal_in_transaction(
+        connection: sqlite3.Connection, *, revision: int, plan: _PendingRemoval
+    ) -> None:
+        pending = connection.execute(
+            _PENDING_REMOVALS_QUERY
+            + "WHERE activation_revision = ? AND publication_key = ? "
+            "AND resource_kind = ?",
+            (revision, plan.publication_key, plan.resource_kind),
+        ).fetchone()
+        expected_pending = (*plan.authority(), 1)
+        if pending is None or tuple(pending) != expected_pending:
+            raise RuntimeError("pending library removal changed")
+        current = connection.execute(
+            "SELECT storage_codec, storage_path, object_sha256, size_bytes, "
+            "device, inode, modified_ns, changed_ns FROM current_entries "
+            "WHERE publication_key = ? AND resource_kind = ?",
+            (plan.publication_key, plan.resource_kind),
+        ).fetchone()
+        if current is None or tuple(current) != plan.authority()[2:]:
+            raise RuntimeError("current library removal authority changed")
+        removed_pending = connection.execute(
+            "DELETE FROM pending_removals WHERE activation_revision = ? "
+            "AND publication_key = ? AND resource_kind = ? "
+            "AND storage_codec = ? AND storage_path = ? "
+            "AND object_sha256 = ? AND size_bytes = ? "
+            "AND device = ? AND inode = ? AND modified_ns = ? "
+            "AND changed_ns = ? AND operation_started = 1",
+            (revision, *plan.authority()),
+        ).rowcount
+        removed_current = connection.execute(
+            "DELETE FROM current_entries WHERE publication_key = ? "
+            "AND resource_kind = ? AND storage_codec = ? "
+            "AND storage_path = ? AND object_sha256 = ? "
+            "AND size_bytes = ? AND device = ? AND inode = ? "
+            "AND modified_ns = ? AND changed_ns = ?",
+            plan.authority(),
+        ).rowcount
+        if removed_pending != 1 or removed_current != 1:
+            raise RuntimeError("library removal terminalization changed")
 
     def _staged_candidate_authority(
         self,

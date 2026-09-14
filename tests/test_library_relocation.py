@@ -608,7 +608,7 @@ def test_relocation_preserves_pending_install_receipt_and_resumes_rename_loss(
         raise RuntimeError("fault: rename before journal")
 
     with monkeypatch.context() as scoped:
-        scoped.setattr(adapter, "_commit_pending_install", stop_before_sql)
+        scoped.setattr(adapter, "_commit_pending_installs", stop_before_sql)
         with pytest.raises(RuntimeError, match="rename before journal"):
             _activate(adapter, (replacement,))
     marker = (original / ".h2hdb-coordination" / "ACTIVATING").read_bytes()
