@@ -154,7 +154,7 @@ def build_runtime(
             library_maintenance = disabled_library
             publication_guard = _disabled_publication_guard
         else:
-            # One structured decision record per CBZ-enabled runtime build
+            # One decision summary and DEBUG record per CBZ-enabled runtime build
             # (the host topology inside it is probed at most once per
             # process): the renderer only receives the selected integer, and
             # nothing below this line logs worker selection again per gallery
@@ -162,7 +162,8 @@ def build_runtime(
             worker_decision = _decide_page_render_workers(
                 config.paths.page_render_workers
             )
-            runtime_event_logger(worker_decision.log_line())
+            runtime_event_logger(worker_decision.summary())
+            logger.debug(worker_decision.log_line())
             qualify_gallery = ImageGalleryQualifier(
                 config.paths.artifact_render_policy(),
                 workers=worker_decision.selected,

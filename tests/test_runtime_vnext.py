@@ -454,7 +454,7 @@ _CONTAINER = _CpuTopology(
 
 
 def _worker_lines(events: list[str]) -> list[str]:
-    return [event for event in events if event.startswith("page_render_workers ")]
+    return [event for event in events if event.startswith("Image rendering uses ")]
 
 
 def test_runtime_decides_omitted_page_workers_once_and_logs_the_decision(
@@ -479,16 +479,11 @@ def test_runtime_decides_omitted_page_workers_once_and_logs_the_decision(
 
     assert isinstance(adapter, ManagedFilesystemLibraryAdapter)
     assert adapter._page_render_workers == 10
-    assert events == [
-        "page_render_workers mode=auto configured=none selected=10 detected=10 "
-        "hard_cap=16 platform=darwin machine=arm64 process_cpu_count=14 "
-        "cpu_count=14 darwin_performance_cores=10 darwin_physical_cores=14 "
-        "darwin_translation=native reason=darwin-performance-cores"
-    ]
+    assert events == ["Image rendering uses 10 workers (automatically selected)."]
     assert str(tmp_path) not in events[0]
 
 
-def test_runtime_logs_a_manual_override_as_manual_next_to_the_host_facts(
+def test_runtime_describes_a_manual_override_without_raw_host_facts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -511,12 +506,7 @@ def test_runtime_logs_a_manual_override_as_manual_next_to_the_host_facts(
 
     assert isinstance(adapter, ManagedFilesystemLibraryAdapter)
     assert adapter._page_render_workers == 10
-    assert events == [
-        "page_render_workers mode=manual configured=10 selected=10 detected=none "
-        "hard_cap=16 platform=linux machine=aarch64 process_cpu_count=4 "
-        "cpu_count=14 darwin_performance_cores=none darwin_physical_cores=none "
-        "darwin_translation=not-probed reason=manual-override"
-    ]
+    assert events == ["Image rendering uses 10 workers (configured)."]
 
 
 def test_runtime_logs_the_worker_decision_once_not_per_archive(

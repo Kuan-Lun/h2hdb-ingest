@@ -93,6 +93,23 @@ _FALLBACK_REASONS = frozenset(
         _PageRenderWorkerReason.CPU_COUNT_UNAVAILABLE_FALLBACK,
     }
 )
+_FALLBACK_DESCRIPTIONS = {
+    _PageRenderWorkerReason.DARWIN_INTEL_TRANSLATED_FALLBACK: (
+        "the process is running under Rosetta"
+    ),
+    _PageRenderWorkerReason.DARWIN_INTEL_TRANSLATION_UNKNOWN_FALLBACK: (
+        "macOS translation status could not be determined"
+    ),
+    _PageRenderWorkerReason.DARWIN_INTEL_PHYSICAL_CORES_UNAVAILABLE_FALLBACK: (
+        "the physical CPU core count could not be determined"
+    ),
+    _PageRenderWorkerReason.DARWIN_PERFORMANCE_CORES_UNAVAILABLE_FALLBACK: (
+        "the performance CPU core count could not be determined"
+    ),
+    _PageRenderWorkerReason.CPU_COUNT_UNAVAILABLE_FALLBACK: (
+        "the available CPU count could not be determined"
+    ),
+}
 
 
 def _require_optional_count(value: object, *, field: str) -> int | None:
@@ -208,8 +225,24 @@ class _PageRenderWorkerDecision:
     def is_fallback(self) -> bool:
         return self.reason in _FALLBACK_REASONS
 
+    def summary(self) -> str:
+        """Explain the selected concurrency without exposing raw probe fields."""
+
+        if self.mode is _PageRenderWorkerMode.MANUAL:
+            explanation = "configured"
+        elif self.is_fallback:
+            explanation = (
+                "conservative fallback: " + _FALLBACK_DESCRIPTIONS[self.reason]
+            )
+        elif self.detected is not None and self.detected > self.selected:
+            explanation = "automatically selected; capped at the worker limit"
+        else:
+            explanation = "automatically selected"
+        workers = "worker" if self.selected == 1 else "workers"
+        return f"Image rendering uses {self.selected} {workers} ({explanation})."
+
     def log_fields(self) -> tuple[tuple[str, str], ...]:
-        """Return the ordered structured fields of the runtime-build log record.
+        """Return the ordered structured fields of the runtime-build DEBUG record.
 
         The runtime logs one such record each time it builds a CBZ-enabled
         runtime; the topology inside it is the once-per-process probe.

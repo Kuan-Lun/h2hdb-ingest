@@ -803,6 +803,67 @@ def test_withdrawn_worker_decision_names_are_absent_from_every_public_surface() 
 # --- structured log -------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("configured", "topology", "expected"),
+    [
+        (1, _linux(process_count=4, cpu_count=8), "1 worker (configured)"),
+        (4, _linux(process_count=4, cpu_count=8), "4 workers (configured)"),
+        (
+            None,
+            _darwin(performance=10),
+            "10 workers (automatically selected)",
+        ),
+        (
+            None,
+            _linux(process_count=1, cpu_count=8),
+            "1 worker (automatically selected)",
+        ),
+        (
+            None,
+            _linux(process_count=16, cpu_count=16),
+            "16 workers (automatically selected)",
+        ),
+        (
+            None,
+            _linux(process_count=32, cpu_count=32),
+            "16 workers (automatically selected; capped at the worker limit)",
+        ),
+        (
+            None,
+            _darwin(machine="x86_64", translation=_DarwinTranslation.TRANSLATED),
+            "1 worker (conservative fallback: the process is running under Rosetta)",
+        ),
+        (
+            None,
+            _darwin(machine="x86_64", translation=_DarwinTranslation.UNKNOWN),
+            "1 worker (conservative fallback: macOS translation status could not be determined)",
+        ),
+        (
+            None,
+            _darwin(machine="x86_64"),
+            "1 worker (conservative fallback: the physical CPU core count could not be determined)",
+        ),
+        (
+            None,
+            _darwin(),
+            "1 worker (conservative fallback: the performance CPU core count could not be determined)",
+        ),
+        (
+            None,
+            _linux(process_count=None, cpu_count=None),
+            "1 worker (conservative fallback: the available CPU count could not be determined)",
+        ),
+    ],
+)
+def test_worker_summary_explains_selection_and_fallbacks(
+    configured: int | None, topology: _CpuTopology, expected: str
+) -> None:
+    decision = _decide_page_render_workers(configured, topology)
+
+    assert decision.summary() == f"Image rendering uses {expected}."
+    assert "=" not in decision.summary()
+
+
 def test_log_line_is_structured_and_carries_no_private_data() -> None:
     decision = _decide_page_render_workers(
         None,

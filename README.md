@@ -435,8 +435,17 @@ Every detected value is capped at 16, and the host topology is probed at most
 once per process (concurrent first calls share one probe, and a forked child
 probes again) rather than per render request.
 
-When a CBZ-enabled runtime is built, the service logs the worker decision
-exactly once as one structured `page_render_workers` line, for example:
+When a CBZ-enabled runtime is built, the service logs one human-readable INFO
+summary of the selected concurrency, for example:
+
+```text
+Image rendering uses 10 workers (automatically selected).
+```
+
+Manual settings are described as `configured`. Automatic choices that are capped
+at the worker limit or fall back to one worker explain the limit or fallback reason.
+The complete selection and host-probe evidence appears once at DEBUG as a
+structured `page_render_workers` line:
 
 ```text
 page_render_workers mode=auto configured=none selected=10 detected=10 hard_cap=16 platform=darwin machine=arm64 process_cpu_count=14 cpu_count=14 darwin_performance_cores=10 darwin_physical_cores=14 darwin_translation=native reason=darwin-performance-cores

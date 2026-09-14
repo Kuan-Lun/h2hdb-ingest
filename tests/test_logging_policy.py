@@ -209,8 +209,17 @@ def test_real_native_rendering_keeps_console_and_file_info_volume_per_batch(
         assert not any(
             raw in line
             for line in info
-            for raw in ("ingest_progress ", "ingest_db_performance ", "counter.")
+            for raw in (
+                "ingest_progress ",
+                "ingest_db_performance ",
+                "counter.",
+                "page_render_workers ",
+                "mode=",
+                "hard_cap=",
+                "process_cpu_count=",
+            )
         )
+        assert "Image rendering uses 2 workers (configured)." in info
         assert any("Catalog batch published:" in line for line in info)
         assert any("Ingest analysis stage finished:" in line for line in info)
         assert any("Ingest publication stage finished:" in line for line in info)
@@ -240,6 +249,15 @@ def test_debug_retains_native_and_per_artifact_metrics_without_polluting_events(
     metrics = [
         line for line in logs.messages("DEBUG") if line.startswith("ingest_metric ")
     ]
+    workers = [
+        line
+        for line in logs.messages("DEBUG")
+        if line.startswith("page_render_workers ")
+    ]
+    assert len(workers) == 1
+    assert "mode=manual configured=2 selected=2 detected=none" in workers[0]
+    assert "hard_cap=16" in workers[0]
+    assert "reason=manual-override" in workers[0]
     assert (
         sum("scope=artifact operation=render_archive " in line for line in metrics) == 3
     )
@@ -251,6 +269,7 @@ def test_debug_retains_native_and_per_artifact_metrics_without_polluting_events(
     events = cast(list[str], logs.result["events"])
     assert events
     assert not any(message.startswith("ingest_metric ") for message in events)
+    assert not any(message.startswith("page_render_workers ") for message in events)
 
 
 def test_dependency_and_real_rejection_diagnostics_remain_visible_with_context(
