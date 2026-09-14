@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-14T01:38:56+00:00",
-  "manifest_sha256": "a07df9cd55b57e9b28b2583a2dca826c2c16d12a2680736976c66ff1017efca3",
+  "checked_at": "2026-09-14T14:59:45+00:00",
+  "manifest_sha256": "32ab9bcd28ec6818e96221e25d7bf53b6759e07c2ff606d7e6baad091f4a3862",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.24.2",
+  "project_version": "0.24.3",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,10 +30,10 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.37.0,<0.39.0",
+      "declared": "h2hdb>=0.38.2,<0.39.0",
       "group": "runtime",
-      "latest": "0.37.3",
-      "latest_satisfies": true,
+      "latest": "0.38.1",
+      "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
       "url": "https://pypi.org/project/h2hdb/"
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all 16 direct Python build/runtime/development entries and the Node markdown tool against registry latest candidates, including candidates outside existing upper bounds. All third-party candidates are identical to the reviewed 0.24.1 receipt and were installed afresh in this task worktree; no new third-party release needs additional release-note review. Registry h2hdb advanced to 0.37.3; its reviewed batching/readiness changes and the explicitly supplied core 0.38.0 candidate were assessed against ingest public API use. The core upper bound expands to <0.39.0 while retaining >=0.37.0: ingest startup uses the unchanged full check API and does not consume initialize() audit fields. The new library batch protocol preserves journal v4, storage keys, CBZ bytes, exact filesystem authority, FULL durability and public reader fencing without a compatibility shim. Repository-local fast checks and all 209 library/relocation/batching tests passed with the supplied core 0.38.0 wheel, including process-kill and response-loss boundaries. Live MariaDB lifecycle evidence and the exact merge gate are reported separately and are not implied by this dependency receipt.",
+    "note": "Reviewed all 16 direct Python build/runtime/development entries and the Node tool against fresh registry latest candidates, including versions outside upper bounds. Third-party candidates match the reviewed 0.24.2 receipt. Registry core advanced to 0.38.1; reviewed source changes separate marker readiness from full check and seek bounded analysis decision layers, without changing the ingest check contract or data layout. This coordinated task requires supplied core 0.38.2 for readable INFO and complete source activity observations; that unpublished local wheel intentionally exceeds the current registry latest 0.38.1, and the <0.39.0 compatibility lane remains. Real SQLite/native rendering INFO and DEBUG subprocess tests passed against the supplied candidate sources. Live MariaDB lifecycle, Compose role-cohort acceptance and full gates are separate evidence and are not implied by this receipt.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
