@@ -99,7 +99,7 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
     artifacts: bool,
     galleries: int,
 ) -> None:
-    """The hourly thread sees the blocked index/selection operation from memory.
+    """The minute reporter sees the blocked index/selection operation from memory.
 
     Real folders exceed the admission limit, and only ten deep observations are
     prepared. The CBZ case also drives the real SQLite publication and verifies
@@ -181,7 +181,7 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
                 periodic_emitted.clear()
                 awaiting_periodic.set()
                 try:
-                    clock.now += 3600
+                    clock.now += 60
                     tracker._wake.set()
                     assert periodic_emitted.wait(5)
                     with messages_lock:
@@ -261,8 +261,11 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
         in stages[VNextSourcePreparationOperation.DISCOVERY_TRANSFER][1]
     )
     assert (
-        "Checking gallery completion and preparing source observations"
+        "Checking gallery completion and freezing source observations"
         in stages[VNextSourcePreparationOperation.SOURCE_FREEZE][1]
+    )
+    assert all(
+        "current activity elapsed 1m 0s" in message for _, message in stages.values()
     )
     assert all("source_discovery" not in message for _, message in stages.values())
     assert all(
