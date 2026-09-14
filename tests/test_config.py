@@ -257,7 +257,9 @@ def test_bounded_runtime_defaults() -> None:
 
     assert resident.max_rows == 128
     assert resident.publication_batch_galleries == 1000
-    assert resident.progress_log_interval_seconds == 3600
+    assert resident.progress_log_interval_seconds == 60
+    config = IngestConfig(paths=IngestPathsConfig(download_path=Path("/download")))
+    assert config.core.logger.level.name.upper() == "INFO"
 
 
 @pytest.mark.parametrize("value", (0, 8193))

@@ -6,6 +6,7 @@ __all__ = ["IngestSynchronizer", "ResidentIngestor"]
 
 import logging
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from enum import StrEnum
 from threading import Event
 from time import monotonic
@@ -39,6 +40,7 @@ from .maintenance import (
     _LibraryStagingSlotConflictError,
 )
 from .progress import IngestProgress, ProgressWork
+from .progress_format import format_batch_published
 from .scratch import ScratchSafetyError
 from .service import VNextIngestSynchronizationResult, _IngestStopRequested
 from .session import IngestLeaseHeartbeat, IngestSessionController
@@ -141,7 +143,7 @@ class ResidentIngestor:
         self._capacity_waiting = False
         self._progress_pending = False
         self._scheduled_progress = False
-        self._progress_wait_reason = "waiting_for_ingest_lease"
+        self._progress_wait_reason = "waiting_for_ingest_availability"
         self._bound_storage_identity: LibraryStorageIdentity | None = None
         self._storage_instance_ready = library_storage_identity is None
         self._last_synchronization_result: VNextIngestSynchronizationResult | None = (
@@ -180,6 +182,7 @@ class ResidentIngestor:
         self._bound_storage_identity = None
         self._last_synchronization_result = None
         self._storage_instance_ready = self._library_storage_identity is None
+        self._progress_operation("database_check")
         report = self._database_admin.check()
         self._progress_operation("initialize_storage")
         if self._library_storage_identity is not None:
@@ -236,7 +239,9 @@ class ResidentIngestor:
         work = self._begin_progress("coordination", announce=False)
         self._progress_pending = periodic_scan or self._scheduled_progress
         self._progress_wait_reason = (
-            "waiting_for_ingest_lease" if periodic_scan else "source_quiet_period"
+            "waiting_for_ingest_availability"
+            if periodic_scan
+            else "waiting_for_source_quiet_period"
         )
         try:
             outcome = self._process_cycle_step(
@@ -279,10 +284,14 @@ class ResidentIngestor:
         should_stop: Callable[[], bool] | None = None,
         on_scan_started: Callable[[], None] | None = None,
     ) -> _ResidentCycleOutcome:
+        work = self._current_progress()
         try:
-            claimed = self._claim_after_maintenance(
-                periodic_scan=periodic_scan, should_stop=should_stop
-            )
+            # Poll activity is observable while blocked, but restores an existing
+            # wait's timer on return. Polling cannot create an INFO per cycle.
+            with nullcontext() if work is None else work.activity("check_pending_work"):
+                claimed = self._claim_after_maintenance(
+                    periodic_scan=periodic_scan, should_stop=should_stop
+                )
         except Exception as error:
             if storage_capacity_error(error) is None:
                 raise
@@ -339,11 +348,18 @@ class ResidentIngestor:
                         postflight()
                     except BaseException as error:
                         raise _PostflightFailed(error) from error
-                self._event_logger(
+                logger.debug(
                     "vNext ingest publication batch completed: "
                     f"deferred_galleries={outcome.deferred_gallery_count} "
                     f"waiting_galleries={outcome.waiting_gallery_count} "
                     f"known_galleries={outcome.source.staged_galleries}"
+                )
+                self._event_logger(
+                    format_batch_published(
+                        galleries=outcome.source.staged_galleries,
+                        deferred=outcome.deferred_gallery_count,
+                        waiting=outcome.waiting_gallery_count,
+                    )
                 )
         except _PostflightFailed as error:
             # The context manager has stopped renewal before releasing the
@@ -360,9 +376,7 @@ class ResidentIngestor:
                 )
             raise error.failure from None
         except _IngestStopRequested:
-            self._event_logger(
-                "vNext ingest stopped at a durable bounded-step boundary"
-            )
+            self._event_logger("Ingest stopped after saving its current progress")
             return _ResidentCycleOutcome.IDLE
         except _LibraryStagingSlotConflictError as error:
             self._progress_pending = True
@@ -470,6 +484,9 @@ class ResidentIngestor:
             if diagnostic is not None:
                 logger.error("%s", diagnostic)
             raise
+        if work is not None:
+            work.phase("maintenance")
+        self._progress_operation("complete_ingest_session")
         try:
             completion = session.complete()
         except Exception as error:
@@ -567,6 +584,7 @@ class ResidentIngestor:
         provider = self._library_storage_identity
         if provider is None:
             return
+        self._progress_operation("inspect_storage")
         expected = self._bound_storage_identity
         if expected is None:
             self._storage_instance_ready = False
@@ -607,6 +625,7 @@ class ResidentIngestor:
             return None
 
     def _run_library_maintenance(self) -> LibraryMaintenanceOutcome:
+        self._progress_operation("library_cleanup")
         if self._temporary_cleanup is not None:
             self._temporary_cleanup()
         outcome = self._library_maintenance.maintain_cleanup()

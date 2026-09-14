@@ -21,10 +21,13 @@ _PHASE_LABELS = {
 }
 
 _OPERATION_LABELS = {
+    "database_check": "Validating database consistency at startup",
+    "check_pending_work": "Checking cleanup and pending ingest work",
+    "complete_ingest_session": "Releasing the completed batch's ingest lease",
     "initialize_storage": "Initializing the library storage",
     "inspect_storage": "Checking the library storage",
     "claim_ingest": "Acquiring permission to start an ingest batch",
-    "waiting_for_ingest_lease": "Waiting for the current ingest owner to release its lease",
+    "waiting_for_ingest_availability": "Waiting for pending ingest work to become available",
     "waiting_for_source_quiet_period": "Waiting for source changes to settle",
     "waiting_for_library_cleanup": "Waiting for library cleanup",
     "waiting_for_catalog_cleanup": "Waiting for database cleanup",
@@ -39,12 +42,13 @@ _OPERATION_LABELS = {
     "source_discovery_verify": "Rechecking discovered folders",
     "source_discovery_commit": "Finishing the folder inventory",
     "source_discovery_transfer": "Copying the gallery inventory into the batch plan",
+    "source_discovery_reconciliation": "Checking previously published galleries for missing source entries",
     "source_discovery_order": "Sorting the complete gallery inventory",
-    "source_batch_selection": "Selecting existing and new galleries for this batch",
+    "source_batch_selection": "Copying selected galleries into the batch inventory",
     "source_batch_order": "Sorting the selected galleries",
     "source_discovery_cleanup": "Removing the temporary gallery inventory",
-    "source_source_freeze": "Checking gallery completion and preparing source observations",
-    "source_freeze": "Freezing the selected gallery observations",
+    "source_source_freeze": "Checking gallery completion and freezing source observations",
+    "source_freeze": "Checking gallery completion and freezing source observations",
     "source_completion_marker": "Checking whether gallery metadata has changed",
     "source_gallery_observation": "Reading gallery metadata and indexing its files",
     "source_file_read": "Reading and verifying source file contents",
@@ -78,6 +82,41 @@ _OPERATION_LABELS = {
     "library_protect": "Protecting library resources during publication",
 }
 
+_PUBLICATION_LABELS = {
+    "begin": "Starting catalog publication",
+    "build_selection": "Selecting galleries for the catalog",
+    "validate_selection": "Checking the selected galleries",
+    "build_catalog": "Preparing catalog metadata and search indexes",
+    "validate_catalog": "Checking catalog metadata and search indexes",
+    "build_artifact_input": "Preparing the source descriptions needed for CBZs",
+    "build_artifact_delta": "Comparing required CBZs with the current catalog",
+    "validate_artifact_input": "Checking the source descriptions needed for CBZs",
+    "abandon_superseded": "Retiring superseded publication work",
+    "begin_operational": "Starting the library change plan",
+    "append_operational": "Recording the library change plan",
+    "seal_operational": "Completing the library change plan",
+    "prepare_artifact": "Preparing CBZs and their catalog covers",
+    "bind_operational": "Recording prepared library files",
+    "validate_prepared": "Checking prepared library file descriptions",
+    "validate_create": "Checking newly created library entries",
+    "validate_rebuild": "Checking rebuilt library entries",
+    "validate_delete": "Checking library entries to remove",
+    "validate_unchanged": "Checking unchanged library entries",
+    "validate_new": "Checking newly selected galleries",
+    "validate_changed": "Checking changed galleries",
+    "validate_removed": "Checking galleries removed from the selection",
+    "validate_duplicate": "Checking duplicate gallery decisions",
+    "commit_publication": "Saving the prepared catalog publication",
+    "library_activation": "Activating the prepared library files",
+    "finalize": "Making the catalog available to readers",
+    "recovery_complete": "Completing interrupted publication recovery",
+    "complete": "Completing catalog publication",
+    "canonical_batch": "Verifying and recording publication descriptions",
+    "canonical_allocate": "Preparing storage for publication descriptions",
+    "canonical_page": "Recording publication descriptions",
+    "canonical_seal": "Verifying completed publication descriptions",
+}
+
 # Only counters with a useful, precise user-facing meaning appear at INFO.
 _COUNTER_LABELS = {
     "galleries_discovered": "gallery folders discovered",
@@ -95,6 +134,18 @@ _COUNTER_LABELS = {
     "library_resources_removed": "obsolete library files removed",
     "publication_batches_finalized": "catalog batches published",
 }
+
+
+def format_batch_published(*, galleries: int, deferred: int, waiting: int) -> str:
+    unit = "gallery" if galleries == 1 else "galleries"
+    parts = [f"Catalog batch published: {galleries:,} {unit} in the source snapshot"]
+    if deferred:
+        unit = "gallery" if deferred == 1 else "galleries"
+        parts.append(f"{deferred:,} new {unit} left for later batches")
+    if waiting:
+        unit = "gallery" if waiting == 1 else "galleries"
+        parts.append(f"{waiting:,} {unit} waiting for source completion")
+    return "; ".join(parts)
 
 
 def format_progress(
@@ -116,39 +167,44 @@ def format_progress(
             "stopped": "Ingest work stopped",
         }.get(status or "", "Ingest work ended"),
     }[event]
-    name = snapshot.operation or snapshot.phase
+    name = (
+        snapshot.operation or snapshot.phase
+        if event == "periodic" or status in {"failed", "retry"}
+        else snapshot.phase
+    )
     label = _OPERATION_LABELS.get(name, _PHASE_LABELS.get(name))
     if label is None:
         label = _describe_operation(name)
     parts = [f"{lead}: {label}"]
     if event == "work_finished" and status == "retry":
         parts.append("this synchronization attempt did not complete")
-    if snapshot.operation_completed is not None:
+    if event == "periodic" and snapshot.operation_completed is not None:
         unit = snapshot.operation_unit or "items"
         if snapshot.operation_total is None:
-            parts.append(
-                f"{snapshot.operation_completed:,} {unit} completed (total unknown)"
-            )
+            parts.append(f"{snapshot.operation_completed:,} {unit} completed")
         else:
             parts.append(
                 f"{snapshot.operation_completed:,} / {snapshot.operation_total:,} {unit} completed"
             )
     elif event == "periodic":
-        count = "completion count unavailable for this operation"
         if snapshot.operation_total is not None:
-            count += f" (total {snapshot.operation_total:,} {snapshot.operation_unit or 'items'})"
-        parts.append(count)
+            parts.append(
+                f"{snapshot.operation_total:,} {snapshot.operation_unit or 'items'} to process"
+            )
     if event == "periodic":
-        parts.append(_interval_summary(snapshot, previous))
-        parts.append(
-            f"last measured advance {_duration(snapshot.last_progress_age_seconds)} ago"
-        )
-    if snapshot.operation is not None:
-        parts.append(
-            f"current operation elapsed {_duration(snapshot.operation_elapsed_seconds)}"
-        )
-    parts.append(f"work elapsed {_duration(snapshot.elapsed_seconds)}")
-    parts.extend(_results(snapshot))
+        changes = _interval_summary(snapshot, previous)
+        if changes is not None:
+            parts.append(changes)
+        if snapshot.operation is not None:
+            parts.append(
+                f"current activity elapsed {_duration(snapshot.operation_elapsed_seconds)}"
+            )
+    if event == "phase_ended":
+        parts.append(f"stage elapsed {_duration(snapshot.phase_elapsed_seconds)}")
+    if event != "phase_started":
+        parts.append(f"work elapsed {_duration(snapshot.elapsed_seconds)}")
+    if event in {"phase_ended", "work_finished"}:
+        parts.extend(_results(snapshot))
     return "; ".join(parts)
 
 
@@ -187,22 +243,27 @@ def format_diagnostics(
 
 
 def _describe_operation(name: str) -> str:
-    for prefix, purpose in (
-        ("publication_", "catalog publication"),
-        ("recovery_", "interrupted publication recovery"),
-    ):
+    for prefix in ("publication_", "recovery_"):
         if name.startswith(prefix):
-            detail = name.removeprefix(prefix)
-            for suffix, verb in (("_prepare", "Preparing"), ("_commit", "Saving")):
+            detail = name.removeprefix(prefix).lower()
+            for suffix in ("_prepare", "_commit"):
                 if detail.endswith(suffix):
-                    words = detail.removesuffix(suffix).replace("_", " ")
-                    return f"{verb} {words} for {purpose}"
+                    detail = detail.removesuffix(suffix)
+                    break
+            label = _PUBLICATION_LABELS.get(detail)
+            if label is not None:
+                return label
+            return (
+                "Continuing catalog publication"
+                if prefix == "publication_"
+                else ("Continuing interrupted publication recovery")
+            )
     return name.replace("_", " ").replace("-", " ").capitalize()
 
 
 def _interval_summary(
     snapshot: ProgressSnapshot, previous: ProgressSnapshot | None
-) -> str:
+) -> str | None:
     if previous is None or previous.generation != snapshot.generation:
         seconds = snapshot.elapsed_seconds
         old: dict[str, int] = {}
@@ -218,8 +279,12 @@ def _interval_summary(
         ):
             delta = snapshot.operation_completed - previous.operation_completed
             return (
-                f"since previous report ({_duration(seconds)}): "
-                f"{delta:+,} {snapshot.operation_unit or 'items'} completed"
+                None
+                if delta == 0
+                else (
+                    f"since previous report ({_duration(seconds)}): "
+                    f"{delta:+,} {snapshot.operation_unit or 'items'} completed"
+                )
             )
     changes = []
     current = dict(snapshot.counters)
@@ -227,28 +292,17 @@ def _interval_summary(
         delta = current.get(key, 0) - old.get(key, 0)
         if delta:
             changes.append(f"{delta:+,} {label}")
-    if not changes:
-        if snapshot.operation_completed is not None:
-            if reference == "since work started":
-                return (
-                    f"current operation: {snapshot.operation_completed:,} "
-                    f"{snapshot.operation_unit or 'items'} completed "
-                    f"in {_duration(snapshot.operation_elapsed_seconds)}"
-                )
-            return (
-                f"current operation started since previous report ({_duration(seconds)}); "
-                f"{snapshot.operation_completed:,} {snapshot.operation_unit or 'items'} completed"
-            )
-        return f"{reference} ({_duration(seconds)}): no completed-item counts available"
-    return f"{reference} ({_duration(seconds)}): {', '.join(changes)}"
+    return (
+        f"{reference} ({_duration(seconds)}): {', '.join(changes[:3])}"
+        if changes
+        else None
+    )
 
 
 def _results(snapshot: ProgressSnapshot) -> list[str]:
     counts = dict(snapshot.counters)
     parts = []
-    if "batch_new_gallery_limit" in counts:
-        parts.append(f"batch limit {counts['batch_new_gallery_limit']:,} new galleries")
-    if "batch_selected_galleries" in counts:
+    if snapshot.phase == "source" and "batch_selected_galleries" in counts:
         parts.append(
             f"galleries in this batch {counts['batch_selected_galleries']:,} (existing and new)"
         )
@@ -262,21 +316,12 @@ def _results(snapshot: ProgressSnapshot) -> list[str]:
             f"galleries waiting for source completion {counts['waiting_galleries']:,} "
             "(other galleries continue)"
         )
-    if counts.get("cbz_enabled") or "archives_rendered" in counts:
+    if counts.get("archives_rendered", 0):
         parts.append(f"CBZs rendered this work {counts.get('archives_rendered', 0):,}")
     if counts.get("publication_batches_finalized", 0):
         parts.append(
             f"catalog batches published {counts['publication_batches_finalized']:,}"
         )
-    elif snapshot.phase in {
-        "ingest",
-        "policy",
-        "recovery",
-        "source",
-        "analysis",
-        "publication",
-    }:
-        parts.append("catalog publication pending")
     return parts
 
 

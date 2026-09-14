@@ -201,7 +201,7 @@ A minimal SQLite configuration with artifacts enabled is:
   },
   "resident": {
     "publication_batch_galleries": 1000,
-    "progress_log_interval_seconds": 3600,
+    "progress_log_interval_seconds": 60,
     "source_quiet_seconds": 300,
     "source_max_wait_seconds": 1800,
     "source_probe_interval_seconds": 30,
@@ -252,33 +252,36 @@ or spam decisions, so later batches can replace or remove earlier CBZs and
 catalog entries. The known source collection grows progressively, but the number
 of published books need not increase on every batch.
 
-While work is active, INFO summaries name the current work in plain English,
-show completed items and the total when known, and report changes since the
-previous summary. The current operation's elapsed time is separate from the
-whole work's elapsed time. Unknown totals and unavailable completion counts are
-explicit; a quiet counter does not by itself establish that work is stuck.
-For example, an hourly summary can say:
+While work is active, INFO summaries name the current activity in plain English.
+They show completed items and the total when measured, useful changes since the
+previous summary, and activity/work durations. Missing counters are omitted;
+a periodic message reports continuing activity, not proof that a blocked call
+is advancing. Exact counter values and their last-change time remain at DEBUG.
+For example:
 
 ```text
-Ingest progress: Copying the gallery inventory into the batch plan; 4,096 / 131,256 galleries completed; since previous report (1h 0m 0s): +4,096 galleries completed; last measured advance 30m 0s ago; current operation elapsed 2h 0m 0s; work elapsed 2h 1m 19s; batch limit 10 new galleries; CBZs rendered this work 0; catalog publication pending
+Ingest progress: Copying the gallery inventory into the batch plan; 4,096 / 131,256 galleries completed; since previous report (1m 0s): +4,096 galleries completed; current activity elapsed 2m 0s; work elapsed 3m 19s
+Ingest progress: Cleaning up unused database records; current activity elapsed 5m 0s; work elapsed 5m 12s
 ```
 
 The batch limit applies to newly included galleries. A complete inventory still
 precedes selection; the inventory total can therefore greatly exceed that limit.
 The selected batch includes previously known galleries as well as new ones.
-CBZs rendered during this work and catalog batches published are separate results:
-rendering a CBZ does not mean readers can already acquire it. Metadata-only work
-does not show a CBZ count.
+Stage-end and work-completion summaries include relevant results. CBZs rendered
+and catalog batches published remain distinct: a rendered CBZ may not yet be
+available to readers. Metadata-only work does not show a CBZ count.
 
-`resident.progress_log_interval_seconds` defaults to 3,600 seconds and must be
-finite and positive. A dedicated thread reads an in-memory snapshot; it never
-polls the catalog, inspects files, or acquires the ingest session lock. Phase
-transitions and work completion are reported immediately. Operation changes only
-update the next summary; they do not emit a log for every gallery or page. Nested
-preparation restores its enclosing operation when it returns or fails, so the
-summary does not keep reporting a completed discovery operation. The interval
-only controls periodic progress summaries and repeated maintenance-failure
-diagnostics. It does not emit a completion record for every image or gallery.
+`resident.progress_log_interval_seconds` defaults to 60 seconds and must be
+finite and positive. Existing explicit interval settings remain effective.
+The default log level remains INFO. A dedicated thread reads an in-memory
+snapshot; it never polls the catalog, inspects files, or acquires the ingest
+session lock. Main stage transitions and work completion are reported
+immediately, including cleanup after publication. Fast coordination and
+maintenance polls stay silent; a slow call is reported at the periodic cadence.
+Operation changes only update the next summary, without logging every gallery,
+page or polling cycle. Nested preparation and repeated pending-work checks
+restore their enclosing activity and timer on return. The interval also controls
+repeated maintenance-failure diagnostics, without changing work scheduling.
 
 An idle resident with no pending work emits no periodic progress record.
 Pending scans, lease waits and cleanup retain their original work timer across

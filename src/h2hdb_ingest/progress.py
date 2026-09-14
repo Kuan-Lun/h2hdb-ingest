@@ -110,7 +110,7 @@ class _ProgressState:
 class ProgressWork:
     """A single work generation; late worker updates are harmless no-ops.
 
-    Phase changes preserve cumulative counters, the hourly deadline and the last
+    Phase changes preserve cumulative counters, the reporting deadline and the last
     counter-progress timestamp. A different phase clears the operation detail;
     repeating the same phase is a no-op. Only changed counter values represent
     measured progress. None of these observations are recovery authority.
@@ -206,7 +206,7 @@ class IngestProgress:
         self,
         emit: Callable[[str], None],
         *,
-        interval_seconds: float = 3600,
+        interval_seconds: float = 60,
         clock: Callable[[], float] = monotonic,
         emit_debug: Callable[[str], None] | None = None,
     ) -> None:
@@ -458,7 +458,7 @@ class IngestProgress:
                     return
                 snapshot = state.snapshot(now)
                 # A delayed reporter emits one current summary, not an event
-                # backlog for each elapsed hour.
+                # backlog for each elapsed interval.
                 state.next_report_at = now + self._interval_seconds
             self._emit_snapshot("periodic", snapshot)
 

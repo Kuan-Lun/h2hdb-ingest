@@ -339,15 +339,19 @@ def test_startup_only_checks_existing_epoch_and_processes_one_session(
         "synchronize",
         (
             "log",
-            "vNext ingest publication batch completed: deferred_galleries=0 "
-            "waiting_galleries=0 known_galleries=1",
+            "Catalog batch published: 1 gallery in the source snapshot",
         ),
     ]
     assert events[6] == ("complete", 2)
     assert events[7] == ("current-only", 10_000_000)
     assert len(events) == 8
     assert [(record.levelno, record.getMessage()) for record in caplog.records] == [
-        (logging.DEBUG, "vNext ingest session completed: generation=2 replayed=False")
+        (
+            logging.DEBUG,
+            "vNext ingest publication batch completed: deferred_galleries=0 "
+            "waiting_galleries=0 known_galleries=1",
+        ),
+        (logging.DEBUG, "vNext ingest session completed: generation=2 replayed=False"),
     ]
 
 
@@ -626,6 +630,8 @@ def test_storage_mismatch_from_current_only_maintenance_is_not_best_effort() -> 
 
 def test_storage_identity_is_rechecked_after_maintenance_before_claim() -> None:
     events: list[object] = []
+    operations: list[str | None] = []
+    progress = IngestProgress(lambda _: None)
     first_uuid = bytes.fromhex("00000000000040008000000000000001")
     replacement_uuid = bytes.fromhex("00000000000040008000000000000002")
     identities = iter(
@@ -639,12 +645,16 @@ def test_storage_identity_is_rechecked_after_maintenance_before_claim() -> None:
     class _ReplacementAfterMaintenance:
         def ensure_storage_identity(self) -> LibraryStorageIdentity:
             events.append("identity")
+            snapshot = progress.snapshot()
+            assert snapshot is not None
+            operations.append(snapshot.operation)
             return next(identities)
 
     resident = _resident(
         events,
         library_storage_identity=_ReplacementAfterMaintenance(),
     )
+    resident._progress = progress
     resident.initialize()
 
     with pytest.raises(
@@ -654,6 +664,7 @@ def test_storage_identity_is_rechecked_after_maintenance_before_claim() -> None:
         resident.process_available(periodic_scan=True)
 
     assert not any(event[0] == "claim" for event in events if isinstance(event, tuple))
+    assert operations == ["initialize_storage", "inspect_storage", "inspect_storage"]
 
 
 def test_storage_binding_mismatch_prevents_maintenance_and_claim() -> None:
@@ -1210,8 +1221,7 @@ def test_maintenance_failure_does_not_undo_completed_ingest(
     assert ("complete", 2) in events
     assert (
         "log",
-        "vNext ingest publication batch completed: deferred_galleries=0 "
-        "waiting_galleries=0 known_galleries=1",
+        "Catalog batch published: 1 gallery in the source snapshot",
     ) in events
 
 

@@ -11,6 +11,7 @@ import pytest
 
 import h2hdb_ingest.progress as progress_module
 from h2hdb_ingest.progress import IngestProgress, ProgressSnapshot
+from h2hdb_ingest.progress_format import format_batch_published
 
 
 class _Clock:
@@ -70,7 +71,9 @@ def _running(
     clock = _Clock()
     wake = _ObservedEvent()
     monkeypatch.setattr(progress_module, "Event", lambda: wake)
-    progress = IngestProgress(lambda _: None, clock=clock, emit_debug=emit)
+    progress = IngestProgress(
+        lambda _: None, interval_seconds=3600, clock=clock, emit_debug=emit
+    )
     progress.start()
     wake.await_wait(1)
     try:
@@ -410,10 +413,7 @@ def test_info_explains_current_work_and_debug_retains_internal_details() -> None
         "Ingest progress: Copying the gallery inventory into the batch plan; "
         "4,096 / 131,256 galleries completed; "
         "since work started (1h 0m 0s): +131,256 gallery folders discovered; "
-        "last measured advance 1h 0m 0s ago; "
-        "current operation elapsed 1h 0m 0s; work elapsed 1h 0m 0s; "
-        "batch limit 10 new galleries; CBZs rendered this work 0; "
-        "catalog publication pending"
+        "current activity elapsed 1h 0m 0s; work elapsed 1h 0m 0s"
     ]
     assert len(debug) == 1
     assert "event=periodic generation=1 phase=source" in debug[0]
@@ -428,12 +428,12 @@ def test_info_explains_current_work_and_debug_retains_internal_details() -> None
     clock.advance(1800)
     progress._report_due()
     assert "since previous report (1h 0m 0s): +4,096 galleries completed" in info[-1]
-    assert "current operation elapsed 2h 0m 0s" in info[-1]
-    assert "last measured advance 30m 0s ago" in info[-1]
+    assert "current activity elapsed 2h 0m 0s" in info[-1]
+    assert "last measured advance" not in info[-1]
     clock.advance(3600)
     progress._report_due()
-    assert "since previous report (1h 0m 0s): +0 galleries completed" in info[-1]
-    assert "last measured advance 1h 30m 0s ago" in info[-1]
+    assert "since previous report" not in info[-1]
+    assert "work elapsed 3h 0m 0s" in info[-1]
 
 
 def test_unknown_and_empty_totals_are_distinct_and_operation_timer_is_separate() -> (
@@ -446,18 +446,19 @@ def test_unknown_and_empty_totals_are_distinct_and_operation_timer_is_separate()
     work.operation("source_discovery", completed=20, unit="galleries")
     clock.advance(3600)
     progress._report_due()
-    assert "20 galleries completed (total unknown)" in info[-1]
+    assert "20 galleries completed" in info[-1]
     work.operation("source_batch_selection", completed=0, total=0, unit="galleries")
     clock.advance(3600)
     progress._report_due()
     assert "0 / 0 galleries completed" in info[-1]
-    assert "current operation elapsed 1h 0m 0s; work elapsed 2h 0m 0s" in info[-1]
-    assert "current operation started since previous report" in info[-1]
+    assert "current activity elapsed 1h 0m 0s; work elapsed 2h 0m 0s" in info[-1]
+    assert "since previous report" not in info[-1]
     work.operation("source_batch_order")
     clock.advance(3600)
     progress._report_due()
-    assert "completion count unavailable for this operation" in info[-1]
-    assert "no completed-item counts available" in info[-1]
+    assert "completion count unavailable" not in info[-1]
+    assert "counts available" not in info[-1]
+    assert "current activity elapsed 1h 0m 0s" in info[-1]
 
 
 def test_info_distinguishes_rendered_cbz_from_published_catalog_and_metadata_only() -> (
@@ -470,9 +471,9 @@ def test_info_distinguishes_rendered_cbz_from_published_catalog_and_metadata_onl
     work.set_counter("batch_selected_galleries", 1010)
     work.advance("archives_rendered", 10)
     work.phase("publication")
-    assert "galleries in this batch 1,010 (existing and new)" in info[-1]
-    assert "CBZs rendered this work 10" in info[-1]
-    assert "catalog publication pending" in info[-1]
+    assert "galleries in this batch 1,010 (existing and new)" in info[-2]
+    assert "CBZs rendered this work 10" in info[-2]
+    assert info[-1] == "Ingest stage started: Preparing and publishing the catalog"
     work.advance("publication_batches_finalized")
     work.finish()
     assert info[-1].startswith("Ingest work completed:")
@@ -636,6 +637,84 @@ def test_default_diagnostics_use_debug_level(caplog: pytest.LogCaptureFixture) -
     assert "event=phase_started" in caplog.records[0].message
 
 
+def test_default_cadence_reports_slow_unannounced_work_every_minute() -> None:
+    info: list[str] = []
+    clock = _Clock()
+    progress = IngestProgress(info.append, clock=clock)
+    work = progress.begin("coordination", announce=False)
+    work.operation("catalog_cleanup")
+    clock.advance(59)
+    progress._report_due()
+    assert not info
+    clock.advance(1)
+    progress._report_due()
+    assert info == [
+        "Ingest progress: Cleaning up unused database records; "
+        "current activity elapsed 1m 0s; work elapsed 1m 0s"
+    ]
+    clock.advance(60)
+    progress._report_due()
+    assert "current activity elapsed 2m 0s; work elapsed 2m 0s" in info[-1]
+    work.finish(announce=False)
+    clock.advance(600)
+    progress._report_due()
+    assert len(info) == 2
+
+
+@pytest.mark.parametrize(
+    ("operation", "label"),
+    [
+        ("BUILD_ARTIFACT_INPUT", "Preparing the source descriptions needed for CBZs"),
+        ("PREPARE_ARTIFACT", "Preparing CBZs and their catalog covers"),
+        ("VALIDATE_CATALOG", "Checking catalog metadata and search indexes"),
+        ("VALIDATE_PREPARED", "Checking prepared library file descriptions"),
+        ("LIBRARY_ACTIVATION", "Activating the prepared library files"),
+        ("FINALIZE", "Making the catalog available to readers"),
+    ],
+)
+@pytest.mark.parametrize("phase", ["publication", "recovery"])
+@pytest.mark.parametrize("action", ["prepare", "commit"])
+def test_publication_activity_names_are_semantic_not_internal_tokens(
+    operation: str, label: str, phase: str, action: str
+) -> None:
+    info: list[str] = []
+    debug: list[str] = []
+    clock = _Clock()
+    progress = IngestProgress(info.append, emit_debug=debug.append, clock=clock)
+    work = progress.begin(phase, announce=False)
+    work.operation(f"{phase}_{operation}_{action}")
+    clock.advance(60)
+    progress._report_due()
+    assert info[0].startswith(f"Ingest progress: {label};")
+    assert operation not in info[0]
+    assert f"operation={phase}_{operation}_{action}" in debug[0]
+
+
+def test_phase_end_names_the_whole_stage_and_its_duration() -> None:
+    info: list[str] = []
+    clock = _Clock()
+    progress = IngestProgress(info.append, clock=clock)
+    work = progress.begin("source")
+    clock.advance(120)
+    work.operation("source_commit")
+    work.phase("analysis")
+    assert info[-2] == (
+        "Ingest stage ended: Preparing gallery data for this batch; "
+        "stage elapsed 2m 0s; work elapsed 2m 0s"
+    )
+
+
+def test_batch_result_reports_remaining_work_without_zero_boilerplate() -> None:
+    assert format_batch_published(galleries=1, deferred=0, waiting=0) == (
+        "Catalog batch published: 1 gallery in the source snapshot"
+    )
+    assert format_batch_published(galleries=2100, deferred=904, waiting=1) == (
+        "Catalog batch published: 2,100 galleries in the source snapshot; "
+        "904 new galleries left for later batches; "
+        "1 gallery waiting for source completion"
+    )
+
+
 def test_known_total_does_not_invent_a_completed_count() -> None:
     info: list[str] = []
     clock = _Clock()
@@ -644,10 +723,7 @@ def test_known_total_does_not_invent_a_completed_count() -> None:
     work.operation("source_batch_order", total=10, unit="galleries")
     clock.advance(3600)
     progress._report_due()
-    assert (
-        "completion count unavailable for this operation (total 10 galleries)"
-        in info[-1]
-    )
+    assert "10 galleries to process" in info[-1]
     assert "0 / 10" not in info[-1]
 
 

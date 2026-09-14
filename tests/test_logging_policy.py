@@ -86,7 +86,11 @@ def _run_workload(root: Path, level: str, gallery_count: int, page_count: int) -
             database=DatabaseConfig(
                 sql_type="sqlite", database=str(root / "catalog.sqlite3")
             ),
-            logger=LoggerConfig.model_validate({"level": level, "file": log_file}),
+            logger=LoggerConfig.model_validate(
+                {"file": log_file}
+                if level == "info"
+                else {"level": level, "file": log_file}
+            ),
         ),
         paths=IngestPathsConfig(
             download_path=source, library_path=library, page_render_workers=2
@@ -142,6 +146,7 @@ def _run_workload(root: Path, level: str, gallery_count: int, page_count: int) -
                 "publications": len(archives),
                 "page_counts": actual_page_counts,
                 "progress_interval_seconds": config.resident.progress_log_interval_seconds,
+                "log_level": config.core.logger.level.name,
                 "events": events,
             }
         )
@@ -198,8 +203,17 @@ def test_real_native_rendering_keeps_console_and_file_info_volume_per_batch(
         assert "ingest_metric " not in logs.file
         assert "routine connection diagnostic" not in logs.file
         assert "debug diagnostic" not in logs.file
-        assert logs.result["progress_interval_seconds"] == 3600
+        assert logs.result["progress_interval_seconds"] == 60
+        assert str(logs.result["log_level"]).upper() == "INFO"
         info = logs.messages("INFO")
+        assert not any(
+            raw in line
+            for line in info
+            for raw in ("ingest_progress ", "ingest_db_performance ", "counter.")
+        )
+        assert any("Catalog batch published:" in line for line in info)
+        assert any("Ingest analysis stage finished:" in line for line in info)
+        assert any("Ingest publication stage finished:" in line for line in info)
         assert any("Preparing gallery data for this batch" in line for line in info)
         assert any("Analyzing gallery selection" in line for line in info)
         assert any("Preparing and publishing the catalog" in line for line in info)

@@ -305,7 +305,7 @@ def _resident(
     )
 
 
-def test_resident_idle_polls_remain_silent_beyond_hourly_interval() -> None:
+def test_resident_idle_polls_remain_silent_beyond_reporting_interval() -> None:
     clock = _Clock()
     messages: list[str] = []
     progress = IngestProgress(messages.append, emit_debug=messages.append, clock=clock)
@@ -328,7 +328,7 @@ def test_resident_idle_polls_remain_silent_beyond_hourly_interval() -> None:
         (False, LibraryMaintenanceOutcome.BLOCKED),
     ],
 )
-def test_resident_pending_polls_keep_one_hourly_work_generation(
+def test_resident_pending_polls_keep_one_work_generation_at_minute_cadence(
     periodic_scan: bool, maintenance: LibraryMaintenanceOutcome
 ) -> None:
     clock = _Clock()
@@ -339,7 +339,7 @@ def test_resident_pending_polls_keep_one_hourly_work_generation(
         assert not resident.process_available(periodic_scan=periodic_scan)
         work = progress.current()
         assert work is not None
-        for _ in range(720):
+        for _ in range(12):
             clock.now += 5
             assert not resident.process_available(periodic_scan=periodic_scan)
             assert progress.current() is work
@@ -347,8 +347,9 @@ def test_resident_pending_polls_keep_one_hourly_work_generation(
         records = _progress_records(messages)
         assert len(records) == 1
         assert records[0]["event"] == "periodic"
-        assert records[0]["elapsed_seconds"] == "3600.0"
-        assert records[0]["last_progress_age_seconds"] == "3600.0"
+        assert records[0]["elapsed_seconds"] == "60.0"
+        assert records[0]["last_progress_age_seconds"] == "60.0"
+        assert records[0]["operation_elapsed_seconds"] == "60.0"
         assert not resident.process_available(
             periodic_scan=periodic_scan, should_stop=lambda: True
         )
@@ -408,7 +409,7 @@ def test_blocked_startup_check_reports_without_another_database_call() -> None:
         assert entered.wait(timeout=5)
         assert admin.calls == 1
         assert facade.calls == 0
-        clock.now = 3600
+        clock.now = 60
         progress._wake.set()
         assert reported.wait(timeout=5)
         assert initializer.is_alive()
@@ -421,7 +422,7 @@ def test_blocked_startup_check_reports_without_another_database_call() -> None:
         ]
         assert len(periodic) == 1
         assert periodic[0]["phase"] == "startup_check"
-        assert periodic[0]["elapsed_seconds"] == "3600.0"
+        assert periodic[0]["elapsed_seconds"] == "60.0"
     finally:
         release.set()
         initializer.join(timeout=5)
@@ -429,6 +430,96 @@ def test_blocked_startup_check_reports_without_another_database_call() -> None:
     assert not initializer.is_alive()
     assert not failures
     assert progress.current() is None
+
+
+@pytest.mark.parametrize(
+    ("blocked", "activity"),
+    [
+        ("library", "Cleaning up unused library resources"),
+        ("catalog", "Cleaning up unused database records"),
+        ("claim", "Acquiring permission to start an ingest batch"),
+    ],
+)
+def test_between_batch_calls_remain_observable_without_polling_or_idle_spam(
+    blocked: str, activity: str
+) -> None:
+    entered = Event()
+    release = Event()
+    reported = Event()
+    clock = _Clock()
+    info: list[str] = []
+    failures: list[BaseException] = []
+    calls: list[str] = []
+
+    def step(name: str) -> None:
+        calls.append(name)
+        if name == blocked:
+            entered.set()
+            assert release.wait(timeout=10)
+
+    class BlockingMaintenance(_Maintenance):
+        def maintain_cleanup(self) -> LibraryMaintenanceOutcome:
+            step("library")
+            return super().maintain_cleanup()
+
+    class BlockingFacade(_Facade):
+        def drain_current_only_maintenance(
+            self,
+            lease_duration_microseconds: int,
+            *,
+            artifact_release_adapters: object,
+        ) -> VNextCurrentOnlyMaintenanceOutcome:
+            step("catalog")
+            return super().drain_current_only_maintenance(
+                lease_duration_microseconds,
+                artifact_release_adapters=artifact_release_adapters,
+            )
+
+        def try_claim_ingest(
+            self, periodic_scan: bool, lease_duration_microseconds: int
+        ) -> VNextIngestSession | None:
+            step("claim")
+            return super().try_claim_ingest(periodic_scan, lease_duration_microseconds)
+
+    def emit(message: str) -> None:
+        info.append(message)
+        if message.startswith("Ingest progress:"):
+            reported.set()
+
+    progress = IngestProgress(emit, clock=clock)
+    resident = _resident(progress, facade=BlockingFacade())
+    resident._library_maintenance = BlockingMaintenance(LibraryMaintenanceOutcome.DONE)
+
+    def process() -> None:
+        try:
+            assert not resident.process_available(periodic_scan=False)
+        except BaseException as error:
+            failures.append(error)
+
+    worker = Thread(target=process, name="test-blocked-resident-progress")
+    progress.start()
+    worker.start()
+    try:
+        assert entered.wait(timeout=5)
+        observed_calls = calls.copy()
+        assert not info
+        clock.now = 60
+        progress._wake.set()
+        assert reported.wait(timeout=5)
+        assert worker.is_alive()
+        assert calls == observed_calls
+        assert info == [
+            f"Ingest progress: {activity}; "
+            "current activity elapsed 1m 0s; work elapsed 1m 0s"
+        ]
+    finally:
+        release.set()
+        worker.join(timeout=5)
+        progress.close()
+    assert not worker.is_alive()
+    assert not failures
+    assert progress.current() is None
+    assert len(info) == 1
 
 
 @pytest.mark.parametrize("fail_close", [False, True])
