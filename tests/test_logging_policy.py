@@ -7,6 +7,7 @@ import logging
 import subprocess
 import sys
 from collections import Counter
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -114,9 +115,13 @@ def _run_workload(root: Path, level: str, gallery_count: int, page_count: int) -
         dependency.info("%s routine connection diagnostic", name)
         dependency.warning("%s warning retained", name)
         dependency.error("%s error retained", name)
-    with DiskScratch(library) as scratch:
+    with ExitStack() as resources:
+        scratch = resources.enter_context(DiskScratch(library))
         with build_runtime(
-            config, event_logger=event, temporary_cleanup=scratch.cleanup_page
+            config,
+            event_logger=event,
+            temporary_cleanup=scratch.cleanup_page,
+            owned_resources=resources.pop_all(),
         ) as runtime:
             runtime.database_admin.initialize()
             runtime.resident.initialize()

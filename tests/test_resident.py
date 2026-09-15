@@ -10,6 +10,7 @@ from threading import Event
 from typing import cast
 
 import pytest
+from database_audit_fixtures import IsolatedDatabaseAudit
 from h2hdb import (
     ArtifactFailureContext,
     ArtifactReleaseAdapter,
@@ -153,6 +154,11 @@ class _Admin:
     def bind_storage_instance(self, storage_instance_uuid: bytes) -> object:
         self._events.append(("bind", storage_instance_uuid))
         return object()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_database_audit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(resident_module, "IngestDatabaseAudit", IsolatedDatabaseAudit)
 
 
 class _StorageIdentity:

@@ -569,3 +569,9 @@ def test_artifact_disabled_runtime_does_not_log_or_probe_worker_selection(
         page_workers._reset_cpu_topology_cache()
 
     assert _worker_lines(events) == []
+
+
+def test_temporary_cleanup_requires_an_owned_shutdown_resource(tmp_path: Path) -> None:
+    config = IngestConfig(paths=IngestPathsConfig(download_path=_source_root(tmp_path)))
+    with pytest.raises(ValueError, match="requires transferred owned_resources"):
+        build_runtime(config, temporary_cleanup=lambda: None)

@@ -6,6 +6,7 @@ import os
 import struct
 import zlib
 from collections.abc import Callable, Iterator
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from hashlib import file_digest, sha256
 from io import BytesIO
@@ -28,6 +29,7 @@ from h2hdb import (
     CatalogTagFilter,
     CatalogTimestampRange,
     CoreConfig,
+    DatabaseAuditReason,
     DatabaseConfig,
     GalleryStagingCapacityError,
     VNextAnalysisAdvanceResult,
@@ -52,10 +54,8 @@ from h2hdb_ingest import (
     IngestConfig,
     IngestPathsConfig,
     IngestSessionController,
-    LibraryMaintenanceOutcome,
     ManagedFilesystemLibraryAdapter,
     ResidentConfig,
-    ResidentIngestor,
     VNextIngestService,
     VNextIngestSynchronizationResult,
 )
@@ -69,7 +69,6 @@ from h2hdb_ingest.filesystem import (
 from h2hdb_ingest.image_qualification import ImageGalleryQualifier
 from h2hdb_ingest.library_relocation import relocate_library
 from h2hdb_ingest.runtime import IngestRuntime, build_runtime
-from h2hdb_ingest.source_monitor import FilesystemCompletionMarkerProbe
 
 
 @pytest.fixture(
@@ -128,6 +127,8 @@ def _rewrite_completion_marker(folder: Path) -> None:
 
 
 def _synchronize_after_cleanup(runtime: IngestRuntime) -> None:
+    if runtime.resident.database_audit.session is None:
+        runtime.resident.initialize()
     for _attempt in range(32):
         outcome = runtime.facade.drain_current_only_maintenance(30_000_000)
         if outcome is VNextCurrentOnlyMaintenanceOutcome.DONE:
@@ -191,11 +192,6 @@ class _CapacityThenSuccessService:
         )
 
 
-class _DoneLibraryMaintenance:
-    def maintain_cleanup(self) -> LibraryMaintenanceOutcome:
-        return LibraryMaintenanceOutcome.DONE
-
-
 def test_capacity_backpressure_releases_real_core_session_for_retry(
     tmp_path: Path,
     runtime_core_config: CoreConfig,
@@ -210,25 +206,16 @@ def test_capacity_backpressure_releases_real_core_session_for_retry(
             heartbeat_seconds=5,
         ),
     )
-    runtime = build_runtime(config)
-    runtime.database_admin.initialize()
-    service = _CapacityThenSuccessService()
-    resident = ResidentIngestor(
-        source_probe=FilesystemCompletionMarkerProbe(source),
-        service=service,
-        facade=runtime.facade,
-        database_admin=runtime.database_admin,
-        library_storage_identity=None,
-        library_maintenance=_DoneLibraryMaintenance(),
-        config=config.resident,
-        database_type=config.core.database.sql_type,
-        artifact_release_adapters={},
-    )
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
+        service = _CapacityThenSuccessService()
+        runtime.resident._service = service
 
-    assert not resident.process_available(periodic_scan=True)
-    assert resident.process_available(periodic_scan=True)
-    assert service.calls == 2
-    assert runtime.database_admin.check().state == "READY"
+        assert not runtime.resident.process_available(periodic_scan=True)
+        assert runtime.resident.process_available(periodic_scan=True)
+        assert service.calls == 2
+        assert runtime.database_admin.check().state == "READY"
 
 
 def test_fresh_epoch_runs_source_analysis_and_publication(
@@ -245,84 +232,84 @@ def test_fresh_epoch_runs_source_analysis_and_publication(
             heartbeat_seconds=5,
         ),
     )
-    runtime = build_runtime(config)
+    with build_runtime(config) as runtime:
+        initialized = runtime.database_admin.initialize()
+        checked = runtime.resident.initialize()
+        processed = runtime.resident.process_available(periodic_scan=True)
+        revision = runtime.catalog.get_catalog_revision()
 
-    initialized = runtime.database_admin.initialize()
-    checked = runtime.resident.initialize()
-    processed = runtime.resident.process_available(periodic_scan=True)
-    revision = runtime.catalog.get_catalog_revision()
-
-    assert initialized.epoch == checked.epoch
-    assert initialized.schema_version == checked.schema_version == 6
-    assert processed
-    assert revision.revision == 1
-    assert revision.publication_count == 1
-    searchable = runtime.catalog.discover_publications(
-        revision=revision,
-        query=CatalogDiscoveryQuery(
-            title="Runtime integration",
-            gid=1001,
-            subjects=(
-                CatalogSubjectFilter(namespace="artist", value="first"),
-                CatalogSubjectFilter(namespace="language", value="english"),
-            ),
-            uploaded=CatalogTimestampRange(
-                start=datetime(2024, 1, 2, tzinfo=UTC),
-                end=datetime(2024, 1, 3, tzinfo=UTC),
-            ),
-            downloaded=CatalogTimestampRange(
-                start=datetime(2024, 2, 3, tzinfo=UTC),
-                end=datetime(2024, 2, 4, tzinfo=UTC),
-            ),
-        ),
-    )
-    assert [publication.gid for publication in searchable.publications] == [1001]
-    tag_bundle = runtime.catalog.list_tag_values_with_publications(
-        namespace="artist", revision=revision
-    )
-    assert [tag.value for tag in tag_bundle.page.values] == ["first"]
-    assert tag_bundle.publications == searchable.publications
-    assert (
-        runtime.catalog.list_tag_publications(
-            subject=CatalogTagFilter(namespace="artist", value="first"),
+        assert initialized.epoch == checked.readiness.epoch
+        assert initialized.schema_version == checked.readiness.schema_version
+        assert checked.full_audit is not None
+        assert processed
+        assert revision.revision == 1
+        assert revision.publication_count == 1
+        searchable = runtime.catalog.discover_publications(
             revision=revision,
-        ).publications
-        == searchable.publications
-    )
-    assert (
-        runtime.catalog.discover_publications(
-            revision=revision,
-            query=CatalogDiscoveryQuery(title="uploader"),
-        ).publications
-        == ()
-    )
+            query=CatalogDiscoveryQuery(
+                title="Runtime integration",
+                gid=1001,
+                subjects=(
+                    CatalogSubjectFilter(namespace="artist", value="first"),
+                    CatalogSubjectFilter(namespace="language", value="english"),
+                ),
+                uploaded=CatalogTimestampRange(
+                    start=datetime(2024, 1, 2, tzinfo=UTC),
+                    end=datetime(2024, 1, 3, tzinfo=UTC),
+                ),
+                downloaded=CatalogTimestampRange(
+                    start=datetime(2024, 2, 3, tzinfo=UTC),
+                    end=datetime(2024, 2, 4, tzinfo=UTC),
+                ),
+            ),
+        )
+        assert [publication.gid for publication in searchable.publications] == [1001]
+        tag_bundle = runtime.catalog.list_tag_values_with_publications(
+            namespace="artist", revision=revision
+        )
+        assert [tag.value for tag in tag_bundle.page.values] == ["first"]
+        assert tag_bundle.publications == searchable.publications
+        assert (
+            runtime.catalog.list_tag_publications(
+                subject=CatalogTagFilter(namespace="artist", value="first"),
+                revision=revision,
+            ).publications
+            == searchable.publications
+        )
+        assert (
+            runtime.catalog.discover_publications(
+                revision=revision,
+                query=CatalogDiscoveryQuery(title="uploader"),
+            ).publications
+            == ()
+        )
 
-    # A periodic scan after process restart must replay the exact SEALED source
-    # snapshot without attempting to reopen its discovery checkpoint.
-    restarted = build_runtime(config)
-    restarted.resident.initialize()
-    assert restarted.resident.process_available(periodic_scan=True)
-    replayed_revision = restarted.catalog.get_catalog_revision()
-    assert replayed_revision == revision
+        # A periodic scan after process restart must replay the exact SEALED source
+        # snapshot without attempting to reopen its discovery checkpoint.
+    with build_runtime(config) as restarted:
+        restarted.resident.initialize()
+        assert restarted.resident.process_available(periodic_scan=True)
+        replayed_revision = restarted.catalog.get_catalog_revision()
+        assert replayed_revision == revision
 
-    # The same content in three galleries with three distinct artists reaches
-    # the registered spam threshold.  This public result covers both derived
-    # source projections: per-observation hash occurrences and artist tags.
-    _gallery(source, 1002, "second")
-    _gallery(source, 1003, "third")
+        # The same content in three galleries with three distinct artists reaches
+        # the registered spam threshold.  This public result covers both derived
+        # source projections: per-observation hash occurrences and artist tags.
+        _gallery(source, 1002, "second")
+        _gallery(source, 1003, "third")
 
-    assert restarted.resident.process_available(periodic_scan=True)
-    excluded_revision = restarted.catalog.get_catalog_revision()
-    assert excluded_revision.revision == 2
-    assert excluded_revision.publication_count == 0
+        assert restarted.resident.process_available(periodic_scan=True)
+        excluded_revision = restarted.catalog.get_catalog_revision()
+        assert excluded_revision.revision == 2
+        assert excluded_revision.publication_count == 0
 
-    # Replay the incremental build after its own publication has advanced the
-    # channel head.  Its analysis must retain the baseline that was persisted
-    # when the run began instead of deriving a new baseline from revision 2.
-    restarted_incremental = build_runtime(config)
-    restarted_incremental.resident.initialize()
-    assert restarted_incremental.resident.process_available(periodic_scan=True)
-    assert restarted_incremental.catalog.get_catalog_revision() == excluded_revision
+        # Replay the incremental build after its own publication has advanced the
+        # channel head.  Its analysis must retain the baseline that was persisted
+        # when the run began instead of deriving a new baseline from revision 2.
+    with build_runtime(config) as restarted_incremental:
+        restarted_incremental.resident.initialize()
+        assert restarted_incremental.resident.process_available(periodic_scan=True)
+        assert restarted_incremental.catalog.get_catalog_revision() == excluded_revision
 
 
 def test_same_locator_content_a_b_a_creates_three_revisions_then_replays(
@@ -340,78 +327,79 @@ def test_same_locator_content_a_b_a_creates_three_revisions_then_replays(
             heartbeat_seconds=5,
         ),
     )
-    runtime = build_runtime(config)
-    runtime.database_admin.initialize()
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
 
-    def current_content() -> str:
-        page = runtime.catalog.discover_publications(limit=128)
-        assert page.total == len(page.publications) == 2
-        # These deterministic fixture GIDs occupy different cleanup shards, so
-        # their two child-first cycles require more than 32 advances.
-        publication = next(item for item in page.publications if item.gid == 1001)
-        content_sha256 = publication.content_sha256
-        assert content_sha256 is not None
-        return content_sha256
+        def current_content() -> str:
+            page = runtime.catalog.discover_publications(limit=128)
+            assert page.total == len(page.publications) == 2
+            # These deterministic fixture GIDs occupy different cleanup shards, so
+            # their two child-first cycles require more than 32 advances.
+            publication = next(item for item in page.publications if item.gid == 1001)
+            content_sha256 = publication.content_sha256
+            assert content_sha256 is not None
+            return content_sha256
 
-    assert runtime.resident.process_available(periodic_scan=True)
-    first_revision = runtime.catalog.get_catalog_revision()
-    first_content = current_content()
-    assert first_revision.revision == 1
+        assert runtime.resident.process_available(periodic_scan=True)
+        first_revision = runtime.catalog.get_catalog_revision()
+        first_content = current_content()
+        assert first_revision.revision == 1
 
-    (source / "1001" / "001.jpg").write_bytes(b"content-B")
-    _rewrite_completion_marker(source / "1001")
-    assert runtime.resident.process_available(periodic_scan=True)
-    second_revision = runtime.catalog.get_catalog_revision()
-    second_content = current_content()
-    assert second_revision.revision == 2
-    assert second_content != first_content
-    # The post-session attempt is capped at 16 committed cleanup advances.
-    # More work remains, so the next resident cycle reports maintenance
-    # progress immediately without claiming a third ingest generation.
-    assert runtime.resident.process_available(periodic_scan=False)
-    assert runtime.catalog.get_catalog_revision() == second_revision
-    outcome = runtime.facade.drain_current_only_maintenance(30_000_000)
-    for _attempt in range(8):
-        if outcome is VNextCurrentOnlyMaintenanceOutcome.DONE:
-            break
-        assert outcome is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED
+        (source / "1001" / "001.jpg").write_bytes(b"content-B")
+        _rewrite_completion_marker(source / "1001")
+        assert runtime.resident.process_available(periodic_scan=True)
+        second_revision = runtime.catalog.get_catalog_revision()
+        second_content = current_content()
+        assert second_revision.revision == 2
+        assert second_content != first_content
+        # The post-session attempt is capped at 16 committed cleanup advances.
+        # More work remains, so the next resident cycle reports maintenance
+        # progress immediately without claiming a third ingest generation.
+        assert runtime.resident.process_available(periodic_scan=False)
+        assert runtime.catalog.get_catalog_revision() == second_revision
         outcome = runtime.facade.drain_current_only_maintenance(30_000_000)
-    assert outcome is VNextCurrentOnlyMaintenanceOutcome.DONE
+        for _attempt in range(8):
+            if outcome is VNextCurrentOnlyMaintenanceOutcome.DONE:
+                break
+            assert outcome is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED
+            outcome = runtime.facade.drain_current_only_maintenance(30_000_000)
+        assert outcome is VNextCurrentOnlyMaintenanceOutcome.DONE
 
-    # Session completion releases the SHARED ingest gate before the resident
-    # claims EXCLUSIVE maintenance.  The finished sweep keeps revision 2 fully
-    # readable, rejects the stale revision-1 pin, and leaves the FK-on epoch
-    # READY after removing every gallery-linear revision-1 catalog row.
-    assert runtime.database_admin.check().state == "READY"
-    assert (
-        runtime.catalog.discover_publications(
-            revision=second_revision,
-            limit=128,
-        ).total
-        == 2
-    )
-    with pytest.raises(CatalogRevisionNotFoundError):
-        runtime.catalog.discover_publications(
-            revision=first_revision,
-            limit=128,
+        # Session completion releases the SHARED ingest gate before the resident
+        # claims EXCLUSIVE maintenance.  The finished sweep keeps revision 2 fully
+        # readable, rejects the stale revision-1 pin, and leaves the FK-on epoch
+        # READY after removing every gallery-linear revision-1 catalog row.
+        assert runtime.database_admin.check().state == "READY"
+        assert (
+            runtime.catalog.discover_publications(
+                revision=second_revision,
+                limit=128,
+            ).total
+            == 2
         )
-    (source / "1001" / "001.jpg").write_bytes(b"content-A")
-    _rewrite_completion_marker(source / "1001")
-    assert runtime.resident.process_available(periodic_scan=True)
-    third_revision = runtime.catalog.get_catalog_revision()
-    third_content = current_content()
-    assert third_revision.revision == 3
-    assert third_content == first_content
+        with pytest.raises(CatalogRevisionNotFoundError):
+            runtime.catalog.discover_publications(
+                revision=first_revision,
+                limit=128,
+            )
+        (source / "1001" / "001.jpg").write_bytes(b"content-A")
+        _rewrite_completion_marker(source / "1001")
+        assert runtime.resident.process_available(periodic_scan=True)
+        third_revision = runtime.catalog.get_catalog_revision()
+        third_content = current_content()
+        assert third_revision.revision == 3
+        assert third_content == first_content
 
-    restarted = build_runtime(config)
-    restarted.resident.initialize()
-    assert restarted.resident.process_available(periodic_scan=True)
-    assert restarted.catalog.get_catalog_revision() == third_revision
-    replayed = restarted.catalog.discover_publications(limit=128)
-    assert replayed.total == len(replayed.publications) == 2
-    assert next(
-        item for item in replayed.publications if item.gid == 1001
-    ).content_sha256 == (first_content)
+    with build_runtime(config) as restarted:
+        restarted.resident.initialize()
+        assert restarted.resident.process_available(periodic_scan=True)
+        assert restarted.catalog.get_catalog_revision() == third_revision
+        replayed = restarted.catalog.discover_publications(limit=128)
+        assert replayed.total == len(replayed.publications) == 2
+        assert next(
+            item for item in replayed.publications if item.gid == 1001
+        ).content_sha256 == (first_content)
 
 
 def test_completion_marker_cache_skips_unchanged_image_bytes_across_restart(
@@ -807,101 +795,102 @@ def test_fresh_artifact_runtime_publishes_one_current_cbz(
             heartbeat_seconds=5,
         ),
     )
-    runtime = build_runtime(config)
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
+        assert runtime.resident.process_available(periodic_scan=True)
+        page = runtime.catalog.discover_publications()
+        current = tuple(current_root.rglob("*.cbz"))
 
-    runtime.database_admin.initialize()
-    runtime.resident.initialize()
-    assert runtime.resident.process_available(periodic_scan=True)
-    page = runtime.catalog.discover_publications()
-    current = tuple(current_root.rglob("*.cbz"))
-
-    assert page.total == 1
-    assert len(page.publications) == 1
-    publication = page.publications[0]
-    assert len(publication.artifacts) == 1
-    assert publication.page_count == 1
-    assert runtime.catalog.discover_publications(
-        query=CatalogDiscoveryQuery(
-            gid=2001, pages=CatalogPageCountRange(minimum=1, maximum=1)
-        )
-    ).publications == (publication,)
-    assert (
-        runtime.catalog.discover_publications(
+        assert page.total == 1
+        assert len(page.publications) == 1
+        publication = page.publications[0]
+        assert len(publication.artifacts) == 1
+        assert publication.page_count == 1
+        assert runtime.catalog.discover_publications(
             query=CatalogDiscoveryQuery(
-                gid=2001, pages=CatalogPageCountRange(maximum=0)
+                gid=2001, pages=CatalogPageCountRange(minimum=1, maximum=1)
             )
-        ).publications
-        == ()
-    )
-    assert publication.cover is not None
-    assert publication.thumbnail is not None
-    assert len(current) == 1
-    first_path = current_root.joinpath(
-        *publication.artifacts[0].storage_object.key.segments
-    )
-    thumbnail_path = current_root.joinpath(
-        *publication.thumbnail.storage_object.key.segments
-    )
-    first_digest = publication.artifacts[0].storage_object.sha256
-    assert current == (first_path,)
-    assert thumbnail_path.is_file()
-    assert sha256(first_path.read_bytes()).hexdigest() == (
-        publication.artifacts[0].storage_object.sha256
-    )
-    assert sha256(thumbnail_path.read_bytes()).hexdigest() == (
-        publication.thumbnail.storage_object.sha256
-    )
-    with ZipFile(first_path) as archive:
-        assert archive.namelist() == [
-            "galleryinfo.txt",
-            "pages/0000.jpg",
-        ]
+        ).publications == (publication,)
         assert (
-            archive.read("galleryinfo.txt")
-            == (source / "2001" / "galleryinfo.txt").read_bytes()
+            runtime.catalog.discover_publications(
+                query=CatalogDiscoveryQuery(
+                    gid=2001, pages=CatalogPageCountRange(maximum=0)
+                )
+            ).publications
+            == ()
         )
-        with Image.open(BytesIO(archive.read("pages/0000.jpg"))) as image:
-            assert image.format == "JPEG"
-            assert image.size == (8, 12)
-        archive_bytes = first_path.read_bytes()
-        cover = publication.cover
-        assert cover.storage_object == publication.artifacts[0].storage_object
+        assert publication.cover is not None
+        assert publication.thumbnail is not None
+        assert len(current) == 1
+        first_path = current_root.joinpath(
+            *publication.artifacts[0].storage_object.key.segments
+        )
+        thumbnail_path = current_root.joinpath(
+            *publication.thumbnail.storage_object.key.segments
+        )
+        first_digest = publication.artifacts[0].storage_object.sha256
+        assert current == (first_path,)
+        assert thumbnail_path.is_file()
+        assert sha256(first_path.read_bytes()).hexdigest() == (
+            publication.artifacts[0].storage_object.sha256
+        )
+        assert sha256(thumbnail_path.read_bytes()).hexdigest() == (
+            publication.thumbnail.storage_object.sha256
+        )
+        with ZipFile(first_path) as archive:
+            assert archive.namelist() == [
+                "galleryinfo.txt",
+                "pages/0000.jpg",
+            ]
+            assert (
+                archive.read("galleryinfo.txt")
+                == (source / "2001" / "galleryinfo.txt").read_bytes()
+            )
+            with Image.open(BytesIO(archive.read("pages/0000.jpg"))) as image:
+                assert image.format == "JPEG"
+                assert image.size == (8, 12)
+            archive_bytes = first_path.read_bytes()
+            cover = publication.cover
+            assert cover.storage_object == publication.artifacts[0].storage_object
+            assert (
+                sha256(
+                    archive_bytes[
+                        cover.extent.offset : cover.extent.offset + cover.extent.length
+                    ]
+                ).hexdigest()
+                == cover.sha256
+            )
+        with Image.open(thumbnail_path) as thumbnail:
+            assert thumbnail.format == "JPEG"
+            assert max(thumbnail.size) <= 320
+
+        Image.new("RGB", (8, 12), "blue").save(source / "2001" / "001.jpg")
+        _rewrite_completion_marker(source / "2001")
+        assert runtime.resident.process_available(periodic_scan=True)
+        second_page = runtime.catalog.discover_publications()
+        second_current = tuple(current_root.rglob("*.cbz"))
+
+        assert second_page.revision.revision == 2
+        assert second_page.total == len(second_page.publications) == 1
+        assert len(second_page.publications[0].artifacts) == 1
+        second_artifact = second_page.publications[0].artifacts[0]
+        assert second_artifact.storage_object.sha256 != first_digest
+        second_path = current_root.joinpath(
+            *second_artifact.storage_object.key.segments
+        )
+        assert second_path == first_path
+        assert len(second_current) == 1
+        assert second_current == (second_path,)
         assert (
-            sha256(
-                archive_bytes[
-                    cover.extent.offset : cover.extent.offset + cover.extent.length
-                ]
-            ).hexdigest()
-            == cover.sha256
+            sha256(second_path.read_bytes()).hexdigest()
+            == second_artifact.storage_object.sha256
         )
-    with Image.open(thumbnail_path) as thumbnail:
-        assert thumbnail.format == "JPEG"
-        assert max(thumbnail.size) <= 320
-
-    Image.new("RGB", (8, 12), "blue").save(source / "2001" / "001.jpg")
-    _rewrite_completion_marker(source / "2001")
-    assert runtime.resident.process_available(periodic_scan=True)
-    second_page = runtime.catalog.discover_publications()
-    second_current = tuple(current_root.rglob("*.cbz"))
-
-    assert second_page.revision.revision == 2
-    assert second_page.total == len(second_page.publications) == 1
-    assert len(second_page.publications[0].artifacts) == 1
-    second_artifact = second_page.publications[0].artifacts[0]
-    assert second_artifact.storage_object.sha256 != first_digest
-    second_path = current_root.joinpath(*second_artifact.storage_object.key.segments)
-    assert second_path == first_path
-    assert len(second_current) == 1
-    assert second_current == (second_path,)
-    assert (
-        sha256(second_path.read_bytes()).hexdigest()
-        == second_artifact.storage_object.sha256
-    )
-    assert runtime.database_admin.check().state == "READY"
-    state = library_root / ".h2hdb-state"
-    assert not list((state / "staging").glob("*.cbz"))
-    assert not list((state / "quarantine").glob("*.cbz"))
-    assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
+        assert runtime.database_admin.check().state == "READY"
+        state = library_root / ".h2hdb-state"
+        assert not list((state / "staging").glob("*.cbz"))
+        assert not list((state / "quarantine").glob("*.cbz"))
+        assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
 
 
 def test_restart_recovers_durable_publication_before_applying_new_policy(
@@ -938,89 +927,96 @@ def test_restart_recovers_durable_publication_before_applying_new_policy(
                 ),
             ),
             resident=ResidentConfig(
-                lease_seconds=30,
-                heartbeat_seconds=5,
+                lease_seconds=2,
+                heartbeat_seconds=0.1,
+                poll_seconds=0.01,
             ),
         )
 
-    first = build_runtime(config(page_jpeg_quality=90))
-    first.database_admin.initialize()
-    first.resident.initialize()
-    claimed = first.facade.try_claim_ingest(True, 30_000_000)
-    assert claimed is not None
-    session = IngestSessionController(
-        first.facade,
-        claimed,
-        lease_duration_microseconds=30_000_000,
-        database_type="sqlite",
-    )
-    service = cast(VNextIngestService, first.resident._service)
-    activation = service._library_activation
-    original_begin = activation.begin
-    crashed = False
+    with (
+        pytest.raises(OSError, match="after durable database commit"),
+        build_runtime(config(page_jpeg_quality=90)) as first,
+    ):
+        first.database_admin.initialize()
+        first.resident.initialize()
+        claimed = first.facade.try_claim_ingest(True, 30_000_000)
+        assert claimed is not None
+        session = IngestSessionController(
+            first.facade,
+            claimed,
+            lease_duration_microseconds=30_000_000,
+            database_type="sqlite",
+        )
+        service = cast(VNextIngestService, first.resident._service)
+        activation = service._library_activation
+        original_begin = activation.begin
+        crashed = False
 
-    def fail_first_activation(
-        revision: int,
-        receipt_id: bytes,
-    ) -> object:
-        nonlocal crashed
-        if not crashed:
-            crashed = True
-            raise OSError("injected crash after durable database commit")
-        return original_begin(revision, receipt_id)
+        def fail_first_activation(
+            revision: int,
+            receipt_id: bytes,
+        ) -> object:
+            nonlocal crashed
+            if not crashed:
+                crashed = True
+                raise OSError("injected crash after durable database commit")
+            return original_begin(revision, receipt_id)
 
-    monkeypatch.setattr(activation, "begin", fail_first_activation)
-    with pytest.raises(OSError, match="after durable database commit"):
-        service.synchronize_once(session)
-    assert crashed
-    staged_old_archives = tuple(
-        (library_root / ".h2hdb-state" / "staging").glob("*.cbz")
-    )
-    assert len(staged_old_archives) == 1
-    with ZipFile(staged_old_archives[0]) as archive:
-        old_policy_page = archive.read("pages/0000.jpg")
-    session.complete()
-    first.close()
+        monkeypatch.setattr(activation, "begin", fail_first_activation)
+        with pytest.raises(OSError, match="after durable database commit") as failure:
+            service.synchronize_once(session)
+        assert crashed
+        staged_old_archives = tuple(
+            (library_root / ".h2hdb-state" / "staging").glob("*.cbz")
+        )
+        assert len(staged_old_archives) == 1
+        with ZipFile(staged_old_archives[0]) as archive:
+            old_policy_page = archive.read("pages/0000.jpg")
+        session.complete()
+        # Propagate the simulated failure through the runtime owner so shutdown
+        # cannot acknowledge a clean writer; startup must wait for the real lease.
+        raise failure.value
 
     # The old snapshot stays unchanged.  Changing only the byte-affecting
     # policy must still produce a successor after the pending old-policy
     # commit has been activated and finalized in this same synchronization.
     requested_config = config(page_jpeg_quality=55)
-    restarted = build_runtime(requested_config)
-    restarted.resident.initialize()
-    assert restarted.resident.process_available(periodic_scan=True)
+    with build_runtime(requested_config) as restarted:
+        startup = restarted.resident.initialize()
+        assert startup.reason is DatabaseAuditReason.PREVIOUS_INTERRUPTION
+        assert startup.full_audit is not None
+        assert restarted.resident.process_available(periodic_scan=True)
 
-    revision = restarted.catalog.get_catalog_revision()
-    page = restarted.catalog.discover_publications()
-    assert revision.revision == 2
-    assert page.revision == revision
-    assert page.total == len(page.publications) == 1
-    publication = page.publications[0]
-    assert publication.gid == 2101
-    assert len(publication.artifacts) == 1
-    current_path = library_root.joinpath(
-        "current",
-        *publication.artifacts[0].storage_object.key.segments,
-    )
-    current_bytes = current_path.read_bytes()
-    assert sha256(current_bytes).hexdigest() == (
-        publication.artifacts[0].storage_object.sha256
-    )
-    with ZipFile(BytesIO(current_bytes)) as archive:
-        current_page = archive.read("pages/0000.jpg")
-    expected_page = BytesIO()
-    with Image.open(source / "2101" / "001.png") as source_page:
-        source_page.save(
-            expected_page,
-            format="JPEG",
-            quality=55,
-            optimize=True,
-            progressive=False,
+        revision = restarted.catalog.get_catalog_revision()
+        page = restarted.catalog.discover_publications()
+        assert revision.revision == 2
+        assert page.revision == revision
+        assert page.total == len(page.publications) == 1
+        publication = page.publications[0]
+        assert publication.gid == 2101
+        assert len(publication.artifacts) == 1
+        current_path = library_root.joinpath(
+            "current",
+            *publication.artifacts[0].storage_object.key.segments,
         )
-    assert current_page == expected_page.getvalue()
-    assert current_page != old_policy_page
-    assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
-    restarted.close()
+        current_bytes = current_path.read_bytes()
+        assert sha256(current_bytes).hexdigest() == (
+            publication.artifacts[0].storage_object.sha256
+        )
+        with ZipFile(BytesIO(current_bytes)) as archive:
+            current_page = archive.read("pages/0000.jpg")
+        expected_page = BytesIO()
+        with Image.open(source / "2101" / "001.png") as source_page:
+            source_page.save(
+                expected_page,
+                format="JPEG",
+                quality=55,
+                optimize=True,
+                progressive=False,
+            )
+        assert current_page == expected_page.getvalue()
+        assert current_page != old_policy_page
+        assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
 
 
 class _SimulatedProcessLoss(RuntimeError):
@@ -1060,7 +1056,9 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
             download_path=source,
             library_path=library_root,
         ),
-        resident=ResidentConfig(lease_seconds=30, heartbeat_seconds=5),
+        resident=ResidentConfig(
+            lease_seconds=2, heartbeat_seconds=0.1, poll_seconds=0.01
+        ),
     )
 
     def current_files() -> dict[Path, bytes]:
@@ -1100,8 +1098,6 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
             )
         }
     )
-    abandoned = build_runtime(abandoned_config)
-    abandoned.resident.initialize()
     original_issue = VNextIngestFacade.issue_publication_step
     original_commit = VNextIngestFacade.commit_publication_step
     issued_operation = [""]
@@ -1130,7 +1126,11 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
             protection_committed[0] = True
         return result
 
-    try:
+    with (
+        pytest.raises(_SimulatedProcessLoss),
+        build_runtime(abandoned_config) as abandoned,
+    ):
+        abandoned.resident.initialize()
         with (
             patch.object(
                 VNextIngestFacade,
@@ -1142,12 +1142,9 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
                 "commit_publication_step",
                 record_protection_commit,
             ),
-            pytest.raises(_SimulatedProcessLoss),
         ):
             for _attempt in range(16):
                 abandoned.resident.process_available(periodic_scan=True)
-    finally:
-        abandoned.close()
     assert any(path.is_file() for path in staging.rglob("*"))
     assert current_files() == initial_current
 
@@ -1163,7 +1160,9 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
     )
     restarted = build_runtime(successor_config)
     try:
-        restarted.resident.initialize()
+        startup = restarted.resident.initialize()
+        assert startup.reason is DatabaseAuditReason.PREVIOUS_INTERRUPTION
+        assert startup.full_audit is not None
 
         # Bounded preliminary maintenance may need several polls before the
         # successor encounters the predecessor's slot and releases it under
@@ -1299,49 +1298,49 @@ def test_deleted_gallery_reconciles_catalog_library_and_historical_cleanup(
             heartbeat_seconds=5,
         ),
     )
-    runtime = build_runtime(config)
-    runtime.database_admin.initialize()
-    runtime.resident.initialize()
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
 
-    assert runtime.resident.process_available(periodic_scan=True)
-    first_revision = runtime.catalog.get_catalog_revision()
-    first_page = runtime.catalog.discover_publications()
-    assert first_page.total == len(first_page.publications) == 1
-    publication = first_page.publications[0]
-    archive_path = current_root.joinpath(
-        *publication.artifacts[0].storage_object.key.segments
-    )
-    assert publication.thumbnail is not None
-    thumbnail_path = current_root.joinpath(
-        *publication.thumbnail.storage_object.key.segments
-    )
-    assert archive_path.is_file()
-    assert thumbnail_path.is_file()
-
-    rmtree(source / "2501")
-    assert runtime.resident.process_available(periodic_scan=True)
-    empty_revision = runtime.catalog.get_catalog_revision()
-    empty_page = runtime.catalog.discover_publications()
-    assert empty_revision.revision == first_revision.revision + 1
-    assert empty_revision.publication_count == 0
-    assert empty_page.total == len(empty_page.publications) == 0
-    assert not archive_path.exists()
-    assert not thumbnail_path.exists()
-    assert not tuple(current_root.rglob("*.cbz"))
-
-    outcome = runtime.facade.drain_current_only_maintenance(30_000_000)
-    for _attempt in range(16):
-        if outcome is VNextCurrentOnlyMaintenanceOutcome.DONE:
-            break
-        assert outcome is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED
-        outcome = runtime.facade.drain_current_only_maintenance(30_000_000)
-    assert outcome is VNextCurrentOnlyMaintenanceOutcome.DONE
-    assert runtime.database_admin.check().state == "READY"
-    with pytest.raises(CatalogRevisionNotFoundError):
-        runtime.catalog.discover_publications(
-            revision=first_revision,
-            limit=128,
+        assert runtime.resident.process_available(periodic_scan=True)
+        first_revision = runtime.catalog.get_catalog_revision()
+        first_page = runtime.catalog.discover_publications()
+        assert first_page.total == len(first_page.publications) == 1
+        publication = first_page.publications[0]
+        archive_path = current_root.joinpath(
+            *publication.artifacts[0].storage_object.key.segments
         )
+        assert publication.thumbnail is not None
+        thumbnail_path = current_root.joinpath(
+            *publication.thumbnail.storage_object.key.segments
+        )
+        assert archive_path.is_file()
+        assert thumbnail_path.is_file()
+
+        rmtree(source / "2501")
+        assert runtime.resident.process_available(periodic_scan=True)
+        empty_revision = runtime.catalog.get_catalog_revision()
+        empty_page = runtime.catalog.discover_publications()
+        assert empty_revision.revision == first_revision.revision + 1
+        assert empty_revision.publication_count == 0
+        assert empty_page.total == len(empty_page.publications) == 0
+        assert not archive_path.exists()
+        assert not thumbnail_path.exists()
+        assert not tuple(current_root.rglob("*.cbz"))
+
+        outcome = runtime.facade.drain_current_only_maintenance(30_000_000)
+        for _attempt in range(16):
+            if outcome is VNextCurrentOnlyMaintenanceOutcome.DONE:
+                break
+            assert outcome is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED
+            outcome = runtime.facade.drain_current_only_maintenance(30_000_000)
+        assert outcome is VNextCurrentOnlyMaintenanceOutcome.DONE
+        assert runtime.database_admin.check().state == "READY"
+        with pytest.raises(CatalogRevisionNotFoundError):
+            runtime.catalog.discover_publications(
+                revision=first_revision,
+                limit=128,
+            )
 
 
 def test_many_replacements_keep_one_stable_current_file_per_gid(
@@ -1375,54 +1374,54 @@ def test_many_replacements_keep_one_stable_current_file_per_gid(
             heartbeat_seconds=5,
         ),
     )
-    runtime = build_runtime(config)
-    runtime.database_admin.initialize()
-    runtime.resident.initialize()
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
 
-    assert runtime.resident.process_available(periodic_scan=True)
-    first = runtime.catalog.discover_publications()
-    assert first.total == len(first.publications) == gallery_count
-    old_paths = {
-        current_root.joinpath(*publication.artifacts[0].storage_object.key.segments)
-        for publication in first.publications
-    }
-    old_digests = {
-        publication.gid: publication.artifacts[0].storage_object.sha256
-        for publication in first.publications
-    }
-    assert len(old_paths) == gallery_count
+        assert runtime.resident.process_available(periodic_scan=True)
+        first = runtime.catalog.discover_publications()
+        assert first.total == len(first.publications) == gallery_count
+        old_paths = {
+            current_root.joinpath(*publication.artifacts[0].storage_object.key.segments)
+            for publication in first.publications
+        }
+        old_digests = {
+            publication.gid: publication.artifacts[0].storage_object.sha256
+            for publication in first.publications
+        }
+        assert len(old_paths) == gallery_count
 
-    for offset in range(gallery_count):
-        gid = 3001 + offset
-        Image.new("RGB", (8, 12), (offset * 11, 255, 0)).save(
-            source / str(gid) / "001.jpg"
-        )
-        _rewrite_completion_marker(source / str(gid))
-    for _attempt in range(8):
-        runtime.resident.process_available(periodic_scan=True)
-        if runtime.catalog.get_catalog_revision().revision == 2:
-            break
-    assert runtime.catalog.get_catalog_revision().revision == 2
+        for offset in range(gallery_count):
+            gid = 3001 + offset
+            Image.new("RGB", (8, 12), (offset * 11, 255, 0)).save(
+                source / str(gid) / "001.jpg"
+            )
+            _rewrite_completion_marker(source / str(gid))
+        for _attempt in range(8):
+            runtime.resident.process_available(periodic_scan=True)
+            if runtime.catalog.get_catalog_revision().revision == 2:
+                break
+        assert runtime.catalog.get_catalog_revision().revision == 2
 
-    second = runtime.catalog.discover_publications()
-    current_paths = {
-        current_root.joinpath(*publication.artifacts[0].storage_object.key.segments)
-        for publication in second.publications
-    }
-    assert second.revision.revision == 2
-    assert second.total == len(second.publications) == gallery_count
-    assert old_paths == current_paths
-    assert all(path.is_file() for path in current_paths)
-    projected_paths = tuple(current_root.rglob("*.cbz"))
-    assert len(projected_paths) == gallery_count
-    assert {
-        publication.gid: publication.artifacts[0].storage_object.sha256
-        for publication in second.publications
-    } != old_digests
-    state = library_root / ".h2hdb-state"
-    assert not list((state / "staging").glob("*.cbz"))
-    assert not list((state / "quarantine").glob("*.cbz"))
-    assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
+        second = runtime.catalog.discover_publications()
+        current_paths = {
+            current_root.joinpath(*publication.artifacts[0].storage_object.key.segments)
+            for publication in second.publications
+        }
+        assert second.revision.revision == 2
+        assert second.total == len(second.publications) == gallery_count
+        assert old_paths == current_paths
+        assert all(path.is_file() for path in current_paths)
+        projected_paths = tuple(current_root.rglob("*.cbz"))
+        assert len(projected_paths) == gallery_count
+        assert {
+            publication.gid: publication.artifacts[0].storage_object.sha256
+            for publication in second.publications
+        } != old_digests
+        state = library_root / ".h2hdb-state"
+        assert not list((state / "staging").glob("*.cbz"))
+        assert not list((state / "quarantine").glob("*.cbz"))
+        assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
 
 
 def _large_monochrome_png(path: Path) -> None:
@@ -1732,7 +1731,9 @@ def test_render_storage_pressure_preserves_gallery_and_publishes_after_retry(
     monkeypatch.setattr(ManagedFilesystemLibraryAdapter, "render_archive", render)
     cleanups: list[bool] = []
     with build_runtime(
-        config, temporary_cleanup=lambda: cleanups.append(True)
+        config,
+        temporary_cleanup=lambda: cleanups.append(True),
+        owned_resources=ExitStack(),
     ) as runtime:
         runtime.database_admin.initialize()
         runtime.resident.initialize()

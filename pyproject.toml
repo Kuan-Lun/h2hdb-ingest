@@ -14,7 +14,7 @@ requires-python = ">=3.14"
 dependencies = [
     "h2h-galleryinfo-parser>=0.5.3,<0.6",
     # Require readable core progress and complete source-stage activity reporting.
-    "h2hdb>=0.38.2,<0.39.0",
+    "h2hdb>=0.39.0,<0.40.0",
     "pillow>=12.3.0,<13.0.0",
     "pydantic>=2.13.4,<3.0.0",
     # Native decoder/resizer behavior is audited within these tested major lanes.

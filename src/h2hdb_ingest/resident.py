@@ -14,8 +14,8 @@ from typing import Protocol
 
 from h2hdb import (
     ArtifactReleaseAdapter,
+    DatabaseAuditReport,
     GalleryStagingCapacityError,
-    SchemaEpochReport,
     VNextCurrentOnlyMaintenanceOutcome,
     VNextDatabaseAdminFacade,
     VNextIngestFacade,
@@ -28,6 +28,7 @@ from ._log_recovery import RecoveryLog
 from ._retry_diagnostics import RetryDiagnostic, retry_diagnostic
 from .artifact_errors import format_artifact_failure
 from .config import ResidentConfig
+from .database_audit import IngestDatabaseAudit, IngestStartupStopped
 from .filesystem import FilesystemSourceChangedError
 from .library_identity import (
     LibraryStorageIdentity,
@@ -138,6 +139,9 @@ class ResidentIngestor:
         self._database_type = database_type.casefold()
         self._event_logger = event_logger or logger.info
         self._progress = progress
+        self._database_audit = IngestDatabaseAudit(
+            database_admin, config, self._event_logger, database_type=database_type
+        )
         self._retry_failure: RetryDiagnostic | None = None
         self._temporary_cleanup = temporary_cleanup
         self._capacity_waiting = False
@@ -163,13 +167,26 @@ class ResidentIngestor:
         result = self._last_synchronization_result
         return 0 if result is None else result.deferred_gallery_count
 
-    def initialize(self) -> SchemaEpochReport:
-        """Validate an existing READY epoch without creating or migrating it."""
+    @property
+    def database_audit(self) -> IngestDatabaseAudit:
+        """Expose process ownership to the runtime lifecycle, never schema internals."""
+
+        return self._database_audit
+
+    def initialize(
+        self, *, should_stop: Callable[[], bool] | None = None
+    ) -> DatabaseAuditReport:
+        """Admit a managed audit session without creating or migrating the schema."""
 
         work = self._begin_progress("startup_check", announce=True)
         try:
-            report = self._initialize()
-        except BaseException:
+            report = self._initialize(should_stop=should_stop)
+        except IngestStartupStopped:
+            if work is not None:
+                work.finish("stopped")
+            raise
+        except BaseException as error:
+            self._database_audit.fail(error)
             if work is not None:
                 work.finish("failed")
             raise
@@ -177,13 +194,15 @@ class ResidentIngestor:
             work.finish()
         return report
 
-    def _initialize(self) -> SchemaEpochReport:
+    def _initialize(
+        self, *, should_stop: Callable[[], bool] | None
+    ) -> DatabaseAuditReport:
 
         self._bound_storage_identity = None
         self._last_synchronization_result = None
         self._storage_instance_ready = self._library_storage_identity is None
         self._progress_operation("database_check")
-        report = self._database_admin.check()
+        report = self._database_audit.start(should_stop=should_stop)
         self._progress_operation("initialize_storage")
         if self._library_storage_identity is not None:
             identity = self._library_storage_identity.ensure_storage_identity()
@@ -233,6 +252,13 @@ class ResidentIngestor:
         on_scan_started: Callable[[], None] | None = None,
     ) -> _ResidentCycleOutcome:
         self._retry_failure = None
+        requested_stop = should_stop
+
+        def checked_stop() -> bool:
+            self._database_audit.raise_if_failed()
+            return requested_stop is not None and requested_stop()
+
+        should_stop = checked_stop
         if self._progress_stop_requested(should_stop):
             self._finish_progress("stopped", announce=False)
             return _ResidentCycleOutcome.IDLE
@@ -244,6 +270,12 @@ class ResidentIngestor:
             else "waiting_for_source_quiet_period"
         )
         try:
+            with (
+                nullcontext()
+                if work is None
+                else work.activity("database_audit_schedule")
+            ):
+                self._database_audit.check_between_sessions()
             outcome = self._process_cycle_step(
                 periodic_scan=periodic_scan,
                 preflight=preflight,
@@ -252,7 +284,8 @@ class ResidentIngestor:
                 on_scan_started=on_scan_started,
             )
             stopped = should_stop is not None and should_stop()
-        except BaseException:
+        except BaseException as error:
+            self._database_audit.fail(error)
             self._finish_progress("failed")
             raise
         if stopped:
@@ -496,6 +529,8 @@ class ResidentIngestor:
             return _ResidentCycleOutcome.IDLE
         self._capacity_waiting = False
         self._last_synchronization_result = outcome
+        if outcome.deferred_gallery_count == 0:
+            self._database_audit.initial_catchup_complete()
         try:
             self._try_library_maintenance()
             self._try_current_only_maintenance(lease_duration)
@@ -702,14 +737,16 @@ class ResidentIngestor:
     def _progress_stop_requested(self, should_stop: Callable[[], bool] | None) -> bool:
         try:
             return should_stop is not None and should_stop()
-        except BaseException:
+        except BaseException as error:
+            self._database_audit.fail(error)
             self._finish_progress("failed")
             raise
 
     def run_forever(self, *, stop: Event | None = None) -> None:
         try:
             self._run_forever(stop=stop)
-        except BaseException:
+        except BaseException as error:
+            self._database_audit.fail(error)
             self._finish_progress("failed")
             raise
         finally:
@@ -737,6 +774,7 @@ class ResidentIngestor:
 
             def should_stop() -> bool:
                 monitor.raise_if_failed()
+                self._database_audit.raise_if_failed()
                 return stop_event.is_set()
 
             while not should_stop():

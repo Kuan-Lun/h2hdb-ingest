@@ -13,6 +13,7 @@ from types import TracebackType
 from typing import Self
 
 from h2hdb import (
+    DatabaseAuditSession,
     LibraryActivationCheckpoint,
     LibraryActivationStatus,
     VNextCatalogFacade,
@@ -23,8 +24,9 @@ from h2hdb import (
 )
 
 from ._diagnostic_logging import DiagnosticFormatter
-from ._resource_cleanup import Closeable, close_resources
+from ._resource_cleanup import Closeable, close_resources, owned_resource
 from .config import IngestConfig
+from .database_audit import IngestDatabaseAudit
 from .image_qualification import ImageGalleryQualifier
 from .library import ManagedFilesystemLibraryAdapter
 from .library_identity import LibraryStorageIdentityProvider
@@ -53,6 +55,12 @@ class IngestRuntime:
     catalog: VNextCatalogFacade
     resident: ResidentIngestor
     _progress: IngestProgress | None = field(default=None, repr=False, compare=False)
+    _audit: IngestDatabaseAudit | None = field(default=None, repr=False, compare=False)
+    _owned_resources: Closeable | None = field(default=None, repr=False, compare=False)
+    _finish_audit: Callable[[DatabaseAuditSession], None] | None = field(
+        default=None, repr=False, compare=False
+    )
+    _unclean: bool = field(default=False, init=False, repr=False, compare=False)
     _lifecycle_lock: Lock = field(
         default_factory=Lock,
         init=False,
@@ -71,11 +79,27 @@ class IngestRuntime:
             resources: tuple[Closeable, ...] = (
                 self.facade,
                 self.catalog,
-                self.database_admin,
             )
             if self._progress is not None:
                 resources = (self._progress, *resources)
-            close_resources(resources)
+            if self._owned_resources is not None:
+                resources = (*resources, self._owned_resources)
+            # Continue renewing while other pools and local scratch drain. Stop
+            # the worker before closing the admin pool that it uses.
+            if self._audit is not None:
+                resources = (*resources, self._audit)
+            resources = (*resources, self.database_admin)
+            try:
+                close_resources(resources)
+                if self._audit is not None and self._audit.failed:
+                    object.__setattr__(self, "_unclean", True)
+                if not self._unclean and self._audit is not None:
+                    session = self._audit.session
+                    if session is not None and self._finish_audit is not None:
+                        self._finish_audit(session)
+            except BaseException:
+                object.__setattr__(self, "_unclean", True)
+                raise
             object.__setattr__(self, "_closed", True)
 
     def __enter__(self) -> Self:
@@ -94,6 +118,9 @@ class IngestRuntime:
         traceback: TracebackType | None,
     ) -> None:
         del exception_type, traceback
+        if exception is not None:
+            with self._lifecycle_lock:
+                object.__setattr__(self, "_unclean", True)
         try:
             self.close()
         except BaseException as cleanup_error:
@@ -112,14 +139,20 @@ def build_runtime(
     *,
     event_logger: Callable[[str], None] | None = None,
     temporary_cleanup: Callable[[], object] | None = None,
+    owned_resources: Closeable | None = None,
 ) -> IngestRuntime:
     """Build the sole supported source-to-publication runtime."""
 
-    if not isinstance(config, IngestConfig):
-        raise TypeError("config must be IngestConfig")
-    facade = VNextIngestFacade(config.core)
-    owned_closers = [facade.close]
+    owned_closers: list[Callable[[], None]] = []
+    if owned_resources is not None:
+        owned_closers.append(owned_resources.close)
     try:
+        if not isinstance(config, IngestConfig):
+            raise TypeError("config must be IngestConfig")
+        if temporary_cleanup is not None and owned_resources is None:
+            raise ValueError("temporary_cleanup requires transferred owned_resources")
+        facade = VNextIngestFacade(config.core)
+        owned_closers.append(facade.close)
         database_admin = VNextDatabaseAdminFacade(config.core)
         owned_closers.append(database_admin.close)
         catalog = VNextCatalogFacade(config.core)
@@ -214,7 +247,16 @@ def build_runtime(
             progress=progress,
         )
         progress.start()
-        return IngestRuntime(facade, database_admin, catalog, resident, progress)
+        return IngestRuntime(
+            facade,
+            database_admin,
+            catalog,
+            resident,
+            progress,
+            resident.database_audit,
+            owned_resources,
+            lambda session: _finish_database_audit(config, session),
+        )
     except BaseException as error:
         for close in reversed(owned_closers):
             try:
@@ -225,6 +267,13 @@ def build_runtime(
                     f"construction failed: {close_error!r}"
                 )
         raise
+
+
+def _finish_database_audit(config: IngestConfig, session: DatabaseAuditSession) -> None:
+    # All original pools, workers and CLI scratch resources are already closed.
+    # A fresh short-lived admin owns only this final durable acknowledgement.
+    with owned_resource(VNextDatabaseAdminFacade(config.core)) as admin:
+        admin.finish_ingest_runtime(session)
 
 
 def configure_logging(config: IngestConfig) -> None:

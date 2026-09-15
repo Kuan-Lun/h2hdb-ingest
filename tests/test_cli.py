@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -19,7 +20,8 @@ class _Resident:
         self.last_synchronization_result: object | None = None
         self.deferred_gallery_count = 0
 
-    def initialize(self) -> None:
+    def initialize(self, *, should_stop: Callable[[], bool] | None = None) -> None:
+        del should_stop
         self._events.append("initialize")
 
     def process_available(

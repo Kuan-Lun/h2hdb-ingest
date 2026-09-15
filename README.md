@@ -200,6 +200,8 @@ A minimal SQLite configuration with artifacts enabled is:
     }
   },
   "resident": {
+    "database_audit_minimum_interval_seconds": 604800,
+    "database_audit_duration_multiplier": 100,
     "publication_batch_galleries": 1000,
     "progress_log_interval_seconds": 60,
     "source_quiet_seconds": 300,
@@ -551,8 +553,44 @@ folders are retained without a conversion tool or manual rebuild.
 ## Run the service
 
 H2HDB core schema creation is a separate administrator action. Normal ingest
-startup checks that the database already has a READY schema epoch; it never
-creates or migrates the core schema.
+startup admits only an existing READY schema epoch; it never creates or migrates
+the core schema. Core owns a durable audit schedule and selects a quick marker
+check or a full structural and semantic audit. A first run, interrupted prior
+process, changed validators, database-clock rollback, or due schedule requires a
+full audit. A recent successful audit and clean previous shutdown permit quick
+startup; the scheduling record is not proof that later database contents are
+uncorrupted. Explicit administration `check` still performs a full audit.
+
+The full-audit interval is the larger of
+`database_audit_minimum_interval_seconds` (default 604800, seven days) and
+`database_audit_duration_multiplier` (default 100) times the measured full-audit
+duration. Core checks the schedule between bounded ingest sessions. Completing
+the initial catch-up, with no galleries deferred by the admission quota, delays
+the next due time once without changing the last successful audit time. Folders
+still awaiting download completion do not prevent this scheduling hint.
+
+Ingest renews a separate process audit lease while working. A competing startup
+waits for its owner to exit or expire, and SIGTERM can stop that wait. An already
+running synchronous full audit finishes before the process can honor a graceful
+stop; forced termination leaves the run unclean. Only a successful normal
+shutdown, after work and all owned resource cleanup, records clean closure.
+Exceptions, cleanup failures and SIGKILL leave the previous run unclean, so the
+next admitted process must audit again. INFO logs describe the selected check,
+reasons, measured duration and next scheduled audit. INFO remains the default log
+level.
+
+Python integrations must call `resident.initialize()` once before processing and use
+`build_runtime(config)` as a context manager. `initialize()` now returns
+`DatabaseAuditReport`: `full_audit` is absent for quick admission. Callers must not
+interpret a quick report as a full audit. When the application owns additional
+resources such as `DiskScratch`, transfer their `ExitStack` to
+`build_runtime(..., owned_resources=stack.pop_all())`. Runtime drains its ingest
+and catalog pools and the transferred resources while the audit lease continues
+to renew, then stops that heartbeat and closes its original admin pool before
+acknowledging clean shutdown. A failed construction also closes the transferred
+resources. Supplying `temporary_cleanup` without transferred `owned_resources`
+is rejected, so the old externally closed scratch pattern cannot acknowledge
+clean shutdown too early.
 
 Run one coordinated scan:
 
@@ -649,8 +687,11 @@ writes, byte/identity checks or fsync requirements.
 
 The journal remains format v4 and CBZ, storage-key and reader-fencing formats are
 unchanged. Existing libraries need no conversion or rebuild for this change.
-The supported core range includes 0.38: ingest still uses `check()` for a full
-startup audit and does not rely on `initialize()` returning an audit report.
+Scheduled startup audits require the matching core audit-scheduling schema and
+public API. Upgrade the core and ingest together; the one-time core schema
+conversion is an administrator operation. Ingest does not retain the previous
+unconditional `check()` startup path or initialize an old schema automatically.
+The library journal and existing CBZ files do not require conversion.
 
 The H2HDB reader head advances only after the library journal reaches `READY`.
 An interrupted rename, journal update, or marker update is replayed from exact

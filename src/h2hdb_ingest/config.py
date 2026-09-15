@@ -178,6 +178,12 @@ class IngestPathsConfig(ConfigModel):
 
 
 class ResidentConfig(ConfigModel):
+    database_audit_minimum_interval_seconds: StrictInt = Field(
+        default=604800, ge=1, le=((1 << 63) - 1) // 1_000_000
+    )
+    database_audit_duration_multiplier: StrictInt = Field(
+        default=100, ge=1, le=(1 << 63) - 1
+    )
     publication_batch_galleries: StrictInt = Field(default=1000, ge=1, le=1_000_000)
     progress_log_interval_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
     source_quiet_seconds: float = Field(default=300, gt=0, allow_inf_nan=False)

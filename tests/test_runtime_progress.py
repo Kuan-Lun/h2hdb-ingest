@@ -11,6 +11,7 @@ from typing import cast
 from zipfile import ZipFile
 
 import pytest
+from database_audit_fixtures import IsolatedDatabaseAudit
 from h2hdb import (
     ArtifactSourceMember,
     CoreConfig,
@@ -25,6 +26,7 @@ from PIL import Image
 
 import h2hdb_ingest.artifact as artifact_module
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
+from h2hdb_ingest.database_audit import IngestDatabaseAudit
 from h2hdb_ingest.filesystem import FilesystemCompletionMarker
 from h2hdb_ingest.maintenance import LibraryMaintenanceOutcome
 from h2hdb_ingest.progress import IngestProgress, ProgressWork
@@ -290,11 +292,12 @@ def _resident(
     admin: _Admin | None = None,
     maintenance: LibraryMaintenanceOutcome = LibraryMaintenanceOutcome.DONE,
 ) -> ResidentIngestor:
-    return ResidentIngestor(
+    selected_admin = admin or _Admin()
+    resident = ResidentIngestor(
         service=_FailingService(),
         source_probe=_empty_probe,
         facade=cast(VNextIngestFacade, facade or _Facade()),
-        database_admin=cast(VNextDatabaseAdminFacade, admin or _Admin()),
+        database_admin=cast(VNextDatabaseAdminFacade, selected_admin),
         library_storage_identity=None,
         library_maintenance=_Maintenance(maintenance),
         config=ResidentConfig(),
@@ -303,6 +306,15 @@ def _resident(
         event_logger=lambda _: None,
         progress=progress,
     )
+    resident._database_audit = cast(
+        IngestDatabaseAudit,
+        IsolatedDatabaseAudit(
+            cast(VNextDatabaseAdminFacade, selected_admin),
+            ResidentConfig(),
+            lambda _: None,
+        ),
+    )
+    return resident
 
 
 def test_resident_idle_polls_remain_silent_beyond_reporting_interval() -> None:
