@@ -26,6 +26,7 @@ import pytest
 from h2hdb import (
     CatalogRevisionNotFoundError,
     CoreConfig,
+    DatabaseAuditReason,
     DatabaseConfig,
     VNextCatalogFacade,
     VNextDatabaseAdminFacade,
@@ -104,7 +105,9 @@ def _config(core: CoreConfig, source: Path, library: Path) -> IngestConfig:
             library_path=library,
             page_render_workers=1,
         ),
-        resident=ResidentConfig(lease_seconds=30, heartbeat_seconds=5),
+        resident=ResidentConfig(
+            lease_seconds=2, heartbeat_seconds=0.2, poll_seconds=0.05
+        ),
     )
 
 
@@ -210,7 +213,8 @@ def _runtime_child(
             build_runtime(config) as runtime,
             _stop_on_termination() as stop,
         ):
-            runtime.resident.initialize()
+            audit = runtime.resident.initialize(should_stop=stop.is_set)
+            channel.send(("audit", audit.reason.value, audit.full_audit is not None))
             source_commit = VNextIngestFacade.commit_source_step
             publication_issue = VNextIngestFacade.issue_publication_step
             publication_commit = VNextIngestFacade.commit_publication_step
@@ -296,6 +300,7 @@ def _run_process(
     phase: _Phase | None = None,
     signal_name: str | None = None,
     clock_offset: int = 0,
+    expected_audit: DatabaseAuditReason = DatabaseAuditReason.FIRST_RUN,
 ) -> _Snapshot | None:
     processes = multiprocessing.get_context("spawn")
     parent, child = processes.Pipe(duplex=False)
@@ -308,6 +313,17 @@ def _run_process(
     try:
         assert parent.poll(15), "spawned runtime child did not report its core import"
         assert parent.recv() == ("import", h2hdb.__file__)
+        assert parent.poll(60), "runtime child did not report its startup audit"
+        message = parent.recv()
+        assert message == (
+            "audit",
+            expected_audit.value,
+            expected_audit
+            not in (
+                DatabaseAuditReason.RECENT_AUDIT,
+                DatabaseAuditReason.INITIAL_CATCHUP,
+            ),
+        ), message
         assert parent.poll(60), "runtime child did not report its bounded outcome"
         message = parent.recv()
         if phase is not None:
@@ -372,4 +388,15 @@ def test_fresh_runtime_recovers_committed_pipeline_after_process_stop(
             catalog.get_catalog_revision()
     finally:
         catalog.close()
-    assert _run_process(recovered, clock_offset=_RESTART_CLOCK_OFFSET_US) == expected
+    assert (
+        _run_process(
+            recovered,
+            clock_offset=_RESTART_CLOCK_OFFSET_US,
+            expected_audit=(
+                DatabaseAuditReason.PREVIOUS_INTERRUPTION
+                if signal_name == "SIGKILL"
+                else DatabaseAuditReason.INITIAL_CATCHUP
+            ),
+        )
+        == expected
+    )

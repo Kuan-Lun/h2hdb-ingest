@@ -258,6 +258,8 @@ def test_bounded_runtime_defaults() -> None:
     assert resident.max_rows == 128
     assert resident.publication_batch_galleries == 1000
     assert resident.progress_log_interval_seconds == 60
+    assert resident.database_audit_minimum_interval_seconds == 604800
+    assert resident.database_audit_duration_multiplier == 100
     config = IngestConfig(paths=IngestPathsConfig(download_path=Path("/download")))
     assert config.core.logger.level.name.upper() == "INFO"
 
@@ -426,3 +428,15 @@ def test_progress_log_interval_rejects_nonpositive_or_nonfinite(value: float) ->
 def test_heartbeat_must_be_shorter_than_lease() -> None:
     with pytest.raises(ValidationError, match="shorter than lease_seconds"):
         ResidentConfig(lease_seconds=10, heartbeat_seconds=10)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("database_audit_minimum_interval_seconds", "database_audit_duration_multiplier"),
+)
+@pytest.mark.parametrize("value", (0, -1, True, 1.5, "100", 1 << 63))
+def test_audit_policy_configuration_rejects_invalid_values(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        ResidentConfig.model_validate({field: value})

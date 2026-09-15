@@ -200,8 +200,12 @@ durable queues、token-fenced coordination、source checkpoints、
 analysis/deduplication policy、catalog repositories、artifact selection 與
 publication。只能依賴公開 vNext facade、protocol 與 domain receipt；不得
 import core repository、connector internals，或重建已移除的 `H2HDB`
-compatibility surface。startup 只能呼叫 `VNextDatabaseAdminFacade.check()`，
-不得初始化或 migrate core schema。
+compatibility surface。startup 使用 `VNextDatabaseAdminFacade` 的 managed audit
+session API，由 core 的持久化排程選擇 quick/full；不得初始化或 migrate core
+schema，也不得將 quick admission 宣稱為完整 audit。週期稽核僅在 bounded
+work sessions 之間執行。正常結束須等工作、facade 與暫存資源全部成功清理後
+才記錄 clean；例外或 SIGKILL 不得記錄。首次 catch-up 只在 deferred count 為零
+時提示一次，waiting incomplete folders 不阻擋，排程權威與完整稽核事實仍屬 core。
 
 Core 只能封存 neutral ordered source member、role、position、hash/size與
 adapter回傳的 opaque locator/evidence；不得擁有 CBZ/ZIP member name、

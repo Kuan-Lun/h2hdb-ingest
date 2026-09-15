@@ -5,12 +5,13 @@ from __future__ import annotations
 import argparse
 import signal
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from threading import Event
 from types import FrameType
 
 from ._diagnostic_logging import command_diagnostics
 from .config import load_config
+from .database_audit import IngestStartupStopped
 from .runtime import build_runtime, configure_logging
 from .scratch import DiskScratch
 
@@ -33,15 +34,23 @@ def main(argv: Sequence[str] | None = None) -> None:
             if config.paths.library_path is None
             else DiskScratch(config.paths.library_path)
         )
-        with scratch_context as scratch:
+        with ExitStack() as resources:
+            scratch = resources.enter_context(scratch_context)
             runtime_context = (
                 build_runtime(config)
                 if scratch is None
-                else build_runtime(config, temporary_cleanup=scratch.cleanup_page)
+                else build_runtime(
+                    config,
+                    temporary_cleanup=scratch.cleanup_page,
+                    owned_resources=resources.pop_all(),
+                )
             )
             with runtime_context as runtime:
                 with _stop_on_termination() as stop:
-                    runtime.resident.initialize()
+                    try:
+                        runtime.resident.initialize(should_stop=stop.is_set)
+                    except IngestStartupStopped:
+                        return
                     if arguments.once:
                         processed = runtime.resident.process_available(
                             periodic_scan=True,

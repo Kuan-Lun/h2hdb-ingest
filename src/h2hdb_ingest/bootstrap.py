@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
 from h2hdb import CatalogRevision, CatalogRevisionNotFoundError
@@ -50,11 +50,16 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if config.paths.library_path is None
             else DiskScratch(config.paths.library_path)
         )
-        with scratch_context as scratch:
+        with ExitStack() as resources:
+            scratch = resources.enter_context(scratch_context)
             runtime_context = (
                 build_runtime(config)
                 if scratch is None
-                else build_runtime(config, temporary_cleanup=scratch.cleanup_page)
+                else build_runtime(
+                    config,
+                    temporary_cleanup=scratch.cleanup_page,
+                    owned_resources=resources.pop_all(),
+                )
             )
             with runtime_context as runtime:
                 runtime.resident.initialize()

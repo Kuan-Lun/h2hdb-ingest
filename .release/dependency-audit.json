@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-14T14:59:45+00:00",
-  "manifest_sha256": "32ab9bcd28ec6818e96221e25d7bf53b6759e07c2ff606d7e6baad091f4a3862",
+  "checked_at": "2026-09-15T12:13:04+00:00",
+  "manifest_sha256": "e6610a46107e11cbea9baac3c3fc048cd3cd5fb45bcff8947b57a2be55b3dc45",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.24.3",
+  "project_version": "0.25.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,9 +30,9 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.38.2,<0.39.0",
+      "declared": "h2hdb>=0.39.0,<0.40.0",
       "group": "runtime",
-      "latest": "0.38.1",
+      "latest": "0.38.3",
       "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all 16 direct Python build/runtime/development entries and the Node tool against fresh registry latest candidates, including versions outside upper bounds. Third-party candidates match the reviewed 0.24.2 receipt. Registry core advanced to 0.38.1; reviewed source changes separate marker readiness from full check and seek bounded analysis decision layers, without changing the ingest check contract or data layout. This coordinated task requires supplied core 0.38.2 for readable INFO and complete source activity observations; that unpublished local wheel intentionally exceeds the current registry latest 0.38.1, and the <0.39.0 compatibility lane remains. Real SQLite/native rendering INFO and DEBUG subprocess tests passed against the supplied candidate sources. Live MariaDB lifecycle, Compose role-cohort acceptance and full gates are separate evidence and are not implied by this receipt.",
+    "note": "Reviewed all 16 Python and 1 Node direct dependencies. Registry latest versions are unchanged from the prior reviewed receipt except h2hdb (0.38.1 to 0.38.3); this coordinated release requires the new core 0.39 audit-session API and schema 7, so the validated local h2hdb 0.39.0 wheel (SHA256 b3756eb80768c60ae44290b92ad8deefde15a4311397f31eefb300e3e543fb0c) is used until the cohort is published. The >=0.39.0,<0.40.0 bound follows that compatibility lane and has no legacy startup fallback. All other resolved installed package versions were preserved, and uv pip check accepted all 44 installed packages. SQLite source/publication, clean restart, dirty exception recovery, SIGTERM/SIGKILL, audit/renewal serialization and INFO logging were exercised; bounded release and opt-in MariaDB results are reported separately, not implied by this receipt.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"

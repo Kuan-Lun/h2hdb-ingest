@@ -14,7 +14,7 @@ import os
 import struct
 import sys
 import zlib
-from contextlib import closing
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from hashlib import sha256
 from importlib.metadata import distribution, version
@@ -267,10 +267,13 @@ def _run_pipeline(*, with_opds: bool) -> None:
             ),
         )
         configure_logging(config)
-        with DiskScratch(library) as scratch:
+        with ExitStack() as resources:
+            scratch = resources.enter_context(DiskScratch(library))
             assert scratch.path.is_relative_to(library / ".h2hdb-state")
             with build_runtime(
-                config, temporary_cleanup=scratch.cleanup_page
+                config,
+                temporary_cleanup=scratch.cleanup_page,
+                owned_resources=resources.pop_all(),
             ) as runtime:
                 runtime.database_admin.initialize()
                 runtime.resident.initialize()
@@ -281,10 +284,14 @@ def _run_pipeline(*, with_opds: bool) -> None:
                 )
                 if with_opds:
                     asyncio.run(_opds_probe(config.core, library, published))
-            # Re-open the real database and library before source repair. Rejection
-            # must survive process-style runtime replacement without losing good CBZs.
+        # Re-open the real database, library and scratch before source repair.
+        # Rejection must survive process replacement without losing good CBZs.
+        with ExitStack() as resources:
+            scratch = resources.enter_context(DiskScratch(library))
             with build_runtime(
-                config, temporary_cleanup=scratch.cleanup_page
+                config,
+                temporary_cleanup=scratch.cleanup_page,
+                owned_resources=resources.pop_all(),
             ) as runtime:
                 runtime.resident.initialize()
                 assert runtime.resident.process_available(periodic_scan=True)
@@ -320,7 +327,7 @@ def _run_pipeline(*, with_opds: bool) -> None:
                 assert final_revision > first_revision
                 if with_opds:
                     asyncio.run(_opds_probe(config.core, library, published))
-            assert tuple(scratch.path.iterdir()) == ()
+                assert tuple(scratch.path.iterdir()) == ()
         log_lines = log_path.read_text(encoding="utf-8").splitlines()
         info_lines = [line for line in log_lines if "[INFO]" in line]
         assert info_lines, "real INFO progress must remain visible"

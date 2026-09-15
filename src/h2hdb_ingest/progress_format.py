@@ -8,7 +8,7 @@ if TYPE_CHECKING:
     from .progress import ProgressSnapshot
 
 _PHASE_LABELS = {
-    "startup_check": "Validating the database and library at startup",
+    "startup_check": "Checking the database and library at startup",
     "coordination": "Checking for pending ingest work",
     "maintenance": "Cleaning up resources from previous work",
     "waiting_for_work": "Waiting to continue pending ingest work",
@@ -21,7 +21,8 @@ _PHASE_LABELS = {
 }
 
 _OPERATION_LABELS = {
-    "database_check": "Validating database consistency at startup",
+    "database_audit_schedule": "Checking whether a full database audit is due",
+    "database_check": "Checking database startup admission and audit requirements",
     "check_pending_work": "Checking cleanup and pending ingest work",
     "complete_ingest_session": "Releasing the completed batch's ingest lease",
     "initialize_storage": "Initializing the library storage",

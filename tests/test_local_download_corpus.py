@@ -310,7 +310,7 @@ def test_private_corpus_completes_mariadb_resident_cycle_and_restart_replay(
         initialized = runtime.database_admin.initialize()
         checked = runtime.resident.initialize()
 
-        assert initialized.epoch == checked.epoch
+        assert initialized.epoch == checked.readiness.epoch
         assert runtime.resident.process_available(periodic_scan=True)
         first_revision = runtime.catalog.get_catalog_revision()
         first_publications = _discover_all_publications(
