@@ -95,7 +95,9 @@ def test_live_mariadb_restart_replays_uuid_after_process_loss(
             library_path=library_root,
             page_render_workers=1,
         ),
-        resident=ResidentConfig(lease_seconds=30, heartbeat_seconds=5),
+        resident=ResidentConfig(
+            lease_seconds=2, heartbeat_seconds=0.2, poll_seconds=0.05
+        ),
     )
     VNextDatabaseAdminFacade(mariadb_config).initialize()
 
