@@ -106,7 +106,13 @@ def _config(core: CoreConfig, source: Path, library: Path) -> IngestConfig:
             page_render_workers=1,
         ),
         resident=ResidentConfig(
-            lease_seconds=2, heartbeat_seconds=0.2, poll_seconds=0.05
+            # This fixture verifies process recovery, not a two-second deadline.
+            # The 120-second restart clock offset expires the predecessor; use
+            # the same 30-second lease as other runtime E2E cases so ordinary
+            # process scheduling cannot consume the entire renewal window.
+            lease_seconds=30,
+            heartbeat_seconds=0.2,
+            poll_seconds=0.05,
         ),
     )
 
