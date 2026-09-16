@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-15T12:13:04+00:00",
-  "manifest_sha256": "e6610a46107e11cbea9baac3c3fc048cd3cd5fb45bcff8947b57a2be55b3dc45",
+  "checked_at": "2026-09-16T08:09:22+00:00",
+  "manifest_sha256": "a7c49fa77544d6a0e0f32a3b9fefcb4e0ac5734d50f101184d3da6d59b489d67",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.25.0",
+  "project_version": "0.25.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,9 +30,9 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.39.0,<0.40.0",
+      "declared": "h2hdb>=0.39.2,<0.40.0",
       "group": "runtime",
-      "latest": "0.38.3",
+      "latest": "0.39.1",
       "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all 16 Python and 1 Node direct dependencies. Registry latest versions are unchanged from the prior reviewed receipt except h2hdb (0.38.1 to 0.38.3); this coordinated release requires the new core 0.39 audit-session API and schema 7, so the validated local h2hdb 0.39.0 wheel (SHA256 b3756eb80768c60ae44290b92ad8deefde15a4311397f31eefb300e3e543fb0c) is used until the cohort is published. The >=0.39.0,<0.40.0 bound follows that compatibility lane and has no legacy startup fallback. All other resolved installed package versions were preserved, and uv pip check accepted all 44 installed packages. SQLite source/publication, clean restart, dirty exception recovery, SIGTERM/SIGKILL, audit/renewal serialization and INFO logging were exercised; bounded release and opt-in MariaDB results are reported separately, not implied by this receipt.",
+    "note": "Reviewed all 16 Python and 1 Node direct dependency declarations against the registry. Every non-Core latest version is unchanged from the prior reviewed receipt, within its compatibility bound and compatible with Python 3.14. Core registry latest is 0.39.1; it does not satisfy the new >=0.39.2,<0.40.0 requirement. This coordinated release requires the Core lease admission/renewal fix: the explicit local h2hdb 0.39.2 wheel (SHA256 ef43c2a960eb8b003b9188a4a3c23341d574d92a51c2e478e7e88a4aa2813405) was installed, every installed Python source was compared with the wheel, and targeted session/service tests and strict checks passed. Core 0.39.2 must be published before this Ingest release can resolve from the registry. No compatibility shim or fallback accepts an older Core. Other installed direct versions were preserved; uv pip check accepted all 44 packages and npm ls passed. Full release gate, opt-in MariaDB and deployment Compose results are separate evidence, not implied by this dependency receipt.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
