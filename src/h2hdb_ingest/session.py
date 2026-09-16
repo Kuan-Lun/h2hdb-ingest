@@ -4,10 +4,13 @@ from __future__ import annotations
 
 __all__ = ["IngestLeaseHeartbeat", "IngestSessionController"]
 
+import logging
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
+from datetime import UTC, datetime
 from threading import Event, Lock, Thread
-from time import monotonic
+from time import monotonic, time_ns
 from types import TracebackType
 
 from h2hdb import (
@@ -15,6 +18,8 @@ from h2hdb import (
     VNextIngestFacade,
     VNextIngestSession,
 )
+
+logger = logging.getLogger(__name__)
 
 SQLITE_RENEW_RETRY_SECONDS = 0.1
 
@@ -44,6 +49,7 @@ class IngestSessionController:
         self._database_type = database_type.casefold()
         self._lock = Lock()
         self._failure: BaseException | None = None
+        self._last_renewed_at: int | None = None
 
     def call[ResultT](
         self,
@@ -72,38 +78,88 @@ class IngestSessionController:
         self.raise_if_failed()
         return result
 
-    def renew(self, *, stop: Event | None = None) -> VNextIngestSession:
-        """Renew atomically, with a bounded SQLite busy retry window."""
+    @contextmanager
+    def prepare[ResultT](
+        self,
+        operation: Callable[[VNextIngestFacade], AbstractContextManager[ResultT]],
+    ) -> Iterator[ResultT]:
+        """Own prepared resources before propagating a concurrent lease failure."""
 
+        if not callable(operation):
+            raise TypeError("preparation operation must be callable")
         with self._lock:
             self._raise_if_failed_locked()
-            deadline = monotonic() + max(
-                0.1,
-                self._lease_duration_microseconds / 1_000_000 - 0.5,
-            )
-            while True:
+            facade = self._facade
+        with operation(facade) as prepared:
+            self.raise_if_failed()
+            yield prepared
+
+    def renew(self, *, stop: Event | None = None) -> VNextIngestSession:
+        """Renew the exact receipt, fencing failures before another call can start."""
+
+        requested_at = time_ns() // 1000
+        requested = monotonic()
+        diagnostic: str | None = None
+        try:
+            with self._lock:
+                self._raise_if_failed_locked()
+                started = monotonic()
                 try:
-                    renewed = self._facade.renew_ingest(
-                        self._session,
-                        self._lease_duration_microseconds,
-                    )
+                    renewed = self._renew_locked(stop=stop)
+                except _HeartbeatStopped:
+                    raise
                 except BaseException as error:
-                    if (
-                        self._database_type != "sqlite"
-                        or not _is_sqlite_lock_error(error)
-                        or monotonic() >= deadline
-                    ):
-                        raise
-                    if stop is not None and stop.wait(
-                        min(
-                            SQLITE_RENEW_RETRY_SECONDS,
-                            max(0.0, deadline - monotonic()),
+                    diagnostic = self._fail_locked(error)
+                    if diagnostic is not None:
+                        diagnostic += (
+                            f" Renewal requested at {_format_timestamp(requested_at)};"
+                            f" waited {started - requested:.3f}s for the session lock;"
+                            f" renewal attempt took {monotonic() - started:.3f}s."
                         )
-                    ):
-                        raise _HeartbeatStopped from None
-                    continue
-                self._session = renewed
+                    raise
+                self._last_renewed_at = time_ns() // 1000
                 return renewed
+        except BaseException as error:
+            if diagnostic is not None:
+                _log_failure(diagnostic, error)
+            raise
+
+    def _renew_locked(self, *, stop: Event | None) -> VNextIngestSession:
+        remaining_seconds = (
+            min(
+                self._session.gate_lease_expires_at,
+                self._session.ingest_lease_expires_at,
+            )
+            - time_ns() // 1000
+        ) / 1_000_000
+        deadline = monotonic() + max(
+            0.0,
+            min(self._lease_duration_microseconds / 1_000_000, remaining_seconds) - 0.5,
+        )
+        interrupt = stop if stop is not None else Event()
+        while True:
+            try:
+                renewed = self._facade.renew_ingest(
+                    self._session,
+                    self._lease_duration_microseconds,
+                )
+            except BaseException as error:
+                if (
+                    self._database_type != "sqlite"
+                    or not _is_sqlite_lock_error(error)
+                    or monotonic() >= deadline
+                ):
+                    raise
+                if interrupt.wait(
+                    min(
+                        SQLITE_RENEW_RETRY_SECONDS,
+                        max(0.0, deadline - monotonic()),
+                    )
+                ):
+                    raise _HeartbeatStopped from None
+                continue
+            self._session = renewed
+            return renewed
 
     def complete(self) -> VNextIngestCompletionReceipt:
         """Complete using the latest receipt after the heartbeat has stopped."""
@@ -114,8 +170,22 @@ class IngestSessionController:
 
     def fail(self, error: BaseException) -> None:
         with self._lock:
-            if self._failure is None:
-                self._failure = error
+            diagnostic = self._fail_locked(error)
+        if diagnostic is not None:
+            _log_failure(diagnostic, error)
+
+    def _fail_locked(self, error: BaseException) -> str | None:
+        if self._failure is not None:
+            return None
+        self._failure = error
+        return (
+            "Lease renewal failed; ingest will stop at the next safe checkpoint. "
+            f"Last successful renewal: {_format_timestamp(self._last_renewed_at)}; "
+            "current receipt: "
+            f"gate lease valid until {_format_timestamp(self._session.gate_lease_expires_at)}, "
+            f"ingest lease valid until {_format_timestamp(self._session.ingest_lease_expires_at)}. "
+            f"Cause: {type(error).__name__}: {error}."
+        )
 
     def raise_if_failed(self) -> None:
         with self._lock:
@@ -149,6 +219,9 @@ class IngestLeaseHeartbeat:
         )
 
     def __enter__(self) -> IngestLeaseHeartbeat:
+        # The claim may have spent most of its remaining lease reaching us.
+        # A failed renewal is fatal; an expired receipt is never re-claimed here.
+        self.renew_now()
         self._thread.start()
         return self
 
@@ -201,3 +274,18 @@ def _is_sqlite_lock_error(error: BaseException) -> bool:
                 return True
         current = current.__cause__ or current.__context__
     return False
+
+
+def _format_timestamp(microseconds: int | None) -> str:
+    if microseconds is None:
+        return "none"
+    try:
+        return datetime.fromtimestamp(microseconds / 1_000_000, tz=UTC).isoformat()
+    except OverflowError, OSError, ValueError:
+        return f"{microseconds} microseconds since Unix epoch"
+
+
+def _log_failure(diagnostic: str, error: BaseException) -> None:
+    # No receipt or owner token is logged. Logging runs outside the receipt lock,
+    # after the failure is already authoritative for every caller.
+    logger.error("%s", diagnostic, exc_info=(type(error), error, error.__traceback__))

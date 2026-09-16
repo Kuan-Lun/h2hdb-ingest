@@ -25,6 +25,7 @@ from h2hdb import (
 
 import h2hdb_ingest.service as service_module
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, build_ingest_policy
+from h2hdb_ingest.filesystem import FilesystemSource, FilesystemStat
 from h2hdb_ingest.metrics import IngestMetric
 from h2hdb_ingest.service import (
     VNextIngestService,
@@ -1043,9 +1044,11 @@ def test_complete_service_recovers_before_source_and_guards_publication(
     ]
 
 
+@pytest.mark.parametrize("heartbeat_failure", (False, True))
 def test_complete_service_stop_during_source_preparation_closes_without_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    heartbeat_failure: bool,
 ) -> None:
     events: list[object] = []
     stopping = False
@@ -1104,11 +1107,15 @@ def test_complete_service_stop_during_source_preparation_closes_without_success(
         **kwargs: object,
     ) -> VNextIngestSourceReceipt:
         nonlocal stopping
-        del session, kwargs
+        del kwargs
+        assert isinstance(session, IngestSessionController)
         assert selected is resolved
         assert isinstance(adapter, _Source)
         events.append("source-prepare-start")
-        stopping = True
+        if heartbeat_failure:
+            session.fail(RuntimeError("renewal was rejected"))
+        else:
+            stopping = True
         adapter.checkpoint()
         raise AssertionError("stop checkpoint returned")
 
@@ -1139,8 +1146,11 @@ def test_complete_service_stop_during_source_preparation_closes_without_success(
         publication_guard=activation.publication_guard,
     )
 
-    with pytest.raises(_IngestStopRequested):
+    expected = RuntimeError if heartbeat_failure else _IngestStopRequested
+    with pytest.raises(expected) as failure:
         service.synchronize_once(controller, should_stop=lambda: stopping)
+    if heartbeat_failure:
+        assert "heartbeat failed" in str(failure.value)
 
     assert events == [
         "ensure-policy",
@@ -1230,3 +1240,146 @@ def test_service_does_not_construct_source_after_recovery_error(
         "recovery-issued",
         "recovery-adapter-failed",
     ]
+
+
+@pytest.mark.parametrize("phase", ("source", "analysis", "publication", "recovery"))
+def test_prepared_resources_close_when_heartbeat_fails_before_return(
+    phase: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    facade: _Facade | _AnalysisFacade | _PublicationFacade
+    if phase == "source":
+        facade = _Facade(events)
+        method = "prepare_source"
+    elif phase == "analysis":
+        facade = _AnalysisFacade(events)
+        method = "prepare_analysis"
+    else:
+        facade = _PublicationFacade(events)
+        method = "prepare_publication_step"
+    controller = IngestSessionController(
+        cast(VNextIngestFacade, facade),
+        _session(),
+        lease_duration_microseconds=10_000_000,
+        database_type="sqlite",
+    )
+    original = getattr(facade, method)
+
+    def failed_preparation(*args: object, **kwargs: object) -> object:
+        prepared = original(*args, **kwargs)
+        controller.fail(RuntimeError("renewal failed just before preparation returned"))
+        return prepared
+
+    monkeypatch.setattr(facade, method, failed_preparation)
+    policy = cast(VNextResolvedIngestPolicy, object())
+    with pytest.raises(RuntimeError, match="heartbeat failed"):
+        if phase == "source":
+            synchronize_source(
+                controller, policy, cast(VNextIngestSourceAdapter, object())
+            )
+        elif phase == "analysis":
+            synchronize_analysis(
+                controller,
+                policy,
+                VNextIngestSourceReceipt(b"b" * 16, 3, 3, True, False),
+                max_rows=64,
+            )
+        elif phase == "publication":
+            synchronize_publication(
+                controller,
+                policy,
+                artifact_adapters={},
+                finalization_adapters={},
+                library_activation=_LibraryActivation(),
+            )
+        else:
+            service_module.synchronize_pending_publication(
+                controller,
+                artifact_adapters={},
+                finalization_adapters={},
+                library_activation=_LibraryActivation(),
+            )
+    close = {"source": "close", "analysis": "analysis-close"}.get(
+        phase, ("publication-close", 0)
+    )
+    assert events[-1] == close
+    assert not any("commit" in str(event) for event in events)
+
+
+def test_heartbeat_failure_interrupts_real_filesystem_inventory_and_closes_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for index in range(2):
+        gallery = tmp_path / str(index)
+        gallery.mkdir()
+        (gallery / "galleryinfo.txt").write_text("fixture")
+    events: list[object] = []
+    activation = _LibraryActivation()
+    policy = build_ingest_policy(
+        IngestConfig(paths=IngestPathsConfig(download_path=tmp_path))
+    )
+
+    class _PolicyFacade(_PublicationFacade):
+        def __init__(self) -> None:
+            super().__init__(events, recovery_stops_after=0)
+
+        def ensure_policy(
+            self, receipt: VNextIngestSession, natural: object
+        ) -> VNextResolvedIngestPolicy:
+            del receipt, natural
+            return cast(VNextResolvedIngestPolicy, object())
+
+        def prepare_source(
+            self, adapter: VNextIngestSourceAdapter, **kwargs: object
+        ) -> object:
+            del kwargs
+            adapter.list_gallery_locators(after_locator=None, limit=128)
+            pytest.fail("inventory finished after heartbeat failure")
+
+    controller = IngestSessionController(
+        cast(VNextIngestFacade, _PolicyFacade()),
+        _session(),
+        lease_duration_microseconds=10_000_000,
+        database_type="sqlite",
+    )
+    original_stat = FilesystemSource._directory_stat
+    original_close = FilesystemSource.close
+    visited: list[Path] = []
+    closed: list[FilesystemSource] = []
+
+    def observe_directory(directory: Path) -> FilesystemStat:
+        observed = original_stat(directory)
+        if directory != tmp_path:
+            visited.append(directory)
+            controller.fail(
+                RuntimeError("lease renewal failed while reading directory")
+            )
+        return observed
+
+    def close(self: FilesystemSource) -> None:
+        original_close(self)
+        closed.append(self)
+
+    monkeypatch.setattr(
+        FilesystemSource, "_directory_stat", staticmethod(observe_directory)
+    )
+    monkeypatch.setattr(FilesystemSource, "close", close)
+    service = VNextIngestService(
+        source_root=tmp_path,
+        policy=policy,
+        max_rows=128,
+        publication_batch_galleries=2,
+        artifact_adapters={},
+        finalization_adapters={},
+        library_activation=activation,
+        publication_guard=activation.publication_guard,
+    )
+    with pytest.raises(RuntimeError, match="heartbeat failed"):
+        service.synchronize_once(controller)
+    assert len(visited) == 1
+    assert len(closed) == 1
+    assert closed[0]._discovery_connection is None
+    assert closed[0]._discovery_temporary is None
+    assert events == [("recovery-empty", 0, 10_000_000)]

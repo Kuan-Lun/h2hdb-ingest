@@ -257,6 +257,12 @@ class _Facade:
             consumed_at=None,
         )
 
+    def renew_ingest(
+        self, session: VNextIngestSession, lease_duration_microseconds: int
+    ) -> VNextIngestSession:
+        del lease_duration_microseconds
+        return session
+
 
 class _Maintenance:
     def __init__(self, outcome: LibraryMaintenanceOutcome) -> None:

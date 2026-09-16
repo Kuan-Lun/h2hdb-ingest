@@ -204,7 +204,11 @@ class VNextIngestService:
 
         if not isinstance(session, IngestSessionController):
             raise TypeError("session must be IngestSessionController")
-        stop_requested = should_stop or _never_stop
+
+        def stop_requested() -> bool:
+            session.raise_if_failed()
+            return should_stop is not None and should_stop()
+
         work = None if self._progress is None else self._progress.current()
         if work is not None:
             work.set_counter(
@@ -323,21 +327,20 @@ def synchronize_pending_publication(
             return None
         if progress is not None:
             progress.operation(f"recovery_{issued.operation}_prepare")
-        prepared = session.outside_session(
+        with session.prepare(
             lambda facade: facade.prepare_publication_step(
                 issued,  # noqa: B023
                 artifact_adapters=artifact_adapters,
                 finalization_adapters=finalization_adapters,
                 library_activation=library_activation,
             )
-        )
-        with prepared:
+        ) as prepared:
             if progress is not None:
                 progress.operation(f"recovery_{issued.operation}_commit")
             result = session.call(
                 lambda facade, receipt: facade.commit_publication_step(
                     receipt,
-                    prepared,  # noqa: B023
+                    prepared,
                 )
             )
         _require_publication_result(result)
@@ -377,14 +380,13 @@ def synchronize_analysis(
 
     if progress is not None:
         progress.operation("analysis_prepare")
-    prepared = session.outside_session(
+    with session.prepare(
         lambda facade: facade.prepare_analysis(
             source_receipt.build_id,
             policy,
             max_rows=max_rows,
         )
-    )
-    with prepared:
+    ) as prepared:
         while True:
             _raise_if_stopping(should_stop)
             if progress is not None:
@@ -480,16 +482,15 @@ def synchronize_publication(
         prepare_started_ns = monotonic_ns()
         if progress is not None:
             progress.operation(f"publication_{operation}_prepare")
-        prepared = session.outside_session(
+        with session.prepare(
             lambda facade: facade.prepare_publication_step(
                 issued,  # noqa: B023
                 artifact_adapters=artifact_adapters,
                 finalization_adapters=finalization_adapters,
                 library_activation=library_activation,
             )
-        )
-        aggregate.prepare_ns += monotonic_ns() - prepare_started_ns
-        with prepared:
+        ) as prepared:
+            aggregate.prepare_ns += monotonic_ns() - prepare_started_ns
             # call invokes its callback before prepared can be reassigned.
             commit_started_ns = monotonic_ns()
             if progress is not None:
@@ -497,7 +498,7 @@ def synchronize_publication(
             result = session.call(
                 lambda facade, receipt: facade.commit_publication_step(
                     receipt,
-                    prepared,  # noqa: B023
+                    prepared,
                 )
             )
             aggregate.commit_ns += monotonic_ns() - commit_started_ns
@@ -546,19 +547,18 @@ def synchronize_source(
             unit="galleries",
         )
 
-    prepared = session.outside_session(
+    with session.prepare(
         lambda facade: facade.prepare_source(
             adapter,
             policy=policy,
             max_new_galleries=max_new_galleries,
             progress=observe if progress is not None else None,
         )
-    )
-    if progress is not None:
-        progress.set_counter("batch_selected_galleries", prepared.gallery_count)
-        progress.set_counter("deferred_galleries", prepared.deferred_gallery_count)
-        progress.set_counter("waiting_galleries", prepared.waiting_gallery_count)
-    with prepared:
+    ) as prepared:
+        if progress is not None:
+            progress.set_counter("batch_selected_galleries", prepared.gallery_count)
+            progress.set_counter("deferred_galleries", prepared.deferred_gallery_count)
+            progress.set_counter("waiting_galleries", prepared.waiting_gallery_count)
         while True:
             _raise_if_stopping(should_stop)
             if progress is not None:
