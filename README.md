@@ -56,6 +56,32 @@ precise rejection reason, then retries qualification when the source marker or
 artifact policy changes. Only qualified galleries participate in analysis.
 Metadata-only operation does not decode images.
 
+For an offline source-I/O investigation, run the synthetic probe with a new
+report path (existing files and symlinks are rejected):
+
+```bash
+.venv/bin/python scripts/probe-source-io.py --output /tmp/source-io-1.json
+.venv/bin/python scripts/probe-source-io.py --workers 2 --output /tmp/source-io-2.json
+```
+
+The fixed-seed default is two galleries with two 32-by-32 uncompressed PNGs each.
+A real SQLite/CBZ publication establishes the baseline; prepare-only comparisons
+then use its durable marker cache unchanged, with only the render policy changed,
+and with one gallery's page/completion marker changed. No private corpus or live
+service is accessed. The child has a 120-second timeout (configurable up to 300),
+and the parent owns scratch cleanup, including timeout/error paths. The report
+is published atomically and records failures with a nonzero exit status.
+
+Source bytes count actual `os.read` calls, partitioned between qualification,
+snapshot capture and other observation. Buffer counters measure observed Python
+stream boundaries, including memory spools; they are not physical-disk or complete
+native-decoder I/O, and must not be added to source bytes. SQLite and core plan I/O,
+rendering after preparation, and the snapshot-verification oracle are excluded.
+Native codecs can reread their private buffers. Nested operation durations and
+concurrent decode sums overlap; tests check bytes, reuse, qualification and
+publication integrity rather than wall-time thresholds. Package source digests,
+distribution versions and checkout version expose environment differences.
+
 The canonical CBZ contains only:
 
 ```text
