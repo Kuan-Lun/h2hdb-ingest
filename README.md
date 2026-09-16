@@ -61,10 +61,20 @@ report path (existing files and symlinks are rejected):
 
 ```bash
 .venv/bin/python scripts/probe-source-io.py --output /tmp/source-io-1.json
-.venv/bin/python scripts/probe-source-io.py --workers 2 --output /tmp/source-io-2.json
+.venv/bin/python scripts/probe-source-io.py --codec jpeg --edge 2048 \
+  --galleries 1 --pages 4 --workers 4 --timeout 300 --output /tmp/source-io-2.json
 ```
 
-The fixed-seed default is two galleries with two 32-by-32 uncompressed PNGs each.
+The fixed-seed default is two galleries with two 256-by-256 uncompressed PNGs each.
+`--codec png|jpeg` selects PNG compression level 0 or JPEG quality 95 with no
+subsampling. `--edge` accepts 16 through 2048; 256, 1024 and 2048 exercise increasing
+decode work, and both 2048 fixtures exceed the 4 MiB qualification-spool threshold.
+The aggregate fixture is capped at 33,554,432 pixels and 128 MiB of encoded PAGE
+bytes. Compare the same shape with `--workers 1` and `--workers 4`, repeating each
+at least twice. Four pages in one gallery allow four qualification workers to run;
+the changed-source case then affects the only gallery. The two-gallery correctness
+tests independently verify partial reuse.
+
 A real SQLite/CBZ publication establishes the baseline; prepare-only comparisons
 then use its durable marker cache unchanged, with only the render policy changed,
 and with one gallery's page/completion marker changed. No private corpus or live
@@ -72,13 +82,31 @@ service is accessed. The child has a 120-second timeout (configurable up to 300)
 and the parent owns scratch cleanup, including timeout/error paths. The report
 is published atomically and records failures with a nonzero exit status.
 
-Source bytes count actual `os.read` calls, partitioned between qualification,
-snapshot capture and other observation. Buffer counters measure observed Python
+Report `format_version` is now 2. Its `fixture.codec` is the machine-readable
+`png` or `jpeg`; `fixture.encoding` describes the encoder settings. The report adds
+aggregate budgets, encoded page sizes, spool counts and `process_cpu_seconds`.
+This changes only the development report format, not runtime APIs or stored data.
+Keep existing version-1 reports as historical evidence; do not delete them or
+convert runtime data. Their missing CPU and spool measurements cannot be recovered
+from the old fields. Run the synthetic probe again only when those new measurements
+are needed; renaming old fields would not recreate the missing observations.
+
+Source bytes count `os.read` results, partitioned between qualification,
+snapshot capture and other observation. Cache hits still count as source reads;
+fresh local fixtures and baseline publication do not represent cold NAS access.
+Buffer counters measure observed Python
 stream boundaries, including memory spools; they are not physical-disk or complete
-native-decoder I/O, and must not be added to source bytes. SQLite and core plan I/O,
-rendering after preparation, and the snapshot-verification oracle are excluded.
+native-decoder I/O, and must not be added to source bytes. I/O counters exclude
+SQLite and core plan I/O, whose work remains inside the preparation wall time.
+Rendering after preparation, the snapshot-verification oracle and prepared-resource
+teardown are outside the measured preparation interval.
+`qualification_disk_spools` counts rolled spools when `_spool` returns, before
+decoding; it does not account for every native or scratch disk operation.
 Native codecs can reread their private buffers. Nested operation durations and
-concurrent decode sums overlap; tests check bytes, reuse, qualification and
+concurrent decode sums overlap and are not wall time. `process_cpu_seconds` uses
+the process CPU clock across all process threads, including native decoders;
+compare it with `elapsed_seconds` without adding concurrent decode durations.
+Tests check bytes, reuse, qualification and
 publication integrity rather than wall-time thresholds. Package source digests,
 distribution versions and checkout version expose environment differences.
 

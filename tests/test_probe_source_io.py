@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from PIL import Image
 
 from h2hdb_ingest.filesystem import (
     FilesystemArtifactSourceRole,
@@ -30,9 +31,10 @@ def _io(case: dict[str, Any], category: str, counter: str) -> int:
     return result
 
 
-@pytest.mark.parametrize("workers", (1, 2))
+@pytest.mark.parametrize("workers", (1, 4))
+@pytest.mark.parametrize("codec", ("png", "jpeg"))
 def test_real_source_matrix_measures_reuse_and_independent_invalidation(
-    tmp_path: Path, workers: int
+    tmp_path: Path, workers: int, codec: str
 ) -> None:
     report_path = tmp_path / "report.json"
     subprocess.run(
@@ -44,7 +46,9 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
             "--pages",
             "2",
             "--edge",
-            "32",
+            "256",
+            "--codec",
+            codec,
             "--workers",
             str(workers),
             "--timeout",
@@ -59,7 +63,9 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
     )
     report = json.loads(report_path.read_text())
     assert report["status"] == "ok"
+    assert report["format_version"] == 2
     assert report["fixture"]["workers"] == workers
+    assert report["fixture"]["codec"] == codec
     assert report["provenance"]["h2hdb"]["python_source_sha256"]
     assert report["provenance"]["checkout_project_version"]
     cases = report["cases"]
@@ -73,6 +79,8 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
     page_bytes = baseline["source_manifest"]["page_bytes"]
 
     for case in cases.values():
+        assert case["process_cpu_seconds"] >= 0
+        assert case["elapsed_seconds"] >= 0
         assert case["galleries"] == 2
         assert case["waiting"] == case["deferred"] == 0
         # File and phase summaries are alternate views of the same raw reads.
@@ -91,7 +99,7 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
             sum(
                 item["read_bytes"]
                 for name, item in case["source_files"].items()
-                if name.endswith(".png")
+                if name.endswith(f".{codec}")
             )
             >= page_bytes
         )
@@ -107,10 +115,12 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
     read_pages = {
         name: item["read_bytes"]
         for name, item in changed["source_files"].items()
-        if name.endswith(".png")
+        if name.endswith(f".{codec}")
     }
-    assert set(read_pages) == {"1000000/000.png", "1000000/001.png"}
-    assert sum(read_pages.values()) >= page_bytes // 2
+    assert set(read_pages) == {f"1000000/000.{codec}", f"1000000/001.{codec}"}
+    assert sum(read_pages.values()) >= sum(
+        changed["source_manifest"]["page_encoded_bytes"][:2]
+    )
     assert unchanged["captured_pages_verified"] == 0
     assert policy["captured_pages_verified"] == 4
     assert changed["captured_pages_verified"] == 2
@@ -157,7 +167,7 @@ def test_meter_calibrates_actual_reads_and_separate_buffer_boundary(
     (
         ("--galleries", "0"),
         ("--pages", "9"),
-        ("--edge", "257"),
+        ("--edge", "2049"),
         ("--workers", "5"),
         ("--timeout", "301"),
     ),
@@ -176,6 +186,63 @@ def test_cli_rejects_out_of_bounds_work_without_writing_report(
     assert result.returncode == 2
     assert "must be in" in result.stderr
     assert not output.exists()
+
+
+def test_cli_rejects_aggregate_pixels_before_launching_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = runpy.run_path(str(_SCRIPT))
+    output = tmp_path / "result.json"
+
+    def forbidden_child(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("oversized fixture must be rejected before work")
+
+    monkeypatch.setattr(subprocess, "run", forbidden_child)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(_SCRIPT),
+            "--galleries",
+            "4",
+            "--pages",
+            "8",
+            "--edge",
+            "2048",
+            "--output",
+            str(output),
+        ],
+    )
+    with pytest.raises(SystemExit) as caught:
+        module["main"]()
+    assert caught.value.code == 2
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("codec", ("png", "jpeg"))
+def test_fixture_is_deterministic_and_crosses_disk_spool_boundary(
+    tmp_path: Path, codec: str
+) -> None:
+    module = runpy.run_path(str(_SCRIPT))
+    first, second = tmp_path / "first", tmp_path / "second"
+    for root in (first, second):
+        module["_fixture"](root, 1, 1, 2048, codec)
+    manifest = module["_manifest"](first)
+    assert manifest == module["_manifest"](second)
+    assert manifest["pages_above_spool_threshold"] == 1
+    assert manifest["page_bytes"] < module["_MAX_FIXTURE_ENCODED_BYTES"]
+    with Image.open(first / "1000000" / f"000.{codec}") as image:
+        assert image.size == (2048, 2048)
+        assert image.format == codec.upper()
+
+
+def test_fixture_enforces_encoded_byte_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = runpy.run_path(str(_SCRIPT))
+    monkeypatch.setitem(module["_fixture"].__globals__, "_MAX_FIXTURE_ENCODED_BYTES", 1)
+    with pytest.raises(ValueError, match="aggregate fixture encoded bytes"):
+        module["_fixture"](tmp_path, 1, 1, 16, "png")
 
 
 def test_real_source_change_still_fails_closed_and_restores_instrumentation(

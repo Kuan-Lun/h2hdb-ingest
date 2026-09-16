@@ -1,4 +1,4 @@
-"""Measure real source preparation I/O against a tiny published SQLite baseline.
+"""Measure real source preparation I/O against a bounded published SQLite baseline.
 
 Only synthetic files are accepted. A child process bounds the complete matrix;
 the report is replaced atomically only after a complete success/error document.
@@ -23,7 +23,7 @@ from hashlib import sha256
 from importlib.metadata import version
 from pathlib import Path
 from threading import Lock
-from time import perf_counter
+from time import perf_counter, process_time
 from typing import Any, BinaryIO
 from unittest.mock import patch
 
@@ -44,6 +44,9 @@ from h2hdb_ingest.source_snapshot import SourceSnapshotStore
 
 _PHASE: ContextVar[str] = ContextVar("source_io_probe_phase", default="observation")
 _COUNTERS = ("read_calls", "read_bytes", "write_calls", "write_bytes")
+_MAX_FIXTURE_PIXELS = 32 * 1024 * 1024
+_MAX_FIXTURE_ENCODED_BYTES = 128 * 1024 * 1024
+_SPOOL_THRESHOLD_BYTES = 4 * 1024 * 1024
 
 
 class _CountedStream:
@@ -95,6 +98,7 @@ class _Meter:
         self.qualified_galleries = 0
         self.accepted_galleries = 0
         self.captured_files = 0
+        self.qualification_disk_spools = 0
         self.operation_seconds: dict[str, float] = defaultdict(float)
         self.file_reads: dict[str, dict[str, int]] = defaultdict(
             lambda: {"read_calls": 0, "read_bytes": 0}
@@ -142,7 +146,10 @@ class _Meter:
             token = _PHASE.set("qualification")
             try:
                 with self.timed("qualification_spool"):
-                    return original_spool(member, position)
+                    result = original_spool(member, position)
+                if result._rolled:
+                    self.qualification_disk_spools += 1
+                return result
             finally:
                 _PHASE.reset(token)
 
@@ -201,6 +208,7 @@ class _Meter:
             "qualified_galleries": self.qualified_galleries,
             "accepted_galleries": self.accepted_galleries,
             "captured_files": self.captured_files,
+            "qualification_disk_spools": self.qualification_disk_spools,
             "operation_seconds_nonadditive": dict(self.operation_seconds),
         }
 
@@ -216,16 +224,40 @@ def _metadata(gid: int, *, changed: bool = False) -> bytes:
     ).encode()
 
 
-def _fixture(root: Path, galleries: int, pages: int, edge: int) -> None:
+def _require_fixture_budget(galleries: int, pages: int, edge: int) -> None:
+    if galleries * pages * edge * edge > _MAX_FIXTURE_PIXELS:
+        raise ValueError(
+            f"aggregate fixture pixels must not exceed {_MAX_FIXTURE_PIXELS}"
+        )
+
+
+def _write_page(path: Path, edge: int, random_bytes: random.Random, codec: str) -> int:
+    with Image.frombytes(
+        "RGB", (edge, edge), random_bytes.randbytes(edge * edge * 3)
+    ) as image:
+        if codec == "png":
+            image.save(path, format="PNG", compress_level=0)
+        else:
+            image.save(path, format="JPEG", quality=95, subsampling=0, optimize=False)
+    return path.stat().st_size
+
+
+def _fixture(root: Path, galleries: int, pages: int, edge: int, codec: str) -> None:
+    _require_fixture_budget(galleries, pages, edge)
     random_bytes = random.Random(47029)
+    encoded_bytes = 0
     for gid in range(1_000_000, 1_000_000 + galleries):
         folder = root / str(gid)
         folder.mkdir(parents=True)
         for page in range(pages):
-            with Image.frombytes(
-                "RGB", (edge, edge), random_bytes.randbytes(edge * edge * 3)
-            ) as image:
-                image.save(folder / f"{page:03}.png", compress_level=0)
+            encoded_bytes += _write_page(
+                folder / f"{page:03}.{codec}", edge, random_bytes, codec
+            )
+            if encoded_bytes > _MAX_FIXTURE_ENCODED_BYTES:
+                raise ValueError(
+                    "aggregate fixture encoded bytes exceed "
+                    f"{_MAX_FIXTURE_ENCODED_BYTES}"
+                )
         # Producer completion evidence must be later than every PAGE write.
         (folder / "galleryinfo.txt").write_bytes(_metadata(gid))
 
@@ -234,6 +266,7 @@ def _manifest(root: Path) -> dict[str, object]:
     digest = sha256()
     pages = 0
     markers = 0
+    page_sizes: list[int] = []
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
@@ -241,26 +274,34 @@ def _manifest(root: Path) -> dict[str, object]:
         name = path.relative_to(root).as_posix().encode()
         digest.update(len(name).to_bytes(8, "big") + name)
         digest.update(len(content).to_bytes(8, "big") + sha256(content).digest())
-        if path.suffix == ".png":
+        if path.suffix in {".png", ".jpeg"}:
             pages += len(content)
+            page_sizes.append(len(content))
         else:
             markers += len(content)
     return {
         "sha256": digest.hexdigest(),
         "page_bytes": pages,
         "marker_bytes": markers,
+        "page_encoded_bytes": page_sizes,
+        "pages_above_spool_threshold": sum(
+            size > _SPOOL_THRESHOLD_BYTES for size in page_sizes
+        ),
     }
 
 
 def _measure(root: Path, operation: Any) -> tuple[Any, dict[str, object]]:
     meter = _Meter(root)
     started = perf_counter()
+    cpu_started = process_time()
     with meter.instrument():
         prepared = operation()
     elapsed = perf_counter() - started
+    cpu_elapsed = process_time() - cpu_started
     return prepared, {
         **meter.report(),
         "elapsed_seconds": elapsed,
+        "process_cpu_seconds": cpu_elapsed,
         "galleries": prepared.gallery_count,
         "waiting": prepared.waiting_gallery_count,
         "deferred": prepared.deferred_gallery_count,
@@ -269,7 +310,13 @@ def _measure(root: Path, operation: Any) -> tuple[Any, dict[str, object]]:
 
 
 def _run_matrix(
-    galleries: int, pages: int, edge: int, workers: int, *, workspace: Path
+    galleries: int,
+    pages: int,
+    edge: int,
+    workers: int,
+    *,
+    codec: str,
+    workspace: Path,
 ) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="matrix-", dir=workspace) as temporary:
         root = Path(temporary)
@@ -277,7 +324,7 @@ def _run_matrix(
         library = root / "library"
         scratch = root / "scratch"
         scratch.mkdir()
-        _fixture(source, galleries, pages, edge)
+        _fixture(source, galleries, pages, edge, codec)
         for child in ("current/acquisitions", "current/artwork", ".h2hdb-coordination"):
             (library / child).mkdir(parents=True, exist_ok=True)
         config = IngestConfig(
@@ -351,8 +398,9 @@ def _run_matrix(
                 ):
                     if name == "source_changed":
                         folder = source / "1000000"
-                        with Image.new("RGB", (edge, edge), (12, 34, 56)) as image:
-                            image.save(folder / "000.png", compress_level=0)
+                        _write_page(
+                            folder / f"000.{codec}", edge, random.Random(87029), codec
+                        )
                         (folder / "galleryinfo.txt").write_bytes(
                             _metadata(1_000_000, changed=True)
                         )
@@ -391,16 +439,26 @@ def _run_matrix(
                 raise RuntimeError("probe left invalid database authority")
         return {
             "status": "ok",
-            "format_version": 1,
+            "format_version": 2,
             "provenance": _provenance(),
             "fixture": {
                 "galleries": galleries,
                 "pages_per_gallery": pages,
                 "dimensions": [edge, edge],
-                "codec": "PNG, compression level 0",
+                "codec": codec,
+                "encoding": (
+                    "PNG, compression level 0"
+                    if codec == "png"
+                    else "JPEG, quality 95, subsampling 0, optimize false"
+                ),
                 "seed": 47029,
+                "source_change_seed": 87029,
                 "workers": workers,
                 "backend": "sqlite",
+                "aggregate_pixels": galleries * pages * edge * edge,
+                "max_fixture_pixels": _MAX_FIXTURE_PIXELS,
+                "max_fixture_encoded_bytes": _MAX_FIXTURE_ENCODED_BYTES,
+                "qualification_spool_threshold_bytes": _SPOOL_THRESHOLD_BYTES,
             },
             "scope": {
                 "measured": "prepare_source only; one real published baseline",
@@ -410,10 +468,13 @@ def _run_matrix(
                 "source_io": "actual os.read bytes/calls, including EOF calls, by inode and exclusive phase",
                 "source_files": "a second view of the same raw reads; do not add it to phase totals",
                 "buffer_io": "logical stream reads/writes, not physical disk I/O; memory qualification spools included",
+                "qualification_disk_spools": "count of rolled spools when _spool returns, before decoding; not all native/scratch disk I/O",
                 "native_io_limit": "only observed Python stream boundaries; native reads bypassing these wrappers are not counted",
-                "excluded": "SQLite I/O, discovery/core spools, seed rendering, snapshot verification oracle, OS cache effects",
+                "excluded": "I/O counters omit SQLite and discovery/core spools; preparation wall includes their work; later rendering, snapshot verification and prepared-resource teardown are outside measured preparation",
                 "timing": "observational; instrumentation overhead included; no wall-time pass threshold",
+                "cache_state": "freshly generated local fixtures followed by baseline publication; no cache flush or NAS throughput claim",
                 "operation_timing": "nested totals and concurrent decode sums overlap; never sum as wall time",
+                "process_cpu": "process_time covers all process threads including native decoders; it is not concurrent decode elapsed sums",
             },
             "seed_publication_seconds": seed_seconds,
             "cases": cases,
@@ -422,7 +483,9 @@ def _run_matrix(
 
 def _verify_captures(root: Path, captured: SourceSnapshotStore) -> int:
     checked = 0
-    for path in sorted(root.rglob("*.png")):
+    for path in sorted(root.rglob("*")):
+        if path.suffix not in {".png", ".jpeg"}:
+            continue
         stream = captured.open_source((path.parent.name,), path.name.encode())
         if stream is not None:
             with stream:
@@ -514,13 +577,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--galleries", type=_bounded_integer(1, 4), default=2)
     parser.add_argument("--pages", type=_bounded_integer(1, 8), default=2)
-    parser.add_argument("--edge", type=_bounded_integer(16, 256), default=32)
+    parser.add_argument("--edge", type=_bounded_integer(16, 2048), default=256)
+    parser.add_argument("--codec", choices=("png", "jpeg"), default="png")
     parser.add_argument("--workers", type=_bounded_integer(1, 4), default=1)
     parser.add_argument("--timeout", type=_bounded_integer(10, 300), default=120)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--workspace", type=Path, help=argparse.SUPPRESS)
     arguments = parser.parse_args()
+    try:
+        _require_fixture_budget(arguments.galleries, arguments.pages, arguments.edge)
+    except ValueError as error:
+        parser.error(str(error))
     if arguments.worker:
         if arguments.workspace is None:
             parser.error("internal worker requires its supervisor-owned workspace")
@@ -531,6 +599,7 @@ def main() -> int:
                     arguments.pages,
                     arguments.edge,
                     arguments.workers,
+                    codec=arguments.codec,
                     workspace=arguments.workspace,
                 )
             )
@@ -552,6 +621,8 @@ def main() -> int:
         str(arguments.edge),
         "--workers",
         str(arguments.workers),
+        "--codec",
+        arguments.codec,
     ]
     try:
         # Parent ownership ensures cleanup after timeout kills the worker before
@@ -568,7 +639,7 @@ def main() -> int:
         if (
             not isinstance(report, dict)
             or report.get("status") != "ok"
-            or report.get("format_version") != 1
+            or report.get("format_version") != 2
             or not isinstance(report.get("cases"), dict)
             or set(report["cases"])
             != {"baseline", "unchanged", "policy_changed", "source_changed"}
@@ -577,7 +648,7 @@ def main() -> int:
     except (subprocess.SubprocessError, ValueError) as error:
         report = {
             "status": "error",
-            "format_version": 1,
+            "format_version": 2,
             "error_type": type(error).__name__,
             "error": str(error),
             "provenance": _provenance(),
@@ -586,6 +657,7 @@ def main() -> int:
                 "pages_per_gallery": arguments.pages,
                 "edge": arguments.edge,
                 "workers": arguments.workers,
+                "codec": arguments.codec,
                 "timeout_seconds": arguments.timeout,
             },
         }
