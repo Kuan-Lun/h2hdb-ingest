@@ -409,11 +409,12 @@ def test_reconfiguration_replaces_handlers_and_applies_all_severity_thresholds(
 
 
 if __name__ == "__main__":
-    if sys.argv[2] == "workload":
-        _run_workload(
-            Path(sys.argv[1]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
-        )
-    elif sys.argv[2] == "severity":
-        _run_severity_probe(Path(sys.argv[1]), sys.argv[3])
-    else:
-        raise ValueError("unknown logging test harness mode")
+    match sys.argv[2]:
+        case "workload":
+            _run_workload(
+                Path(sys.argv[1]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+            )
+        case "severity":
+            _run_severity_probe(Path(sys.argv[1]), sys.argv[3])
+        case _:
+            raise ValueError("unknown logging test harness mode")

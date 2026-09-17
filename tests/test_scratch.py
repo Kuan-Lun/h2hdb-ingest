@@ -141,12 +141,13 @@ def test_unknown_entries_and_forged_run_markers_are_preserved(
         unknown = container / ("run-" + "1" * 32)
         unknown.mkdir()
         marker = unknown / "owner.json"
-        if marker_kind == "directory":
-            marker.mkdir()
-        elif marker_kind == "symlink":
-            marker.symlink_to(tmp_path / "not-owned-marker")
-        else:
-            marker.write_text("{}")
+        match marker_kind:
+            case "directory":
+                marker.mkdir()
+            case "symlink":
+                marker.symlink_to(tmp_path / "not-owned-marker")
+            case _:
+                marker.write_text("{}")
         (unknown / "keep").write_bytes(b"unknown")
         external = tmp_path / "external"
         external.mkdir()

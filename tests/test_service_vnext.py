@@ -1249,15 +1249,16 @@ def test_prepared_resources_close_when_heartbeat_fails_before_return(
 ) -> None:
     events: list[object] = []
     facade: _Facade | _AnalysisFacade | _PublicationFacade
-    if phase == "source":
-        facade = _Facade(events)
-        method = "prepare_source"
-    elif phase == "analysis":
-        facade = _AnalysisFacade(events)
-        method = "prepare_analysis"
-    else:
-        facade = _PublicationFacade(events)
-        method = "prepare_publication_step"
+    match phase:
+        case "source":
+            facade = _Facade(events)
+            method = "prepare_source"
+        case "analysis":
+            facade = _AnalysisFacade(events)
+            method = "prepare_analysis"
+        case _:
+            facade = _PublicationFacade(events)
+            method = "prepare_publication_step"
     controller = IngestSessionController(
         cast(VNextIngestFacade, facade),
         _session(),
@@ -1274,32 +1275,33 @@ def test_prepared_resources_close_when_heartbeat_fails_before_return(
     monkeypatch.setattr(facade, method, failed_preparation)
     policy = cast(VNextResolvedIngestPolicy, object())
     with pytest.raises(RuntimeError, match="heartbeat failed"):
-        if phase == "source":
-            synchronize_source(
-                controller, policy, cast(VNextIngestSourceAdapter, object())
-            )
-        elif phase == "analysis":
-            synchronize_analysis(
-                controller,
-                policy,
-                VNextIngestSourceReceipt(b"b" * 16, 3, 3, True, False),
-                max_rows=64,
-            )
-        elif phase == "publication":
-            synchronize_publication(
-                controller,
-                policy,
-                artifact_adapters={},
-                finalization_adapters={},
-                library_activation=_LibraryActivation(),
-            )
-        else:
-            service_module.synchronize_pending_publication(
-                controller,
-                artifact_adapters={},
-                finalization_adapters={},
-                library_activation=_LibraryActivation(),
-            )
+        match phase:
+            case "source":
+                synchronize_source(
+                    controller, policy, cast(VNextIngestSourceAdapter, object())
+                )
+            case "analysis":
+                synchronize_analysis(
+                    controller,
+                    policy,
+                    VNextIngestSourceReceipt(b"b" * 16, 3, 3, True, False),
+                    max_rows=64,
+                )
+            case "publication":
+                synchronize_publication(
+                    controller,
+                    policy,
+                    artifact_adapters={},
+                    finalization_adapters={},
+                    library_activation=_LibraryActivation(),
+                )
+            case _:
+                service_module.synchronize_pending_publication(
+                    controller,
+                    artifact_adapters={},
+                    finalization_adapters={},
+                    library_activation=_LibraryActivation(),
+                )
     close = {"source": "close", "analysis": "analysis-close"}.get(
         phase, ("publication-close", 0)
     )

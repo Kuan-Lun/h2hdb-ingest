@@ -321,11 +321,13 @@ class ManagedFilesystemLibraryAdapter:
 
         if type(resource_kind) is not CatalogResourceKind:
             raise TypeError("resource_kind must be CatalogResourceKind")
-        if resource_kind is CatalogResourceKind.ACQUISITION:
-            return _acquisition_storage_key(gid)
-        if resource_kind is CatalogResourceKind.THUMBNAIL:
-            return _thumbnail_storage_key(gid)
-        raise ValueError("unsupported catalog resource kind")
+        match resource_kind:
+            case CatalogResourceKind.ACQUISITION:
+                return _acquisition_storage_key(gid)
+            case CatalogResourceKind.THUMBNAIL:
+                return _thumbnail_storage_key(gid)
+            case _:
+                raise ValueError("unsupported catalog resource kind")
 
     @contextmanager
     def publication_guard(self) -> Iterator[None]:
@@ -600,43 +602,45 @@ class ManagedFilesystemLibraryAdapter:
                     raise RuntimeError(
                         "resource protection token was reused with another modified_at"
                     )
-                if state == "STAGED":
-                    if existing[6] != stage_leaf:
-                        raise RuntimeError(
-                            "staged resource journal leaf disagrees with its token"
+                match state:
+                    case "STAGED":
+                        if existing[6] != stage_leaf:
+                            raise RuntimeError(
+                                "staged resource journal leaf disagrees with its token"
+                            )
+                    case "WRITING":
+                        if existing[6] != stage_leaf or any(
+                            value is not None for value in existing[7:]
+                        ):
+                            raise RuntimeError(
+                                "writing resource journal authority is inconsistent"
+                            )
+                    case "INSTALLED":
+                        if existing[6] is not None or any(
+                            value is not None for value in existing[7:]
+                        ):
+                            raise RuntimeError(
+                                "installed resource journal authority is inconsistent"
+                            )
+                        installed = connection.execute(
+                            "SELECT device, inode, modified_ns, changed_ns "
+                            "FROM current_entries WHERE storage_codec = ? "
+                            "AND storage_path = ? AND object_sha256 = ? "
+                            "AND size_bytes = ? AND published_modified_at = ?",
+                            expected_facts,
+                        ).fetchone()
+                        if installed is None:
+                            raise RuntimeError(
+                                "installed resource lacks current journal authority"
+                            )
+                        installed_signature = _storage_signature(
+                            installed,
+                            size=size_bytes,
                         )
-                elif state not in {"WRITING", "INSTALLED"}:
-                    raise RuntimeError("resource protection journal state is corrupt")
-                if state == "WRITING" and (
-                    existing[6] != stage_leaf
-                    or any(value is not None for value in existing[7:])
-                ):
-                    raise RuntimeError(
-                        "writing resource journal authority is inconsistent"
-                    )
-                if state == "INSTALLED" and (
-                    existing[6] is not None
-                    or any(value is not None for value in existing[7:])
-                ):
-                    raise RuntimeError(
-                        "installed resource journal authority is inconsistent"
-                    )
-                if state == "INSTALLED":
-                    installed = connection.execute(
-                        "SELECT device, inode, modified_ns, changed_ns "
-                        "FROM current_entries WHERE storage_codec = ? "
-                        "AND storage_path = ? AND object_sha256 = ? "
-                        "AND size_bytes = ? AND published_modified_at = ?",
-                        expected_facts,
-                    ).fetchone()
-                    if installed is None:
+                    case _:
                         raise RuntimeError(
-                            "installed resource lacks current journal authority"
+                            "resource protection journal state is corrupt"
                         )
-                    installed_signature = _storage_signature(
-                        installed,
-                        size=size_bytes,
-                    )
             else:
                 conflicting = connection.execute(
                     "SELECT token FROM protection_tokens WHERE storage_path = ? "
@@ -746,51 +750,52 @@ class ManagedFilesystemLibraryAdapter:
             if current is None or tuple(current[:5]) != expected_facts:
                 raise RuntimeError("resource protection journal changed")
             state = str(current[5])
-            if state == "RELEASED":
-                released = True
-            elif state == "STAGED":
-                if current[6] != stage_leaf:
-                    raise RuntimeError(
-                        "staged resource journal leaf disagrees with its token"
-                    )
-                journal_signature = _storage_signature(current[7:], size=size_bytes)
-                if not _same_content_identity(journal_signature, signature):
-                    raise RuntimeError("resource protection journal changed")
-                terminal_signature = journal_signature
-            elif (
-                state != "WRITING"
-                or current[6] != stage_leaf
-                or any(value is not None for value in current[7:])
-            ):
-                raise RuntimeError("resource protection journal changed")
-            else:
-                connection.execute("BEGIN IMMEDIATE")
-                try:
-                    affected = connection.execute(
-                        "UPDATE protection_tokens SET state = 'STAGED', "
-                        "device = ?, inode = ?, modified_ns = ?, changed_ns = ? "
-                        "WHERE token = ? AND state = 'WRITING' "
-                        "AND storage_codec = ? AND storage_path = ? "
-                        "AND object_sha256 = ? AND size_bytes = ? "
-                        "AND published_modified_at = ? AND staging_leaf = ? "
-                        "AND device IS NULL AND inode IS NULL "
-                        "AND modified_ns IS NULL AND changed_ns IS NULL",
-                        (
-                            signature.device,
-                            signature.inode,
-                            signature.modified_ns,
-                            signature.changed_ns,
-                            token,
-                            *expected_facts,
-                            stage_leaf,
-                        ),
-                    ).rowcount
-                    if affected != 1:
+            match state:
+                case "RELEASED":
+                    released = True
+                case "STAGED":
+                    if current[6] != stage_leaf:
+                        raise RuntimeError(
+                            "staged resource journal leaf disagrees with its token"
+                        )
+                    journal_signature = _storage_signature(current[7:], size=size_bytes)
+                    if not _same_content_identity(journal_signature, signature):
                         raise RuntimeError("resource protection journal changed")
-                    connection.commit()
-                except BaseException:
-                    connection.rollback()
-                    raise
+                    terminal_signature = journal_signature
+                case "WRITING":
+                    if current[6] != stage_leaf or any(
+                        value is not None for value in current[7:]
+                    ):
+                        raise RuntimeError("resource protection journal changed")
+                    connection.execute("BEGIN IMMEDIATE")
+                    try:
+                        affected = connection.execute(
+                            "UPDATE protection_tokens SET state = 'STAGED', "
+                            "device = ?, inode = ?, modified_ns = ?, changed_ns = ? "
+                            "WHERE token = ? AND state = 'WRITING' "
+                            "AND storage_codec = ? AND storage_path = ? "
+                            "AND object_sha256 = ? AND size_bytes = ? "
+                            "AND published_modified_at = ? AND staging_leaf = ? "
+                            "AND device IS NULL AND inode IS NULL "
+                            "AND modified_ns IS NULL AND changed_ns IS NULL",
+                            (
+                                signature.device,
+                                signature.inode,
+                                signature.modified_ns,
+                                signature.changed_ns,
+                                token,
+                                *expected_facts,
+                                stage_leaf,
+                            ),
+                        ).rowcount
+                        if affected != 1:
+                            raise RuntimeError("resource protection journal changed")
+                        connection.commit()
+                    except BaseException:
+                        connection.rollback()
+                        raise
+                case _:
+                    raise RuntimeError("resource protection journal changed")
 
         if released:
             self._discard_uncommitted_stage(
@@ -830,26 +835,28 @@ class ManagedFilesystemLibraryAdapter:
         if row is None or tuple(row[:5]) != expected:
             return None
         state = str(row[5])
-        if state == "RELEASED":
-            return ArtifactStorageEvidence(False)
-        if state == "INSTALLED":
-            self._verify_current(
-                key,
-                expected_sha256=digest,
-                expected_size=size,
-                label="installed library resource",
-            )
-            return ArtifactStorageEvidence(True, storage_object)
-        if state != "STAGED" or row[6] != stage_leaf:
-            return None
-        self._verify_stage_row(
-            row[6:],
-            token=token,
-            key=key,
-            digest=digest,
-            size=size,
-        )
-        return ArtifactStorageEvidence(True, storage_object)
+        match state:
+            case "RELEASED":
+                return ArtifactStorageEvidence(False)
+            case "INSTALLED":
+                self._verify_current(
+                    key,
+                    expected_sha256=digest,
+                    expected_size=size,
+                    label="installed library resource",
+                )
+                return ArtifactStorageEvidence(True, storage_object)
+            case "STAGED" if row[6] == stage_leaf:
+                self._verify_stage_row(
+                    row[6:],
+                    token=token,
+                    key=key,
+                    digest=digest,
+                    size=size,
+                )
+                return ArtifactStorageEvidence(True, storage_object)
+            case _:
+                return None
 
     def _discard_uncommitted_stage(
         self,
@@ -1262,33 +1269,34 @@ class ManagedFilesystemLibraryAdapter:
                 or state.phase not in {"SEALED", "ACTIVATING", "READY"}
             ):
                 raise RuntimeError("library activation is not ready to reconcile")
-            if state.phase == "READY":
-                self._verify_marker(target, receipt)
-                return LibraryActivationCheckpoint(
-                    target,
-                    receipt,
-                    LibraryActivationStatus.READY,
-                    None,
-                )
-            if state.phase == "SEALED":
-                self._write_marker(target, receipt)
-                connection.execute("BEGIN IMMEDIATE")
-                try:
-                    affected = connection.execute(
-                        "UPDATE library_state SET phase = 'ACTIVATING', "
-                        "last_cursor = NULL "
-                        "WHERE singleton = 1 AND pending_revision = ? "
-                        "AND phase = 'SEALED'",
-                        (target,),
-                    ).rowcount
-                    if affected != 1:
-                        raise RuntimeError("library activation state changed")
-                    connection.commit()
-                except BaseException:
-                    connection.rollback()
-                    raise
-            else:
-                self._verify_marker(target, receipt)
+            match state.phase:
+                case "READY":
+                    self._verify_marker(target, receipt)
+                    return LibraryActivationCheckpoint(
+                        target,
+                        receipt,
+                        LibraryActivationStatus.READY,
+                        None,
+                    )
+                case "SEALED":
+                    self._write_marker(target, receipt)
+                    connection.execute("BEGIN IMMEDIATE")
+                    try:
+                        affected = connection.execute(
+                            "UPDATE library_state SET phase = 'ACTIVATING', "
+                            "last_cursor = NULL "
+                            "WHERE singleton = 1 AND pending_revision = ? "
+                            "AND phase = 'SEALED'",
+                            (target,),
+                        ).rowcount
+                        if affected != 1:
+                            raise RuntimeError("library activation state changed")
+                        connection.commit()
+                    except BaseException:
+                        connection.rollback()
+                        raise
+                case _:
+                    self._verify_marker(target, receipt)
 
         installed = self._activate_pending(
             revision=target,
@@ -4908,24 +4916,25 @@ def _rename_noreplace(
         raise ValueError("no-replace rename requires safe leaf names")
     library = ctypes.CDLL(None, use_errno=True)
     syscall_number: int | None = None
-    if sys.platform == "darwin":
-        function = getattr(library, "renameatx_np", None)
-        flag = 0x00000004  # RENAME_EXCL
-    elif sys.platform.startswith("linux"):
-        function = getattr(library, "renameat2", None)
-        flag = 0x00000001  # RENAME_NOREPLACE
-        if function is None:
-            machine = os.uname().machine.casefold()
-            syscall_number = {
-                "aarch64": 276,
-                "arm64": 276,
-                "amd64": 316,
-                "x86_64": 316,
-            }.get(machine)
-            function = getattr(library, "syscall", None)
-    else:
-        function = None
-        flag = 0
+    match sys.platform:
+        case "darwin":
+            function = getattr(library, "renameatx_np", None)
+            flag = 0x00000004  # RENAME_EXCL
+        case _ if sys.platform.startswith("linux"):
+            function = getattr(library, "renameat2", None)
+            flag = 0x00000001  # RENAME_NOREPLACE
+            if function is None:
+                machine = os.uname().machine.casefold()
+                syscall_number = {
+                    "aarch64": 276,
+                    "arm64": 276,
+                    "amd64": 316,
+                    "x86_64": 316,
+                }.get(machine)
+                function = getattr(library, "syscall", None)
+        case _:
+            function = None
+            flag = 0
     if function is None or (
         sys.platform.startswith("linux")
         and getattr(library, "renameat2", None) is None

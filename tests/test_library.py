@@ -334,18 +334,19 @@ def test_storage_identity_corruption_fails_closed(
     adapter.ensure_storage_identity()
     database = root / ".h2hdb-state" / "journal" / "library-activation.sqlite3"
     with sqlite3.connect(database) as connection:
-        if corruption == "missing":
-            connection.execute("DELETE FROM library_storage_identity")
-        elif corruption == "nil":
-            connection.execute(
-                "UPDATE library_storage_identity SET storage_instance_uuid = ?",
-                (bytes(16),),
-            )
-        else:
-            connection.execute(
-                "UPDATE library_storage_identity SET storage_instance_uuid = ?",
-                (bytes.fromhex("00000000000050008000000000000001"),),
-            )
+        match corruption:
+            case "missing":
+                connection.execute("DELETE FROM library_storage_identity")
+            case "nil":
+                connection.execute(
+                    "UPDATE library_storage_identity SET storage_instance_uuid = ?",
+                    (bytes(16),),
+                )
+            case _:
+                connection.execute(
+                    "UPDATE library_storage_identity SET storage_instance_uuid = ?",
+                    (bytes.fromhex("00000000000050008000000000000001"),),
+                )
         connection.commit()
 
     with pytest.raises(RuntimeError, match="storage identity"):
@@ -586,14 +587,15 @@ def test_layout_rejects_legacy_coordination_before_creating_new_sibling(
     state.mkdir(mode=0o700)
     state.chmod(0o700)
     legacy = state / "coordination"
-    if legacy_kind == "directory":
-        legacy.mkdir(mode=0o755)
-    elif legacy_kind == "file":
-        legacy.write_bytes(b"legacy")
-    else:
-        outside = tmp_path / "outside"
-        outside.mkdir()
-        legacy.symlink_to(outside, target_is_directory=True)
+    match legacy_kind:
+        case "directory":
+            legacy.mkdir(mode=0o755)
+        case "file":
+            legacy.write_bytes(b"legacy")
+        case _:
+            outside = tmp_path / "outside"
+            outside.mkdir()
+            legacy.symlink_to(outside, target_is_directory=True)
 
     adapter = ManagedFilesystemLibraryAdapter(
         root,
@@ -615,14 +617,15 @@ def test_layout_rejects_legacy_current_artifact_tree_without_deleting_it(
     root = tmp_path / "library"
     _provision_library_root(root)
     legacy = root / "current" / "hash-v1"
-    if legacy_kind == "directory":
-        legacy.mkdir(mode=0o755)
-    elif legacy_kind == "file":
-        legacy.write_bytes(b"legacy")
-    else:
-        outside = tmp_path / "outside"
-        outside.mkdir()
-        legacy.symlink_to(outside, target_is_directory=True)
+    match legacy_kind:
+        case "directory":
+            legacy.mkdir(mode=0o755)
+        case "file":
+            legacy.write_bytes(b"legacy")
+        case _:
+            outside = tmp_path / "outside"
+            outside.mkdir()
+            legacy.symlink_to(outside, target_is_directory=True)
 
     adapter = ManagedFilesystemLibraryAdapter(
         root,
@@ -1160,82 +1163,80 @@ def test_install_fault_boundaries_recover_exact_current_file(
     receipt = b"f" * 16
 
     with monkeypatch.context() as scoped:
-        if boundary == "marker-written":
-            original = cast(
-                Callable[..., object],
-                adapter._write_marker,
-            )
-
-            def marker_then_interrupt(*args: object, **kwargs: object) -> object:
-                original(*args, **kwargs)
-                raise RuntimeError("fault: marker-written")
-
-            scoped.setattr(adapter, "_write_marker", marker_then_interrupt)
-        elif boundary == "operation-authorized":
-
-            def reject_install(*args: object, **kwargs: object) -> object:
-                del args, kwargs
-                raise RuntimeError("fault: operation-authorized")
-
-            scoped.setattr(adapter, "_install_staged", reject_install)
-        elif boundary == "rename-return-lost":
-            original_rename = library_module._rename_noreplace
-
-            def rename_then_interrupt(
-                source: str,
-                destination: str,
-                *,
-                source_descriptor: int,
-                destination_descriptor: int,
-            ) -> None:
-                original_rename(
-                    source,
-                    destination,
-                    source_descriptor=source_descriptor,
-                    destination_descriptor=destination_descriptor,
+        match boundary:
+            case "marker-written":
+                original = cast(
+                    Callable[..., object],
+                    adapter._write_marker,
                 )
-                if destination.startswith("h2h-"):
-                    raise RuntimeError("fault: rename-return-lost")
 
-            scoped.setattr(
-                library_module,
-                "_rename_noreplace",
-                rename_then_interrupt,
-            )
-        elif boundary in {
-            "installed-before-journal",
-            "journal-transaction-aborted",
-        }:
-            original = cast(
-                Callable[..., object],
-                adapter._terminalize_stage_in_transaction,
-            )
+                def marker_then_interrupt(*args: object, **kwargs: object) -> object:
+                    original(*args, **kwargs)
+                    raise RuntimeError("fault: marker-written")
 
-            def terminalize_with_interrupt(
-                *args: object,
-                **kwargs: object,
-            ) -> object:
-                if boundary == "installed-before-journal":
+                scoped.setattr(adapter, "_write_marker", marker_then_interrupt)
+            case "operation-authorized":
+
+                def reject_install(*args: object, **kwargs: object) -> object:
+                    del args, kwargs
+                    raise RuntimeError("fault: operation-authorized")
+
+                scoped.setattr(adapter, "_install_staged", reject_install)
+            case "rename-return-lost":
+                original_rename = library_module._rename_noreplace
+
+                def rename_then_interrupt(
+                    source: str,
+                    destination: str,
+                    *,
+                    source_descriptor: int,
+                    destination_descriptor: int,
+                ) -> None:
+                    original_rename(
+                        source,
+                        destination,
+                        source_descriptor=source_descriptor,
+                        destination_descriptor=destination_descriptor,
+                    )
+                    if destination.startswith("h2h-"):
+                        raise RuntimeError("fault: rename-return-lost")
+
+                scoped.setattr(
+                    library_module,
+                    "_rename_noreplace",
+                    rename_then_interrupt,
+                )
+            case "installed-before-journal" | "journal-transaction-aborted":
+                original = cast(
+                    Callable[..., object],
+                    adapter._terminalize_stage_in_transaction,
+                )
+
+                def terminalize_with_interrupt(
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    if boundary == "installed-before-journal":
+                        raise RuntimeError(f"fault: {boundary}")
+                    original(*args, **kwargs)
                     raise RuntimeError(f"fault: {boundary}")
-                original(*args, **kwargs)
-                raise RuntimeError(f"fault: {boundary}")
 
-            scoped.setattr(
-                adapter,
-                "_terminalize_stage_in_transaction",
-                terminalize_with_interrupt,
-            )
-        else:
-            original = cast(
-                Callable[..., object],
-                adapter._activate_pending,
-            )
+                scoped.setattr(
+                    adapter,
+                    "_terminalize_stage_in_transaction",
+                    terminalize_with_interrupt,
+                )
+            case _:
+                original = cast(
+                    Callable[..., object],
+                    adapter._activate_pending,
+                )
 
-            def activate_then_interrupt(*args: object, **kwargs: object) -> object:
-                original(*args, **kwargs)
-                raise RuntimeError("fault: entry-journal-return-lost")
+                def activate_then_interrupt(*args: object, **kwargs: object) -> object:
+                    original(*args, **kwargs)
+                    raise RuntimeError("fault: entry-journal-return-lost")
 
-            scoped.setattr(adapter, "_activate_pending", activate_then_interrupt)
+                scoped.setattr(adapter, "_activate_pending", activate_then_interrupt)
 
         with adapter.publication_guard():
             adapter.begin(1, receipt)
@@ -1592,43 +1593,46 @@ def test_stale_removal_fault_boundaries_recover_without_unknown_deletion(
     receipt = b"g" * 16
 
     with monkeypatch.context() as scoped:
-        if boundary in {"removal-authorized", "quarantine-return-lost"}:
-            original = cast(
-                Callable[..., object],
-                adapter._quarantine_current,
-            )
+        match boundary:
+            case "removal-authorized" | "quarantine-return-lost":
+                original = cast(
+                    Callable[..., object],
+                    adapter._quarantine_current,
+                )
 
-            def quarantine_with_interrupt(
-                *args: object,
-                **kwargs: object,
-            ) -> object:
-                if boundary == "removal-authorized":
+                def quarantine_with_interrupt(
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    if boundary == "removal-authorized":
+                        raise RuntimeError(f"fault: {boundary}")
+                    original(*args, **kwargs)
                     raise RuntimeError(f"fault: {boundary}")
-                original(*args, **kwargs)
-                raise RuntimeError(f"fault: {boundary}")
 
-            scoped.setattr(adapter, "_quarantine_current", quarantine_with_interrupt)
-        elif boundary == "unlink-return-lost":
-            original_unlink = os.unlink
+                scoped.setattr(
+                    adapter, "_quarantine_current", quarantine_with_interrupt
+                )
+            case "unlink-return-lost":
+                original_unlink = os.unlink
 
-            def unlink_then_interrupt(
-                path: str | bytes | Path,
-                *,
-                dir_fd: int | None = None,
-            ) -> None:
-                original_unlink(path, dir_fd=dir_fd)
-                if dir_fd is not None:
-                    raise RuntimeError("fault: unlink-return-lost")
+                def unlink_then_interrupt(
+                    path: str | bytes | Path,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> None:
+                    original_unlink(path, dir_fd=dir_fd)
+                    if dir_fd is not None:
+                        raise RuntimeError("fault: unlink-return-lost")
 
-            scoped.setattr("h2hdb_ingest.library.os.unlink", unlink_then_interrupt)
-        else:
-            original = cast(Callable[..., object], adapter._remove_stale)
+                scoped.setattr("h2hdb_ingest.library.os.unlink", unlink_then_interrupt)
+            case _:
+                original = cast(Callable[..., object], adapter._remove_stale)
 
-            def remove_then_interrupt(*args: object, **kwargs: object) -> object:
-                original(*args, **kwargs)
-                raise RuntimeError("fault: removal-journal-return-lost")
+                def remove_then_interrupt(*args: object, **kwargs: object) -> object:
+                    original(*args, **kwargs)
+                    raise RuntimeError("fault: removal-journal-return-lost")
 
-            scoped.setattr(adapter, "_remove_stale", remove_then_interrupt)
+                scoped.setattr(adapter, "_remove_stale", remove_then_interrupt)
 
         with adapter.publication_guard():
             adapter.begin(2, receipt)
@@ -3784,53 +3788,56 @@ def test_replacement_response_loss_reconciles_one_exact_current_link(
     _protect(adapter, second, b"second", 70)
 
     with monkeypatch.context() as scoped:
-        if boundary == "capture-return-lost":
-            original_capture = cast(Callable[..., object], adapter._quarantine_current)
-
-            def capture_then_interrupt(*args: object, **kwargs: object) -> None:
-                original_capture(*args, **kwargs)
-                raise RuntimeError("fault: capture-return-lost")
-
-            scoped.setattr(adapter, "_quarantine_current", capture_then_interrupt)
-        elif boundary == "rename-return-lost":
-            original_rename = library_module._rename_noreplace
-
-            def rename_then_interrupt(
-                source: str,
-                destination: str,
-                *,
-                source_descriptor: int,
-                destination_descriptor: int,
-            ) -> None:
-                original_rename(
-                    source,
-                    destination,
-                    source_descriptor=source_descriptor,
-                    destination_descriptor=destination_descriptor,
+        match boundary:
+            case "capture-return-lost":
+                original_capture = cast(
+                    Callable[..., object], adapter._quarantine_current
                 )
-                if destination == second.storage_key.segments[-1]:
-                    raise RuntimeError("fault: rename-return-lost")
 
-            scoped.setattr(
-                library_module,
-                "_rename_noreplace",
-                rename_then_interrupt,
-            )
-        else:
-            original_retire = cast(
-                Callable[..., object],
-                adapter._retire_replaced_current,
-            )
+                def capture_then_interrupt(*args: object, **kwargs: object) -> None:
+                    original_capture(*args, **kwargs)
+                    raise RuntimeError("fault: capture-return-lost")
 
-            def retire_then_interrupt(*args: object, **kwargs: object) -> object:
-                original_retire(*args, **kwargs)
-                raise RuntimeError("fault: retirement-return-lost")
+                scoped.setattr(adapter, "_quarantine_current", capture_then_interrupt)
+            case "rename-return-lost":
+                original_rename = library_module._rename_noreplace
 
-            scoped.setattr(
-                adapter,
-                "_retire_replaced_current",
-                retire_then_interrupt,
-            )
+                def rename_then_interrupt(
+                    source: str,
+                    destination: str,
+                    *,
+                    source_descriptor: int,
+                    destination_descriptor: int,
+                ) -> None:
+                    original_rename(
+                        source,
+                        destination,
+                        source_descriptor=source_descriptor,
+                        destination_descriptor=destination_descriptor,
+                    )
+                    if destination == second.storage_key.segments[-1]:
+                        raise RuntimeError("fault: rename-return-lost")
+
+                scoped.setattr(
+                    library_module,
+                    "_rename_noreplace",
+                    rename_then_interrupt,
+                )
+            case _:
+                original_retire = cast(
+                    Callable[..., object],
+                    adapter._retire_replaced_current,
+                )
+
+                def retire_then_interrupt(*args: object, **kwargs: object) -> object:
+                    original_retire(*args, **kwargs)
+                    raise RuntimeError("fault: retirement-return-lost")
+
+                scoped.setattr(
+                    adapter,
+                    "_retire_replaced_current",
+                    retire_then_interrupt,
+                )
 
         with adapter.publication_guard():
             adapter.begin(2, b"b" * 16)
