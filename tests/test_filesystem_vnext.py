@@ -788,19 +788,20 @@ def test_final_marker_probe_revalidates_the_entire_observed_entry_set(
         adapter = VNextFilesystemSourceAdapter(source)
         adapter.observe_gallery(("1001",))
         target = folder / "002.jpg"
-        if mutation == "add":
-            (folder / "003.jpg").write_bytes(b"new page")
-        elif mutation == "remove":
-            target.unlink()
-        elif mutation == "replace":
-            replacement = folder / "replacement"
-            replacement.write_bytes(target.read_bytes())
-            replacement.replace(target)
-        elif mutation == "mtime":
-            value = target.stat()
-            os.utime(target, ns=(value.st_atime_ns, value.st_mtime_ns - 1))
-        else:
-            target.write_bytes(b"third!")
+        match mutation:
+            case "add":
+                (folder / "003.jpg").write_bytes(b"new page")
+            case "remove":
+                target.unlink()
+            case "replace":
+                replacement = folder / "replacement"
+                replacement.write_bytes(target.read_bytes())
+                replacement.replace(target)
+            case "mtime":
+                value = target.stat()
+                os.utime(target, ns=(value.st_atime_ns, value.st_mtime_ns - 1))
+            case _:
+                target.write_bytes(b"third!")
         with pytest.raises(VNextSourceDeferredError):
             adapter.observe_completion_marker(("1001",))
 

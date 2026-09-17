@@ -21,27 +21,25 @@ def artifact_name(gid: int) -> str:
 def storage_path(gid: int, kind: str) -> str:
     exact_gid = require_gid(gid)
     shard = sha256(_SHARD_DOMAIN + exact_gid.to_bytes(8, "big")).hexdigest()
-    if kind == "acquisition":
-        return f"acquisitions/hash-v2/{shard[:2]}/{shard[2]}/{artifact_name(gid)}"
-    if kind == "thumbnail":
-        return (
-            f"artwork/hash-v2/{shard[:2]}/{shard[2]}/h2h-{exact_gid}/thumbnail-320.jpg"
-        )
-    raise ValueError("storage key has an unsupported presentation-v2 shape")
+    match kind:
+        case "acquisition":
+            return f"acquisitions/hash-v2/{shard[:2]}/{shard[2]}/{artifact_name(gid)}"
+        case "thumbnail":
+            return f"artwork/hash-v2/{shard[:2]}/{shard[2]}/h2h-{exact_gid}/thumbnail-320.jpg"
+        case _:
+            raise ValueError("storage key has an unsupported presentation-v2 shape")
 
 
 def path_kind(codec: str, segments: tuple[str, ...]) -> str:
     if codec != STORAGE_OBJECT_CODEC:
         raise ValueError("storage key is not the ingest presentation-v2 codec")
-    if len(segments) == 5 and segments[:2] == ("acquisitions", "hash-v2"):
-        return "acquisition"
-    if (
-        len(segments) == 6
-        and segments[:2] == ("artwork", "hash-v2")
-        and segments[-1] == "thumbnail-320.jpg"
-    ):
-        return "thumbnail"
-    raise ValueError("storage key has an unsupported presentation-v2 shape")
+    match segments:
+        case tuple(("acquisitions", "hash-v2", _, _, _)):
+            return "acquisition"
+        case tuple(("artwork", "hash-v2", _, _, _, "thumbnail-320.jpg")):
+            return "thumbnail"
+        case _:
+            raise ValueError("storage key has an unsupported presentation-v2 shape")
 
 
 def path_gid(codec: str, segments: tuple[str, ...]) -> int:

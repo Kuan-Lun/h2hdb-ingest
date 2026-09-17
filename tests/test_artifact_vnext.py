@@ -1944,16 +1944,17 @@ def test_large_source_streams_to_spools_and_preserves_exact_byte_authority(
         evidence = original_render(source, destination, policy=policy)
         if change_after_decode != "none":
             with path.open("r+b") as changed:
-                if change_after_decode == "same_size":
-                    changed.seek(-1, 2)
-                    old = changed.read(1)
-                    changed.seek(-1, 2)
-                    changed.write(bytes((old[0] ^ 1,)))
-                elif change_after_decode == "shorter":
-                    changed.truncate(size - 1)
-                else:
-                    changed.seek(0, 2)
-                    changed.write(b"unexpected trailing byte")
+                match change_after_decode:
+                    case "same_size":
+                        changed.seek(-1, 2)
+                        old = changed.read(1)
+                        changed.seek(-1, 2)
+                        changed.write(bytes((old[0] ^ 1,)))
+                    case "shorter":
+                        changed.truncate(size - 1)
+                    case _:
+                        changed.seek(0, 2)
+                        changed.write(b"unexpected trailing byte")
         return evidence
 
     monkeypatch.setattr(artifact_module, "_render_page", render_then_change)

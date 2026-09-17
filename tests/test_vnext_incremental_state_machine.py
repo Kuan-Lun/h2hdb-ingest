@@ -302,28 +302,29 @@ def test_generated_invalid_incremental_context_is_rejected(
     selected_policy = policy
     selected_baseline = baseline
     selected_target = target
-    if mismatch == "policy":
-        selected_policy = PolicyContext(policy.policy_version + 1)
-    elif mismatch == "channel":
-        selected_target = replace(
-            target,
-            channel="preview" if baseline.channel == "stable" else "stable",
-        )
-    elif mismatch == "scope":
-        alternate_scope = next(
-            scope for scope in _SCOPE_KEYS if scope != baseline.source_scope_key
-        )
-        selected_target = replace(target, source_scope_key=alternate_scope)
-    elif mismatch == "revision":
-        selected_baseline = replace(
-            baseline,
-            source_revision=baseline.source_revision + 1,
-        )
-    else:
-        selected_baseline = replace(
-            baseline,
-            head_generation=baseline.head_generation + 1,
-        )
+    match mismatch:
+        case "policy":
+            selected_policy = PolicyContext(policy.policy_version + 1)
+        case "channel":
+            selected_target = replace(
+                target,
+                channel="preview" if baseline.channel == "stable" else "stable",
+            )
+        case "scope":
+            alternate_scope = next(
+                scope for scope in _SCOPE_KEYS if scope != baseline.source_scope_key
+            )
+            selected_target = replace(target, source_scope_key=alternate_scope)
+        case "revision":
+            selected_baseline = replace(
+                baseline,
+                source_revision=baseline.source_revision + 1,
+            )
+        case _:
+            selected_baseline = replace(
+                baseline,
+                head_generation=baseline.head_generation + 1,
+            )
 
     with pytest.raises(ValueError):
         evaluate_incremental(

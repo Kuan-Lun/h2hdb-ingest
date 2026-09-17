@@ -297,13 +297,15 @@ def test_cli_errors_are_complete_reports_not_success(
     def failed_child(
         command: list[str], **_kwargs: object
     ) -> subprocess.CompletedProcess[str]:
-        if failure == "timeout":
-            raise subprocess.TimeoutExpired(command, 10)
-        if failure == "child_exit":
-            raise subprocess.CalledProcessError(1, command, stderr="fixture failed")
-        return subprocess.CompletedProcess(
-            command, 0, stdout="{}" if failure == "incomplete" else "not JSON"
-        )
+        match failure:
+            case "timeout":
+                raise subprocess.TimeoutExpired(command, 10)
+            case "child_exit":
+                raise subprocess.CalledProcessError(1, command, stderr="fixture failed")
+            case _:
+                return subprocess.CompletedProcess(
+                    command, 0, stdout="{}" if failure == "incomplete" else "not JSON"
+                )
 
     monkeypatch.setattr(subprocess, "run", failed_child)
     monkeypatch.setattr(sys, "argv", [str(_SCRIPT), "--output", str(output)])

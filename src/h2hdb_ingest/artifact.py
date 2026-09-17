@@ -827,24 +827,25 @@ def _preflight_archive_members(
                 "selected source positions must be strictly increasing"
             )
         previous_position = member.position
-        if role is ArtifactSourceRole.OTHER:
-            raise PresentationImageError(
-                "OTHER sources must never cross the archive render boundary"
-            )
-        if role is ArtifactSourceRole.METADATA:
-            if metadata is not None:
+        match role:
+            case ArtifactSourceRole.OTHER:
                 raise PresentationImageError(
-                    "artifact source has more than one metadata member"
+                    "OTHER sources must never cross the archive render boundary"
                 )
-            if member.expected_size_bytes > MAX_METADATA_BYTES:
-                raise PresentationImageError(
-                    "artifact source exceeds its encoded-size bound"
-                )
-            metadata = member
-            continue
-        pages.append(member)
-        if len(pages) > MAX_PAGE_COUNT:
-            raise PresentationImageError("presentation exceeds 4096 pages")
+            case ArtifactSourceRole.METADATA:
+                if metadata is not None:
+                    raise PresentationImageError(
+                        "artifact source has more than one metadata member"
+                    )
+                if member.expected_size_bytes > MAX_METADATA_BYTES:
+                    raise PresentationImageError(
+                        "artifact source exceeds its encoded-size bound"
+                    )
+                metadata = member
+            case _:
+                pages.append(member)
+                if len(pages) > MAX_PAGE_COUNT:
+                    raise PresentationImageError("presentation exceeds 4096 pages")
     if metadata is None:
         raise PresentationImageError("artifact source lacks its unique metadata member")
     return metadata, tuple(pages)

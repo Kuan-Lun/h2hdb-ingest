@@ -1650,25 +1650,26 @@ def _parse_galleryinfo_content(
             key, value = line.split(":", 1)
             key = key.strip()
             value = value.strip()
-            if key == "Tags":
-                tags = []
-                for tag in value.split(","):
-                    if ":" in tag:
-                        tag_key, tag_value = tag.split(":", 1)
-                        if tag_key.strip() != "":
-                            tags.append((tag_key.strip(), tag_value.strip()))
+            match key:
+                case "Tags":
+                    tags = []
+                    for tag in value.split(","):
+                        if ":" in tag:
+                            tag_key, tag_value = tag.split(":", 1)
+                            if tag_key.strip() != "":
+                                tags.append((tag_key.strip(), tag_value.strip()))
+                            else:
+                                tags.append(("untagged", tag_value.strip()))
                         else:
-                            tags.append(("untagged", tag_value.strip()))
-                    else:
-                        tags.append(("untagged", tag.strip()))
-            elif key == "Title":
-                title = value
-            elif key == "Upload Time":
-                upload_time = datetime.strptime(value, "%Y-%m-%d %H:%M")
-            elif key == "Uploaded By":
-                upload_account = value
-            elif key == "Downloaded":
-                download_time = datetime.strptime(value, "%Y-%m-%d %H:%M")
+                            tags.append(("untagged", tag.strip()))
+                case "Title":
+                    title = value
+                case "Upload Time":
+                    upload_time = datetime.strptime(value, "%Y-%m-%d %H:%M")
+                case "Uploaded By":
+                    upload_account = value
+                case "Downloaded":
+                    download_time = datetime.strptime(value, "%Y-%m-%d %H:%M")
 
     if (
         title is None

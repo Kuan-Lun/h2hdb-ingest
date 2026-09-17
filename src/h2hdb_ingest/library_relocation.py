@@ -138,18 +138,19 @@ def relocate_library_step(
         if session.phase != "FINALIZING":
             _ensure_marker(files, session)
             _notify(fault, "marker_durable")
-        if session.phase == "CLEANUP":
-            _cleanup(connection, session, batch_size)
-        elif session.phase == "SCAN":
-            _scan(files, connection, session, batch_size, progress, fault)
-        elif session.phase == "TOKENS":
-            _tokens(files, connection, session, batch_size, progress, fault)
-        elif session.phase == "AUDIT":
-            _audit(files, connection, session, batch_size, fault)
-        elif session.phase == "FINALIZING":
-            _finalize(files, connection, session, fault)
-        else:
-            raise RuntimeError("library relocation session phase is corrupt")
+        match session.phase:
+            case "CLEANUP":
+                _cleanup(connection, session, batch_size)
+            case "SCAN":
+                _scan(files, connection, session, batch_size, progress, fault)
+            case "TOKENS":
+                _tokens(files, connection, session, batch_size, progress, fault)
+            case "AUDIT":
+                _audit(files, connection, session, batch_size, fault)
+            case "FINALIZING":
+                _finalize(files, connection, session, fault)
+            case _:
+                raise RuntimeError("library relocation session phase is corrupt")
         current = _session(connection)
         if current is None:
             raise RuntimeError("library relocation session disappeared")
@@ -372,11 +373,13 @@ def _cleanup(connection: sqlite3.Connection, session: _Session, limit: int) -> N
 
 
 def _active_filter(table: str) -> str:
-    if table == "protection_tokens":
-        return " AND state IN ('WRITING', 'STAGED')"
-    if table in {"pending_entries", "pending_removals"}:
-        return " AND activation_revision = (SELECT pending_revision FROM library_state WHERE singleton = 1)"
-    return ""
+    match table:
+        case "protection_tokens":
+            return " AND state IN ('WRITING', 'STAGED')"
+        case "pending_entries" | "pending_removals":
+            return " AND activation_revision = (SELECT pending_revision FROM library_state WHERE singleton = 1)"
+        case _:
+            return ""
 
 
 def _paths(connection: sqlite3.Connection, cursor: str, limit: int) -> list[str]:

@@ -399,17 +399,18 @@ def test_relocation_preserves_unverified_or_unsafe_current(
     payload = target.read_bytes()
     outside = tmp_path / "outside"
     outside.write_bytes(payload)
-    if corruption == "bytes":
-        target.write_bytes(bytes(value ^ 1 for value in payload))
-    elif corruption == "size":
-        target.write_bytes(payload + b"extra")
-    elif corruption == "symlink":
-        target.unlink()
-        target.symlink_to(outside)
-    elif corruption == "missing":
-        target.unlink()
-    else:
-        os.link(target, tmp_path / "other-link")
+    match corruption:
+        case "bytes":
+            target.write_bytes(bytes(value ^ 1 for value in payload))
+        case "size":
+            target.write_bytes(payload + b"extra")
+        case "symlink":
+            target.unlink()
+            target.symlink_to(outside)
+        case "missing":
+            target.unlink()
+        case _:
+            os.link(target, tmp_path / "other-link")
     before = None if corruption == "missing" else target.lstat()
     before_bytes = None if corruption == "missing" else target.read_bytes()
 

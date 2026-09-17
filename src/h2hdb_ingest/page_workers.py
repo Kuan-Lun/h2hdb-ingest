@@ -355,11 +355,13 @@ def _read_darwin_translation_status() -> _DarwinTranslation:
         return _DarwinTranslation.UNKNOWN
     if returned_size != sizeof(c_int):
         return _DarwinTranslation.UNKNOWN
-    if value == 0:
-        return _DarwinTranslation.NATIVE
-    if value == 1:
-        return _DarwinTranslation.TRANSLATED
-    return _DarwinTranslation.UNKNOWN
+    match value:
+        case 0:
+            return _DarwinTranslation.NATIVE
+        case 1:
+            return _DarwinTranslation.TRANSLATED
+        case _:
+            return _DarwinTranslation.UNKNOWN
 
 
 def _running_platform() -> str:

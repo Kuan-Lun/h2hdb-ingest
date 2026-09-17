@@ -126,10 +126,11 @@ def _output_manifest(root: Path) -> tuple[str, int, int, int, int]:
         digest.update(content_digest.digest())
         file_count += 1
         byte_count += size
-        if path.suffix == ".cbz":
-            acquisition_count += 1
-        elif path.name == "thumbnail-320.jpg":
-            artwork_count += 1
+        match path:
+            case Path(suffix=".cbz"):
+                acquisition_count += 1
+            case Path(name="thumbnail-320.jpg"):
+                artwork_count += 1
     return (
         digest.hexdigest(),
         file_count,

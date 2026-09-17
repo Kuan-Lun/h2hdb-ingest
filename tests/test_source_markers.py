@@ -530,10 +530,11 @@ def test_root_replacement_after_discovery_fails_before_reading_a_gallery(
             (moved / "1001").rename(root / "1001")
         with pytest.raises(FilesystemObservationError) as caught:
             adapter = VNextFilesystemSourceAdapter(source)
-            if operation == "marker":
-                adapter.observe_completion_marker(("1001",))
-            elif operation == "gallery":
-                adapter.observe_gallery(("1001",))
-            else:
-                source.list_files(("1001",), after_name=None, limit=128)
+            match operation:
+                case "marker":
+                    adapter.observe_completion_marker(("1001",))
+                case "gallery":
+                    adapter.observe_gallery(("1001",))
+                case _:
+                    source.list_files(("1001",), after_name=None, limit=128)
         assert not isinstance(caught.value, FilesystemSourceChangedError)

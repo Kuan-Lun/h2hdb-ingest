@@ -169,23 +169,24 @@ def test_changed_actual_archive_never_uses_retained_inspection(
         BytesIO(original), (canonical_page_member_name(0),)
     )
     changed = bytearray(original)
-    if change == "crc":
-        changed[inspected.pages[0].byte_offset + 10] ^= 1
-    elif change == "truncate":
-        del changed[-10:]
-    elif change == "append":
-        changed += b"untrusted extra bytes"
-    else:
-        with ZipFile(BytesIO(original)) as source:
-            replacement = BytesIO()
-            with ZipFile(replacement, "w") as target:
-                for info in source.infolist():
-                    content = source.read(info.filename)
-                    if info.filename == "galleryinfo.txt":
-                        content = b"Title: best\n"
-                    target.writestr(info, content)
-            changed = bytearray(replacement.getvalue())
-        assert len(changed) == len(original)
+    match change:
+        case "crc":
+            changed[inspected.pages[0].byte_offset + 10] ^= 1
+        case "truncate":
+            del changed[-10:]
+        case "append":
+            changed += b"untrusted extra bytes"
+        case _:
+            with ZipFile(BytesIO(original)) as source:
+                replacement = BytesIO()
+                with ZipFile(replacement, "w") as target:
+                    for info in source.infolist():
+                        content = source.read(info.filename)
+                        if info.filename == "galleryinfo.txt":
+                            content = b"Title: best\n"
+                        target.writestr(info, content)
+                changed = bytearray(replacement.getvalue())
+            assert len(changed) == len(original)
     calls = 0
     inspect = artifact_module.inspect_presentation_archive
 
