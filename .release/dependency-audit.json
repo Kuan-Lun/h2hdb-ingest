@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-16T08:09:22+00:00",
+  "checked_at": "2026-09-17T14:28:39+00:00",
   "manifest_sha256": "a7c49fa77544d6a0e0f32a3b9fefcb4e0ac5734d50f101184d3da6d59b489d67",
   "node": [
     {
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.25.1",
+  "project_version": "0.25.2",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -32,8 +32,8 @@
     {
       "declared": "h2hdb>=0.39.2,<0.40.0",
       "group": "runtime",
-      "latest": "0.39.1",
-      "latest_satisfies": false,
+      "latest": "0.39.7",
+      "latest_satisfies": true,
       "name": "h2hdb",
       "python_3_14": true,
       "url": "https://pypi.org/project/h2hdb/"
@@ -140,7 +140,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.16.7",
+      "latest": "0.16.8",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all 16 Python and 1 Node direct dependency declarations against the registry. Every non-Core latest version is unchanged from the prior reviewed receipt, within its compatibility bound and compatible with Python 3.14. Core registry latest is 0.39.1; it does not satisfy the new >=0.39.2,<0.40.0 requirement. This coordinated release requires the Core lease admission/renewal fix: the explicit local h2hdb 0.39.2 wheel (SHA256 ef43c2a960eb8b003b9188a4a3c23341d574d92a51c2e478e7e88a4aa2813405) was installed, every installed Python source was compared with the wheel, and targeted session/service tests and strict checks passed. Core 0.39.2 must be published before this Ingest release can resolve from the registry. No compatibility shim or fallback accepts an older Core. Other installed direct versions were preserved; uv pip check accepted all 44 packages and npm ls passed. Full release gate, opt-in MariaDB and deployment Compose results are separate evidence, not implied by this dependency receipt.",
+    "note": "Reviewed all 16 Python and 1 Node direct dependency entries, including registry latest candidates outside declared upper bounds. Compared the preceding committed receipt: external candidates are unchanged except Ruff 0.16.8, and coordinated core h2hdb is now published as 0.39.7. No dependency constraints changed. Reviewed https://github.com/astral-sh/ruff/releases/tag/0.16.8: type-analysis and pyupgrade fixes, lazy-import support, regex diagnostics and formatter warning changes; current Python 3.14 settings pass complete repository Ruff lint/format and strict mypy with the new Ruff installed. Reviewed core local release history through merge 656c6fe: bounded GID preparation, marker canonical reads, cleanup lease recovery, telemetry and exact-key cleanup batching preserve the public facade/domain and epoch-3/schema-7 consumer contract. Installed public registry h2hdb 0.39.7 and Ruff 0.16.8 into the repository-local environment through the normal uv resolver. All 44 installed packages pass uv pip check; all direct Node packages match discovered latest candidates and npm ls succeeds. 140 focused tests passed using these latest candidates. The broader syntax-refactor focused tests previously passed against the prior compatible core wheel; final complete merge gates and isolated cross-repository deployment acceptance are reported separately. The patch release changes value/shape dispatch syntax; public APIs, data formats, byte output, safety guards and ordering of effects are unchanged.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
