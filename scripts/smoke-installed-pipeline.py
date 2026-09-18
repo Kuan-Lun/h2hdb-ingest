@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import importlib
 import json
+import logging
 import os
 import struct
 import sys
@@ -24,7 +25,13 @@ from tempfile import TemporaryDirectory
 from typing import Any
 from zipfile import ZipFile
 
-from h2hdb import CatalogTagFilter, CoreConfig, DatabaseConfig, open_database
+from h2hdb import (
+    CatalogTagFilter,
+    CoreConfig,
+    DatabaseConfig,
+    LoggerConfig,
+    open_database,
+)
 from PIL import Image
 
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
@@ -235,6 +242,19 @@ async def _opds_probe(
                     assert response.content == item.thumbnail
 
 
+def _require_source_summaries(log_path: Path, *, expected: int) -> list[str]:
+    summaries = [
+        line
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if "ingest_metric " in line
+    ]
+    assert len(summaries) == expected, "each source turn emits exactly one summary"
+    for line in summaries:
+        assert "[INFO] ingest_metric scope=source operation=synchronize " in line
+        assert " status=completed " in line
+    return summaries
+
+
 def _run_pipeline(*, with_opds: bool) -> None:
     with TemporaryDirectory(prefix="h2hdb-installed-pipeline-") as temporary:
         root = Path(temporary).resolve()
@@ -254,7 +274,9 @@ def _run_pipeline(*, with_opds: bool) -> None:
         log_path = root / "ingest.log"
         config = IngestConfig(
             core=CoreConfig(
-                logger={"level": "INFO", "file": str(log_path)},
+                logger=LoggerConfig.model_validate(
+                    {"level": "INFO", "file": str(log_path)}
+                ),
                 database=DatabaseConfig(
                     sql_type="sqlite", database=str(root / "catalog.sqlite3")
                 ),
@@ -267,11 +289,18 @@ def _run_pipeline(*, with_opds: bool) -> None:
             ),
         )
         configure_logging(config)
+        events: list[str] = []
+
+        def event(message: str) -> None:
+            events.append(message)
+            logging.getLogger("h2hdb_ingest.runtime").info(message)
+
         with ExitStack() as resources:
             scratch = resources.enter_context(DiskScratch(library))
             assert scratch.path.is_relative_to(library / ".h2hdb-state")
             with build_runtime(
                 config,
+                event_logger=event,
                 temporary_cleanup=scratch.cleanup_page,
                 owned_resources=resources.pop_all(),
             ) as runtime:
@@ -279,6 +308,7 @@ def _run_pipeline(*, with_opds: bool) -> None:
                 runtime.resident.initialize()
                 assert runtime.resident.process_available(periodic_scan=True)
                 published = _inspect(runtime, library, {2001, 2002, 2004})
+                _require_source_summaries(log_path, expected=1)
                 first_revision = (
                     runtime.catalog.discover_publications().revision.revision
                 )
@@ -290,12 +320,14 @@ def _run_pipeline(*, with_opds: bool) -> None:
             scratch = resources.enter_context(DiskScratch(library))
             with build_runtime(
                 config,
+                event_logger=event,
                 temporary_cleanup=scratch.cleanup_page,
                 owned_resources=resources.pop_all(),
             ) as runtime:
                 runtime.resident.initialize()
                 assert runtime.resident.process_available(periodic_scan=True)
                 _inspect(runtime, library, {2001, 2002, 2004})
+                _require_source_summaries(log_path, expected=2)
                 with Image.new("RGB", (20, 30), "blue") as image:
                     image.save(repair / "001.png", format="PNG")
                 marker = repair / "galleryinfo.txt"
@@ -332,13 +364,16 @@ def _run_pipeline(*, with_opds: bool) -> None:
         info_lines = [line for line in log_lines if "[INFO]" in line]
         assert info_lines, "real INFO progress must remain visible"
         assert all("VIPS:" not in line for line in info_lines)
-        assert all("ingest_metric" not in line for line in info_lines)
+        source_summaries = _require_source_summaries(log_path, expected=3)
+        assert events
+        assert not any(message.startswith("ingest_metric ") for message in events)
         assert any("gallery_image_rejected" in line for line in log_lines)
         print(
             json.dumps(
                 {
                     "pipeline_behavior": "passed",
                     "info_logging": "passed",
+                    "source_info_summaries": len(source_summaries),
                     "disk_scratch": "passed",
                     "initial_publications": 3,
                     "repaired_publications": 4,
