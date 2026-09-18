@@ -34,6 +34,7 @@ from h2h_galleryinfo_parser import GalleryInfoParser, parse_gid
 
 from ._limits import MAX_METADATA_BYTES
 from .progress import ProgressWork
+from .source_performance import SourcePerformance
 
 FILESYSTEM_OBSERVATION_VERSION = 3
 GALLERY_INFO_NAME = "galleryinfo.txt"
@@ -124,6 +125,10 @@ class FilesystemFileObservation:
         default=None, repr=False, compare=False, kw_only=True
     )
 
+    _source_performance: SourcePerformance = field(
+        default_factory=SourcePerformance, repr=False, compare=False, kw_only=True
+    )
+
     def content_parts(self) -> Iterator[bytes]:
         """Yield exact file bytes after a no-follow open and stat check."""
 
@@ -157,10 +162,13 @@ class FilesystemFileObservation:
             digest = sha256()
             while True:
                 self._checkpoint()
-                part = os.read(descriptor, _READ_BYTES)
+                with self._source_performance.phase("read"):
+                    part = os.read(descriptor, _READ_BYTES)
                 if not part:
                     break
-                digest.update(part)
+                with self._source_performance.phase("hash"):
+                    digest.update(part)
+                self._source_performance.add("logical_bytes_read", len(part))
                 if self._progress is not None:
                     self._progress.advance("source_bytes_read", len(part))
                 yield part
@@ -262,11 +270,15 @@ class FilesystemSource:
         *,
         checkpoint: Callable[[], None] | None = None,
         progress: ProgressWork | None = None,
+        performance: SourcePerformance | None = None,
     ) -> None:
         if checkpoint is not None and not callable(checkpoint):
             raise TypeError("checkpoint must be callable or None")
         self._checkpoint = checkpoint if checkpoint is not None else _noop_checkpoint
         self._progress = progress
+        self._source_performance = (
+            performance if performance is not None else SourcePerformance()
+        )
         self._checkpoint()
         try:
             resolved = root.resolve(strict=True)
@@ -546,6 +558,7 @@ class FilesystemSource:
                 _snapshot=content,
                 _checkpoint=self._checkpoint,
                 _progress=self._progress,
+                _source_performance=self._source_performance,
             )
         except OSError as error:
             raise _source_io_error(
@@ -665,6 +678,7 @@ class FilesystemSource:
                 ),
                 _checkpoint=self._checkpoint,
                 _progress=self._progress,
+                _source_performance=self._source_performance,
             )
             for row in rows[:bound]
         )
@@ -756,139 +770,142 @@ class FilesystemSource:
             return self._build_discovery_index()
 
     def _build_discovery_index(self) -> sqlite3.Connection:
-        temporary = tempfile.TemporaryDirectory(prefix="h2hdb-ingest-discovery-")
-        connection = sqlite3.connect(Path(temporary.name) / "locators.sqlite3")
-        try:
-            connection.executescript("""
-                PRAGMA foreign_keys = ON;
-                PRAGMA temp_store = FILE;
-                CREATE TABLE locators (
-                    payload BLOB PRIMARY KEY,
-                    device BLOB NOT NULL CHECK (length(device) = 8),
-                    inode BLOB NOT NULL CHECK (length(inode) = 8),
-                    size_bytes INTEGER NOT NULL,
-                    modified_ns INTEGER NOT NULL,
-                    changed_ns INTEGER NOT NULL
-                );
-                CREATE TABLE discovery_directories (
-                    ordinal INTEGER PRIMARY KEY,
-                    path TEXT NOT NULL UNIQUE,
-                    device BLOB NOT NULL CHECK (length(device) = 8),
-                    inode BLOB NOT NULL CHECK (length(inode) = 8),
-                    size_bytes INTEGER NOT NULL,
-                    modified_ns INTEGER NOT NULL,
-                    changed_ns INTEGER NOT NULL,
-                    visited INTEGER NOT NULL CHECK (visited IN (0, 1))
-                );
-                CREATE INDEX pending_discovery_directories
-                    ON discovery_directories (visited, ordinal);
-                CREATE TABLE gallery_audits (
-                    payload BLOB PRIMARY KEY REFERENCES locators(payload),
-                    metadata_audit_sha256 BLOB NOT NULL
-                        CHECK (length(metadata_audit_sha256) = 32),
-                    entry_audit_sha256 BLOB NOT NULL
-                        CHECK (length(entry_audit_sha256) = 32),
-                    metadata_sha256 BLOB NOT NULL
-                        CHECK (length(metadata_sha256) = 32),
-                    directory_device BLOB NOT NULL
-                        CHECK (length(directory_device) = 8),
-                    directory_inode BLOB NOT NULL
-                        CHECK (length(directory_inode) = 8),
-                    directory_size_bytes INTEGER NOT NULL,
-                    directory_modified_ns INTEGER NOT NULL,
-                    directory_changed_ns INTEGER NOT NULL,
-                    entry_count INTEGER NOT NULL CHECK (entry_count >= 1)
-                );
-                CREATE TABLE active_gallery_snapshot (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    payload BLOB NOT NULL UNIQUE REFERENCES locators(payload),
-                    metadata_audit_sha256 BLOB NOT NULL
-                        CHECK (length(metadata_audit_sha256) = 32),
-                    entry_audit_sha256 BLOB NOT NULL
-                        CHECK (length(entry_audit_sha256) = 32),
-                    metadata_sha256 BLOB NOT NULL
-                        CHECK (length(metadata_sha256) = 32),
-                    directory_device BLOB NOT NULL
-                        CHECK (length(directory_device) = 8),
-                    directory_inode BLOB NOT NULL
-                        CHECK (length(directory_inode) = 8),
-                    directory_size_bytes INTEGER NOT NULL,
-                    directory_modified_ns INTEGER NOT NULL,
-                    directory_changed_ns INTEGER NOT NULL,
-                    entry_count INTEGER NOT NULL CHECK (entry_count >= 1),
-                    gid INTEGER NOT NULL,
-                    title TEXT NOT NULL,
-                    comment TEXT NOT NULL,
-                    upload_account TEXT NOT NULL,
-                    upload_time INTEGER NOT NULL,
-                    download_time INTEGER NOT NULL,
-                    modified_time INTEGER NOT NULL,
-                    scan_observation_version INTEGER NOT NULL,
-                    source_file_count INTEGER NOT NULL
-                        CHECK (source_file_count >= 1),
-                    page_count INTEGER NOT NULL CHECK (page_count >= 0)
-                );
-                CREATE TABLE gallery_entries (
-                    name_bytes BLOB PRIMARY KEY,
-                    device BLOB NOT NULL CHECK (length(device) = 8),
-                    inode BLOB NOT NULL CHECK (length(inode) = 8),
-                    size_bytes INTEGER NOT NULL,
-                    modified_ns INTEGER NOT NULL,
-                    changed_ns INTEGER NOT NULL,
-                    file_type INTEGER NOT NULL CHECK (file_type BETWEEN 0 AND 3)
-                );
-                CREATE TABLE gallery_tags (
-                    ordinal INTEGER PRIMARY KEY CHECK (ordinal >= 0),
-                    namespace TEXT NOT NULL,
-                    value TEXT NOT NULL
-                );
-                CREATE TABLE gallery_audit_entries (
-                    name_bytes BLOB PRIMARY KEY,
-                    device BLOB NOT NULL CHECK (length(device) = 8),
-                    inode BLOB NOT NULL CHECK (length(inode) = 8),
-                    size_bytes INTEGER NOT NULL,
-                    modified_ns INTEGER NOT NULL,
-                    changed_ns INTEGER NOT NULL,
-                    file_type INTEGER NOT NULL CHECK (file_type BETWEEN 0 AND 3)
-                );
-                """)
-            expected_root = self._directory_stat(self._root)
-            for locator, observed in self._discover_directory(self._root, connection):
-                self._checkpoint()
-                try:
-                    connection.execute(
-                        "INSERT INTO locators VALUES (?, ?, ?, ?, ?, ?)",
-                        (
-                            _encode_locator(locator),
-                            observed.device.to_bytes(8, "big"),
-                            observed.inode.to_bytes(8, "big"),
-                            observed.size_bytes,
-                            observed.modified_ns,
-                            observed.changed_ns,
-                        ),
+        with self._source_performance.phase("discovery"):
+            temporary = tempfile.TemporaryDirectory(prefix="h2hdb-ingest-discovery-")
+            connection = sqlite3.connect(Path(temporary.name) / "locators.sqlite3")
+            try:
+                connection.executescript("""
+                    PRAGMA foreign_keys = ON;
+                    PRAGMA temp_store = FILE;
+                    CREATE TABLE locators (
+                        payload BLOB PRIMARY KEY,
+                        device BLOB NOT NULL CHECK (length(device) = 8),
+                        inode BLOB NOT NULL CHECK (length(inode) = 8),
+                        size_bytes INTEGER NOT NULL,
+                        modified_ns INTEGER NOT NULL,
+                        changed_ns INTEGER NOT NULL
+                    );
+                    CREATE TABLE discovery_directories (
+                        ordinal INTEGER PRIMARY KEY,
+                        path TEXT NOT NULL UNIQUE,
+                        device BLOB NOT NULL CHECK (length(device) = 8),
+                        inode BLOB NOT NULL CHECK (length(inode) = 8),
+                        size_bytes INTEGER NOT NULL,
+                        modified_ns INTEGER NOT NULL,
+                        changed_ns INTEGER NOT NULL,
+                        visited INTEGER NOT NULL CHECK (visited IN (0, 1))
+                    );
+                    CREATE INDEX pending_discovery_directories
+                        ON discovery_directories (visited, ordinal);
+                    CREATE TABLE gallery_audits (
+                        payload BLOB PRIMARY KEY REFERENCES locators(payload),
+                        metadata_audit_sha256 BLOB NOT NULL
+                            CHECK (length(metadata_audit_sha256) = 32),
+                        entry_audit_sha256 BLOB NOT NULL
+                            CHECK (length(entry_audit_sha256) = 32),
+                        metadata_sha256 BLOB NOT NULL
+                            CHECK (length(metadata_sha256) = 32),
+                        directory_device BLOB NOT NULL
+                            CHECK (length(directory_device) = 8),
+                        directory_inode BLOB NOT NULL
+                            CHECK (length(directory_inode) = 8),
+                        directory_size_bytes INTEGER NOT NULL,
+                        directory_modified_ns INTEGER NOT NULL,
+                        directory_changed_ns INTEGER NOT NULL,
+                        entry_count INTEGER NOT NULL CHECK (entry_count >= 1)
+                    );
+                    CREATE TABLE active_gallery_snapshot (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        payload BLOB NOT NULL UNIQUE REFERENCES locators(payload),
+                        metadata_audit_sha256 BLOB NOT NULL
+                            CHECK (length(metadata_audit_sha256) = 32),
+                        entry_audit_sha256 BLOB NOT NULL
+                            CHECK (length(entry_audit_sha256) = 32),
+                        metadata_sha256 BLOB NOT NULL
+                            CHECK (length(metadata_sha256) = 32),
+                        directory_device BLOB NOT NULL
+                            CHECK (length(directory_device) = 8),
+                        directory_inode BLOB NOT NULL
+                            CHECK (length(directory_inode) = 8),
+                        directory_size_bytes INTEGER NOT NULL,
+                        directory_modified_ns INTEGER NOT NULL,
+                        directory_changed_ns INTEGER NOT NULL,
+                        entry_count INTEGER NOT NULL CHECK (entry_count >= 1),
+                        gid INTEGER NOT NULL,
+                        title TEXT NOT NULL,
+                        comment TEXT NOT NULL,
+                        upload_account TEXT NOT NULL,
+                        upload_time INTEGER NOT NULL,
+                        download_time INTEGER NOT NULL,
+                        modified_time INTEGER NOT NULL,
+                        scan_observation_version INTEGER NOT NULL,
+                        source_file_count INTEGER NOT NULL
+                            CHECK (source_file_count >= 1),
+                        page_count INTEGER NOT NULL CHECK (page_count >= 0)
+                    );
+                    CREATE TABLE gallery_entries (
+                        name_bytes BLOB PRIMARY KEY,
+                        device BLOB NOT NULL CHECK (length(device) = 8),
+                        inode BLOB NOT NULL CHECK (length(inode) = 8),
+                        size_bytes INTEGER NOT NULL,
+                        modified_ns INTEGER NOT NULL,
+                        changed_ns INTEGER NOT NULL,
+                        file_type INTEGER NOT NULL CHECK (file_type BETWEEN 0 AND 3)
+                    );
+                    CREATE TABLE gallery_tags (
+                        ordinal INTEGER PRIMARY KEY CHECK (ordinal >= 0),
+                        namespace TEXT NOT NULL,
+                        value TEXT NOT NULL
+                    );
+                    CREATE TABLE gallery_audit_entries (
+                        name_bytes BLOB PRIMARY KEY,
+                        device BLOB NOT NULL CHECK (length(device) = 8),
+                        inode BLOB NOT NULL CHECK (length(inode) = 8),
+                        size_bytes INTEGER NOT NULL,
+                        modified_ns INTEGER NOT NULL,
+                        changed_ns INTEGER NOT NULL,
+                        file_type INTEGER NOT NULL CHECK (file_type BETWEEN 0 AND 3)
+                    );
+                    """)
+                expected_root = self._directory_stat(self._root)
+                for locator, observed in self._discover_directory(
+                    self._root, connection
+                ):
+                    self._checkpoint()
+                    try:
+                        connection.execute(
+                            "INSERT INTO locators VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                _encode_locator(locator),
+                                observed.device.to_bytes(8, "big"),
+                                observed.inode.to_bytes(8, "big"),
+                                observed.size_bytes,
+                                observed.modified_ns,
+                                observed.changed_ns,
+                            ),
+                        )
+                    except sqlite3.IntegrityError as error:
+                        raise FilesystemObservationError(
+                            f"duplicate gallery locator: {locator!r}"
+                        ) from error
+                    if self._progress is not None:
+                        self._progress.advance("galleries_discovered")
+                if not _same_directory_identity(
+                    self._directory_stat(self._root), expected_root
+                ):
+                    raise FilesystemSourceChangedError(
+                        f"source root changed during discovery snapshot: {self._root}"
                     )
-                except sqlite3.IntegrityError as error:
-                    raise FilesystemObservationError(
-                        f"duplicate gallery locator: {locator!r}"
-                    ) from error
-                if self._progress is not None:
-                    self._progress.advance("galleries_discovered")
-            if not _same_directory_identity(
-                self._directory_stat(self._root), expected_root
-            ):
-                raise FilesystemSourceChangedError(
-                    f"source root changed during discovery snapshot: {self._root}"
-                )
-            connection.commit()
-            self._checkpoint()
-        except BaseException:
-            connection.close()
-            temporary.cleanup()
-            raise
-        self._discovery_temporary = temporary
-        self._discovery_connection = connection
-        self._discovery_root_stat = expected_root
-        return connection
+                connection.commit()
+                self._checkpoint()
+            except BaseException:
+                connection.close()
+                temporary.cleanup()
+                raise
+            self._discovery_temporary = temporary
+            self._discovery_connection = connection
+            self._discovery_root_stat = expected_root
+            return connection
 
     def _gallery_index(
         self,
@@ -948,18 +965,19 @@ class FilesystemSource:
         folder: Path,
         directory_stat: FilesystemStat,
     ) -> _FilesystemGalleryIndex:
-        activity = (
-            nullcontext()
-            if self._progress is None
-            else self._progress.activity("source_gallery_observation")
-        )
-        with activity:
-            return self._build_gallery_snapshot(
-                connection,
-                payload=payload,
-                folder=folder,
-                directory_stat=directory_stat,
+        with self._source_performance.phase("gallery_index"):
+            activity = (
+                nullcontext()
+                if self._progress is None
+                else self._progress.activity("source_gallery_observation")
             )
+            with activity:
+                return self._build_gallery_snapshot(
+                    connection,
+                    payload=payload,
+                    folder=folder,
+                    directory_stat=directory_stat,
+                )
 
     def _build_gallery_snapshot(
         self,
@@ -986,11 +1004,11 @@ class FilesystemSource:
         )
         self._checkpoint()
         try:
-            parsed = _parse_galleryinfo_content(
-                folder,
-                metadata_content,
-                modified_ns=metadata_stat.modified_ns,
-            )
+            with self._source_performance.phase("metadata_parse"):
+                parsed = _parse_galleryinfo_content(
+                    folder, metadata_content, modified_ns=metadata_stat.modified_ns
+                )
+            self._source_performance.add("metadata_tags", len(parsed.tags))
         except Exception as error:
             self._require_metadata_unchanged(
                 metadata_path, metadata_stat, metadata_sha256
@@ -1591,14 +1609,17 @@ class FilesystemSource:
             digest = sha256()
             while len(content) <= MAX_METADATA_BYTES:
                 self._checkpoint()
-                part = os.read(
-                    descriptor,
-                    min(_READ_BYTES, MAX_METADATA_BYTES + 1 - len(content)),
-                )
+                with self._source_performance.phase("read"):
+                    part = os.read(
+                        descriptor,
+                        min(_READ_BYTES, MAX_METADATA_BYTES + 1 - len(content)),
+                    )
                 if not part:
                     break
                 content.extend(part)
-                digest.update(part)
+                with self._source_performance.phase("hash"):
+                    digest.update(part)
+                self._source_performance.add("logical_bytes_read", len(part))
                 if self._progress is not None:
                     self._progress.advance("source_bytes_read", len(part))
             self._checkpoint()

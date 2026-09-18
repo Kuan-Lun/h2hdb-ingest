@@ -7,6 +7,8 @@ import os
 import runpy
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,7 @@ from h2hdb_ingest.filesystem import (
     FilesystemSourceChangedError,
     FilesystemStat,
 )
+from h2hdb_ingest.source_performance import SourcePerformance, SourcePhase
 from h2hdb_ingest.source_snapshot import SourceSnapshotStore
 
 _SCRIPT = Path(__file__).parents[1] / "scripts" / "probe-source-io.py"
@@ -63,7 +66,7 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
     )
     report = json.loads(report_path.read_text())
     assert report["status"] == "ok"
-    assert report["format_version"] == 2
+    assert report["format_version"] == 3
     assert report["fixture"]["workers"] == workers
     assert report["fixture"]["codec"] == codec
     assert report["provenance"]["h2hdb"]["python_source_sha256"]
@@ -83,6 +86,15 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
         assert case["elapsed_seconds"] >= 0
         assert case["galleries"] == 2
         assert case["waiting"] == case["deferred"] == 0
+        assert case["telemetry_comparison"]["matched"] is True
+        metric = case["production_telemetry"]
+        assert metric["status"] == "completed"
+        assert metric["scope"] == "source"
+        assert all(value >= 0 for value in metric["phases_ns_inclusive"].values())
+        for name, value in case["telemetry_comparison"][
+            "independent_expected_counters"
+        ].items():
+            assert metric["counters"].get(name, 0) == value
         # File and phase summaries are alternate views of the same raw reads.
         for counter in ("read_bytes", "read_calls"):
             assert sum(item[counter] for item in case["source_files"].values()) == sum(
@@ -124,6 +136,69 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
     assert unchanged["captured_pages_verified"] == 0
     assert policy["captured_pages_verified"] == 4
     assert changed["captured_pages_verified"] == 2
+
+
+@pytest.mark.parametrize("omitted", ("read", "logical_bytes_read"))
+def test_real_negative_control_rejects_missing_production_read_measurement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, omitted: str
+) -> None:
+    module = runpy.run_path(str(_SCRIPT))
+    original_phase = SourcePerformance.phase
+    original_add = SourcePerformance.add
+
+    @contextmanager
+    def phase(self: SourcePerformance, name: SourcePhase) -> Iterator[None]:
+        if omitted == name:
+            yield
+        else:
+            with original_phase(self, name):
+                yield
+
+    def add(self: SourcePerformance, name: str, value: int = 1) -> None:
+        if name != omitted:
+            original_add(self, name, value)
+
+    monkeypatch.setattr(SourcePerformance, "phase", phase)
+    monkeypatch.setattr(SourcePerformance, "add", add)
+    with pytest.raises(
+        RuntimeError, match="production source telemetry differs from independent meter"
+    ):
+        module["_run_matrix"](1, 1, 16, 1, codec="png", workspace=tmp_path)
+
+
+def test_capture_byte_oracle_runs_after_measured_region(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = runpy.run_path(str(_SCRIPT))
+    original_instrument = module["_Meter"].instrument
+    original_verify = module["_verify_captures"]
+    active = False
+    verified = 0
+
+    @contextmanager
+    def instrument(self: Any) -> Iterator[None]:
+        nonlocal active
+        assert not active
+        active = True
+        try:
+            with original_instrument(self):
+                yield
+        finally:
+            active = False
+
+    def verify(root: Path, captured: SourceSnapshotStore) -> int:
+        nonlocal verified
+        assert not active, "verification reads must not enter the preparation cost"
+        verified += 1
+        result = original_verify(root, captured)
+        assert type(result) is int
+        return result
+
+    monkeypatch.setattr(module["_Meter"], "instrument", instrument)
+    monkeypatch.setitem(module["_run_matrix"].__globals__, "_verify_captures", verify)
+    result = module["_run_matrix"](1, 1, 16, 1, codec="png", workspace=tmp_path)
+    assert result["status"] == "ok"
+    assert verified == 3
 
 
 def test_meter_calibrates_actual_reads_and_separate_buffer_boundary(
