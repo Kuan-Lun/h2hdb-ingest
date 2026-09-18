@@ -37,6 +37,7 @@ from h2hdb_ingest.service import (
     synchronize_source,
 )
 from h2hdb_ingest.session import IngestSessionController
+from h2hdb_ingest.source_performance import SourcePerformance
 
 
 def _session(*, lease_expires_at: int = 10_000_000) -> VNextIngestSession:
@@ -886,7 +887,9 @@ def test_complete_service_recovers_before_source_and_guards_publication(
             *,
             checkpoint: Callable[[], None],
             progress: object = None,
+            performance: SourcePerformance,
         ) -> None:
+            assert isinstance(performance, SourcePerformance)
             assert progress is None
             assert root == tmp_path
             assert callable(checkpoint)
@@ -979,8 +982,13 @@ def test_complete_service_recovers_before_source_and_guards_publication(
         return publication
 
     def fake_adapter(
-        source: object, *, qualify_gallery: object, snapshot: object
+        source: object,
+        *,
+        qualify_gallery: object,
+        snapshot: object,
+        performance: SourcePerformance,
     ) -> object:
+        assert isinstance(performance, SourcePerformance)
         assert qualify_gallery is None
         assert snapshot is None
         events.append("adapter")
@@ -1064,7 +1072,9 @@ def test_complete_service_stop_during_source_preparation_closes_without_success(
             *,
             checkpoint: Callable[[], None],
             progress: object = None,
+            performance: SourcePerformance,
         ) -> None:
+            assert isinstance(performance, SourcePerformance)
             assert progress is None
             assert root == tmp_path
             self.checkpoint = checkpoint
@@ -1093,8 +1103,13 @@ def test_complete_service_stop_during_source_preparation_closes_without_success(
             return resolved
 
     def fake_adapter(
-        source: object, *, qualify_gallery: object, snapshot: object
+        source: object,
+        *,
+        qualify_gallery: object,
+        snapshot: object,
+        performance: SourcePerformance,
     ) -> object:
+        assert isinstance(performance, SourcePerformance)
         assert qualify_gallery is None
         assert snapshot is None
         events.append("adapter")

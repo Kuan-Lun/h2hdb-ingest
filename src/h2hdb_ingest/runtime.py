@@ -34,7 +34,7 @@ from .maintenance import (
     LibraryMaintenanceAdapter,
     LibraryMaintenanceOutcome,
 )
-from .metrics import TextIngestMetricSink, _configure_metric_log_interval
+from .metrics import IngestMetric, TextIngestMetricSink, _configure_metric_log_interval
 from .page_workers import _decide_page_render_workers
 from .policy import build_ingest_policy
 from .progress import IngestProgress
@@ -160,9 +160,13 @@ def build_runtime(
         runtime_event_logger = event_logger or logger.info
         # Timing/counter records are diagnostics, independent of the human
         # progress callback and its INFO-level delivery.
-        metrics_sink = TextIngestMetricSink(
-            logging.getLogger("h2hdb_ingest.metrics").debug
-        )
+        metric_logger = logging.getLogger("h2hdb_ingest.metrics")
+        detailed_metrics = TextIngestMetricSink(metric_logger.debug)
+        summary_metrics = TextIngestMetricSink(metric_logger.info)
+
+        def metrics_sink(metric: IngestMetric) -> None:
+            (summary_metrics if metric.scope == "source" else detailed_metrics)(metric)
+
         progress = IngestProgress(
             runtime_event_logger,
             interval_seconds=config.resident.progress_log_interval_seconds,

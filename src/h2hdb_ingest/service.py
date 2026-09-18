@@ -43,6 +43,7 @@ from .metrics import (
 )
 from .progress import IngestProgress, ProgressWork
 from .session import IngestSessionController
+from .source_performance import SourcePerformance
 from .source_snapshot import SourceSnapshotStore
 
 _ANALYSIS_SNAPSHOT_STAGE = b"snapshot_manifest"
@@ -234,20 +235,41 @@ class VNextIngestService:
             )
         if work is not None:
             work.phase("source")
-        with FilesystemSource(
-            self._source_root,
-            checkpoint=lambda: _raise_if_stopping(stop_requested),
-            progress=work,
-        ) as source:
+        source_performance = SourcePerformance()
+        if work is not None:
+            source_performance.add("work_generation", work.generation)
+        with (
+            source_performance.operation(
+                self._metrics_sink, interruptions=(_IngestStopRequested,)
+            ),
+            FilesystemSource(
+                self._source_root,
+                performance=source_performance,
+                checkpoint=lambda: _raise_if_stopping(stop_requested),
+                progress=work,
+            ) as source,
+        ):
             source_result = synchronize_source(
                 session,
                 resolved,
                 VNextFilesystemSourceAdapter(
-                    source, qualify_gallery=self._qualify_gallery, snapshot=snapshot
+                    source,
+                    qualify_gallery=self._qualify_gallery,
+                    snapshot=snapshot,
+                    performance=source_performance,
                 ),
                 max_new_galleries=self._publication_batch_galleries,
                 should_stop=stop_requested,
                 progress=work,
+            )
+            source_performance.add(
+                "selected_galleries", source_result.receipt.staged_galleries
+            )
+            source_performance.add(
+                "waiting_galleries", source_result.waiting_gallery_count
+            )
+            source_performance.add(
+                "deferred_galleries", source_result.deferred_gallery_count
             )
         source_receipt = source_result.receipt
         if work is not None:

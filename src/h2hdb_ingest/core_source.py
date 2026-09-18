@@ -34,6 +34,7 @@ from .filesystem import (
     FilesystemSource,
     FilesystemSourceChangedError,
 )
+from .source_performance import SourcePerformance
 from .source_snapshot import SourceSnapshotStore
 
 logger = logging.getLogger(__name__)
@@ -85,10 +86,14 @@ class VNextFilesystemSourceAdapter:
         *,
         qualify_gallery: SourceGalleryQualifier | None = None,
         snapshot: SourceSnapshotStore | None = None,
+        performance: SourcePerformance | None = None,
     ) -> None:
         self._source = source
         self._qualify_gallery = qualify_gallery
         self._snapshot = snapshot
+        self._source_performance = (
+            performance if performance is not None else SourcePerformance()
+        )
 
     def _discard_snapshot(
         self, target: tuple[str, ...] | VNextIngestGalleryObservation
@@ -120,6 +125,7 @@ class VNextFilesystemSourceAdapter:
             after_locator=after_locator,
             limit=limit,
         )
+        self._source_performance.add("locator_rows", len(page.items))
         return VNextIngestPage(
             page.items,
             None if page.terminal else page.items[-1],
@@ -136,14 +142,17 @@ class VNextFilesystemSourceAdapter:
         locator_components: tuple[str, ...],
     ) -> VNextIngestGalleryObservation:
         observed = self._source.observe_gallery(locator_components)
+        qualification = VNextSourceQualification()
+        if self._qualify_gallery is not None:
+            with self._source_performance.phase("qualification"):
+                qualification = self._qualify_gallery(
+                    self._source, locator_components, observed
+                )
+            self._source_performance.add("qualified_galleries")
         return VNextIngestGalleryObservation(
             locator_components=locator_components,
             metadata=_metadata(observed.metadata),
-            qualification=(
-                VNextSourceQualification()
-                if self._qualify_gallery is None
-                else self._qualify_gallery(self._source, locator_components, observed)
-            ),
+            qualification=qualification,
         )
 
     @_defer_source_changes
@@ -153,6 +162,7 @@ class VNextFilesystemSourceAdapter:
     ) -> VNextSourceCompletionMarker:
         observed = self._source.observe_completion_marker(locator_components)
         self._source.revalidate_observed_gallery(locator_components)
+        self._source_performance.add("completion_markers")
         return VNextSourceCompletionMarker(
             file=_file(observed),
             observation_version=FILESYSTEM_OBSERVATION_VERSION,
@@ -176,7 +186,7 @@ class VNextFilesystemSourceAdapter:
             _file(
                 item,
                 content=(
-                    self._snapshot.capture(observation.locator_components, item)
+                    self._capture(observation.locator_components, item)
                     if self._snapshot is not None
                     and item.artifact_role is not FilesystemArtifactSourceRole.OTHER
                     else None
@@ -184,11 +194,22 @@ class VNextFilesystemSourceAdapter:
             )
             for item in page.items
         )
+        self._source_performance.add("file_rows", len(items))
         return VNextIngestPage(
             items,
             None if page.terminal else items[-1].name_bytes,
             page.terminal,
         )
+
+    def _capture(
+        self, locator: tuple[str, ...], item: FilesystemFileObservation
+    ) -> FileContentReceipt:
+        assert self._snapshot is not None
+        with self._source_performance.phase("snapshot"):
+            result = self._snapshot.capture(locator, item)
+        self._source_performance.add("snapshot_bytes", result.size_bytes)
+        self._source_performance.add("snapshot_files")
+        return result
 
     @_defer_source_changes
     def list_directory_observations(
@@ -205,6 +226,7 @@ class VNextFilesystemSourceAdapter:
         )
         self._require_metadata(observation, observed)
         items = tuple(_directory(item) for item in page.items)
+        self._source_performance.add("directory_rows", len(items))
         return VNextIngestPage(
             items,
             None if page.terminal else items[-1].name_bytes,
@@ -229,6 +251,7 @@ class VNextFilesystemSourceAdapter:
         items = tuple(
             TagObservation(namespace, value) for namespace, value in page.items
         )
+        self._source_performance.add("tag_rows", len(items))
         return VNextIngestPage(
             items,
             None if page.terminal else start + len(items) - 1,

@@ -15,7 +15,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import RLock
-from typing import Protocol
+from typing import Literal, Protocol
 
 from ._log_recovery import RecoveryLog
 
@@ -69,8 +69,11 @@ class IngestMetric:
     phases_ns: tuple[IngestMetricValue, ...] = ()
     counters: tuple[IngestMetricValue, ...] = ()
     operations: tuple[IngestMetricOperation, ...] = ()
+    status: Literal["completed", "failed", "interrupted"] = "completed"
 
     def __post_init__(self) -> None:
+        if self.status not in {"completed", "failed", "interrupted"}:
+            raise ValueError("unknown metric status")
         if type(self.scope) is not str or not self.scope:
             raise ValueError("metric scope must be a non-empty str")
         if type(self.operation) is not str or not self.operation:
@@ -162,6 +165,7 @@ class TextIngestMetricSink:
             f"scope={metric.scope}",
             f"operation={metric.operation}",
             f"elapsed_ns={metric.elapsed_ns}",
+            f"status={metric.status}",
         ]
         parts.extend(
             f"phase.{value.name}_ns={value.value}" for value in metric.phases_ns

@@ -238,6 +238,21 @@ publication completion before expecting it in a reader. An idle service emits
 no periodic progress message. Enable detailed diagnostics with
 `"logger": {"level": "DEBUG"}` inside `core`.
 
+Each finished or failed source turn emits an INFO `ingest_metric` summary with
+its status, work generation, selected/waiting/deferred galleries, source rows,
+logical bytes read and snapshot bytes. Adapter timings separate discovery,
+gallery indexing, metadata parsing, reads, hashes, image qualification and
+snapshot capture. These timings are inclusive: qualification and snapshot capture
+can contain reads and hashes, so do not add them to estimate total wall time.
+Logical bytes include rereads and do not measure physical disk traffic. A killed
+process can leave a turn without a terminal summary; absence is not zero cost.
+
+Core records source actions, ingest permission checks and cleanup candidate
+checks separately. Long-operation progress identifies a pending connector call;
+completed SQL totals exclude that call until it returns. Publication completion,
+cleanup `DONE`, and the next successful work claim are distinct milestones.
+Compare all three when investigating a delay between batches.
+
 Ingest periodically audits the database. A first start, unclean previous shutdown,
 changed validator, or due audit requires a full check. A recent successful audit
 and clean shutdown can allow a quick startup check. For an explicit full check:

@@ -64,7 +64,7 @@ def test_text_sink_emits_one_compact_record_for_nested_operations() -> None:
     )
 
     assert messages == [
-        "ingest_metric scope=publication operation=synchronize elapsed_ns=40 "
+        "ingest_metric scope=publication operation=synchronize elapsed_ns=40 status=completed "
         "counter.steps=1 operation.PREPARE_ARTIFACT.prepare_ns=30 "
         "operation.PREPARE_ARTIFACT.processed_rows=1"
     ]
