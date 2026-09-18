@@ -16,7 +16,7 @@ import sys
 import tempfile
 import tomllib
 from collections import defaultdict
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import partial
 from hashlib import sha256
@@ -38,8 +38,10 @@ from h2hdb_ingest.config import ArtifactRenderPolicyConfig
 from h2hdb_ingest.core_source import VNextFilesystemSourceAdapter
 from h2hdb_ingest.filesystem import FilesystemFileObservation, FilesystemSource
 from h2hdb_ingest.image_qualification import ImageGalleryQualifier
+from h2hdb_ingest.metrics import IngestMetric, TextIngestMetricSink
 from h2hdb_ingest.policy import build_ingest_policy
 from h2hdb_ingest.runtime import build_runtime
+from h2hdb_ingest.source_performance import SourcePerformance
 from h2hdb_ingest.source_snapshot import SourceSnapshotStore
 
 _PHASE: ContextVar[str] = ContextVar("source_io_probe_phase", default="observation")
@@ -148,7 +150,8 @@ class _Meter:
                 with self.timed("qualification_spool"):
                     result = original_spool(member, position)
                 if result._rolled:
-                    self.qualification_disk_spools += 1
+                    with self.lock:
+                        self.qualification_disk_spools += 1
                 return result
             finally:
                 _PHASE.reset(token)
@@ -167,8 +170,9 @@ class _Meter:
         def qualify(*args: Any, **kwargs: Any) -> Any:
             with self.timed("qualification_total"):
                 result = original_qualify(*args, **kwargs)
-            self.qualified_galleries += 1
-            self.accepted_galleries += int(result.accepted)
+            with self.lock:
+                self.qualified_galleries += 1
+                self.accepted_galleries += int(result.accepted)
             return result
 
         def capture(store: SourceSnapshotStore, *args: Any, **kwargs: Any) -> Any:
@@ -176,7 +180,8 @@ class _Meter:
             try:
                 with self.timed("snapshot_capture"):
                     result = original_capture(store, *args, **kwargs)
-                self.captured_files += 1
+                with self.lock:
+                    self.captured_files += 1
                 return result
             finally:
                 _PHASE.reset(token)
@@ -290,15 +295,21 @@ def _manifest(root: Path) -> dict[str, object]:
     }
 
 
-def _measure(root: Path, operation: Any) -> tuple[Any, dict[str, object]]:
+def _measure(
+    root: Path, operation: Any, *, performance: SourcePerformance | None = None
+) -> tuple[Any, dict[str, object]]:
     meter = _Meter(root)
+    metrics: list[IngestMetric] = []
     started = perf_counter()
     cpu_started = process_time()
-    with meter.instrument():
+    with (
+        meter.instrument(),
+        nullcontext() if performance is None else performance.operation(metrics.append),
+    ):
         prepared = operation()
     elapsed = perf_counter() - started
     cpu_elapsed = process_time() - cpu_started
-    return prepared, {
+    measured = {
         **meter.report(),
         "elapsed_seconds": elapsed,
         "process_cpu_seconds": cpu_elapsed,
@@ -306,6 +317,67 @@ def _measure(root: Path, operation: Any) -> tuple[Any, dict[str, object]]:
         "waiting": prepared.waiting_gallery_count,
         "deferred": prepared.deferred_gallery_count,
         "source_manifest": _manifest(root),
+    }
+    if performance is not None:
+        try:
+            if len(metrics) != 1:
+                raise RuntimeError("direct preparation must emit one source metric")
+            _attach_production_metric(
+                measured,
+                metrics[0],
+                scope="prepare_source only; shared production SourcePerformance instance",
+            )
+        except BaseException:
+            prepared.close()
+            raise
+    return prepared, measured
+
+
+def _attach_production_metric(
+    measured: dict[str, Any], metric: IngestMetric, *, scope: str
+) -> None:
+    """Independent source-read counts must agree before telemetry is evidence."""
+    if metric.scope != "source" or metric.status != "completed":
+        raise RuntimeError("source probe did not receive a completed production metric")
+    counters = {item.name: item.value for item in metric.counters}
+    actual = {
+        "logical_bytes_read": sum(
+            item["read_bytes"]
+            for name, item in measured["io"].items()
+            if name.startswith("source.")
+        ),
+        "read_calls": sum(
+            item["read_calls"]
+            for name, item in measured["io"].items()
+            if name.startswith("source.")
+        ),
+        "qualified_galleries": measured["qualified_galleries"],
+        "snapshot_files": measured["captured_files"],
+        "snapshot_bytes": measured["io"]
+        .get("snapshot_buffer", {})
+        .get("write_bytes", 0),
+    }
+    for name, expected in actual.items():
+        if counters.get(name, 0) != expected:
+            raise RuntimeError(
+                f"production source telemetry differs from independent meter: {name} "
+                f"(metric={counters.get(name, 0)}, actual={expected})"
+            )
+    measured["production_telemetry"] = {
+        "scope": metric.scope,
+        "operation": metric.operation,
+        "status": metric.status,
+        "measurement_scope": scope,
+        "elapsed_ns": metric.elapsed_ns,
+        "phases_ns_inclusive": {item.name: item.value for item in metric.phases_ns},
+        "counters": counters,
+    }
+    measured["telemetry_comparison"] = {
+        "matched": True,
+        "independent_expected_counters": actual,
+        "logical_bytes_include_rereads": True,
+        "read_calls_include_eof": True,
+        "timing_is_not_an_exact_counter_oracle": True,
     }
 
 
@@ -341,10 +413,19 @@ def _run_matrix(
             resident=ResidentConfig(lease_seconds=1800, heartbeat_seconds=30),
         )
         cases: dict[str, dict[str, object]] = {}
+        source_metrics: list[IngestMetric] = []
+        original_metric_sink = TextIngestMetricSink.__call__
+
+        def capture_metric(sink: TextIngestMetricSink, metric: IngestMetric) -> None:
+            if metric.scope == "source" and len(source_metrics) < 2:
+                source_metrics.append(metric)
+            original_metric_sink(sink, metric)
+
         # An explicit disposable scratch scope is part of this synthetic probe.
         # It never changes deployment scratch policy or consumes a private corpus.
         with (
             patch.object(tempfile, "tempdir", str(scratch)),
+            patch.object(TextIngestMetricSink, "__call__", capture_metric),
             build_runtime(config, event_logger=lambda _message: None) as runtime,
         ):
             runtime.database_admin.initialize()
@@ -363,6 +444,15 @@ def _run_matrix(
                 if not runtime.resident.process_available(periodic_scan=True):
                     raise RuntimeError("synthetic baseline did not publish")
             seed_seconds = perf_counter() - started
+            if len(source_metrics) != 1:
+                raise RuntimeError(
+                    "baseline must emit exactly one production source metric"
+                )
+            _attach_production_metric(
+                cases["baseline"],
+                source_metrics.pop(),
+                scope="production source synchronization including prepare and source issue/commit",
+            )
             revision = runtime.catalog.get_catalog_revision()
             if revision.publication_count != galleries:
                 raise RuntimeError("published baseline lost synthetic galleries")
@@ -407,9 +497,10 @@ def _run_matrix(
                     policy = runtime.facade.ensure_policy(
                         session, build_ingest_policy(selected)
                     )
+                    performance = SourcePerformance()
                     with (
                         SourceSnapshotStore() as captured,
-                        FilesystemSource(source) as fs,
+                        FilesystemSource(source, performance=performance) as fs,
                     ):
                         adapter = VNextFilesystemSourceAdapter(
                             fs,
@@ -417,12 +508,15 @@ def _run_matrix(
                                 selected.paths.artifact_render_policy(), workers=workers
                             ),
                             snapshot=captured,
+                            performance=performance,
                         )
+
                         prepared, result = _measure(
                             source,
                             partial(
                                 runtime.facade.prepare_source, adapter, policy=policy
                             ),
+                            performance=performance,
                         )
                         try:
                             result["captured_pages_verified"] = _verify_captures(
@@ -439,7 +533,7 @@ def _run_matrix(
                 raise RuntimeError("probe left invalid database authority")
         return {
             "status": "ok",
-            "format_version": 2,
+            "format_version": 3,
             "provenance": _provenance(),
             "fixture": {
                 "galleries": galleries,
@@ -467,6 +561,8 @@ def _run_matrix(
                 "policy_changed": "page_jpeg_quality 90 -> 89; source unchanged",
                 "source_io": "actual os.read bytes/calls, including EOF calls, by inode and exclusive phase",
                 "source_files": "a second view of the same raw reads; do not add it to phase totals",
+                "production_telemetry": "actual SourcePerformance metrics; exact read bytes/calls, snapshot bytes/files and qualification counts checked against independent meter",
+                "production_metric_timing": "baseline source metric includes source issue/commit after preparation; comparison metrics cover prepare_source only; inclusive phase times overlap and cannot be summed",
                 "buffer_io": "logical stream reads/writes, not physical disk I/O; memory qualification spools included",
                 "qualification_disk_spools": "count of rolled spools when _spool returns, before decoding; not all native/scratch disk I/O",
                 "native_io_limit": "only observed Python stream boundaries; native reads bypassing these wrappers are not counted",
@@ -639,7 +735,7 @@ def main() -> int:
         if (
             not isinstance(report, dict)
             or report.get("status") != "ok"
-            or report.get("format_version") != 2
+            or report.get("format_version") != 3
             or not isinstance(report.get("cases"), dict)
             or set(report["cases"])
             != {"baseline", "unchanged", "policy_changed", "source_changed"}
@@ -648,7 +744,7 @@ def main() -> int:
     except (subprocess.SubprocessError, ValueError) as error:
         report = {
             "status": "error",
-            "format_version": 2,
+            "format_version": 3,
             "error_type": type(error).__name__,
             "error": str(error),
             "provenance": _provenance(),
