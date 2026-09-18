@@ -205,15 +205,29 @@ def test_real_native_rendering_keeps_console_and_file_info_volume_per_batch(
     for logs in (small, larger):
         assert Counter(logs.console.splitlines()) == Counter(logs.file.splitlines())
         assert "VIPS:" not in logs.file
-        assert "ingest_metric " not in logs.file
         assert "routine connection diagnostic" not in logs.file
         assert "debug diagnostic" not in logs.file
         assert logs.result["progress_interval_seconds"] == 60
         assert str(logs.result["log_level"]).upper() == "INFO"
         info = logs.messages("INFO")
+        metrics = [line for line in info if line.startswith("ingest_metric ")]
+        assert len(metrics) == 1
+        assert metrics[0].startswith(
+            "ingest_metric scope=source operation=synchronize "
+        )
+        assert "status=completed" in metrics[0]
+        for output in (logs.console, logs.file):
+            metric_lines = [
+                line for line in output.splitlines() if "ingest_metric " in line
+            ]
+            assert len(metric_lines) == 1
+            assert f"[INFO] {metrics[0]}" in metric_lines[0]
+        # The one terminal source summary carries diagnostic counters. Routine
+        # activity messages still exclude per-page and per-artifact details.
+        activity = [line for line in info if line not in metrics]
         assert not any(
             raw in line
-            for line in info
+            for line in activity
             for raw in (
                 "ingest_progress ",
                 "ingest_db_performance ",
@@ -254,6 +268,13 @@ def test_debug_retains_native_and_per_artifact_metrics_without_polluting_events(
     metrics = [
         line for line in logs.messages("DEBUG") if line.startswith("ingest_metric ")
     ]
+    source_summaries = [
+        line
+        for line in logs.messages("INFO")
+        if line.startswith("ingest_metric scope=source operation=synchronize ")
+    ]
+    assert len(source_summaries) == 1
+    assert not any("scope=source " in line for line in metrics)
     workers = [
         line
         for line in logs.messages("DEBUG")
