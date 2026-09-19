@@ -243,16 +243,20 @@ async def _opds_probe(
 
 
 def _require_source_summaries(log_path: Path, *, expected: int) -> list[str]:
-    summaries = [
-        line
-        for line in log_path.read_text(encoding="utf-8").splitlines()
-        if "ingest_metric " in line
-    ]
+    summaries: list[tuple[str, dict[str, str]]] = []
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        _prefix, marker, payload = line.partition("ingest_metric ")
+        if not marker:
+            continue
+        fields = dict(token.split("=", 1) for token in payload.split())
+        if fields.get("scope") == "source":
+            summaries.append((line, fields))
     assert len(summaries) == expected, "each source turn emits exactly one summary"
-    for line in summaries:
-        assert "[INFO] ingest_metric scope=source operation=synchronize " in line
-        assert " status=completed " in line
-    return summaries
+    for line, fields in summaries:
+        assert "[INFO] ingest_metric " in line
+        assert fields.get("operation") == "synchronize"
+        assert fields.get("status") == "completed"
+    return [line for line, _fields in summaries]
 
 
 def _run_pipeline(*, with_opds: bool) -> None:
