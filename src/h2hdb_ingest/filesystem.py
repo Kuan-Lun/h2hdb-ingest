@@ -159,24 +159,25 @@ class FilesystemFileObservation:
                     f"source entry is no longer regular: {self.path}"
                 )
             self._require_stat(opened, stage="before read")
-            digest = sha256()
+            # Only an expected digest gives this local hash an authority check.
+            # Consumers derive receipts or spool checksums from the yielded bytes.
+            digest = None if self.expected_sha256 is None else sha256()
             while True:
                 self._checkpoint()
                 with self._source_performance.phase("read"):
                     part = os.read(descriptor, _READ_BYTES)
                 if not part:
                     break
-                with self._source_performance.phase("hash"):
-                    digest.update(part)
+                if digest is not None:
+                    with self._source_performance.phase("hash"):
+                        digest.update(part)
                 self._source_performance.add("logical_bytes_read", len(part))
                 if self._progress is not None:
                     self._progress.advance("source_bytes_read", len(part))
                 yield part
             self._checkpoint()
             self._require_stat(os.fstat(descriptor), stage="after read")
-            if self.expected_sha256 is not None and digest.digest() != (
-                self.expected_sha256
-            ):
+            if digest is not None and digest.digest() != self.expected_sha256:
                 raise FilesystemSourceChangedError(
                     f"source metadata bytes changed after parsing: {self.path}"
                 )

@@ -18,6 +18,8 @@ from .filesystem import (
     FilesystemSource,
     FilesystemSourceChangedError,
 )
+from .metrics import IngestMetricSink, TextIngestMetricSink
+from .source_performance import SourcePerformance
 from .source_schedule import SourceScanSchedule
 from .storage_capacity import storage_capacity_error, storage_capacity_message
 
@@ -35,15 +37,44 @@ class CompletionMarkerProbe(Protocol):
 
 
 class FilesystemCompletionMarkerProbe:
-    def __init__(self, source_root: Path) -> None:
+    def __init__(
+        self, source_root: Path, *, metrics_sink: IngestMetricSink | None = None
+    ) -> None:
         self._source_root = source_root
+        self._metrics_sink = (
+            metrics_sink
+            if metrics_sink is not None
+            else TextIngestMetricSink(logging.getLogger("h2hdb_ingest.metrics").info)
+        )
 
     @contextmanager
     def __call__(
         self, checkpoint: Callable[[], None]
     ) -> Iterator[Iterator[tuple[tuple[str, ...], FilesystemCompletionMarker]]]:
-        with FilesystemSource(self._source_root, checkpoint=checkpoint) as source:
-            yield source.iter_completion_markers()
+        performance = SourcePerformance()
+        performance.add("inventory_passes")
+        with (
+            performance.operation(
+                self._metrics_sink,
+                scope="source_monitor",
+                operation="inventory",
+                interruptions=(_SourceProbeStopped,),
+            ),
+            FilesystemSource(
+                self._source_root, checkpoint=checkpoint, performance=performance
+            ) as source,
+        ):
+
+            def markers() -> Iterator[
+                tuple[tuple[str, ...], FilesystemCompletionMarker]
+            ]:
+                for item in source.iter_completion_markers():
+                    performance.add("marker_rows")
+                    yield item
+
+            # The consuming index reconciliation happens inside this context,
+            # so elapsed_ns includes its transaction and cleanup work as well.
+            yield markers()
 
 
 class _SourceProbeStopped(Exception):

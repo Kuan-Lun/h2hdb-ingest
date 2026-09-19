@@ -182,17 +182,29 @@ class VNextFilesystemSourceAdapter:
             limit=limit,
         )
         self._require_metadata(observation, observed)
-        items = tuple(
-            _file(
-                item,
-                content=(
-                    self._capture(observation.locator_components, item)
-                    if self._snapshot is not None
-                    and item.artifact_role is not FilesystemArtifactSourceRole.OTHER
-                    else None
-                ),
+        captured: dict[bytes, FileContentReceipt] = {}
+        if self._snapshot is not None:
+            members = tuple(
+                item
+                for item in page.items
+                if item.artifact_role is not FilesystemArtifactSourceRole.OTHER
             )
-            for item in page.items
+            with self._source_performance.phase("snapshot"):
+                contents = self._snapshot.capture_many(
+                    observation.locator_components,
+                    members,
+                    performance=self._source_performance,
+                )
+            captured = {
+                item.name_bytes: content
+                for item, content in zip(members, contents, strict=True)
+            }
+            self._source_performance.add(
+                "snapshot_bytes", sum(item.size_bytes for item in contents)
+            )
+            self._source_performance.add("snapshot_files", len(contents))
+        items = tuple(
+            _file(item, content=captured.get(item.name_bytes)) for item in page.items
         )
         self._source_performance.add("file_rows", len(items))
         return VNextIngestPage(
@@ -200,16 +212,6 @@ class VNextFilesystemSourceAdapter:
             None if page.terminal else items[-1].name_bytes,
             page.terminal,
         )
-
-    def _capture(
-        self, locator: tuple[str, ...], item: FilesystemFileObservation
-    ) -> FileContentReceipt:
-        assert self._snapshot is not None
-        with self._source_performance.phase("snapshot"):
-            result = self._snapshot.capture(locator, item)
-        self._source_performance.add("snapshot_bytes", result.size_bytes)
-        self._source_performance.add("snapshot_files")
-        return result
 
     @_defer_source_changes
     def list_directory_observations(

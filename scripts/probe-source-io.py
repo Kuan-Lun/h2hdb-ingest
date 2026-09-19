@@ -127,7 +127,7 @@ class _Meter:
         original_temporary = qualification.SpooledTemporaryFile
         original_decode = qualification.load_source_page_image
         original_qualify = ImageGalleryQualifier.__call__
-        original_capture = SourceSnapshotStore.capture
+        original_capture = SourceSnapshotStore.capture_many
         original_open = Path.open
 
         def read(descriptor: int, size: int) -> bytes:
@@ -181,7 +181,7 @@ class _Meter:
                 with self.timed("snapshot_capture"):
                     result = original_capture(store, *args, **kwargs)
                 with self.lock:
-                    self.captured_files += 1
+                    self.captured_files += len(result)
                 return result
             finally:
                 _PHASE.reset(token)
@@ -199,7 +199,7 @@ class _Meter:
                 (qualification, "SpooledTemporaryFile", temporary),
                 (qualification, "load_source_page_image", decode),
                 (ImageGalleryQualifier, "__call__", qualify),
-                (SourceSnapshotStore, "capture", capture),
+                (SourceSnapshotStore, "capture_many", capture),
                 (Path, "open", opened),
             ):
                 stack.enter_context(patch.object(owner, name, replacement))
