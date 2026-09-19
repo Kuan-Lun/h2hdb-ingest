@@ -165,7 +165,11 @@ def build_runtime(
         summary_metrics = TextIngestMetricSink(metric_logger.info)
 
         def metrics_sink(metric: IngestMetric) -> None:
-            (summary_metrics if metric.scope == "source" else detailed_metrics)(metric)
+            (
+                summary_metrics
+                if metric.scope in {"source", "publication", "artifact_totals"}
+                else detailed_metrics
+            )(metric)
 
         progress = IngestProgress(
             runtime_event_logger,

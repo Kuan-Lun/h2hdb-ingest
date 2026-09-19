@@ -211,7 +211,7 @@ def test_real_native_rendering_keeps_console_and_file_info_volume_per_batch(
         assert str(logs.result["log_level"]).upper() == "INFO"
         info = logs.messages("INFO")
         metrics = [line for line in info if line.startswith("ingest_metric ")]
-        assert len(metrics) == 1
+        assert len(metrics) == 3
         assert metrics[0].startswith(
             "ingest_metric scope=source operation=synchronize "
         )
@@ -220,9 +220,19 @@ def test_real_native_rendering_keeps_console_and_file_info_volume_per_batch(
             metric_lines = [
                 line for line in output.splitlines() if "ingest_metric " in line
             ]
-            assert len(metric_lines) == 1
-            assert f"[INFO] {metrics[0]}" in metric_lines[0]
-        # The one terminal source summary carries diagnostic counters. Routine
+            assert len(metric_lines) == 3
+            assert all(
+                any(f"[INFO] {metric}" in line for line in metric_lines)
+                for metric in metrics
+            )
+        artifact_summary = next(
+            line for line in metrics if "scope=artifact_totals " in line
+        )
+        assert "operation.render_archive.completed_calls=" in artifact_summary
+        assert "operation.render_archive.render_batches_ns=" in artifact_summary
+        assert "operation.render_archive.archive_page_write_ns=" in artifact_summary
+        assert any("scope=publication " in line for line in logs.messages("INFO"))
+        # Terminal source, publication and artifact summaries carry counters. Routine
         # activity messages still exclude per-page and per-artifact details.
         activity = [line for line in info if line not in metrics]
         assert not any(
@@ -291,7 +301,7 @@ def test_debug_retains_native_and_per_artifact_metrics_without_polluting_events(
         sum("scope=artifact operation=render_presentation " in line for line in metrics)
         == 3
     )
-    assert any("scope=publication " in line for line in metrics)
+    assert any("scope=publication " in line for line in logs.messages("INFO"))
     events = cast(list[str], logs.result["events"])
     assert events
     assert not any(message.startswith("ingest_metric ") for message in events)

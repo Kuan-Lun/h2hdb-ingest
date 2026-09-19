@@ -368,3 +368,97 @@ def test_exception_formatting_preserves_process_cancellation(
     with pytest.raises(failure_type) as caught:
         reporter.log_failure(InterruptedError())
     assert caught.value is failure
+
+
+def test_artifact_summary_aggregates_completed_calls_without_sink_authority() -> None:
+    from h2hdb_ingest.metrics import summarize_artifact_metrics
+
+    records: list[IngestMetric] = []
+    with summarize_artifact_metrics(records.append):
+        for _ in range(130):
+            emit_ingest_metric(
+                None,
+                IngestMetric(
+                    "artifact",
+                    "render_archive",
+                    10,
+                    phases_ns=(IngestMetricValue("render_batches", 5),),
+                    counters=(
+                        IngestMetricValue("pages", 3),
+                        IngestMetricValue("page_render_workers", 2),
+                    ),
+                ),
+            )
+    (summary,) = records
+    assert summary.elapsed_ns == 1300
+    (operation,) = summary.operations
+    assert {value.name: value.value for value in operation.counters} == {
+        "completed_calls": 130,
+        "pages": 390,
+    }
+    assert {value.name: value.value for value in operation.phases_ns} == {
+        "elapsed": 1300,
+        "render_batches": 650,
+    }
+
+
+def test_artifact_summary_failure_and_nested_scopes_do_not_leak() -> None:
+    from h2hdb_ingest.metrics import summarize_artifact_metrics
+
+    records: list[IngestMetric] = []
+    with summarize_artifact_metrics(records.append):
+        emit_ingest_metric(None, IngestMetric("artifact", "render_archive", 10))
+        with (
+            pytest.raises(RuntimeError, match="render failed"),
+            summarize_artifact_metrics(records.append),
+        ):
+            emit_ingest_metric(None, IngestMetric("artifact", "render_archive", 20))
+            raise RuntimeError("render failed")
+    with summarize_artifact_metrics(records.append):
+        pass
+    assert [(value.status, value.elapsed_ns) for value in records] == [
+        ("failed", 20),
+        ("completed", 10),
+        ("completed", 0),
+    ]
+
+
+@pytest.mark.parametrize("fields", [31, 32, 33, 65])
+def test_artifact_summary_capacity_cycles_conserve_phase_cost(fields: int) -> None:
+    from h2hdb_ingest.metrics import summarize_artifact_metrics
+
+    records: list[IngestMetric] = []
+    with summarize_artifact_metrics(records.append):
+        for _ in range(3):
+            emit_ingest_metric(
+                None,
+                IngestMetric(
+                    "artifact",
+                    "render_archive",
+                    fields,
+                    phases_ns=tuple(
+                        IngestMetricValue(f"phase_{i}", 1) for i in range(fields)
+                    ),
+                ),
+            )
+    (operation,) = records[0].operations
+    phases = {value.name: value.value for value in operation.phases_ns}
+    assert phases.pop("elapsed") == fields * 3
+    assert len(phases) <= 33
+    assert sum(phases.values()) == fields * 3
+
+
+def test_artifact_summary_observer_error_cannot_change_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from h2hdb_ingest.metrics import summarize_artifact_metrics
+
+    def fail(self: object, metric: IngestMetric) -> None:
+        raise RuntimeError("collector failed")
+
+    monkeypatch.setattr(metrics_module._ArtifactSummary, "record", fail)
+    records: list[IngestMetric] = []
+    with summarize_artifact_metrics(records.append):
+        emit_ingest_metric(None, IngestMetric("artifact", "render_archive", 10))
+    assert records[0].status == "failed"
+    assert records[0].counters == (IngestMetricValue("collection_errors", 1),)

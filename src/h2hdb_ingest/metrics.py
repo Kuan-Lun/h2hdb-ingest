@@ -12,8 +12,10 @@ __all__ = [
 ]
 
 import logging
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from threading import RLock
 from typing import Literal, Protocol
 
@@ -189,6 +191,12 @@ def emit_ingest_metric(
 ) -> None:
     """Emit telemetry without letting an observer alter ingest completion."""
 
+    summary = _artifact_summary.get()
+    if summary is not None and metric.scope == "artifact":
+        try:
+            summary.record(metric)
+        except Exception:
+            summary.collection_errors += 1
     if sink is None:
         return
     try:
@@ -212,3 +220,106 @@ def _validate_metric_values(
         if value.name in observed:
             raise ValueError(f"metric {label} names must be unique")
         observed.add(value.name)
+
+
+@dataclass
+class _ArtifactTotals:
+    """Fixed renderer vocabulary; completed calls only, not partial failed work."""
+
+    calls: int = 0
+    elapsed_ns: int = 0
+    phases: dict[str, int] = field(default_factory=dict)
+    counters: dict[str, int] = field(default_factory=dict)
+
+    def record(self, metric: IngestMetric) -> None:
+        self.calls += 1
+        self.elapsed_ns += metric.elapsed_ns
+        for values, target in (
+            (metric.phases_ns, self.phases),
+            (metric.counters, self.counters),
+        ):
+            for value in values:
+                # A worker count is configuration, not additive work.
+                if value.name in {"page_render_workers", "elapsed", "completed_calls"}:
+                    continue
+                key = (
+                    value.name if value.name in target or len(target) < 32 else "other"
+                )
+                target[key] = target.get(key, 0) + value.value
+
+
+@dataclass
+class _ArtifactSummary:
+    collection_errors: int = 0
+    operations: dict[str, _ArtifactTotals] = field(default_factory=dict)
+
+    def record(self, metric: IngestMetric) -> None:
+        if metric.status == "completed" and metric.operation in {
+            "render_archive",
+            "render_presentation",
+        }:
+            self.operations.setdefault(metric.operation, _ArtifactTotals()).record(
+                metric
+            )
+
+    def metric(
+        self, status: Literal["completed", "failed", "interrupted"]
+    ) -> IngestMetric:
+        return IngestMetric(
+            scope="artifact_totals",
+            operation="publication",
+            status="failed" if self.collection_errors else status,
+            counters=(IngestMetricValue("collection_errors", self.collection_errors),),
+            elapsed_ns=sum(value.elapsed_ns for value in self.operations.values()),
+            operations=tuple(
+                IngestMetricOperation(
+                    operation=name,
+                    phases_ns=(
+                        IngestMetricValue("elapsed", value.elapsed_ns),
+                        *(
+                            IngestMetricValue(key, number)
+                            for key, number in sorted(value.phases.items())
+                        ),
+                    ),
+                    counters=(
+                        IngestMetricValue("completed_calls", value.calls),
+                        *(
+                            IngestMetricValue(key, number)
+                            for key, number in sorted(value.counters.items())
+                        ),
+                    ),
+                )
+                for name, value in sorted(self.operations.items())
+            ),
+        )
+
+
+_artifact_summary: ContextVar[_ArtifactSummary | None] = ContextVar(
+    "h2hdb_ingest_artifact_summary", default=None
+)
+
+
+@contextmanager
+def summarize_artifact_metrics(sink: IngestMetricSink | None) -> Iterator[None]:
+    """Sum sequential archive/presentation calls in this publication scope.
+
+    Renderer worker batches are joined before each metric is emitted. These are
+    wall durations per completed renderer call, not summed worker CPU time.
+    Failed partial render calls emit no completion metric and remain outside the
+    total. A failed publication emits a failed summary and cannot leak counters
+    into the next attempt. No sink callback is a source of ingest authority.
+    """
+    summary = _ArtifactSummary()
+    token = _artifact_summary.set(summary)
+    status: Literal["completed", "failed", "interrupted"] = "completed"
+    try:
+        yield
+    except Exception:
+        status = "failed"
+        raise
+    except BaseException:
+        status = "interrupted"
+        raise
+    finally:
+        _artifact_summary.reset(token)
+        emit_ingest_metric(sink, summary.metric(status))

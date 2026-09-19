@@ -28,6 +28,7 @@ from ._log_recovery import RecoveryLog
 from ._retry_diagnostics import RetryDiagnostic, retry_diagnostic
 from .artifact_errors import format_artifact_failure
 from .config import ResidentConfig
+from .cycle_performance import CyclePerformance
 from .database_audit import IngestDatabaseAudit, IngestStartupStopped
 from .filesystem import FilesystemSourceChangedError
 from .library_identity import (
@@ -139,6 +140,7 @@ class ResidentIngestor:
         self._database_type = database_type.casefold()
         self._event_logger = event_logger or logger.info
         self._progress = progress
+        self._cycle_performance = CyclePerformance()
         self._database_audit = IngestDatabaseAudit(
             database_admin, config, self._event_logger, database_type=database_type
         )
@@ -198,6 +200,7 @@ class ResidentIngestor:
         self, *, should_stop: Callable[[], bool] | None
     ) -> DatabaseAuditReport:
 
+        self._cycle_performance.reset()
         self._bound_storage_identity = None
         self._last_synchronization_result = None
         self._storage_instance_ready = self._library_storage_identity is None
@@ -371,6 +374,8 @@ class ResidentIngestor:
                         session,
                         should_stop=should_stop,
                     )
+                if isinstance(outcome, VNextIngestSynchronizationResult):
+                    self._cycle_performance.published(claimed.ingest_generation)
                 heartbeat.raise_if_failed()
                 if not isinstance(outcome, VNextIngestSynchronizationResult):
                     raise TypeError(
@@ -598,6 +603,8 @@ class ResidentIngestor:
             # A due source scan requires a quiescent downloader. A pending
             # durable handoff must still be claimable while it blocks that path.
             claimed = self._facade.try_claim_ingest(False, lease_duration)
+        if isinstance(claimed, VNextIngestSession):
+            self._cycle_performance.claimed(claimed.ingest_generation)
         return _ResidentCycleOutcome.IDLE if claimed is None else claimed
 
     def _wait_for_storage_capacity(
@@ -666,6 +673,8 @@ class ResidentIngestor:
         outcome = self._library_maintenance.maintain_cleanup()
         if not isinstance(outcome, LibraryMaintenanceOutcome):
             raise TypeError("library maintenance returned an invalid outcome")
+        if outcome is LibraryMaintenanceOutcome.DONE:
+            self._cycle_performance.maintenance_done("library")
         return outcome
 
     def _try_current_only_maintenance(
@@ -684,6 +693,8 @@ class ResidentIngestor:
                 artifact_release_adapters=self._artifact_release_adapters,
             )
             self._catalog_maintenance_failure_log.recovered()
+            if outcome is VNextCurrentOnlyMaintenanceOutcome.DONE:
+                self._cycle_performance.maintenance_done("catalog")
             if outcome is VNextCurrentOnlyMaintenanceOutcome.PROGRESSED:
                 work = self._current_progress()
                 if work is not None:

@@ -40,6 +40,7 @@ from .metrics import (
     IngestMetricSink,
     IngestMetricValue,
     emit_ingest_metric,
+    summarize_artifact_metrics,
 )
 from .progress import IngestProgress, ProgressWork
 from .session import IngestSessionController
@@ -288,7 +289,7 @@ class VNextIngestService:
         if work is not None:
             work.phase("publication")
             work.operation("waiting_publication_guard")
-        with self._publication_guard():
+        with self._publication_guard(), summarize_artifact_metrics(self._metrics_sink):
             publication = synchronize_publication(
                 session,
                 resolved,
