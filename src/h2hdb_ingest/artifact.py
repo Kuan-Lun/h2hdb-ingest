@@ -568,6 +568,8 @@ def _render_archive(
                 _verify_source_stream(metadata)
                 member_names.append(_METADATA_MEMBER_NAME)
                 render_pages_started_ns = monotonic_ns()
+                render_batches_ns = 0
+                archive_page_write_ns = 0
                 if progress is not None:
                     progress.operation("archive_render_pages")
                 executor = (
@@ -583,6 +585,7 @@ def _render_archive(
                         if progress is not None:
                             progress.operation("archive_render_pages")
                         batch = pages[batch_start : batch_start + workers]
+                        render_batch_started_ns = monotonic_ns()
                         rendered_batch = _render_page_batch(
                             batch,
                             gid=gid,
@@ -590,7 +593,9 @@ def _render_archive(
                             executor=executor,
                             progress=progress,
                         )
+                        render_batches_ns += monotonic_ns() - render_batch_started_ns
                         try:
+                            archive_page_write_started_ns = monotonic_ns()
                             if progress is not None:
                                 progress.operation("archive_write_pages")
                             for offset, (member, rendered) in enumerate(
@@ -632,6 +637,9 @@ def _render_archive(
                                 )
                                 if progress is not None:
                                     progress.advance("pages_written")
+                            archive_page_write_ns += (
+                                monotonic_ns() - archive_page_write_started_ns
+                            )
                         finally:
                             close_resources(rendered_batch, error=sys.exception())
                 finally:
@@ -687,6 +695,8 @@ def _render_archive(
             elapsed_ns=monotonic_ns() - started_ns,
             phases_ns=(
                 IngestMetricValue("render_pages", render_pages_ns),
+                IngestMetricValue("render_batches", render_batches_ns),
+                IngestMetricValue("archive_page_write", archive_page_write_ns),
                 IngestMetricValue("archive_inspect", archive_inspect_ns),
                 IngestMetricValue("archive_finalize", archive_finalize_ns),
             ),

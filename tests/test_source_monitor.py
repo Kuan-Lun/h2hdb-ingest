@@ -16,6 +16,7 @@ from h2hdb_ingest.filesystem import (
     FilesystemSourceChangedError,
     FilesystemStat,
 )
+from h2hdb_ingest.metrics import IngestMetric
 from h2hdb_ingest.source_monitor import (
     FilesystemCompletionMarkerProbe,
     SourceChangeMonitor,
@@ -352,3 +353,43 @@ def test_monitor_shutdown_interrupts_stream_and_closes_probe() -> None:
         assert started.wait(2), "metadata probe did not start"
     assert closed.is_set()
     monitor.raise_if_failed()
+
+
+@pytest.mark.parametrize("failure", (False, True))
+def test_real_monitor_pass_reports_its_own_bytes_time_and_failure(
+    tmp_path: Path, failure: bool
+) -> None:
+    root = tmp_path / "download"
+    gallery = root / "1001"
+    gallery.mkdir(parents=True)
+    payload = b"completion marker bytes"
+    (gallery / "galleryinfo.txt").write_bytes(payload)
+    records: list[IngestMetric] = []
+    probe = FilesystemCompletionMarkerProbe(root, metrics_sink=records.append)
+    index = _MarkerIndex(tmp_path / "marker-index.sqlite3")
+    try:
+
+        def consume() -> None:
+            with probe(_checkpoint) as markers:
+                index.reconcile(markers, changed=lambda: None, checkpoint=_checkpoint)
+                if failure:
+                    raise OSError("injected after inventory index reconciliation")
+
+        if failure:
+            with pytest.raises(OSError, match="injected after inventory"):
+                consume()
+        else:
+            consume()
+        assert len(records) == 1
+        metric = records[0]
+        assert metric.scope == "source_monitor"
+        assert metric.operation == "inventory"
+        assert metric.elapsed_ns > 0
+        assert metric.status == ("failed" if failure else "completed")
+        counters = {v.name: v.value for v in metric.counters}
+        assert counters["inventory_passes"] == 1
+        assert counters["marker_rows"] == 1
+        assert counters["logical_bytes_read"] == len(payload)
+        assert "discovery" in {v.name for v in metric.phases_ns}
+    finally:
+        index.close()

@@ -397,9 +397,16 @@ def test_artifact_metrics_split_render_inspect_finalize_and_thumbnail_phases(
     ]
     assert [value.name for value in metrics[0].phases_ns] == [
         "render_pages",
+        "render_batches",
+        "archive_page_write",
         "archive_inspect",
         "archive_finalize",
     ]
+    archive_phases = {value.name: value.value for value in metrics[0].phases_ns}
+    assert (
+        archive_phases["render_batches"] + archive_phases["archive_page_write"]
+        <= archive_phases["render_pages"]
+    )
     assert [value.name for value in metrics[1].phases_ns] == [
         "archive_inspect",
         "presentation",

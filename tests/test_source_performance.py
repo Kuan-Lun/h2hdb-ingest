@@ -154,6 +154,12 @@ def test_real_source_summary_is_visible_at_info_and_separates_adapter_work(
         "metadata_parse",
         "qualification",
         "snapshot",
+        "snapshot_observe",
+        "snapshot_write",
+        "snapshot_flush",
+        "snapshot_receipt_hash",
+        "snapshot_index",
+        "snapshot_index_commit",
     ):
         assert f"phase.{phase}_ns=" in summary
         assert f"counter.{phase}_calls=" in summary
@@ -168,3 +174,5 @@ def test_real_source_summary_is_visible_at_info_and_separates_adapter_work(
     ):
         assert f"counter.{counter}=" in summary
     assert "counter.selected_galleries=2" in summary
+    assert "counter.snapshot_index_commit_calls=2" in summary
+    assert "counter.snapshot_files=4" in summary

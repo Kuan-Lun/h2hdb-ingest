@@ -6,8 +6,7 @@ import json
 import os
 import sqlite3
 import stat
-from collections.abc import Generator, Iterator
-from contextlib import closing
+from collections.abc import Iterable, Iterator
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,7 +15,6 @@ from typing import BinaryIO, Self, cast
 from h2hdb import FileContentReceipt
 
 from .filesystem import FilesystemFileObservation
-from .source_performance import SourcePerformance
 
 
 class SourceSnapshotStore:
@@ -72,129 +70,54 @@ class SourceSnapshotStore:
         self,
         locator: tuple[str, ...],
         observed: FilesystemFileObservation,
-        *,
-        performance: SourcePerformance | None = None,
     ) -> FileContentReceipt:
-        """Capture one member using the same bounded page operation."""
-        return self.capture_many(locator, (observed,), performance=performance)[0]
+        """Hash and spool the same bounded read consumed by source observation."""
 
-    def capture_many(
-        self,
-        locator: tuple[str, ...],
-        observations: tuple[FilesystemFileObservation, ...],
-        *,
-        performance: SourcePerformance | None = None,
-    ) -> tuple[FileContentReceipt, ...]:
-        """Spool at most 128 members, then publish their private index atomically.
-
-        Bytes are copied outside the SQLite transaction. This index is disposable,
-        not a restart checkpoint. Old copies remain until the complete index page
-        commits; an ambiguous commit failure retains both copies until close.
-        """
         self._require_open()
-        if len(observations) > 128:
-            raise ValueError("source snapshot capture page exceeds 128 members")
-        if not observations:
-            return ()
-        if len({item.name_bytes for item in observations}) != len(observations):
-            raise ValueError("source snapshot page contains duplicate names")
-        measured = performance if performance is not None else SourcePerformance()
         key = _locator_key(locator)
-        captured: list[tuple[int, FilesystemFileObservation, FileContentReceipt]] = []
-        previous: list[int] = []
+        ordinal = self._next_ordinal
+        self._next_ordinal += 1
+        path = self._root / str(ordinal)
         index_write_started = False
         try:
-            for observed in observations:
-                ordinal = self._next_ordinal
-                self._next_ordinal += 1
-                content = self._spool(ordinal, observed, measured)
-                captured.append((ordinal, observed, content))
-            with measured.phase("snapshot_index"):
-                for _, observed, _ in captured:
-                    row = self._connection.execute(
-                        "SELECT ordinal FROM source WHERE locator = ? AND name = ?",
-                        (key, observed.name_bytes),
-                    ).fetchone()
-                    if row is not None:
-                        previous.append(int(row[0]))
-                index_write_started = True
-                self._connection.executemany(
+            with path.open("xb") as destination:
+
+                def parts(source: Iterable[bytes]) -> Iterator[bytes]:
+                    for part in source:
+                        if destination.write(part) != len(part):
+                            raise OSError("source snapshot accepted a partial write")
+                        yield part
+
+                content = FileContentReceipt.from_parts(parts(observed.content_parts()))
+            if content.size_bytes != observed.stat.size_bytes:
+                raise RuntimeError("source snapshot size differs from observation")
+            previous = self._connection.execute(
+                "SELECT ordinal FROM source WHERE locator = ? AND name = ?",
+                (key, observed.name_bytes),
+            ).fetchone()
+            index_write_started = True
+            with self._connection:
+                self._connection.execute(
                     "INSERT INTO source VALUES (?, ?, ?, ?, ?) "
                     "ON CONFLICT(locator, name) DO UPDATE SET ordinal = excluded.ordinal, "
                     "size_bytes = excluded.size_bytes, sha256 = excluded.sha256",
                     (
-                        (
-                            ordinal,
-                            key,
-                            observed.name_bytes,
-                            content.size_bytes,
-                            content.file_sha256,
-                        )
-                        for ordinal, observed, content in captured
+                        ordinal,
+                        key,
+                        observed.name_bytes,
+                        content.size_bytes,
+                        content.file_sha256,
                     ),
                 )
-            with measured.phase("snapshot_index_commit"):
-                self._connection.commit()
-            for ordinal in previous:
-                (self._root / str(ordinal)).unlink()
-            measured.add("snapshot_index_pages")
-            return tuple(content for _, _, content in captured)
-        except BaseException as error:
-            try:
-                with measured.phase("snapshot_index_rollback"):
-                    self._connection.rollback()
-            except BaseException as rollback_error:
-                error.add_note(
-                    f"Source snapshot rollback also failed: {rollback_error!r}"
-                )
-            # Before any index write, all new complete copies are unreferenced.
-            # Later failures can be response loss: keep both complete versions.
-            if not index_write_started:
-                for ordinal, _, _ in captured:
-                    (self._root / str(ordinal)).unlink(missing_ok=True)
-            raise
-
-    def _spool(
-        self,
-        ordinal: int,
-        observed: FilesystemFileObservation,
-        measured: SourcePerformance,
-    ) -> FileContentReceipt:
-        path = self._root / str(ordinal)
-
-        def owned_source() -> Generator[bytes]:
-            # yield-from forwards close to the source iterator when supported,
-            # preserving its Iterator API without depending on garbage collection.
-            yield from observed.content_parts()
-
-        try:
-            with closing(owned_source()) as source, path.open("xb") as destination:
-
-                def parts() -> Iterator[bytes]:
-                    while True:
-                        # Includes source open/stat/hash/checkpoint work; the
-                        # separate source read/hash phases measure their primitives.
-                        with measured.phase("snapshot_observe"):
-                            part = next(source, None)
-                        if part is None:
-                            break
-                        with measured.phase("snapshot_write"):
-                            if destination.write(part) != len(part):
-                                raise OSError(
-                                    "source snapshot accepted a partial write"
-                                )
-                        # The receipt's consumer hashes while this yield is suspended.
-                        with measured.phase("snapshot_receipt_hash"):
-                            yield part
-
-                content = FileContentReceipt.from_parts(parts())
-                with measured.phase("snapshot_flush"):
-                    destination.flush()
-            if content.size_bytes != observed.stat.size_bytes:
-                raise RuntimeError("source snapshot size differs from observation")
+            if previous is not None:
+                (self._root / str(previous[0])).unlink()
             return content
         except BaseException:
-            path.unlink(missing_ok=True)
+            # An index-write/cleanup failure may leave either mapping installed.
+            # Keep both complete copies until this disposable attempt closes;
+            # deleting the new copy here could create a dangling committed row.
+            if not index_write_started:
+                path.unlink(missing_ok=True)
             raise
 
     def open_source(self, locator: tuple[str, ...], name: bytes) -> BinaryIO | None:

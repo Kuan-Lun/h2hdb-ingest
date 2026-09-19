@@ -28,9 +28,16 @@ SourcePhase = Literal[
     "metadata_parse",
     "qualification",
     "snapshot",
+    "snapshot_observe",
+    "snapshot_write",
+    "snapshot_flush",
+    "snapshot_receipt_hash",
+    "snapshot_index",
+    "snapshot_index_commit",
+    "snapshot_index_rollback",
     "source_synchronize",
 ]
-_COUNTER_LIMIT = 32
+_COUNTER_LIMIT = 64
 
 
 class SourcePerformance:
@@ -74,12 +81,16 @@ class SourcePerformance:
             self.add(name + "_calls")
 
     def metric(
-        self, *, status: Literal["completed", "failed", "interrupted"]
+        self,
+        *,
+        status: Literal["completed", "failed", "interrupted"],
+        scope: str = "source",
+        operation: str = "synchronize",
     ) -> IngestMetric:
         with self._lock:
             return IngestMetric(
-                scope="source",
-                operation="synchronize",
+                scope=scope,
+                operation=operation,
                 status=status,
                 elapsed_ns=self._phases.get("source_synchronize", 0),
                 phases_ns=tuple(
@@ -99,6 +110,8 @@ class SourcePerformance:
         sink: IngestMetricSink | None,
         *,
         interruptions: tuple[type[BaseException], ...] = (),
+        scope: str = "source",
+        operation: str = "synchronize",
     ) -> Iterator[None]:
         status: Literal["completed", "failed", "interrupted"] = "completed"
         try:
@@ -111,4 +124,6 @@ class SourcePerformance:
             status = "interrupted"
             raise
         finally:
-            emit_ingest_metric(sink, self.metric(status=status))
+            emit_ingest_metric(
+                sink, self.metric(status=status, scope=scope, operation=operation)
+            )
