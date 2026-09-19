@@ -15,6 +15,12 @@ from typing import BinaryIO, Final, Self, cast
 
 from h2hdb import FileContentReceipt
 
+from ._adapter_performance import (
+    adapter_bytes,
+    adapter_operation,
+    adapter_phase,
+    adapter_read,
+)
 from .filesystem import FilesystemFileObservation
 from .source_performance import SourcePerformance
 
@@ -201,6 +207,7 @@ class SourceSnapshotStore:
             path.unlink(missing_ok=True)
             raise
 
+    @adapter_operation("snapshot_open")
     def open_source(self, locator: tuple[str, ...], name: bytes) -> BinaryIO | None:
         """Open captured bytes, or report that this turn reused a durable source."""
 
@@ -227,12 +234,16 @@ class SourceSnapshotStore:
             digest = sha256()
             remaining = int(row[1])
             while remaining:
-                part = stream.read(min(remaining, 1024 * 1024))
+                part = adapter_read(
+                    stream, min(remaining, 1024 * 1024), "snapshot_read"
+                )
                 if not part:
                     raise RuntimeError("source snapshot ended before its indexed size")
                 remaining -= len(part)
-                digest.update(part)
-            if stream.read(1):
+                with adapter_phase("snapshot_hash"):
+                    digest.update(part)
+                    adapter_bytes("snapshot_hash", len(part))
+            if adapter_read(stream, 1, "snapshot_read"):
                 raise RuntimeError("source snapshot grew beyond its indexed size")
             if digest.digest() != bytes(row[2]):
                 raise RuntimeError("source snapshot bytes differ from their index")

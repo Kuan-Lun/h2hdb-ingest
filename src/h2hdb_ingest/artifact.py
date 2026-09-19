@@ -70,6 +70,11 @@ from h2hdb import (
 from PIL import Image, ImageFile, ImageOps, UnidentifiedImageError, features
 from PIL import __version__ as PILLOW_VERSION
 
+from ._image_performance import (
+    ImageWorkMeasurement,
+    image_phase,
+    measure_image_work,
+)
 from ._limits import MAX_METADATA_BYTES
 from ._resource_cleanup import close_resources, owned_resource
 from .artifact_errors import attach_page_failure_context
@@ -206,6 +211,7 @@ class _RawCentralMember:
 class _RenderedPageBuffer:
     image: CanonicalImageEvidence
     stream: BinaryIO
+    measurement: ImageWorkMeasurement | None = None
 
     def close(self) -> None:
         self.stream.close()
@@ -535,6 +541,10 @@ def _render_archive(
     metadata, pages = _preflight_archive_members(members)
     page_evidence: list[ArtifactRenderedPage] = []
     member_names: list[str] = []
+    worker_phases: dict[str, int] = {}
+    worker_elapsed_ns = 0
+    worker_thread_cpu_ns = 0
+    decoder_input_bytes = 0
     with _ArchiveScratch(destination) as staged:
         try:
             with owned_resource(
@@ -554,6 +564,7 @@ def _render_archive(
                     _METADATA_MEMBER_NAME,
                     _deflate_worst_case(metadata.expected_size_bytes),
                 )
+                metadata_write_started_ns = monotonic_ns()
                 info = _canonical_zip_info(
                     _METADATA_MEMBER_NAME,
                     compression=ZIP_DEFLATED,
@@ -565,6 +576,7 @@ def _render_archive(
                     force_zip64=False,
                 ) as target:
                     _copy_exact_source(metadata, cast(BinaryIO, target))
+                metadata_write_ns = monotonic_ns() - metadata_write_started_ns
                 _verify_source_stream(metadata)
                 member_names.append(_METADATA_MEMBER_NAME)
                 render_pages_started_ns = monotonic_ns()
@@ -601,6 +613,15 @@ def _render_archive(
                             for offset, (member, rendered) in enumerate(
                                 zip(batch, rendered_batch, strict=True)
                             ):
+                                measured = rendered.measurement
+                                if measured is not None:
+                                    worker_elapsed_ns += measured.elapsed_ns
+                                    worker_thread_cpu_ns += measured.thread_cpu_ns
+                                    decoder_input_bytes += measured.decoder_input_bytes
+                                    for name, elapsed in measured.phases_ns.items():
+                                        worker_phases[name] = (
+                                            worker_phases.get(name, 0) + elapsed
+                                        )
                                 page_index = batch_start + offset
                                 image = rendered.image
                                 locator = canonical_page_member_name(page_index)
@@ -646,6 +667,8 @@ def _render_archive(
                     if executor is not None:
                         executor.shutdown(wait=True, cancel_futures=True)
                 render_pages_ns = monotonic_ns() - render_pages_started_ns
+                archive_close_started_ns = monotonic_ns()
+            archive_close_ns = monotonic_ns() - archive_close_started_ns
         except LargeZipFile as error:
             raise PresentationImageError("presentation-v2 forbids ZIP64") from error
 
@@ -699,6 +722,14 @@ def _render_archive(
                 IngestMetricValue("archive_page_write", archive_page_write_ns),
                 IngestMetricValue("archive_inspect", archive_inspect_ns),
                 IngestMetricValue("archive_finalize", archive_finalize_ns),
+                IngestMetricValue("archive_metadata_write", metadata_write_ns),
+                IngestMetricValue("archive_zip_close", archive_close_ns),
+                IngestMetricValue("worker_elapsed_sum", worker_elapsed_ns),
+                IngestMetricValue("worker_thread_cpu_sum", worker_thread_cpu_ns),
+                *(
+                    IngestMetricValue("worker_" + name + "_sum", elapsed)
+                    for name, elapsed in sorted(worker_phases.items())
+                ),
             ),
             counters=(
                 IngestMetricValue("source_members", len(members)),
@@ -709,6 +740,7 @@ def _render_archive(
                 IngestMetricValue("pages", len(page_evidence)),
                 IngestMetricValue("page_render_workers", workers),
                 IngestMetricValue("archive_bytes", size_bytes),
+                IngestMetricValue("decoder_input_logical_bytes", decoder_input_bytes),
             ),
         ),
     )
@@ -726,15 +758,18 @@ def _render_page_member(
         SpooledTemporaryFile(max_size=4 * 1024 * 1024, mode="w+b"),
     )
     try:
-        _verify_source_stream(member)
-        image = _render_page(member.source, stream, policy=policy)
-        _verify_source_stream(member)
+        with measure_image_work() as measured:
+            with image_phase("source_verify"):
+                _verify_source_stream(member)
+            image = _render_page(member.source, stream, policy=policy)
+            with image_phase("source_verify"):
+                _verify_source_stream(member)
         stream.seek(0)
         # Record completion in the worker: an earlier slow future must not hide
         # another page's successful render. The captured work fences late workers.
         if progress is not None:
             progress.advance("pages_rendered")
-        return _RenderedPageBuffer(image=image, stream=stream)
+        return _RenderedPageBuffer(image=image, stream=stream, measurement=measured)
     except BaseException as error:
         attach_page_failure_context(
             error,
@@ -1562,7 +1597,8 @@ def _render_page(
     policy.__post_init__()
     image = load_source_page_image(source, policy=policy)
     try:
-        image = _rgb_on_white(image)
+        with image_phase("color_convert"):
+            image = _rgb_on_white(image)
         return _encode_jpeg(
             image,
             destination,
@@ -1663,26 +1699,28 @@ def _encode_jpeg(
     with owned_resource(
         SpooledTemporaryFile(max_size=4 * 1024 * 1024, mode="w+b")
     ) as encoded:
-        image.save(
-            encoded,
-            format="JPEG",
-            quality=quality,
-            optimize=optimize,
-            progressive=False,
-        )
+        with image_phase("jpeg_encode"):
+            image.save(
+                encoded,
+                format="JPEG",
+                quality=quality,
+                optimize=optimize,
+                progressive=False,
+            )
         size = encoded.tell()
         if not 1 <= size <= MAX_ENCODED_PAGE_BYTES:
             raise PresentationImageError("encoded JPEG exceeds the 32 MiB policy")
         encoded.seek(0)
         digest = sha256()
         remaining = size
-        while remaining:
-            chunk = encoded.read(min(_COPY_BUFFER_BYTES, remaining))
-            if not chunk:
-                raise PresentationImageError("encoded JPEG ended unexpectedly")
-            _write_all(destination, chunk, label="encoded JPEG")
-            digest.update(chunk)
-            remaining -= len(chunk)
+        with image_phase("encoded_copy_hash"):
+            while remaining:
+                chunk = encoded.read(min(_COPY_BUFFER_BYTES, remaining))
+                if not chunk:
+                    raise PresentationImageError("encoded JPEG ended unexpectedly")
+                _write_all(destination, chunk, label="encoded JPEG")
+                digest.update(chunk)
+                remaining -= len(chunk)
     return CanonicalImageEvidence(
         sha256=digest.digest(),
         size_bytes=size,

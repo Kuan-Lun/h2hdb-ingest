@@ -167,7 +167,8 @@ def build_runtime(
         def metrics_sink(metric: IngestMetric) -> None:
             (
                 summary_metrics
-                if metric.scope in {"source", "publication", "artifact_totals"}
+                if metric.scope
+                in {"source", "publication", "artifact_totals", "adapter_io"}
                 else detailed_metrics
             )(metric)
 

@@ -20,6 +20,7 @@ from typing import BinaryIO
 import pyvips  # type: ignore[import-untyped]  # pyvips 3.2 ships no PEP 561 marker.
 from PIL import Image
 
+from ._image_performance import current_image_measurement, image_phase
 from .artifact_errors import attach_image_dimensions
 from .image_diagnostics import native_image_log_scope
 
@@ -88,10 +89,18 @@ class _SourceBridge:
 
     def __init__(self, stream: BinaryIO) -> None:
         errors: list[BaseException] = []
+        measurement = current_image_measurement()
 
         def read(size: int) -> bytes | None:
             try:
-                return stream.read(min(size, _READ_CHUNK_BYTES)) or None
+                if measurement is None:
+                    return stream.read(min(size, _READ_CHUNK_BYTES)) or None
+                # Capture the worker's owner explicitly: native callbacks need
+                # not execute with the Python caller's context variables.
+                with measurement.phase("decoder_input_read"):
+                    content = stream.read(min(size, _READ_CHUNK_BYTES))
+                measurement.decoder_input_bytes += len(content)
+                return content or None
             except BaseException as error:
                 errors.append(error)
                 return None
@@ -199,22 +208,24 @@ def _decode_pixels(
     )
     # thumbnail_source's fail_on keyword is not forwarded to its loader by
     # libvips 8.18. Pass the loader option explicitly, including on header reads.
-    small = pyvips.Image.thumbnail_source(
-        bridge.source,
-        intermediate[0],
-        height=intermediate[1],
-        size="down",
-        option_string="fail_on=error",
-    )
-    if small.interpretation != "srgb":
-        small = small.colourspace("srgb")
-    small = small.cast("uchar")
-    pixels = small.write_to_memory()
-    bridge.check()
-    mode = "RGBA" if small.hasalpha() else "RGB"
-    image = Image.frombytes(mode, (small.width, small.height), pixels)
+    with image_phase("decode_and_shrink"):
+        small = pyvips.Image.thumbnail_source(
+            bridge.source,
+            intermediate[0],
+            height=intermediate[1],
+            size="down",
+            option_string="fail_on=error",
+        )
+        if small.interpretation != "srgb":
+            small = small.colourspace("srgb")
+        small = small.cast("uchar")
+        pixels = small.write_to_memory()
+        bridge.check()
+        mode = "RGBA" if small.hasalpha() else "RGB"
+        image = Image.frombytes(mode, (small.width, small.height), pixels)
     try:
-        image.thumbnail(target, resampler)
+        with image_phase("resize"):
+            image.thumbnail(target, resampler)
     except BaseException:
         image.close()
         raise
@@ -250,7 +261,7 @@ def load_source_image(
     ``max_pixels`` and side bounds apply to intermediate and output images.
     """
 
-    with native_image_log_scope():
+    with native_image_log_scope(), image_phase("decoder_pipeline"):
         return _load_source_image(
             source,
             max_short_side=max_short_side,

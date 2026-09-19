@@ -389,6 +389,8 @@ def test_real_monitor_pass_reports_its_own_bytes_time_and_failure(
         counters = {v.name: v.value for v in metric.counters}
         assert counters["inventory_passes"] == 1
         assert counters["marker_rows"] == 1
+        assert counters["completion_marker_files_observed"] == 1
+        assert counters["completion_marker_bytes_observed"] == len(payload)
         assert counters["logical_bytes_read"] == len(payload)
         assert "discovery" in {v.name for v in metric.phases_ns}
     finally:

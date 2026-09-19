@@ -42,6 +42,13 @@ from h2hdb import (
     VNextSourceChangedError,
 )
 
+from ._adapter_performance import (
+    adapter_bytes,
+    adapter_fsync,
+    adapter_operation,
+    adapter_phase,
+    adapter_read,
+)
 from ._library_journal import FORMAT_VERSION as _JOURNAL_FORMAT_VERSION
 from ._library_journal import create_fresh_journal as _create_fresh_journal
 from ._library_journal import require_exact_schema as _require_exact_journal_schema
@@ -521,6 +528,7 @@ class ManagedFilesystemLibraryAdapter:
                 gid=gid,
             )
 
+    @adapter_operation("protect")
     def protect(
         self,
         content: BinaryIO,
@@ -665,9 +673,11 @@ class ManagedFilesystemLibraryAdapter:
                         "VALUES (?, ?, ?, ?, ?, ?, 'WRITING', ?)",
                         (token, *expected_facts, stage_leaf),
                     )
-                    connection.commit()
+                    with adapter_phase("journal_commit"):
+                        connection.commit()
                 except BaseException:
-                    connection.rollback()
+                    with adapter_phase("journal_rollback"):
+                        connection.rollback()
                     raise
 
         if existing is not None and state == "INSTALLED":
@@ -790,9 +800,11 @@ class ManagedFilesystemLibraryAdapter:
                         ).rowcount
                         if affected != 1:
                             raise RuntimeError("resource protection journal changed")
-                        connection.commit()
+                        with adapter_phase("journal_commit"):
+                            connection.commit()
                     except BaseException:
-                        connection.rollback()
+                        with adapter_phase("journal_rollback"):
+                            connection.rollback()
                         raise
                 case _:
                     raise RuntimeError("resource protection journal changed")
@@ -992,9 +1004,11 @@ class ManagedFilesystemLibraryAdapter:
                         "VALUES (?, ?, ?, ?, ?, 'RELEASED', NULL)",
                         (token, *facts),
                     )
-                    connection.commit()
+                    with adapter_phase("journal_commit"):
+                        connection.commit()
                 except BaseException:
-                    connection.rollback()
+                    with adapter_phase("journal_rollback"):
+                        connection.rollback()
                     raise
             return ArtifactReleaseStorageEvidence(True)
 
@@ -1037,9 +1051,11 @@ class ManagedFilesystemLibraryAdapter:
                     ).rowcount
                     if affected != 1:
                         raise RuntimeError("artifact release authorization changed")
-                    connection.commit()
+                    with adapter_phase("journal_commit"):
+                        connection.commit()
                 except BaseException:
-                    connection.rollback()
+                    with adapter_phase("journal_rollback"):
+                        connection.rollback()
                     raise
 
         self._heal_released_stage_duplicate(
@@ -1078,9 +1094,11 @@ class ManagedFilesystemLibraryAdapter:
                     ).rowcount
                     if affected != 1:
                         raise RuntimeError("artifact release cleanup authority changed")
-                    connection.commit()
+                    with adapter_phase("journal_commit"):
+                        connection.commit()
                 except BaseException:
-                    connection.rollback()
+                    with adapter_phase("journal_rollback"):
+                        connection.rollback()
                     raise
         return ArtifactReleaseStorageEvidence(True)
 
@@ -1138,9 +1156,11 @@ class ManagedFilesystemLibraryAdapter:
                 ).rowcount
                 if affected != 1:
                     raise RuntimeError("library activation state changed")
-                connection.commit()
+                with adapter_phase("journal_commit"):
+                    connection.commit()
             except BaseException:
-                connection.rollback()
+                with adapter_phase("journal_rollback"):
+                    connection.rollback()
                 raise
         return LibraryActivationCheckpoint(
             target,
@@ -1218,14 +1238,17 @@ class ManagedFilesystemLibraryAdapter:
                         "UPDATE library_state SET last_cursor = ? WHERE singleton = 1",
                         (_activation_key(page[-1]),),
                     )
-                connection.commit()
+                with adapter_phase("journal_commit"):
+                    connection.commit()
             except sqlite3.IntegrityError as error:
-                connection.rollback()
+                with adapter_phase("journal_rollback"):
+                    connection.rollback()
                 raise RuntimeError(
                     "library activation contains a duplicate resource or storage key"
                 ) from error
             except BaseException:
-                connection.rollback()
+                with adapter_phase("journal_rollback"):
+                    connection.rollback()
                 raise
 
     def seal(self, revision: int) -> None:
@@ -1242,9 +1265,11 @@ class ManagedFilesystemLibraryAdapter:
                 ).rowcount
                 if affected != 1:
                     raise RuntimeError("library activation spool cannot be sealed")
-                connection.commit()
+                with adapter_phase("journal_commit"):
+                    connection.commit()
             except BaseException:
-                connection.rollback()
+                with adapter_phase("journal_rollback"):
+                    connection.rollback()
                 raise
 
     def reconcile_page(
@@ -1291,9 +1316,11 @@ class ManagedFilesystemLibraryAdapter:
                         ).rowcount
                         if affected != 1:
                             raise RuntimeError("library activation state changed")
-                        connection.commit()
+                        with adapter_phase("journal_commit"):
+                            connection.commit()
                     except BaseException:
-                        connection.rollback()
+                        with adapter_phase("journal_rollback"):
+                            connection.rollback()
                         raise
                 case _:
                     self._verify_marker(target, receipt)
@@ -1341,9 +1368,11 @@ class ManagedFilesystemLibraryAdapter:
                         "ORDER BY c.publication_key, c.resource_kind LIMIT ?",
                         (target, target, limit),
                     )
-                    connection.commit()
+                    with adapter_phase("journal_commit"):
+                        connection.commit()
                 except BaseException:
-                    connection.rollback()
+                    with adapter_phase("journal_rollback"):
+                        connection.rollback()
                     raise
 
         removed = self._remove_stale(
@@ -1386,9 +1415,11 @@ class ManagedFilesystemLibraryAdapter:
                 ).rowcount
                 if affected != 1:
                     raise RuntimeError("library activation state changed before READY")
-                connection.commit()
+                with adapter_phase("journal_commit"):
+                    connection.commit()
             except BaseException:
-                connection.rollback()
+                with adapter_phase("journal_rollback"):
+                    connection.rollback()
                 raise
             return LibraryActivationCheckpoint(
                 target,
@@ -1457,9 +1488,11 @@ class ManagedFilesystemLibraryAdapter:
                 ).rowcount
                 if affected != 1:
                     raise RuntimeError("library activation changed before completion")
-                connection.commit()
+                with adapter_phase("journal_commit"):
+                    connection.commit()
             except BaseException:
-                connection.rollback()
+                with adapter_phase("journal_rollback"):
+                    connection.rollback()
                 raise
             self._remove_marker(target, receipt)
 
@@ -1530,9 +1563,11 @@ class ManagedFilesystemLibraryAdapter:
                     ).rowcount
                     if affected != 1:
                         raise RuntimeError("library cleanup authority changed")
-                    connection.commit()
+                    with adapter_phase("journal_commit"):
+                        connection.commit()
                 except BaseException:
-                    connection.rollback()
+                    with adapter_phase("journal_rollback"):
+                        connection.rollback()
                     raise
 
         with self._exclusive_state() as connection:
@@ -1564,9 +1599,11 @@ class ManagedFilesystemLibraryAdapter:
                         "AND resource_kind = ?",
                         completed_rows,
                     )
-                    connection.commit()
+                    with adapter_phase("journal_commit"):
+                        connection.commit()
                 except BaseException:
-                    connection.rollback()
+                    with adapter_phase("journal_rollback"):
+                        connection.rollback()
                     raise
                 return LibraryMaintenanceOutcome.PROGRESSED
             return LibraryMaintenanceOutcome.DONE
@@ -1636,9 +1673,11 @@ class ManagedFilesystemLibraryAdapter:
                     )
                     for publication_key, resource_kind in rows
                 )
-                connection.commit()
+                with adapter_phase("journal_commit"):
+                    connection.commit()
             except BaseException:
-                connection.rollback()
+                with adapter_phase("journal_rollback"):
+                    connection.rollback()
                 raise
         return plans
 
@@ -1839,9 +1878,11 @@ class ManagedFilesystemLibraryAdapter:
                         last.publication_key, last.resource_kind
                     ),
                 )
-                connection.commit()
+                with adapter_phase("journal_commit"):
+                    connection.commit()
             except BaseException:
-                connection.rollback()
+                with adapter_phase("journal_rollback"):
+                    connection.rollback()
                 raise
         return checkpoint
 
@@ -2105,8 +2146,8 @@ class ManagedFilesystemLibraryAdapter:
                 raise RuntimeError(
                     f"unknown library target appeared: {self._target(key)}"
                 ) from error
-            os.fsync(parent_descriptor)
-            os.fsync(staging_descriptor)
+            adapter_fsync(parent_descriptor, directory=True)
+            adapter_fsync(staging_descriptor, directory=True)
             installed = _verify_regular_at(
                 parent_descriptor,
                 key.segments[-1],
@@ -2204,8 +2245,8 @@ class ManagedFilesystemLibraryAdapter:
                 raise RuntimeError(
                     f"unknown library target appeared: {target}"
                 ) from error
-            os.fsync(parent_descriptor)
-            os.fsync(staging_descriptor)
+            adapter_fsync(parent_descriptor, directory=True)
+            adapter_fsync(staging_descriptor, directory=True)
             installed = _require_regular_authority_at(
                 parent_descriptor,
                 key.segments[-1],
@@ -2285,8 +2326,8 @@ class ManagedFilesystemLibraryAdapter:
             )
             if not _same_content_identity(verified, staged.signature):
                 raise RuntimeError("recovered current changed staged inode identity")
-            os.fsync(parent_descriptor)
-            os.fsync(staging_descriptor)
+            adapter_fsync(parent_descriptor, directory=True)
+            adapter_fsync(staging_descriptor, directory=True)
             durable = _verify_regular_at(
                 parent_descriptor,
                 key.segments[-1],
@@ -2477,9 +2518,11 @@ class ManagedFilesystemLibraryAdapter:
                         ).rowcount
                         if affected != 1:
                             raise RuntimeError("library removal authorization changed")
-                connection.commit()
+                with adapter_phase("journal_commit"):
+                    connection.commit()
             except BaseException:
-                connection.rollback()
+                with adapter_phase("journal_rollback"):
+                    connection.rollback()
                 raise
         return plans
 
@@ -2578,9 +2621,11 @@ class ManagedFilesystemLibraryAdapter:
                         last.publication_key, last.resource_kind
                     ),
                 )
-                connection.commit()
+                with adapter_phase("journal_commit"):
+                    connection.commit()
             except BaseException:
-                connection.rollback()
+                with adapter_phase("journal_rollback"):
+                    connection.rollback()
                 raise
         return checkpoint
 
@@ -2856,6 +2901,7 @@ class ManagedFilesystemLibraryAdapter:
             )
             return signature
 
+    @adapter_operation("stage")
     def _write_stage(
         self,
         archive: BinaryIO,
@@ -3014,8 +3060,8 @@ class ManagedFilesystemLibraryAdapter:
                 raise RuntimeError(
                     "stale quarantine destination is occupied"
                 ) from error
-            os.fsync(quarantine_descriptor)
-            os.fsync(parent_descriptor)
+            adapter_fsync(quarantine_descriptor, directory=True)
+            adapter_fsync(parent_descriptor, directory=True)
             try:
                 if reuse_verified_digest:
                     captured = _require_regular_authority_at(
@@ -3062,8 +3108,8 @@ class ManagedFilesystemLibraryAdapter:
                     # overwrite the entry that raced with the capture.
                     pass
                 else:
-                    os.fsync(parent_descriptor)
-                    os.fsync(quarantine_descriptor)
+                    adapter_fsync(parent_descriptor, directory=True)
+                    adapter_fsync(quarantine_descriptor, directory=True)
                 raise RuntimeError(
                     f"captured a foreign library path: {self._target(key)}"
                 ) from error
@@ -3156,8 +3202,8 @@ class ManagedFilesystemLibraryAdapter:
                     label=label,
                 )
 
-            os.fsync(quarantine_descriptor)
-            os.fsync(parent_descriptor)
+            adapter_fsync(quarantine_descriptor, directory=True)
+            adapter_fsync(parent_descriptor, directory=True)
 
             if _lstat_at(parent_descriptor, key.segments[-1]) is not None:
                 raise RuntimeError(
@@ -3338,6 +3384,7 @@ class ManagedFilesystemLibraryAdapter:
                 label="removed library ACTIVATING marker",
             )
 
+    @adapter_operation("layout")
     def _ensure_layout(self) -> None:
         progress = None if self._progress is None else self._progress.current()
         if progress is not None:
@@ -3551,7 +3598,9 @@ class ManagedFilesystemLibraryAdapter:
         progress = None if self._progress is None else self._progress.current()
         if progress is not None:
             progress.operation("library_state_lock_wait")
-        with self._state_process_lock:
+        with adapter_phase("state_lock_wait"):
+            self._state_process_lock.acquire()
+        try:
             descriptor = os.open(
                 self._state_lock_path,
                 os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
@@ -3562,16 +3611,22 @@ class ManagedFilesystemLibraryAdapter:
                     descriptor,
                     label="library state lock",
                 )
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                with adapter_phase("state_lock_wait"):
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
                 if progress is not None:
                     progress.operation("library_state")
-                with self._connection() as connection:
+                with (
+                    adapter_phase("journal_session"),
+                    self._connection() as connection,
+                ):
                     yield connection
             finally:
                 try:
                     fcntl.flock(descriptor, fcntl.LOCK_UN)
                 finally:
                     os.close(descriptor)
+        finally:
+            self._state_process_lock.release()
 
     def _acquire_publication_lock(self) -> None:
         self._require_pinned_storage_identity()
@@ -3593,7 +3648,8 @@ class ManagedFilesystemLibraryAdapter:
                 descriptor,
                 label="library publication lock",
             )
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            with adapter_phase("publication_lock_wait"):
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
             if progress is not None:
                 progress.operation("library_activation")
         except BaseException:
@@ -3655,7 +3711,8 @@ class ManagedFilesystemLibraryAdapter:
             operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
             if progress is not None:
                 progress.operation("library_publication_lock_wait")
-            fcntl.flock(descriptor, operation)
+            with adapter_phase("publication_lock_wait"):
+                fcntl.flock(descriptor, operation)
             if progress is not None:
                 progress.operation("library_storage")
             yield
@@ -3690,7 +3747,8 @@ class ManagedFilesystemLibraryAdapter:
             )
             if progress is not None:
                 progress.operation("library_protection_lock_wait")
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            with adapter_phase("protection_lock_wait"):
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
             if progress is not None:
                 progress.operation("library_protect")
             yield
@@ -3766,7 +3824,8 @@ class ManagedFilesystemLibraryAdapter:
             _require_no_relocation(connection)
             identity = _read_storage_identity(connection)
             self._require_pinned_storage_uuid(identity)
-            connection.commit()
+            with adapter_phase("journal_commit"):
+                connection.commit()
             _ensure_managed_file(
                 self._database_path,
                 _PRIVATE_FILE_CREATION_MODE,
@@ -4095,8 +4154,8 @@ def _ensure_managed_directory(
                 or (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino)
             ):
                 raise RuntimeError(f"managed directory identity is unsafe: {path}")
-            os.fsync(child_descriptor)
-            os.fsync(parent_descriptor)
+            adapter_fsync(child_descriptor, directory=True)
+            adapter_fsync(parent_descriptor, directory=True)
             durable = os.fstat(child_descriptor)
             visible = os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
             if (
@@ -4143,8 +4202,8 @@ def _ensure_managed_file(
                 label=label,
                 parent_descriptor=parent_descriptor,
             )
-            os.fsync(descriptor)
-            os.fsync(parent_descriptor)
+            adapter_fsync(descriptor, directory=False)
+            adapter_fsync(parent_descriptor, directory=True)
             _require_managed_file_descriptor(
                 path,
                 descriptor,
@@ -4251,8 +4310,8 @@ def _open_directory_chain(
                 os.close(next_descriptor)
                 raise RuntimeError(f"library shard identity is unsafe: {component}")
             if create:
-                os.fsync(next_descriptor)
-                os.fsync(current_descriptor)
+                adapter_fsync(next_descriptor, directory=True)
+                adapter_fsync(current_descriptor, directory=True)
                 durable = os.fstat(next_descriptor)
                 visible = os.stat(
                     component,
@@ -4408,7 +4467,8 @@ def _publish_resumable_file(
                     dir_fd=directory_descriptor,
                 )
             if file_descriptor is not None:
-                fcntl.flock(file_descriptor, fcntl.LOCK_EX)
+                with adapter_phase("stage_lock_wait"):
+                    fcntl.flock(file_descriptor, fcntl.LOCK_EX)
                 opened = os.fstat(file_descriptor)
                 opened_signature = _Signature.from_stat(opened)
                 _require_managed_file_metadata(
@@ -4432,35 +4492,47 @@ def _publish_resumable_file(
                     destination.seek(0)
                     remaining = opened.st_size
                     while remaining:
-                        part = destination.read(min(_COPY_BUFFER_BYTES, remaining))
+                        part = adapter_read(
+                            destination,
+                            min(_COPY_BUFFER_BYTES, remaining),
+                            "stage_prefix_read",
+                        )
                         if not isinstance(part, bytes) or not part:
                             raise RuntimeError(f"{label} temporary could not be read")
-                        expected_part = source.read(len(part))
+                        expected_part = adapter_read(source, len(part), "stage_read")
                         if not isinstance(expected_part, bytes):
                             raise TypeError(f"{label} source must yield bytes")
                         if expected_part != part:
                             raise RuntimeError(
                                 f"{label} temporary is not an exact source prefix"
                             )
-                        observed_digest.update(part)
+                        with adapter_phase("stage_hash"):
+                            observed_digest.update(part)
+                            adapter_bytes("stage_hash", len(part))
                         remaining -= len(part)
 
                     size_bytes = opened.st_size
                     destination.seek(size_bytes)
-                    while part := source.read(_COPY_BUFFER_BYTES):
+                    while part := adapter_read(
+                        source, _COPY_BUFFER_BYTES, "stage_read"
+                    ):
                         if not isinstance(part, bytes):
                             raise TypeError(f"{label} source must yield bytes")
                         if size_bytes + len(part) > expected_size:
                             raise RuntimeError(f"{label} source exceeds expected size")
-                        observed_digest.update(part)
-                        _write_all(destination, part, label=label)
+                        with adapter_phase("stage_hash"):
+                            observed_digest.update(part)
+                            adapter_bytes("stage_hash", len(part))
+                        with adapter_phase("stage_write"):
+                            _write_all(destination, part, label=label)
                         size_bytes += len(part)
                     if size_bytes != expected_size:
                         raise RuntimeError(f"{label} source has an unexpected size")
                     if observed_digest.digest() != expected_sha256:
                         raise RuntimeError(f"{label} source has an unexpected digest")
-                    destination.flush()
-                    os.fsync(destination.fileno())
+                    with adapter_phase("stage_flush"):
+                        destination.flush()
+                    adapter_fsync(destination.fileno(), directory=False)
                 after = os.fstat(file_descriptor)
                 if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
                     raise RuntimeError(f"{label} temporary changed open identity")
@@ -4472,7 +4544,7 @@ def _publish_resumable_file(
                 )
             else:  # pragma: no cover - both os.open branches assign or raise
                 raise RuntimeError(f"{label} temporary could not be opened")
-            os.fsync(directory_descriptor)
+            adapter_fsync(directory_descriptor, directory=True)
             try:
                 temporary_signature = _require_regular_authority_at(
                     directory_descriptor,
@@ -4507,7 +4579,7 @@ def _publish_resumable_file(
                 )
             except FileExistsError as error:
                 raise RuntimeError(f"{label} destination appeared") from error
-            os.fsync(directory_descriptor)
+            adapter_fsync(directory_descriptor, directory=True)
             try:
                 installed = _require_regular_authority_at(
                     directory_descriptor,
@@ -4538,7 +4610,7 @@ def _publish_resumable_file(
                 except FileExistsError, FileNotFoundError, RuntimeError, OSError:
                     pass
                 else:
-                    os.fsync(directory_descriptor)
+                    adapter_fsync(directory_descriptor, directory=True)
                 raise RuntimeError(f"published {label} is foreign") from error
             return installed
     finally:
@@ -4558,6 +4630,7 @@ def _write_all(destination: BinaryIO, content: bytes, *, label: str) -> None:
         if type(written) is not int or written <= 0 or written > len(view) - offset:
             raise RuntimeError(f"{label} destination write made no progress")
         offset += written
+        adapter_bytes("stage_write", written)
 
 
 def _capture_regular_at(
@@ -4578,8 +4651,10 @@ def _capture_regular_at(
         opened = os.fstat(source.fileno())
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
             raise RuntimeError(f"{label} changed while opening: {leaf}")
-        while part := source.read(_COPY_BUFFER_BYTES):
-            digest.update(part)
+        while part := adapter_read(source, _COPY_BUFFER_BYTES, "verify_read"):
+            with adapter_phase("verify_hash"):
+                digest.update(part)
+                adapter_bytes("verify_hash", len(part))
         after = os.fstat(source.fileno())
     if _Signature.from_stat(opened) != _Signature.from_stat(after):
         raise RuntimeError(f"{label} changed while hashing: {leaf}")
@@ -4605,8 +4680,10 @@ def _verify_regular_at(
         opened = os.fstat(source.fileno())
         if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
             raise RuntimeError(f"{label} changed while opening: {leaf}")
-        while part := source.read(_COPY_BUFFER_BYTES):
-            digest.update(part)
+        while part := adapter_read(source, _COPY_BUFFER_BYTES, "verify_read"):
+            with adapter_phase("verify_hash"):
+                digest.update(part)
+                adapter_bytes("verify_hash", len(part))
         after = os.fstat(source.fileno())
     if _Signature.from_stat(opened) != _Signature.from_stat(after):
         raise RuntimeError(f"{label} changed while hashing: {leaf}")
@@ -4640,7 +4717,7 @@ def _verify_and_fsync_published_at(
         expected_signature=verified,
         label=label,
     )
-    os.fsync(descriptor)
+    adapter_fsync(descriptor, directory=True)
     durable = _verify_regular_at(
         descriptor,
         leaf,
@@ -4695,7 +4772,7 @@ def _verify_and_fsync_file_at(
             expected_signature=verified,
             label=label,
         )
-        os.fsync(file_descriptor)
+        adapter_fsync(file_descriptor, directory=False)
         durable = os.fstat(file_descriptor)
         named = _lstat_at(descriptor, leaf)
         if (
@@ -4737,9 +4814,9 @@ def _heal_same_inode_rename_duplicate(
         expected_identity=expected_identity,
         label=label,
     )
-    os.fsync(destination_descriptor)
+    adapter_fsync(destination_descriptor, directory=True)
     if source_descriptor != destination_descriptor:
-        os.fsync(source_descriptor)
+        adapter_fsync(source_descriptor, directory=True)
     durable_duplicate = _verify_same_inode_rename_names(
         source_descriptor=source_descriptor,
         source_leaf=source_leaf,
@@ -4762,9 +4839,9 @@ def _heal_same_inode_rename_duplicate(
     )
     if not _same_content_identity(survivor, durable_duplicate):
         raise RuntimeError(f"{label} survivor changed content identity")
-    os.fsync(source_descriptor)
+    adapter_fsync(source_descriptor, directory=True)
     if source_descriptor != destination_descriptor:
-        os.fsync(destination_descriptor)
+        adapter_fsync(destination_descriptor, directory=True)
     if _lstat_at(source_descriptor, source_leaf) is not None:
         raise RuntimeError(f"{label} retained its duplicate source name")
     durable_survivor = _verify_regular_at(
@@ -4838,7 +4915,7 @@ def _fsync_absent_at(descriptor: int, leaf: str, *, label: str) -> None:
 
     if _lstat_at(descriptor, leaf) is not None:
         raise RuntimeError(f"{label} reappeared before absence sync")
-    os.fsync(descriptor)
+    adapter_fsync(descriptor, directory=True)
     if _lstat_at(descriptor, leaf) is not None:
         raise RuntimeError(f"{label} reappeared after absence sync")
 
@@ -4867,7 +4944,7 @@ def _unlink_verified_at(
     if named is None or _Signature.from_stat(named) != verified:
         raise RuntimeError(f"{label} changed immediately before unlink")
     os.unlink(leaf, dir_fd=descriptor)
-    os.fsync(descriptor)
+    adapter_fsync(descriptor, directory=True)
 
 
 def _unlink_preserved_authority_at(
@@ -4893,9 +4970,10 @@ def _unlink_preserved_authority_at(
     if named is None or _Signature.from_stat(named) != observed:
         raise RuntimeError(f"{label} changed immediately before unlink")
     os.unlink(leaf, dir_fd=descriptor)
-    os.fsync(descriptor)
+    adapter_fsync(descriptor, directory=True)
 
 
+@adapter_operation("rename")
 def _rename_noreplace(
     source: str,
     destination: str,
@@ -5028,7 +5106,7 @@ def _verify_regular_file(
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
-        os.fsync(descriptor)
+        adapter_fsync(descriptor, directory=True)
     finally:
         os.close(descriptor)
 

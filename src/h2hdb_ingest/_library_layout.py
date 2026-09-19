@@ -6,6 +6,8 @@ import os
 import stat
 from pathlib import Path
 
+from ._adapter_performance import adapter_fsync
+
 CURRENT_DIRECTORY_NAME = "current"
 ACQUISITIONS_DIRECTORY_NAME = "acquisitions"
 ARTWORK_DIRECTORY_NAME = "artwork"
@@ -110,8 +112,8 @@ def _validate_current_subtrees(
                 durable=durable,
             )
         if durable:
-            os.fsync(current_descriptor)
-            os.fsync(root_descriptor)
+            adapter_fsync(current_descriptor, directory=True)
+            adapter_fsync(root_descriptor, directory=True)
     finally:
         os.close(current_descriptor)
 
@@ -165,8 +167,8 @@ def _validate_child_directory(
             label=label,
         )
         if durable:
-            os.fsync(descriptor)
-            os.fsync(parent_descriptor)
+            adapter_fsync(descriptor, directory=True)
+            adapter_fsync(parent_descriptor, directory=True)
         durable_value = os.fstat(descriptor)
         visible = os.stat(leaf, dir_fd=parent_descriptor, follow_symlinks=False)
         _require_opened_directory(
@@ -231,8 +233,8 @@ def _reject_legacy_coordination(
                 "a fresh library root is required"
             )
         if durable:
-            os.fsync(state_descriptor)
-            os.fsync(root_descriptor)
+            adapter_fsync(state_descriptor, directory=True)
+            adapter_fsync(root_descriptor, directory=True)
         durable_value = os.fstat(state_descriptor)
         visible = os.stat(
             STATE_DIRECTORY_NAME,

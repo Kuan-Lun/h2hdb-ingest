@@ -32,6 +32,7 @@ from h2hdb import (
     VNextSourcePreparationProgress,
 )
 
+from ._adapter_performance import summarize_adapter_io
 from .core_source import SourceGalleryQualifier, VNextFilesystemSourceAdapter
 from .filesystem import FilesystemSource
 from .metrics import (
@@ -289,7 +290,12 @@ class VNextIngestService:
         if work is not None:
             work.phase("publication")
             work.operation("waiting_publication_guard")
-        with self._publication_guard(), summarize_artifact_metrics(self._metrics_sink):
+        generation = session.call(lambda _facade, receipt: receipt.ingest_generation)
+        with (
+            self._publication_guard(),
+            summarize_artifact_metrics(self._metrics_sink),
+            summarize_adapter_io(self._metrics_sink, generation=generation),
+        ):
             publication = synchronize_publication(
                 session,
                 resolved,
