@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-19T07:11:41+00:00",
-  "manifest_sha256": "a7c49fa77544d6a0e0f32a3b9fefcb4e0ac5734d50f101184d3da6d59b489d67",
+  "checked_at": "2026-09-19T14:48:20+00:00",
+  "manifest_sha256": "01c5a49c77a269f569ed7d209bfa79794ee55a50288220da8a94911a48410254",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.25.5",
+  "project_version": "0.25.6",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,10 +30,10 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.39.2,<0.40.0",
+      "declared": "h2hdb>=0.39.12,<0.40.0",
       "group": "runtime",
       "latest": "0.39.11",
-      "latest_satisfies": true,
+      "latest_satisfies": false,
       "name": "h2hdb",
       "python_3_14": true,
       "url": "https://pypi.org/project/h2hdb/"
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed fresh public PyPI/npm candidate metadata for all 16 Python requirement entries (15 unique packages) and the Node dependency, including latest candidates beyond existing bounds. Relative to the committed 0.25.4 receipt checked at 2026-09-19T02:32:19+00:00, the only changed registry candidate is public h2hdb 0.39.10 to 0.39.11; all other upstream reviews carry forward only for identical versions. The official GitHub releases endpoint still contains no release-note entries. Reviewed Core committed history from 3cfba6c65de1f20b9d7742ad9a805a8788046b2d to 65d99551ae6bc93b8359ea0952048444521b0786: batched fresh ancestry validation, bounded exact unchanged-page descriptor copying, and cumulative SQL/transaction diagnostics; public package exports, facade signatures, ports and epoch-3/schema-7 generated schema remain unchanged. Downloaded the official 0.39.11 PyPI wheel and verified SHA256 0733d53df281409f4df6fc310d45d311516433d42a7cdc912fc9b0f41542e02e. It is byte-for-byte identical to the coordinated local wheel already used for the prior 0.25.4 validation, and all 87 installed Core Python modules match it exactly. All latest candidates satisfy declared bounds and their Python metadata supports 3.14; installed direct dependency versions match these candidates. uv pip check passed for 44 installed packages and npm ls --depth=0 passed with markdownlint-cli2 0.23.2. No dependency was installed or upgraded during this review. The prior 19 live MariaDB 10.11.11 resident E2E cases and 3 real CBZ/raster deployment-fixture cases are historical compatibility evidence for these same Core wheel bytes; this receipt does not claim that the new snapshot-boundary regression tests, current live-MariaDB run, or current full merge gate have passed. Their results are reported separately.",
+    "note": "Reviewed fresh public PyPI/npm candidates for all 16 Python requirement entries (15 unique packages) and markdownlint-cli2, including candidates beyond existing upper bounds. Registry candidate versions are unchanged from the committed 0.25.5 audit, so identical-version upstream reviews carry forward. The only manifest change requires coordinated Core 0.39.12 for artifact I/O attribution; the registry latest remains 0.39.11 and does not yet satisfy this new lower bound. This is an explicit local coordinated-release dependency, not a claim that 0.39.12 is publicly available. Built and installed the supplied local h2hdb-0.39.12 wheel without dependency resolution; no new public facade, schema or persistent format is introduced by its runtime telemetry. All other installed direct versions equal latest candidates and satisfy bounds; Python metadata supports 3.14. uv pip check passed for 44 packages and npm ls reports markdownlint-cli2 0.23.2. A clean checkout can use scripts/rebuild-env.sh with an explicitly supplied Core wheel. Full gate, live-MariaDB and installed-wheel artifact experiments are reported separately and are not implied by this audit.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
