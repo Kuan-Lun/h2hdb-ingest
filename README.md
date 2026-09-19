@@ -247,6 +247,54 @@ can contain reads and hashes, so do not add them to estimate total wall time.
 Logical bytes include rereads and do not measure physical disk traffic. A killed
 process can leave a turn without a terminal summary; absence is not zero cost.
 
+Snapshot capture now reports observation, destination writes, buffer flush,
+receipt hashing, index writes, and index commit/rollback separately. The source
+`read`/`hash` timings are contained in snapshot observation. The observer hashes
+only when it has an expected digest to verify; the receipt still derives its
+SHA-256 from every actual captured byte. Index commits cover at most 128 members after
+their bytes have been captured. These copies contain source images and metadata,
+not CBZ archives; they are discarded after the publication attempt.
+
+Background inventory emits its own INFO `scope=source_monitor operation=inventory`
+summary, including status, completed marker rows, logical read bytes, discovery,
+read/hash work and total pass time including index reconciliation. These passes
+can overlap foreground ingest; do not add their elapsed times to foreground wall
+time or interpret a failed/interrupted pass as a completed inventory.
+
+From a development checkout, compare actual snapshot capture wall time against
+the frozen per-file writer with local, disposable exact-byte fixtures:
+
+```bash
+.venv/bin/python scripts/probe-source-snapshot.py --output /tmp/snapshot-ab.json
+.venv/bin/python scripts/probe-source-snapshot.py --counts 128 512 \
+  --bytes 2097152 --monitor-galleries 512 --output /tmp/snapshot-monitor-ab.json
+```
+
+The default matrix crosses 127/128/129/512 files, uses 4 KiB and 2 MiB payloads,
+and rotates three variants for three repetitions: the historical writer,
+batching alone, and batching with the unused observer hash removed. It verifies every
+receipt and captured byte outside timed capture, records raw timings and source
+hashes, and removes supervisor-owned scratch even after a worker timeout. Run it
+without concurrent builds or benchmarks; `--isolated` records that operator
+confirmation. It measures one component on the local filesystem, not NAS speed
+or end-to-end publication throughput. The synthetic controller sensitivity tool
+`probe-publication-budget.py --output /tmp/publication-budget.json` separately
+compares first publication, target misses and total catch-up under fixed/per-gallery
+cost assumptions; its modeled times are not runtime measurements.
+
+Successful batches also emit `publication` and `artifact_totals` summaries at
+INFO. The latter aggregates all completed render calls in that batch; individual
+artifact metrics remain available at DEBUG. Subtract the aggregate
+`render_archive.elapsed` from publication elapsed to separate CBZ production,
+and subtract `render_presentation` separately to exclude thumbnail production.
+This is elapsed wall time for completed calls, not the sum of overlapping page
+worker durations. `render_batches` includes source verification, decode, resize
+and JPEG encoding; `archive_page_write` measures serial ZIP_STORED page copying.
+The existing `render_pages` is inclusive and may overlap worker execution.
+Partial failed render calls have unknown remaining cost and must not be treated
+as zero. Foreground source, publication and artifact totals are three batch
+summaries; the background monitor remains a separate concurrent measurement.
+
 Core records source actions, ingest permission checks and cleanup candidate
 checks separately. Long-operation progress identifies a pending connector call;
 completed SQL totals exclude that call until it returns. Publication completion,
