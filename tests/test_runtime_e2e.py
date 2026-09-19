@@ -893,6 +893,126 @@ def test_fresh_artifact_runtime_publishes_one_current_cbz(
         assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
 
 
+def test_source_snapshot_page_boundaries_publish_complete_cbz_and_replay(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "download"
+    gid = 2701
+    page_count = 257
+    _gallery(source, gid, "snapshot-boundary")
+    folder = source / str(gid)
+    (folder / "001.jpg").unlink()
+    expected_source: list[tuple[bytes, int, bytes]] = []
+    expected_pages: list[bytes] = []
+    for position in range(page_count):
+        name = f"{position:04d}.png"
+        with Image.new(
+            "RGB",
+            (8, 12),
+            (position % 256, (position // 256) * 127, position * 37 % 256),
+        ) as image:
+            image.save(folder / name, format="PNG")
+            encoded = BytesIO()
+            image.save(
+                encoded, format="JPEG", quality=90, optimize=True, progressive=False
+            )
+            expected_pages.append(encoded.getvalue())
+        content = (folder / name).read_bytes()
+        expected_source.append((name.encode(), len(content), sha256(content).digest()))
+    assert len({digest for _name, _size, digest in expected_source}) == page_count
+    _rewrite_completion_marker(folder)
+    metadata = (folder / "galleryinfo.txt").read_bytes()
+    library = tmp_path / "library"
+    _provision_library_root(library)
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(
+            download_path=source,
+            library_path=library,
+            page_render_workers=2,
+            render_policy=ArtifactRenderPolicyConfig(page_jpeg_quality=90),
+        ),
+        resident=ResidentConfig(lease_seconds=30, heartbeat_seconds=5),
+    )
+    rendered: list[tuple[ArtifactSourceMember, ...]] = []
+    original_render = ManagedFilesystemLibraryAdapter.render_archive
+
+    def record_render(
+        adapter: ManagedFilesystemLibraryAdapter,
+        members: tuple[ArtifactSourceMember, ...],
+        destination: BinaryIO,
+        *,
+        gid: int,
+    ) -> ArtifactArchiveRenderEvidence:
+        rendered.append(members)
+        return original_render(adapter, members, destination, gid=gid)
+
+    monkeypatch.setattr(
+        ManagedFilesystemLibraryAdapter, "render_archive", record_render
+    )
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        runtime.resident.initialize()
+        assert runtime.resident.process_available(periodic_scan=True)
+        revision = runtime.catalog.get_catalog_revision()
+        publications = runtime.catalog.discover_publications().publications
+        assert len(publications) == 1
+        publication = publications[0]
+        assert publication.gid == gid
+        assert publication.page_count == page_count
+        assert len(publication.artifacts) == 1
+        assert len(rendered) == 1
+        assert [
+            (member.source_name, member.expected_size_bytes, member.expected_sha256)
+            for member in rendered[0]
+            if member.role is ArtifactSourceRole.PAGE
+        ] == expected_source
+        assert [
+            (member.source_name, member.expected_size_bytes, member.expected_sha256)
+            for member in rendered[0]
+            if member.role is ArtifactSourceRole.METADATA
+        ] == [(b"galleryinfo.txt", len(metadata), sha256(metadata).digest())]
+        archive_path = library.joinpath(
+            "current", *publication.artifacts[0].storage_object.key.segments
+        )
+        archive_bytes = archive_path.read_bytes()
+        assert sha256(archive_bytes).hexdigest() == (
+            publication.artifacts[0].storage_object.sha256
+        )
+        with ZipFile(BytesIO(archive_bytes)) as archive:
+            assert archive.testzip() is None
+            assert archive.namelist() == [
+                "galleryinfo.txt",
+                *(f"pages/{position:04d}.jpg" for position in range(page_count)),
+            ]
+            assert archive.read("galleryinfo.txt") == metadata
+            assert [
+                archive.read(f"pages/{position:04d}.jpg")
+                for position in range(page_count)
+            ] == expected_pages
+        assert publication.cover is not None
+        cover = publication.cover
+        assert (
+            archive_bytes[
+                cover.extent.offset : cover.extent.offset + cover.extent.length
+            ]
+            == expected_pages[0]
+        )
+        assert runtime.database_admin.check().state == "READY"
+        assert not (library / ".h2hdb-coordination" / "ACTIVATING").exists()
+
+    with build_runtime(config) as restarted:
+        restarted.resident.initialize()
+        _synchronize_after_cleanup(restarted)
+        assert restarted.catalog.get_catalog_revision() == revision
+        assert restarted.catalog.discover_publications().publications == publications
+        assert archive_path.read_bytes() == archive_bytes
+        assert len(rendered) == 1
+        assert restarted.database_admin.check().state == "READY"
+
+
 def test_restart_recovers_durable_publication_before_applying_new_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

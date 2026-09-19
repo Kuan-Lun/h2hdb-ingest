@@ -11,12 +11,14 @@ from contextlib import closing
 from hashlib import sha256
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import BinaryIO, Self, cast
+from typing import BinaryIO, Final, Self, cast
 
 from h2hdb import FileContentReceipt
 
 from .filesystem import FilesystemFileObservation
 from .source_performance import SourcePerformance
+
+SNAPSHOT_CAPTURE_PAGE_SIZE: Final = 128
 
 
 class SourceSnapshotStore:
@@ -92,8 +94,10 @@ class SourceSnapshotStore:
         commits; an ambiguous commit failure retains both copies until close.
         """
         self._require_open()
-        if len(observations) > 128:
-            raise ValueError("source snapshot capture page exceeds 128 members")
+        if len(observations) > SNAPSHOT_CAPTURE_PAGE_SIZE:
+            raise ValueError(
+                f"source snapshot capture page exceeds {SNAPSHOT_CAPTURE_PAGE_SIZE} members"
+            )
         if not observations:
             return ()
         if len({item.name_bytes for item in observations}) != len(observations):

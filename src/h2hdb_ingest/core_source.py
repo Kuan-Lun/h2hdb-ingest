@@ -7,6 +7,7 @@ __all__ = ["VNextFilesystemSourceAdapter"]
 import logging
 from collections.abc import Callable
 from functools import wraps
+from itertools import batched
 from typing import Concatenate, cast
 
 from h2hdb import (
@@ -35,7 +36,7 @@ from .filesystem import (
     FilesystemSourceChangedError,
 )
 from .source_performance import SourcePerformance
-from .source_snapshot import SourceSnapshotStore
+from .source_snapshot import SNAPSHOT_CAPTURE_PAGE_SIZE, SourceSnapshotStore
 
 logger = logging.getLogger(__name__)
 
@@ -190,19 +191,22 @@ class VNextFilesystemSourceAdapter:
                 if item.artifact_role is not FilesystemArtifactSourceRole.OTHER
             )
             with self._source_performance.phase("snapshot"):
-                contents = self._snapshot.capture_many(
-                    observation.locator_components,
-                    members,
-                    performance=self._source_performance,
-                )
-            captured = {
-                item.name_bytes: content
-                for item, content in zip(members, contents, strict=True)
-            }
-            self._source_performance.add(
-                "snapshot_bytes", sum(item.size_bytes for item in contents)
-            )
-            self._source_performance.add("snapshot_files", len(contents))
+                # Core FILE pages hold 256 rows. The disposable snapshot index
+                # commits at most 128 members without changing that outer page.
+                for batch in batched(members, SNAPSHOT_CAPTURE_PAGE_SIZE, strict=False):
+                    contents = self._snapshot.capture_many(
+                        observation.locator_components,
+                        batch,
+                        performance=self._source_performance,
+                    )
+                    captured.update(
+                        (item.name_bytes, content)
+                        for item, content in zip(batch, contents, strict=True)
+                    )
+                    self._source_performance.add(
+                        "snapshot_bytes", sum(item.size_bytes for item in contents)
+                    )
+                    self._source_performance.add("snapshot_files", len(contents))
         items = tuple(
             _file(item, content=captured.get(item.name_bytes)) for item in page.items
         )
