@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-19T02:32:19+00:00",
+  "checked_at": "2026-09-19T07:11:41+00:00",
   "manifest_sha256": "a7c49fa77544d6a0e0f32a3b9fefcb4e0ac5734d50f101184d3da6d59b489d67",
   "node": [
     {
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.25.4",
+  "project_version": "0.25.5",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -32,7 +32,7 @@
     {
       "declared": "h2hdb>=0.39.2,<0.40.0",
       "group": "runtime",
-      "latest": "0.39.10",
+      "latest": "0.39.11",
       "latest_satisfies": true,
       "name": "h2hdb",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed fresh public PyPI/npm candidate metadata for all 16 Python requirement entries (15 unique packages) and the Node dependency, including latest candidates outside existing bounds. The only candidate change since the committed 0.25.3 receipt checked at 2026-09-18T05:27:54+00:00 is public h2hdb 0.39.8 to 0.39.10; all other upstream reviews carry forward only for the identical versions. The official GitHub releases endpoint returned no release-note entries. Reviewed Core committed release history and source changes from 0.39.8 through 0.39.10: additive diagnostics, equivalent canonical/index-seek predicates and fenced cleanup terminal selection; public facade argument signatures, package exports and epoch-3/schema-7 generated schema are unchanged. Downloaded the official 0.39.10 wheel, verified PyPI SHA256 f39a72bfda2ff0f3a7b47a22a300a706594a76fd91a9020898fb73815f972f58 and confirmed all 87 Python modules exactly match committed Core 3cfba6c65de1f20b9d7742ad9a805a8788046b2d. All candidates satisfy constraints and Python metadata supports 3.14. uv pip check passed for 44 installed packages and npm ls --depth=0 passed. The explicitly supplied coordinated Core 0.39.11 wheel (SHA256 0733d53df281409f4df6fc310d45d311516433d42a7cdc912fc9b0f41542e02e) replaced the previous local Core 0.39.9 in the Ingest development environment. uv pip check then passed for 44 packages. Against this exact wheel, all 19 live MariaDB 10.11.11 resident E2E cases passed, and the Core deployment-fixture test_real cases using this explicit Ingest interpreter passed 3 cases with actual CBZ/raster oracles. No other dependency package was installed or upgraded. The Core candidate adds measured batched ancestry/descriptor SQL and bounded diagnostics without changing public facade signatures or epoch/schema. Exact-tree release gates and isolated Docker deployment acceptance have separate outcomes and are not implied by this dependency receipt.",
+    "note": "Reviewed fresh public PyPI/npm candidate metadata for all 16 Python requirement entries (15 unique packages) and the Node dependency, including latest candidates beyond existing bounds. Relative to the committed 0.25.4 receipt checked at 2026-09-19T02:32:19+00:00, the only changed registry candidate is public h2hdb 0.39.10 to 0.39.11; all other upstream reviews carry forward only for identical versions. The official GitHub releases endpoint still contains no release-note entries. Reviewed Core committed history from 3cfba6c65de1f20b9d7742ad9a805a8788046b2d to 65d99551ae6bc93b8359ea0952048444521b0786: batched fresh ancestry validation, bounded exact unchanged-page descriptor copying, and cumulative SQL/transaction diagnostics; public package exports, facade signatures, ports and epoch-3/schema-7 generated schema remain unchanged. Downloaded the official 0.39.11 PyPI wheel and verified SHA256 0733d53df281409f4df6fc310d45d311516433d42a7cdc912fc9b0f41542e02e. It is byte-for-byte identical to the coordinated local wheel already used for the prior 0.25.4 validation, and all 87 installed Core Python modules match it exactly. All latest candidates satisfy declared bounds and their Python metadata supports 3.14; installed direct dependency versions match these candidates. uv pip check passed for 44 installed packages and npm ls --depth=0 passed with markdownlint-cli2 0.23.2. No dependency was installed or upgraded during this review. The prior 19 live MariaDB 10.11.11 resident E2E cases and 3 real CBZ/raster deployment-fixture cases are historical compatibility evidence for these same Core wheel bytes; this receipt does not claim that the new snapshot-boundary regression tests, current live-MariaDB run, or current full merge gate have passed. Their results are reported separately.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
