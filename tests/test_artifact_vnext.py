@@ -401,12 +401,59 @@ def test_artifact_metrics_split_render_inspect_finalize_and_thumbnail_phases(
         "archive_page_write",
         "archive_inspect",
         "archive_finalize",
+        "archive_metadata_write",
+        "archive_zip_close",
+        "worker_elapsed_sum",
+        "worker_thread_cpu_sum",
+        "worker_color_convert_sum",
+        "worker_decode_and_shrink_sum",
+        "worker_decoder_input_read_sum",
+        "worker_decoder_pipeline_sum",
+        "worker_encoded_copy_hash_sum",
+        "worker_jpeg_encode_sum",
+        "worker_resize_sum",
+        "worker_source_verify_sum",
     ]
     archive_phases = {value.name: value.value for value in metrics[0].phases_ns}
     assert (
         archive_phases["render_batches"] + archive_phases["archive_page_write"]
         <= archive_phases["render_pages"]
     )
+    assert (
+        archive_phases["worker_decode_and_shrink_sum"]
+        + archive_phases["worker_resize_sum"]
+        <= archive_phases["worker_decoder_pipeline_sum"]
+    )
+    assert (
+        sum(
+            archive_phases[f"worker_{name}_sum"]
+            for name in (
+                "source_verify",
+                "decoder_pipeline",
+                "color_convert",
+                "jpeg_encode",
+                "encoded_copy_hash",
+            )
+        )
+        <= archive_phases["worker_elapsed_sum"]
+    )
+    assert (
+        sum(
+            archive_phases[name]
+            for name in (
+                "archive_metadata_write",
+                "archive_zip_close",
+                "render_batches",
+                "archive_page_write",
+                "archive_inspect",
+                "archive_finalize",
+            )
+        )
+        <= metrics[0].elapsed_ns
+    )
+    assert {value.name: value.value for value in metrics[0].counters}[
+        "decoder_input_logical_bytes"
+    ] > 0
     assert [value.name for value in metrics[1].phases_ns] == [
         "archive_inspect",
         "presentation",

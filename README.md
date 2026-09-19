@@ -259,7 +259,13 @@ Background inventory emits its own INFO `scope=source_monitor operation=inventor
 summary, including status, completed marker rows, logical read bytes, discovery,
 read/hash work and total pass time including index reconciliation. These passes
 can overlap foreground ingest; do not add their elapsed times to foreground wall
-time or interpret a failed/interrupted pass as a completed inventory.
+time or interpret a failed/interrupted pass as a completed inventory. The
+`completion_marker_files_observed` and `completion_marker_bytes_observed`
+counters identify completed observations of `galleryinfo.txt`, rather than
+images. Read-call counters also include EOF calls.
+Each inventory rereads the markers; the index uses their fingerprints to decide
+which galleries need foreground work. It does not skip marker reads based only
+on an unchanged filesystem timestamp.
 
 From a development checkout, compare actual snapshot capture wall time against
 the frozen per-file writer with local, disposable exact-byte fixtures:
@@ -284,16 +290,56 @@ cost assumptions; its modeled times are not runtime measurements.
 
 Successful batches also emit `publication` and `artifact_totals` summaries at
 INFO. The latter aggregates all completed render calls in that batch; individual
-artifact metrics remain available at DEBUG. Subtract the aggregate
-`render_archive.elapsed` from publication elapsed to separate CBZ production,
-and subtract `render_presentation` separately to exclude thumbnail production.
-This is elapsed wall time for completed calls, not the sum of overlapping page
-worker durations. `render_batches` includes source verification, decode, resize
-and JPEG encoding; `archive_page_write` measures serial ZIP_STORED page copying.
+artifact metrics remain available at DEBUG. Subtracting the aggregate
+`render_archive.elapsed` from publication elapsed excludes the entire archive
+renderer, including its input checks and final archive inspection, rather than
+only compression and packing. `render_presentation` separately measures thumbnail
+production. These are wall times for completed calls, not the sum of overlapping
+page worker durations. `render_batches` includes source verification, decode,
+resize and JPEG encoding; `archive_page_write` measures serial ZIP_STORED copying.
 The existing `render_pages` is inclusive and may overlap worker execution.
 Partial failed render calls have unknown remaining cost and must not be treated
-as zero. Foreground source, publication and artifact totals are three batch
-summaries; the background monitor remains a separate concurrent measurement.
+as zero.
+
+The INFO archive totals also distinguish worker source verification, native
+decode/shrink, final resize, JPEG encoding, encoded-buffer copying/hashing, and
+main-thread ZIP metadata writes and close. `worker_elapsed_sum` adds elapsed
+worker durations and can exceed archive wall time. `worker_thread_cpu_sum`
+excludes other libvips native threads. The worker decoder pipeline includes
+scheduling/header work, decode/shrink and final resize; decoder input reads are
+inclusive suboperations. Do not add these overlapping measurements or subtract
+parallel JPEG worker durations from publication wall time. A compression-free
+counterfactual requires a separate controlled experiment.
+
+INFO `scope=adapter_io` summaries correlate with the publication generation and
+report source-snapshot rereads, protection, layout checks, staging, journal
+transactions, lock waits, fsync and rename. Snapshots are cumulative, emitted at
+completed outer operation boundaries after 60 seconds and at completion or
+failure; subtract consecutive snapshots when computing interval costs. Inclusive
+wall time contains nested operations; exclusive wall time excludes them. Bytes
+are actual logical transfers, not device traffic. An operation still in progress
+is absent until it returns; the progress heartbeat identifies pending work.
+Core's publication summary separately attributes source copy/rehash, archive and
+presentation verification, and protection-boundary hashing. These Core and
+adapter measurements describe overlapping layers and must not be added together.
+Foreground source, publication, artifact totals and adapter I/O remain distinct
+summaries; the background monitor is a concurrent measurement.
+
+To exercise these boundaries with deterministic real JPEG files, public ingest,
+independent archive/raster checks, cleanup and a subsequent work claim:
+
+```bash
+.venv/bin/python scripts/probe-artifact-io.py --galleries 32 --pages 64 \
+  --edge 512 --workers 4 --isolated --timeout 900 \
+  --output /tmp/artifact-io.json
+```
+
+Only pass `--isolated` when other benchmarks and builds are stopped. The report
+records source hashes, raw INFO measurements and logical amplification; its local
+wall time is not a NAS throughput prediction. A small fixture with
+`--fsync-delay-ms 2 --fsync-delay-kind directory` or `file` injects a known delay
+at the adapter boundary to check attribution. It still executes the actual
+fsync and all publication checks; the artificial delay is not a device model.
 
 Core records source actions, ingest permission checks and cleanup candidate
 checks separately. Long-operation progress identifies a pending connector call;

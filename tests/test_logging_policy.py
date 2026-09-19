@@ -211,7 +211,7 @@ def test_real_native_rendering_keeps_console_and_file_info_volume_per_batch(
         assert str(logs.result["log_level"]).upper() == "INFO"
         info = logs.messages("INFO")
         metrics = [line for line in info if line.startswith("ingest_metric ")]
-        assert len(metrics) == 3
+        assert len(metrics) == 4
         assert metrics[0].startswith(
             "ingest_metric scope=source operation=synchronize "
         )
@@ -220,7 +220,7 @@ def test_real_native_rendering_keeps_console_and_file_info_volume_per_batch(
             metric_lines = [
                 line for line in output.splitlines() if "ingest_metric " in line
             ]
-            assert len(metric_lines) == 3
+            assert len(metric_lines) == 4
             assert all(
                 any(f"[INFO] {metric}" in line for line in metric_lines)
                 for metric in metrics
@@ -232,6 +232,10 @@ def test_real_native_rendering_keeps_console_and_file_info_volume_per_batch(
         assert "operation.render_archive.render_batches_ns=" in artifact_summary
         assert "operation.render_archive.archive_page_write_ns=" in artifact_summary
         assert any("scope=publication " in line for line in logs.messages("INFO"))
+        adapter_summary = next(line for line in metrics if "scope=adapter_io " in line)
+        assert "counter.ingest_generation=" in adapter_summary
+        assert "operation.protect.inclusive_ns=" in adapter_summary
+        assert "operation.stage_read.logical_bytes=" in adapter_summary
         # Terminal source, publication and artifact summaries carry counters. Routine
         # activity messages still exclude per-page and per-artifact details.
         activity = [line for line in info if line not in metrics]

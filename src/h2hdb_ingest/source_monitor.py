@@ -70,6 +70,13 @@ class FilesystemCompletionMarkerProbe:
             ]:
                 for item in source.iter_completion_markers():
                     performance.add("marker_rows")
+                    # The watcher reads completion metadata, never image files.
+                    # Count successfully observed marker payloads separately from
+                    # primitive reads, which also include EOF and failed attempts.
+                    performance.add("completion_marker_files_observed")
+                    performance.add(
+                        "completion_marker_bytes_observed", item[1].stat.size_bytes
+                    )
                     yield item
 
             # The consuming index reconciliation happens inside this context,
