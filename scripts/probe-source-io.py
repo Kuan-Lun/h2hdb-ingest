@@ -1,4 +1,4 @@
-"""Measure real source preparation I/O against a bounded published SQLite baseline.
+"""Measure real source synchronization I/O against a bounded published SQLite baseline.
 
 Only synthetic files are accepted. A child process bounds the complete matrix;
 the report is replaced atomically only after a complete success/error document.
@@ -11,12 +11,13 @@ import json
 import os
 import platform
 import random
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import tomllib
 from collections import defaultdict
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import partial
 from hashlib import sha256
@@ -28,11 +29,12 @@ from typing import Any, BinaryIO
 from unittest.mock import patch
 
 import h2hdb
-from h2hdb import CoreConfig, DatabaseConfig, VNextIngestFacade
+from h2hdb import CoreConfig, DatabaseConfig, VNextCurrentOnlyMaintenanceOutcome
 from PIL import Image
 
 import h2hdb_ingest
 import h2hdb_ingest.image_qualification as qualification
+import h2hdb_ingest.service as service
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
 from h2hdb_ingest.config import ArtifactRenderPolicyConfig
 from h2hdb_ingest.core_source import VNextFilesystemSourceAdapter
@@ -41,6 +43,7 @@ from h2hdb_ingest.image_qualification import ImageGalleryQualifier
 from h2hdb_ingest.metrics import IngestMetric, TextIngestMetricSink
 from h2hdb_ingest.policy import build_ingest_policy
 from h2hdb_ingest.runtime import build_runtime
+from h2hdb_ingest.session import IngestSessionController
 from h2hdb_ingest.source_performance import SourcePerformance
 
 _PHASE: ContextVar[str] = ContextVar("source_io_probe_phase", default="observation")
@@ -282,31 +285,29 @@ def _measure(
         meter.instrument(),
         nullcontext() if performance is None else performance.operation(metrics.append),
     ):
-        prepared = operation()
+        result = operation()
     elapsed = perf_counter() - started
     cpu_elapsed = process_time() - cpu_started
     measured = {
         **meter.report(),
         "elapsed_seconds": elapsed,
         "process_cpu_seconds": cpu_elapsed,
-        "galleries": prepared.gallery_count,
-        "waiting": prepared.waiting_gallery_count,
-        "deferred": prepared.deferred_gallery_count,
+        "galleries": result.receipt.staged_galleries,
+        "waiting": result.waiting_gallery_count,
+        "deferred": result.deferred_gallery_count,
         "source_manifest": _manifest(root),
     }
     if performance is not None:
-        try:
-            if len(metrics) != 1:
-                raise RuntimeError("direct preparation must emit one source metric")
-            _attach_production_metric(
-                measured,
-                metrics[0],
-                scope="prepare_source only; shared production SourcePerformance instance",
-            )
-        except BaseException:
-            prepared.close()
-            raise
-    return prepared, measured
+        if len(metrics) != 1:
+            raise RuntimeError("source synchronization must emit one source metric")
+        _attach_production_metric(
+            measured,
+            metrics[0],
+            scope="complete source synchronization; shared production SourcePerformance instance",
+        )
+    if result.inventory_scan_pending:
+        raise RuntimeError("source I/O comparison requires a complete fresh inventory")
+    return result, measured
 
 
 def _attach_production_metric(
@@ -402,17 +403,17 @@ def _run_matrix(
         ):
             runtime.database_admin.initialize()
             runtime.resident.initialize()
-            original_prepare = VNextIngestFacade.prepare_source
+            original_source = service.synchronize_source
 
-            def measured_prepare(facade: VNextIngestFacade, *args: Any, **kwargs: Any):
-                prepared, measured = _measure(
-                    source, lambda: original_prepare(facade, *args, **kwargs)
+            def measured_source(*args: Any, **kwargs: Any):
+                result, measured = _measure(
+                    source, lambda: original_source(*args, **kwargs)
                 )
                 cases["baseline"] = measured
-                return prepared
+                return result
 
             started = perf_counter()
-            with patch.object(VNextIngestFacade, "prepare_source", measured_prepare):
+            with patch.object(service, "synchronize_source", measured_source):
                 if not runtime.resident.process_available(periodic_scan=True):
                     raise RuntimeError("synthetic baseline did not publish")
             seed_seconds = perf_counter() - started
@@ -438,69 +439,119 @@ def _run_matrix(
             if runtime.database_admin.check().state != "READY":
                 raise RuntimeError("published baseline failed full database audit")
 
-            session = runtime.facade.try_claim_ingest(True, 1_800_000_000)
-            if session is None:
-                raise RuntimeError("synthetic baseline did not release its ingest turn")
-            try:
-                changed = config.model_copy(
+            changed = config.model_copy(
+                update={
+                    "paths": config.paths.model_copy(
+                        update={
+                            "render_policy": ArtifactRenderPolicyConfig(
+                                page_jpeg_quality=89
+                            )
+                        }
+                    )
+                }
+            )
+            for name, selected in (
+                ("unchanged", config),
+                ("policy_changed", changed),
+                ("source_changed", config),
+            ):
+                if name == "source_changed":
+                    folder = source / "1000000"
+                    _write_page(
+                        folder / f"000.{codec}", edge, random.Random(87029), codec
+                    )
+                    (folder / "galleryinfo.txt").write_bytes(
+                        _metadata(1_000_000, changed=True)
+                    )
+                # A completed source pass now writes durable checkpoints. Give
+                # each comparison an independent, exact copy of the published
+                # baseline so policy invalidation cannot contaminate the next
+                # case's qualification authority. SQLite backup includes WAL.
+                comparison_database = root / f"{name}.sqlite3"
+                with (
+                    closing(sqlite3.connect(config.core.database.database)) as original,
+                    closing(sqlite3.connect(comparison_database)) as copied,
+                ):
+                    original.backup(copied)
+                selected = selected.model_copy(
                     update={
-                        "paths": config.paths.model_copy(
+                        "core": selected.core.model_copy(
                             update={
-                                "render_policy": ArtifactRenderPolicyConfig(
-                                    page_jpeg_quality=89
+                                "database": selected.core.database.model_copy(
+                                    update={"database": str(comparison_database)}
                                 )
                             }
                         )
                     }
                 )
-                for name, selected in (
-                    ("unchanged", config),
-                    ("policy_changed", changed),
-                    ("source_changed", config),
-                ):
-                    if name == "source_changed":
-                        folder = source / "1000000"
-                        _write_page(
-                            folder / f"000.{codec}", edge, random.Random(87029), codec
+                with build_runtime(
+                    selected, event_logger=lambda _message: None
+                ) as comparison:
+                    for _ in range(128):
+                        outcome = comparison.facade.drain_current_only_maintenance(
+                            1_800_000_000
                         )
-                        (folder / "galleryinfo.txt").write_bytes(
-                            _metadata(1_000_000, changed=True)
+                        if outcome is VNextCurrentOnlyMaintenanceOutcome.DONE:
+                            break
+                        if outcome is not VNextCurrentOnlyMaintenanceOutcome.PROGRESSED:
+                            raise RuntimeError(
+                                f"source comparison maintenance: {outcome}"
+                            )
+                    else:
+                        raise RuntimeError(
+                            "source comparison maintenance exceeded bound"
                         )
-                    policy = runtime.facade.ensure_policy(
-                        session, build_ingest_policy(selected)
+                    session = comparison.facade.try_claim_ingest(True, 1_800_000_000)
+                    if session is None:
+                        raise RuntimeError(
+                            "source comparison could not acquire its turn"
+                        )
+                    controller = IngestSessionController(
+                        comparison.facade,
+                        session,
+                        lease_duration_microseconds=1_800_000_000,
+                        database_type="sqlite",
                     )
-                    performance = SourcePerformance()
-                    with (
-                        FilesystemSource(source, performance=performance) as fs,
-                    ):
-                        adapter = VNextFilesystemSourceAdapter(
-                            fs,
-                            qualify_gallery=ImageGalleryQualifier(
-                                selected.paths.artifact_render_policy(), workers=workers
-                            ),
-                            performance=performance,
+                    try:
+                        policy = comparison.facade.ensure_policy(
+                            session, build_ingest_policy(selected)
                         )
-
-                        prepared, result = _measure(
-                            source,
-                            partial(
-                                runtime.facade.prepare_source, adapter, policy=policy
-                            ),
-                            performance=performance,
+                        performance = SourcePerformance()
+                        with FilesystemSource(source, performance=performance) as fs:
+                            adapter = VNextFilesystemSourceAdapter(
+                                fs,
+                                qualify_gallery=ImageGalleryQualifier(
+                                    selected.paths.artifact_render_policy(),
+                                    workers=workers,
+                                ),
+                                performance=performance,
+                            )
+                            _result, measured = _measure(
+                                source,
+                                partial(
+                                    service.synchronize_source,
+                                    controller,
+                                    policy,
+                                    adapter,
+                                ),
+                                performance=performance,
+                            )
+                            cases[name] = measured
+                    finally:
+                        comparison.facade.complete_ingest(session)
+                    if comparison.catalog.get_catalog_revision() != revision:
+                        raise RuntimeError(
+                            "source-only comparison changed the published head"
                         )
-                        try:
-                            cases[name] = result
-                        finally:
-                            prepared.close()
-            finally:
-                runtime.facade.complete_ingest(session)
+                    if comparison.database_admin.check().state != "READY":
+                        raise RuntimeError("comparison left invalid database authority")
             if runtime.catalog.get_catalog_revision() != revision:
-                raise RuntimeError("prepare-only comparison changed the published head")
+                raise RuntimeError("source-only comparison changed the published head")
             if runtime.database_admin.check().state != "READY":
                 raise RuntimeError("probe left invalid database authority")
         return {
             "status": "ok",
-            "format_version": 4,
+            "format_version": 5,
             "provenance": _provenance(),
             "fixture": {
                 "galleries": galleries,
@@ -522,18 +573,18 @@ def _run_matrix(
                 "qualification_spool_threshold_bytes": _SPOOL_THRESHOLD_BYTES,
             },
             "scope": {
-                "measured": "prepare_source only; one real published baseline",
-                "comparisons": "all prepare-only cases use the same published baseline",
+                "measured": "complete source synchronization, including durable observation checkpoints; one real published baseline",
+                "comparisons": "all source-only cases use independent SQLite backups of the same published baseline",
                 "source_changed": "one PAGE plus its producer completion marker",
                 "policy_changed": "page_jpeg_quality 90 -> 89; source unchanged",
                 "source_io": "actual os.read bytes/calls, including EOF calls, by inode and exclusive phase",
                 "source_files": "a second view of the same raw reads; do not add it to phase totals",
                 "production_telemetry": "actual SourcePerformance metrics; exact read bytes/calls and qualification counts checked against independent meter",
-                "production_metric_timing": "baseline source metric includes source issue/commit after preparation; comparison metrics cover prepare_source only; inclusive phase times overlap and cannot be summed",
+                "production_metric_timing": "all metrics cover complete source synchronization; inclusive phase times overlap and cannot be summed",
                 "buffer_io": "logical stream reads/writes, not physical disk I/O; memory qualification spools included",
                 "qualification_disk_spools": "count of rolled spools when _spool returns, before decoding; not all native/scratch disk I/O",
                 "native_io_limit": "only observed Python stream boundaries; native reads bypassing these wrappers are not counted",
-                "excluded": "I/O counters omit SQLite and discovery/core spools; preparation wall includes their work; later rendering and prepared-resource teardown are outside measured preparation",
+                "excluded": "I/O counters omit SQLite and discovery/core spools; source wall includes their work and teardown; fixture backup, inter-turn maintenance, later analysis and artifact rendering are excluded",
                 "timing": "observational; instrumentation overhead included; no wall-time pass threshold",
                 "cache_state": "freshly generated local fixtures followed by baseline publication; no cache flush or NAS throughput claim",
                 "operation_timing": "nested totals and concurrent decode sums overlap; never sum as wall time",
@@ -686,7 +737,7 @@ def main() -> int:
         if (
             not isinstance(report, dict)
             or report.get("status") != "ok"
-            or report.get("format_version") != 4
+            or report.get("format_version") != 5
             or not isinstance(report.get("cases"), dict)
             or set(report["cases"])
             != {"baseline", "unchanged", "policy_changed", "source_changed"}
@@ -695,7 +746,7 @@ def main() -> int:
     except (subprocess.SubprocessError, ValueError) as error:
         report = {
             "status": "error",
-            "format_version": 4,
+            "format_version": 5,
             "error_type": type(error).__name__,
             "error": str(error),
             "provenance": _provenance(),
