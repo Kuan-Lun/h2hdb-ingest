@@ -19,14 +19,8 @@ from h2hdb_ingest._adapter_performance import (
     adapter_read,
     summarize_adapter_io,
 )
-from h2hdb_ingest.filesystem import (
-    FilesystemArtifactSourceRole,
-    FilesystemFileObservation,
-    FilesystemStat,
-)
 from h2hdb_ingest.library import _publish_resumable_file
 from h2hdb_ingest.metrics import IngestMetric
-from h2hdb_ingest.source_snapshot import SourceSnapshotStore
 
 
 def _values(metric: IngestMetric, operation: str) -> dict[str, int]:
@@ -164,38 +158,6 @@ def test_real_protect_replay_has_no_copy_and_records_journal_cost(
     assert _values(first, "state_lock_wait")["calls"] == 4
     assert "stage_read" not in {item.operation for item in replay.operations}
     assert _values(replay, "layout")["calls"] == 1
-
-
-def test_snapshot_reread_counts_actual_bytes_and_still_rejects_corruption(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "image.jpg"
-    path.write_bytes(b"good image bytes")
-    observed = FilesystemFileObservation(
-        folder=path.parent,
-        name_bytes=path.name.encode(),
-        stat=FilesystemStat.from_os_stat(path.stat()),
-        artifact_role=FilesystemArtifactSourceRole.PAGE,
-    )
-    records: list[IngestMetric] = []
-    with SourceSnapshotStore() as store:
-        store.capture(("1001",), observed)
-        with summarize_adapter_io(records.append, generation=8):
-            for _ in range(2):
-                stream = store.open_source(("1001",), b"image.jpg")
-                assert stream is not None
-                stream.close()
-        assert _values(records[0], "snapshot_open")["calls"] == 2
-        expected = 2 * len(b"good image bytes")
-        assert _values(records[0], "snapshot_read")["logical_bytes"] == expected
-        assert _values(records[0], "snapshot_hash")["logical_bytes"] == expected
-        (store._root / "0").write_bytes(b"evil image bytes")
-        with (
-            pytest.raises(RuntimeError, match="bytes differ"),
-            summarize_adapter_io(records.append, generation=9),
-        ):
-            store.open_source(("1001",), b"image.jpg")
-        assert _values(records[-1], "snapshot_open")["failed_calls"] == 1
 
 
 def test_observer_failure_does_not_change_filesystem_result(tmp_path: Path) -> None:

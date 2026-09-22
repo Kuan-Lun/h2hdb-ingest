@@ -43,11 +43,10 @@ _MODEL = {
         "qualification_tracks_admission": "decode_calls and qualified_galleries <= B",
         "PAGE_reads_track_admission": "PAGE read bytes <= 2 * encoded bytes of the B newly admitted PAGE files",
         "marker_reads_bounded_by_inventory_and_admission": "marker bytes <= 2 * all inventory marker bytes + 8 * newly admitted marker bytes",
-        "snapshot_tracks_admission": "snapshot_files <= 2 * B (one PAGE and one marker)",
     },
     "sql_interpretation": "record source_prepare and SOURCE action SQL counts separately; no unsupported SQL-count bound or NAS latency target is asserted",
     "counterexample": "one additional read of every PAGE in the fixed inventory must violate the PAGE bound",
-    "limits": "N<=1024 is local evidence, not NAS N=130000; inclusive phase times overlap; no wall-time gate",
+    "limits": "N<=1024 is local evidence, not NAS N=130000; inclusive phase times overlap; no wall-time gate; source preparation rereads bytes without retaining a full-turn byte snapshot; this probe measures reads, not scratch retention",
 }
 
 
@@ -157,7 +156,6 @@ def _costs(
             marker_bytes,
             2 * all_marker_bytes + 8 * selected_marker_bytes,
         ),
-        "snapshot_tracks_admission": (measured["captured_files"], 2 * _BATCH),
     }
     checks = {
         key: {"observed": value, "upper_bound": bound, "met": value <= bound}

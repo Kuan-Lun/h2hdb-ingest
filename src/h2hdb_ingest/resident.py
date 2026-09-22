@@ -26,6 +26,7 @@ from h2hdb import (
 
 from ._log_recovery import RecoveryLog
 from ._retry_diagnostics import RetryDiagnostic, retry_diagnostic
+from ._source_retry import SourceReobservation
 from .artifact_errors import format_artifact_failure
 from .config import ResidentConfig
 from .cycle_performance import CyclePerformance
@@ -77,6 +78,8 @@ class IngestSynchronizer(Protocol):
         session: IngestSessionController,
         *,
         should_stop: Callable[[], bool] | None = None,
+        reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+        reuse_sealed_observations: bool = True,
     ) -> VNextIngestSynchronizationResult: ...
 
 
@@ -145,6 +148,7 @@ class ResidentIngestor:
             database_admin, config, self._event_logger, database_type=database_type
         )
         self._retry_failure: RetryDiagnostic | None = None
+        self._source_reobservation = SourceReobservation()
         self._temporary_cleanup = temporary_cleanup
         self._capacity_waiting = False
         self._progress_pending = False
@@ -367,13 +371,14 @@ class ResidentIngestor:
                 session,
                 interval_seconds=self._config.heartbeat_seconds,
             ) as heartbeat:
-                if should_stop is None:
-                    outcome = self._service.synchronize_once(session)
-                else:
-                    outcome = self._service.synchronize_once(
-                        session,
-                        should_stop=should_stop,
-                    )
+                outcome = self._service.synchronize_once(
+                    session,
+                    should_stop=should_stop,
+                    reobserve_gallery_locators=self._source_reobservation.locators,
+                    reuse_sealed_observations=(
+                        self._source_reobservation.reuse_sealed_observations
+                    ),
+                )
                 if isinstance(outcome, VNextIngestSynchronizationResult):
                     self._cycle_performance.published(claimed.ingest_generation)
                 heartbeat.raise_if_failed()
@@ -467,6 +472,7 @@ class ResidentIngestor:
                 return _ResidentCycleOutcome.MAINTENANCE_PROGRESSED
             return _ResidentCycleOutcome.IDLE
         except (VNextSourceChangedError, FilesystemSourceChangedError) as error:
+            self._source_reobservation.record_failure(error)
             # A changed completion marker invalidates this attempt, not the
             # resident process. Heartbeat has stopped before releasing its
             # exact session and allowing bounded cleanup to make progress.
@@ -534,6 +540,7 @@ class ResidentIngestor:
             return _ResidentCycleOutcome.IDLE
         self._capacity_waiting = False
         self._last_synchronization_result = outcome
+        self._source_reobservation.clear()
         if outcome.deferred_gallery_count == 0:
             self._database_audit.initial_catchup_complete()
         try:

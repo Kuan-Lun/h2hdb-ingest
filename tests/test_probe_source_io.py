@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from h2hdb import FileContentReceipt
 from PIL import Image
 
 from h2hdb_ingest.filesystem import (
@@ -23,7 +24,6 @@ from h2hdb_ingest.filesystem import (
     FilesystemStat,
 )
 from h2hdb_ingest.source_performance import SourcePerformance, SourcePhase
-from h2hdb_ingest.source_snapshot import SourceSnapshotStore
 
 _SCRIPT = Path(__file__).parents[1] / "scripts" / "probe-source-io.py"
 
@@ -66,7 +66,7 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
     )
     report = json.loads(report_path.read_text())
     assert report["status"] == "ok"
-    assert report["format_version"] == 3
+    assert report["format_version"] == 4
     assert report["fixture"]["workers"] == workers
     assert report["fixture"]["codec"] == codec
     assert report["provenance"]["h2hdb"]["python_source_sha256"]
@@ -105,7 +105,6 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
     for case in (baseline, policy):
         assert case["decode_calls"] == 4
         assert case["qualified_galleries"] == case["accepted_galleries"] == 2
-        assert case["captured_files"] == 6
         # Preserve correctness without requiring today's duplicate read cost.
         assert (
             sum(
@@ -115,7 +114,7 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
             )
             >= page_bytes
         )
-    assert unchanged["decode_calls"] == unchanged["captured_files"] == 0
+    assert unchanged["decode_calls"] == 0
     assert tuple(unchanged["io"]) == ("source.observation.marker",)
     assert (
         _io(unchanged, "source.observation.marker", "read_bytes")
@@ -123,7 +122,6 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
     )
     assert changed["decode_calls"] == 2
     assert changed["qualified_galleries"] == changed["accepted_galleries"] == 1
-    assert changed["captured_files"] == 3
     read_pages = {
         name: item["read_bytes"]
         for name, item in changed["source_files"].items()
@@ -133,9 +131,6 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
     assert sum(read_pages.values()) >= sum(
         changed["source_manifest"]["page_encoded_bytes"][:2]
     )
-    assert unchanged["captured_pages_verified"] == 0
-    assert policy["captured_pages_verified"] == 4
-    assert changed["captured_pages_verified"] == 2
 
 
 @pytest.mark.parametrize("omitted", ("read", "logical_bytes_read"))
@@ -164,41 +159,6 @@ def test_real_negative_control_rejects_missing_production_read_measurement(
         RuntimeError, match="production source telemetry differs from independent meter"
     ):
         module["_run_matrix"](1, 1, 16, 1, codec="png", workspace=tmp_path)
-
-
-def test_capture_byte_oracle_runs_after_measured_region(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    module = runpy.run_path(str(_SCRIPT))
-    original_instrument = module["_Meter"].instrument
-    original_verify = module["_verify_captures"]
-    active = False
-    verified = 0
-
-    @contextmanager
-    def instrument(self: Any) -> Iterator[None]:
-        nonlocal active
-        assert not active
-        active = True
-        try:
-            with original_instrument(self):
-                yield
-        finally:
-            active = False
-
-    def verify(root: Path, captured: SourceSnapshotStore) -> int:
-        nonlocal verified
-        assert not active, "verification reads must not enter the preparation cost"
-        verified += 1
-        result = original_verify(root, captured)
-        assert type(result) is int
-        return result
-
-    monkeypatch.setattr(module["_Meter"], "instrument", instrument)
-    monkeypatch.setitem(module["_run_matrix"].__globals__, "_verify_captures", verify)
-    result = module["_run_matrix"](1, 1, 16, 1, codec="png", workspace=tmp_path)
-    assert result["status"] == "ok"
-    assert verified == 3
 
 
 def test_meter_calibrates_actual_reads_and_separate_buffer_boundary(
@@ -334,13 +294,10 @@ def test_real_source_change_still_fails_closed_and_restores_instrumentation(
     )
     meter = module["_Meter"](tmp_path)
     original_read = os.read
-    with SourceSnapshotStore() as captured:
-        path.write_bytes(b"changed during observation")
-        with pytest.raises(FilesystemSourceChangedError), meter.instrument():
-            captured.capture(("1000000",), observed)
-        assert captured.open_source(("1000000",), b"001.png") is None
+    path.write_bytes(b"changed during observation")
+    with pytest.raises(FilesystemSourceChangedError), meter.instrument():
+        FileContentReceipt.from_parts(observed.content_parts())
     assert os.read is original_read
-    assert meter.captured_files == 0
 
 
 def test_atomic_report_failure_preserves_previous_complete_document(

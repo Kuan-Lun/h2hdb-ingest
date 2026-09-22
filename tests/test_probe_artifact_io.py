@@ -49,16 +49,14 @@ def test_real_runtime_probe_proves_publication_cleanup_claim_and_rasters(
 ) -> None:
     report = artifact_probe_report
     assert report["status"] == "completed"
+    assert report["format_version"] == 2
     assert report["fixture_removed"] and report["supervisor_scratch_removed"]
     assert report["oracle"]["galleries"] == 2
     assert report["oracle"]["raster_pages"] == 8
     assert report["oracle"]["full_ready_audit"]
     assert report["oracle"]["max_mean_pixel_error"] < 32
     assert report["provenance"]["h2hdb"]["source_sha256"]
-    assert (
-        report["logical_amplification"]["snapshot_revalidation_reads_per_source_byte"]
-        >= 1
-    )
+    assert report["logical_amplification"]["source_reopen_calls"] >= 10
     assert all(value > 0 for value in report["timings_ns"].values())
     events = report["cycle_events"]
     publication = next(
@@ -91,7 +89,7 @@ def test_real_runtime_probe_proves_publication_cleanup_claim_and_rasters(
     [
         ("operation.protect.calls", "both resources"),
         ("operation.stage_write.logical_bytes", "protected output"),
-        ("operation.snapshot_read.logical_bytes", "source pages"),
+        ("operation.source_open.calls", "source members"),
     ],
 )
 def test_probe_negative_control_rejects_missing_measured_work(

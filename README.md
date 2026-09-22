@@ -17,9 +17,10 @@ You need:
 - A nonempty download directory containing completed galleries with
   `galleryinfo.txt` metadata. Nested collection folders are supported.
 - An H2HDB database, using SQLite or MariaDB. This release requires
-  `h2hdb>=0.39.2,<0.40.0` and schema epoch 3, version 7.
+  `h2hdb>=0.40.0,<0.41.0` and schema epoch 3, version 7.
 - For CBZ output, a separate writable library directory and enough disk space
-  for source snapshots, image processing, and publication staging.
+  for image processing, one gallery's verified render input, database plans,
+  and all output awaiting publication.
 
 Ingest writes to the database and library. Do not point it at a library managed
 by another writer, and do not edit its generated files manually. The download
@@ -131,7 +132,7 @@ Optional settings can be added to `paths` or a top-level `resident` object:
 | --- | --- | --- |
 | `paths.max_image_short_side` | `768` | Choose the maximum short-side pixels for generated pages; accepts 1–8192. Images keep their aspect ratio and are never enlarged. |
 | `paths.page_render_workers` | `null` | Set 1–16 concurrent page workers, or leave automatic selection enabled. Lower it if image processing puts too much pressure on memory. |
-| `resident.publication_batch_galleries` | `1000` | Admit 1–1,000,000 previously unknown galleries per publication batch. |
+| `resident.publication_batch_galleries` | `null` | Select all eligible complete galleries before publication. An explicit integer from 1 through 1,000,000 limits newly admitted galleries per publication. |
 | `resident.progress_log_interval_seconds` | `60` | Set the interval, in positive seconds, between progress summaries while work is active. |
 | `resident.source_quiet_seconds` | `300` | Wait this long without another observed source change before synchronizing. |
 | `resident.source_max_wait_seconds` | `1800` | Synchronize after this maximum wait despite continuing source changes. Must be at least the quiet interval. |
@@ -167,8 +168,9 @@ For a single coordinated publication attempt:
 h2hdb-ingest --config ingest.json --once
 ```
 
-A one-shot run is not a promise to import every new gallery: the admission limit
-still applies. Use resident mode to continue processing the remaining collection.
+A one-shot run selects the complete inventory by default. An explicit admission
+limit still applies, and incomplete or changing galleries require a later turn.
+Use resident mode to continue processing that pending work.
 A one-shot run fails if it cannot complete a publication, for example because
 of lease contention or insufficient storage.
 
@@ -189,11 +191,26 @@ progress must finish before a graceful stop can take effect.
 
 ## What to expect
 
-The first run inventories the source collection. Each publication batch admits
-up to the configured number of new galleries while applying changes and
-confirmed deletions to previously known galleries. The limit is not a cap on
-the total inventory, processing time, or number of published books. Completed
-batches are available to readers while ingest prepares later batches.
+The first run inventories the source collection. By default,
+`resident.publication_batch_galleries` is `null`: ingest selects all eligible
+complete galleries in one turn before global analysis and publication. This
+prioritizes total catch-up time by avoiding repeated whole-collection analysis
+and validation after small additions. Readers see the result after the complete
+turn; database operations and filesystem pages retain their own bounded limits.
+
+An explicit positive value preserves incremental publication. For example,
+`100` still admits at most 100 previously unknown galleries per publication,
+while applying changes and confirmed deletions to known galleries. It does not
+limit the inventory or total published books. Existing settings are not silently
+overridden: change an explicit `100` to `null` to select full-collection catch-up.
+This setting does not impose a time or disk-space budget.
+
+Source observation retains immutable hashes and metadata, without copying every
+gallery's images until publication ends. Rendering rereads the original files
+and verifies them against that observation. Core keeps one gallery's verified
+render-input spool while preparing its artifact, then releases it. Changed or
+missing source bytes cannot be published under the earlier observation and must
+be observed again. Keep the source collection available throughout the turn.
 
 Keep `galleryinfo.txt` as the completion marker: finish writing a gallery's
 images before writing its metadata. Incomplete or changing galleries wait for
@@ -240,20 +257,16 @@ no periodic progress message. Enable detailed diagnostics with
 
 Each finished or failed source turn emits an INFO `ingest_metric` summary with
 its status, work generation, selected/waiting/deferred galleries, source rows,
-logical bytes read and snapshot bytes. Adapter timings separate discovery,
-gallery indexing, metadata parsing, reads, hashes, image qualification and
-snapshot capture. These timings are inclusive: qualification and snapshot capture
-can contain reads and hashes, so do not add them to estimate total wall time.
+and logical bytes read. Adapter timings separate discovery, gallery indexing,
+metadata parsing, reads, hashes, and image qualification. These timings are
+inclusive: qualification can contain reads and hashes, so do not add them to
+estimate total wall time.
 Logical bytes include rereads and do not measure physical disk traffic. A killed
 process can leave a turn without a terminal summary; absence is not zero cost.
 
-Snapshot capture now reports observation, destination writes, buffer flush,
-receipt hashing, index writes, and index commit/rollback separately. The source
-`read`/`hash` timings are contained in snapshot observation. The observer hashes
-only when it has an expected digest to verify; the receipt still derives its
-SHA-256 from every actual captured byte. Index commits cover at most 128 members after
-their bytes have been captured. These copies contain source images and metadata,
-not CBZ archives; they are discarded after the publication attempt.
+Source progress at INFO states whether selection covers all complete galleries
+or admits up to the explicit number of new galleries. Unbounded admission is not
+reported as a zero-gallery quota.
 
 Background inventory emits its own INFO `scope=source_monitor operation=inventory`
 summary, including status, completed marker rows, logical read bytes, discovery,
@@ -267,23 +280,23 @@ Each inventory rereads the markers; the index uses their fingerprints to decide
 which galleries need foreground work. It does not skip marker reads based only
 on an unchanged filesystem timestamp.
 
-From a development checkout, compare actual snapshot capture wall time against
-the frozen per-file writer with local, disposable exact-byte fixtures:
+From a development checkout, measure source reads and marker reuse with local,
+disposable real-image fixtures:
 
 ```bash
-.venv/bin/python scripts/probe-source-snapshot.py --output /tmp/snapshot-ab.json
-.venv/bin/python scripts/probe-source-snapshot.py --counts 128 512 \
-  --bytes 2097152 --monitor-galleries 512 --output /tmp/snapshot-monitor-ab.json
+.venv/bin/python scripts/probe-source-io.py --galleries 2 --pages 2 \
+  --codec jpeg --workers 1 --output /tmp/source-io.json
+.venv/bin/python scripts/probe-source-backlog.py --inventory 129 \
+  --output /tmp/source-backlog.json
 ```
 
-The default matrix crosses 127/128/129/512 files, uses 4 KiB and 2 MiB payloads,
-and rotates three variants for three repetitions: the historical writer,
-batching alone, and batching with the unused observer hash removed. It verifies every
-receipt and captured byte outside timed capture, records raw timings and source
-hashes, and removes supervisor-owned scratch even after a worker timeout. Run it
-without concurrent builds or benchmarks; `--isolated` records that operator
-confirmation. It measures one component on the local filesystem, not NAS speed
-or end-to-end publication throughput. The synthetic controller sensitivity tool
+The source matrix compares a new inventory, unchanged markers, a changed policy,
+and changed source bytes. Independent read counters check production telemetry.
+The backlog probe intentionally keeps an eight-gallery quota over three real
+publications, measuring how a fixed inventory affects repeated selection; it
+also checks cleanup and a subsequent work claim. Neither probe measures physical
+disk traffic or proves a NAS completion time. Run without concurrent builds or
+benchmarks when comparing wall times. The synthetic controller sensitivity tool
 `probe-publication-budget.py --output /tmp/publication-budget.json` separately
 compares first publication, target misses and total catch-up under fixed/per-gallery
 cost assumptions; its modeled times are not runtime measurements.
@@ -312,7 +325,7 @@ parallel JPEG worker durations from publication wall time. A compression-free
 counterfactual requires a separate controlled experiment.
 
 INFO `scope=adapter_io` summaries correlate with the publication generation and
-report source-snapshot rereads, protection, layout checks, staging, journal
+report source opens, protection, layout checks, staging, journal
 transactions, lock waits, fsync and rename. Snapshots are cumulative, emitted at
 completed outer operation boundaries after 60 seconds and at completion or
 failure; subtract consecutive snapshots when computing interval costs. Inclusive
@@ -360,8 +373,11 @@ full audit's duration. Advanced deployments can change
 `resident.database_audit_minimum_interval_seconds` and
 `resident.database_audit_duration_multiplier`; audits run between work sessions.
 
-Keep free space available in the library filesystem for temporary source copies,
-page processing, a CBZ being written, and publication staging. Disk-full or quota
+Keep free space available in the library filesystem for one gallery's verified
+source spool, page processing, a CBZ being written, and every prepared CBZ and
+thumbnail awaiting publication. Database and disk-backed discovery/analysis plans
+also require space. Removing the full-turn source-byte copy does not make total
+scratch or pending output constant-sized. Disk-full or quota
 errors keep work pending for retry instead of publishing incomplete files. Free
 space or increase the quota, then let resident mode retry. Do not manually remove
 private journal, staging, or coordination files to clear an error.

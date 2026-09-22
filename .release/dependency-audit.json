@@ -1,20 +1,20 @@
 {
-  "checked_at": "2026-09-19T14:48:20+00:00",
-  "manifest_sha256": "01c5a49c77a269f569ed7d209bfa79794ee55a50288220da8a94911a48410254",
+  "checked_at": "2026-09-22T18:01:09+00:00",
+  "manifest_sha256": "b8c8d58346b89a1865161dfebb0960a7226dbe8e14ba9e8edc8b9b3458f0e752",
   "node": [
     {
       "declared": ">=0.23.2",
-      "latest": "0.23.2",
+      "latest": "0.23.3",
       "latest_satisfies": true,
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.25.6",
+  "project_version": "0.26.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
       "group": "build",
-      "latest": "1.32.3",
+      "latest": "1.32.4",
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
@@ -30,7 +30,7 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.39.12,<0.40.0",
+      "declared": "h2hdb>=0.40.0,<0.41.0",
       "group": "runtime",
       "latest": "0.39.11",
       "latest_satisfies": false,
@@ -86,7 +86,7 @@
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
       "group": "optional:dev",
-      "latest": "1.32.3",
+      "latest": "1.32.4",
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed fresh public PyPI/npm candidates for all 16 Python requirement entries (15 unique packages) and markdownlint-cli2, including candidates beyond existing upper bounds. Registry candidate versions are unchanged from the committed 0.25.5 audit, so identical-version upstream reviews carry forward. The only manifest change requires coordinated Core 0.39.12 for artifact I/O attribution; the registry latest remains 0.39.11 and does not yet satisfy this new lower bound. This is an explicit local coordinated-release dependency, not a claim that 0.39.12 is publicly available. Built and installed the supplied local h2hdb-0.39.12 wheel without dependency resolution; no new public facade, schema or persistent format is introduced by its runtime telemetry. All other installed direct versions equal latest candidates and satisfy bounds; Python metadata supports 3.14. uv pip check passed for 44 packages and npm ls reports markdownlint-cli2 0.23.2. A clean checkout can use scripts/rebuild-env.sh with an explicitly supplied Core wheel. Full gate, live-MariaDB and installed-wheel artifact experiments are reported separately and are not implied by this audit.",
+    "note": "Reviewed fresh public PyPI/npm candidates for every direct build, runtime, development and Node dependency, including versions beyond current upper bounds. Compared with the committed 0.25.6 audit, hatchling advanced from 1.32.3 to 1.32.4 and markdownlint-cli2 from 0.23.2 to 0.23.3; all other registry candidates are unchanged, so identical-version upstream reviews carry forward. Reviewed https://hatch.pypa.io/dev/history/hatchling/ for the BuildHookInterface compatibility/CalVer fixes and upstream markdownlint-cli2 package CHANGELOG for 0.23.3 dependency updates. Installed latest direct versions in an independent worktree venv; uv pip check passed for 43 packages and npm reports no vulnerabilities. Requires coordinated local Core 0.40.0 for exact unpublished sealed-observation reuse and targeted refresh hints; public registry latest 0.39.11 does not satisfy this lower bound and is not claimed to do so. Built and installed the explicitly supplied h2hdb-0.40.0 wheel; clean checkout rebuild supports an explicit wheel override without sibling discovery. Ingest 0.26.0 removes whole-turn source-byte retention and defaults to full completed-source selection; immutable database schema and artifact formats are unchanged. Manual runtime experiments, live-MariaDB tests and exact-tree gate have separate evidence and are not implied by this receipt.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"

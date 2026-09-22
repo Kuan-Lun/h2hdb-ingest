@@ -1,6 +1,6 @@
 """Offline real-JPEG publication and cleanup experiment using public runtime.
 
-Fixtures, source snapshots, canonical CBZ, thumbnails and the catalog are real.
+Fixtures, source observations, canonical CBZ, thumbnails and the catalog are real.
 Times exclude fixture creation and the independent catalog/archive/raster oracle.
 Logical bytes include rereads; this is not a physical-device or NAS benchmark.
 """
@@ -228,24 +228,21 @@ def _validate_metrics(metrics, oracle, fixture):
     output_bytes = oracle["archive_bytes"] + oracle["thumbnail_bytes"]
     if adapter["operation.stage_write.logical_bytes"] < output_bytes:
         raise RuntimeError("stage byte accounting omitted protected output")
-    if adapter["operation.snapshot_read.logical_bytes"] < fixture["page_bytes"]:
-        raise RuntimeError("snapshot read accounting omitted source pages")
+    if (
+        adapter["operation.source_open.calls"]
+        < oracle["raster_pages"] + oracle["galleries"]
+    ):
+        raise RuntimeError("source reopen accounting omitted source members")
     source_bytes = fixture["page_bytes"] + fixture["marker_bytes"]
     return {
         "source_observation_reads_per_source_byte": source["counter.logical_bytes_read"]
         / source_bytes,
-        "snapshot_revalidation_reads_per_source_byte": adapter[
-            "operation.snapshot_read.logical_bytes"
-        ]
-        / source_bytes,
+        "source_reopen_calls": adapter["operation.source_open.calls"],
         "stage_reads_per_output_byte": adapter["operation.stage_read.logical_bytes"]
         / output_bytes,
         "stage_writes_per_output_byte": adapter["operation.stage_write.logical_bytes"]
         / output_bytes,
-        "snapshot_and_stage_read_bytes": adapter[
-            "operation.snapshot_read.logical_bytes"
-        ]
-        + adapter["operation.stage_read.logical_bytes"],
+        "stage_read_bytes": adapter["operation.stage_read.logical_bytes"],
     }
 
 
@@ -363,7 +360,7 @@ def _run(args, root: Path):
     provenance_after = _provenance()
     return {
         "status": "completed",
-        "format_version": 1,
+        "format_version": 2,
         "fixture": {
             "galleries": args.galleries,
             "pages_per_gallery": args.pages,

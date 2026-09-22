@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "h2hdb-ingest"
-version = "0.25.6"
+version = "0.26.0"
 description = "Filesystem ingest and CBZ reconciliation for H2HDB"
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
@@ -13,8 +13,8 @@ license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = [
     "h2h-galleryinfo-parser>=0.5.3,<0.6",
-    # Require artifact I/O attribution alongside bounded SQL diagnostics.
-    "h2hdb>=0.39.12,<0.40.0",
+    # Require exact sealed-observation reuse and bounded source refresh hints.
+    "h2hdb>=0.40.0,<0.41.0",
     "pillow>=12.3.0,<13.0.0",
     "pydantic>=2.13.4,<3.0.0",
     # Native decoder/resizer behavior is audited within these tested major lanes.

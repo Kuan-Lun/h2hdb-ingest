@@ -411,6 +411,7 @@ def test_info_explains_current_work_and_debug_retains_internal_details() -> None
     progress._report_due()
     assert info == [
         "Ingest progress: Copying the gallery inventory into the batch plan; "
+        "up to 10 new galleries selected before publication; "
         "4,096 / 131,256 galleries completed; "
         "since work started (1h 0m 0s): +131,256 gallery folders discovered; "
         "current activity elapsed 1h 0m 0s; work elapsed 1h 0m 0s"
@@ -706,10 +707,10 @@ def test_phase_end_names_the_whole_stage_and_its_duration() -> None:
 
 def test_batch_result_reports_remaining_work_without_zero_boilerplate() -> None:
     assert format_batch_published(galleries=1, deferred=0, waiting=0) == (
-        "Catalog batch published: 1 gallery in the source snapshot"
+        "Catalog batch published: 1 gallery in the selected source set"
     )
     assert format_batch_published(galleries=2100, deferred=904, waiting=1) == (
-        "Catalog batch published: 2,100 galleries in the source snapshot; "
+        "Catalog batch published: 2,100 galleries in the selected source set; "
         "904 new galleries left for later batches; "
         "1 gallery waiting for source completion"
     )

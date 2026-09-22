@@ -13,7 +13,7 @@ __all__ = [
 ]
 
 from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic_ns
@@ -46,7 +46,6 @@ from .metrics import (
 from .progress import IngestProgress, ProgressWork
 from .session import IngestSessionController
 from .source_performance import SourcePerformance
-from .source_snapshot import SourceSnapshotStore
 
 _ANALYSIS_SNAPSHOT_STAGE = b"snapshot_manifest"
 
@@ -130,16 +129,12 @@ class VNextIngestService:
         source_root: Path,
         policy: VNextIngestPolicy,
         max_rows: int,
-        publication_batch_galleries: int,
+        publication_batch_galleries: int | None,
         artifact_adapters: Mapping[bytes, ArtifactStorageAdapter],
         finalization_adapters: Mapping[bytes, ArtifactReleaseAdapter],
         library_activation: VNextLibraryActivationAdapter,
         publication_guard: Callable[[], AbstractContextManager[None]],
         qualify_gallery: SourceGalleryQualifier | None = None,
-        source_snapshot_context: Callable[
-            [], AbstractContextManager[SourceSnapshotStore | None]
-        ]
-        | None = None,
         metrics_sink: IngestMetricSink | None = None,
         progress: IngestProgress | None = None,
     ) -> None:
@@ -152,9 +147,15 @@ class VNextIngestService:
             raise TypeError("max_rows must be int")
         if not 1 <= max_rows <= 128:
             raise ValueError("max_rows must be from 1 through 128")
-        if type(publication_batch_galleries) is not int:
-            raise TypeError("publication_batch_galleries must be int")
-        if not 1 <= publication_batch_galleries <= 1_000_000:
+        if (
+            publication_batch_galleries is not None
+            and type(publication_batch_galleries) is not int
+        ):
+            raise TypeError("publication_batch_galleries must be int or None")
+        if (
+            publication_batch_galleries is not None
+            and not 1 <= publication_batch_galleries <= 1_000_000
+        ):
             raise ValueError(
                 "publication_batch_galleries must be from 1 through 1000000"
             )
@@ -167,7 +168,6 @@ class VNextIngestService:
         if metrics_sink is not None and not callable(metrics_sink):
             raise TypeError("metrics_sink must be callable")
         self._qualify_gallery = qualify_gallery
-        self._source_snapshot_context = source_snapshot_context
         self._source_root = source_root
         self._policy = policy
         self._max_rows = max_rows
@@ -184,26 +184,10 @@ class VNextIngestService:
         session: IngestSessionController,
         *,
         should_stop: Callable[[], bool] | None = None,
+        reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+        reuse_sealed_observations: bool = True,
     ) -> VNextIngestSynchronizationResult:
-        """Publish a batch using source bytes captured before global analysis."""
-
-        context = (
-            nullcontext(None)
-            if self._source_snapshot_context is None
-            else self._source_snapshot_context()
-        )
-        with context as snapshot:
-            return self._synchronize_once(
-                session, should_stop=should_stop, snapshot=snapshot
-            )
-
-    def _synchronize_once(
-        self,
-        session: IngestSessionController,
-        *,
-        should_stop: Callable[[], bool] | None,
-        snapshot: SourceSnapshotStore | None,
-    ) -> VNextIngestSynchronizationResult:
+        """Observe exact source facts, then reread each gallery when rendering."""
 
         if not isinstance(session, IngestSessionController):
             raise TypeError("session must be IngestSessionController")
@@ -215,8 +199,15 @@ class VNextIngestService:
         work = None if self._progress is None else self._progress.current()
         if work is not None:
             work.set_counter(
-                "batch_new_gallery_limit", self._publication_batch_galleries
+                "source_reobserve_galleries", len(reobserve_gallery_locators)
             )
+            work.set_counter("source_full_refresh", int(not reuse_sealed_observations))
+            if self._publication_batch_galleries is None:
+                work.set_counter("full_source_selection", 1)
+            else:
+                work.set_counter(
+                    "batch_new_gallery_limit", self._publication_batch_galleries
+                )
             work.set_counter("cbz_enabled", int(self._policy.artifacts_required))
             work.phase("policy")
         _raise_if_stopping(stop_requested)
@@ -238,6 +229,8 @@ class VNextIngestService:
         if work is not None:
             work.phase("source")
         source_performance = SourcePerformance()
+        source_performance.add("reobserve_galleries", len(reobserve_gallery_locators))
+        source_performance.add("full_refresh", int(not reuse_sealed_observations))
         if work is not None:
             source_performance.add("work_generation", work.generation)
         with (
@@ -257,10 +250,11 @@ class VNextIngestService:
                 VNextFilesystemSourceAdapter(
                     source,
                     qualify_gallery=self._qualify_gallery,
-                    snapshot=snapshot,
                     performance=source_performance,
                 ),
                 max_new_galleries=self._publication_batch_galleries,
+                reobserve_gallery_locators=reobserve_gallery_locators,
+                reuse_sealed_observations=reuse_sealed_observations,
                 should_stop=stop_requested,
                 progress=work,
             )
@@ -556,6 +550,8 @@ def synchronize_source(
     adapter: VNextIngestSourceAdapter,
     *,
     max_new_galleries: int | None = None,
+    reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+    reuse_sealed_observations: bool = True,
     should_stop: Callable[[], bool] = _never_stop,
     progress: ProgressWork | None = None,
 ) -> VNextIngestSourceSynchronizationResult:
@@ -581,6 +577,8 @@ def synchronize_source(
             adapter,
             policy=policy,
             max_new_galleries=max_new_galleries,
+            reobserve_gallery_locators=reobserve_gallery_locators,
+            reuse_sealed_observations=reuse_sealed_observations,
             progress=observe if progress is not None else None,
         )
     ) as prepared:

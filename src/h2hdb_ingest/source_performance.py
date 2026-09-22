@@ -27,14 +27,6 @@ SourcePhase = Literal[
     "hash",
     "metadata_parse",
     "qualification",
-    "snapshot",
-    "snapshot_observe",
-    "snapshot_write",
-    "snapshot_flush",
-    "snapshot_receipt_hash",
-    "snapshot_index",
-    "snapshot_index_commit",
-    "snapshot_index_rollback",
     "source_synchronize",
 ]
 _COUNTER_LIMIT = 64

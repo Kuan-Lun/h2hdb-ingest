@@ -256,7 +256,7 @@ def test_bounded_runtime_defaults() -> None:
     resident = ResidentConfig()
 
     assert resident.max_rows == 128
-    assert resident.publication_batch_galleries == 1000
+    assert resident.publication_batch_galleries is None
     assert resident.progress_log_interval_seconds == 60
     assert resident.database_audit_minimum_interval_seconds == 604800
     assert resident.database_audit_duration_multiplier == 100
@@ -405,14 +405,14 @@ def test_bounded_runtime_limits_are_enforced(field: str, value: int) -> None:
         ResidentConfig.model_validate({field: value})
 
 
-@pytest.mark.parametrize("value", (0, -1, 1_000_001, True, 1.5, "1000", None))
+@pytest.mark.parametrize("value", (0, -1, 1_000_001, True, 1.5, "1000"))
 def test_publication_batch_rejects_invalid_gallery_counts(value: object) -> None:
     with pytest.raises(ValidationError):
         ResidentConfig.model_validate({"publication_batch_galleries": value})
 
 
-@pytest.mark.parametrize("value", (1, 1000, 1_000_000))
-def test_publication_batch_accepts_bounded_gallery_counts(value: int) -> None:
+@pytest.mark.parametrize("value", (None, 1, 1000, 1_000_000))
+def test_publication_batch_accepts_explicit_selection_policy(value: int | None) -> None:
     assert (
         ResidentConfig(publication_batch_galleries=value).publication_batch_galleries
         == value

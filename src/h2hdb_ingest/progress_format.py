@@ -139,7 +139,9 @@ _COUNTER_LABELS = {
 
 def format_batch_published(*, galleries: int, deferred: int, waiting: int) -> str:
     unit = "gallery" if galleries == 1 else "galleries"
-    parts = [f"Catalog batch published: {galleries:,} {unit} in the source snapshot"]
+    parts = [
+        f"Catalog batch published: {galleries:,} {unit} in the selected source set"
+    ]
     if deferred:
         unit = "gallery" if deferred == 1 else "galleries"
         parts.append(f"{deferred:,} new {unit} left for later batches")
@@ -177,6 +179,12 @@ def format_progress(
     if label is None:
         label = _describe_operation(name)
     parts = [f"{lead}: {label}"]
+    if snapshot.phase == "source":
+        counters = dict(snapshot.counters)
+        if counters.get("full_source_selection") == 1:
+            parts.append("all complete galleries selected before publication")
+        elif (limit := counters.get("batch_new_gallery_limit")) is not None:
+            parts.append(f"up to {limit:,} new galleries selected before publication")
     if event == "work_finished" and status == "retry":
         parts.append("this synchronization attempt did not complete")
     if event == "periodic" and snapshot.operation_completed is not None:
