@@ -167,8 +167,8 @@ class ResidentIngestor:
         return self._last_synchronization_result
 
     @property
-    def deferred_gallery_count(self) -> int:
-        """Report new galleries deferred by this process's last completed batch."""
+    def deferred_gallery_count(self) -> int | None:
+        """Report the last inventory count, or None after resuming a sealed cut."""
 
         result = self._last_synchronization_result
         return 0 if result is None else result.deferred_gallery_count
@@ -559,7 +559,7 @@ class ResidentIngestor:
         )
         return (
             _ResidentCycleOutcome.BATCH_PUBLISHED
-            if outcome.deferred_gallery_count
+            if outcome.inventory_scan_pending or outcome.deferred_gallery_count
             else _ResidentCycleOutcome.INGESTED
         )
 
@@ -827,7 +827,10 @@ class ResidentIngestor:
                                 _ResidentCycleOutcome.BATCH_PUBLISHED,
                             )
                             and self._last_synchronization_result is not None
-                            and self._last_synchronization_result.waiting_gallery_count
+                            and (
+                                self._last_synchronization_result.waiting_gallery_count
+                                or 0
+                            )
                             > 0
                         ),
                     )

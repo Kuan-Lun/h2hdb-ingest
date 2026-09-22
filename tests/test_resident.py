@@ -80,7 +80,7 @@ def _session() -> VNextIngestSession:
 
 
 def _synchronized(
-    *, deferred_gallery_count: int = 0
+    *, deferred_gallery_count: int | None = 0
 ) -> VNextIngestSynchronizationResult:
     return VNextIngestSynchronizationResult(
         source=VNextIngestSourceReceipt(b"b" * 16, 1, 1, True, False),
@@ -91,6 +91,7 @@ def _synchronized(
             VNextIngestPhase.FINALIZATION, 0, True, False
         ),
         deferred_gallery_count=deferred_gallery_count,
+        waiting_gallery_count=None if deferred_gallery_count is None else 0,
     )
 
 
@@ -1310,11 +1311,13 @@ def test_run_forever_waits_instead_of_exiting_on_staging_capacity(
     ]
 
 
+@pytest.mark.parametrize("remaining", [(2, 1, 0), (None, 1, 0)])
 def test_run_forever_publishes_pending_batches_without_waiting_for_source_changes(
     monkeypatch: pytest.MonkeyPatch,
+    remaining: tuple[int | None, ...],
 ) -> None:
     events: list[object] = []
-    deferred = iter((2, 1, 0))
+    deferred = iter(remaining)
     scans: list[float] = []
     now = 100.0
 
@@ -1361,6 +1364,11 @@ def test_run_forever_publishes_pending_batches_without_waiting_for_source_change
     resident = _resident(events, facade=facade, service=_BatchService(events))
     monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
     monkeypatch.setattr(resident_module, "monotonic", lambda: now)
+    monkeypatch.setattr(
+        IsolatedDatabaseAudit,
+        "initial_catchup_complete",
+        lambda _audit: events.append("catchup_complete"),
+    )
     resident.run_forever(stop=cast(Event, _Stop()))
 
     assert scans == [100.0, 100.0, 100.0]
@@ -1373,6 +1381,14 @@ def test_run_forever_publishes_pending_batches_without_waiting_for_source_change
         ("claim", False, 10_000_000),
     ]
     assert events.count(("complete", 2)) == 3
+    assert events.count("catchup_complete") == 1
+    if remaining[0] is None:
+        assert any(
+            isinstance(event, tuple)
+            and event[0] == "log"
+            and "fresh source inventory is pending" in event[1]
+            for event in events
+        )
     assert events[-1] == ("wait", 1.0)
 
 

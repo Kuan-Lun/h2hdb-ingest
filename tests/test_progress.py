@@ -714,6 +714,10 @@ def test_batch_result_reports_remaining_work_without_zero_boilerplate() -> None:
         "904 new galleries left for later batches; "
         "1 gallery waiting for source completion"
     )
+    assert format_batch_published(galleries=2100, deferred=None, waiting=None) == (
+        "Catalog batch published: 2,100 galleries in the selected source set; "
+        "resumed sealed batch; a fresh source inventory is pending"
+    )
 
 
 def test_known_total_does_not_invent_a_completed_count() -> None:

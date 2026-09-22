@@ -296,10 +296,25 @@ def test_analysis_orchestration_rejects_a_terminal_non_analysis_stage() -> None:
     assert events[-1] == "analysis-close"
 
 
+class _SourceAdapter:
+    source_root_components = ("source",)
+
+
 class _Facade:
     def __init__(self, events: list[object]) -> None:
         self._events = events
         self._step = 0
+
+    def prepare_source_resume(
+        self,
+        *,
+        policy: object,
+        source_root_components: tuple[str, ...],
+    ) -> None:
+        del policy
+        assert source_root_components == ("source",)
+        self._events.append("prepare-source-resume")
+        return None
 
     def prepare_source(
         self,
@@ -361,7 +376,7 @@ class _Facade:
 def test_source_orchestration_keeps_local_preparation_between_bounded_calls() -> None:
     events: list[object] = []
     facade = _Facade(events)
-    adapter = cast(VNextIngestSourceAdapter, object())
+    adapter = cast(VNextIngestSourceAdapter, _SourceAdapter())
     controller = IngestSessionController(
         cast(VNextIngestFacade, facade),
         _session(),
@@ -379,6 +394,7 @@ def test_source_orchestration_keeps_local_preparation_between_bounded_calls() ->
     assert result.receipt.build_id == b"b" * 16
     assert result.deferred_gallery_count == 7
     assert events == [
+        "prepare-source-resume",
         ("prepare-source", adapter, 1000),
         "enter",
         ("issue", 0, 10_000_000),
@@ -422,7 +438,7 @@ def test_source_orchestration_rejects_terminal_result_without_sealed_receipt() -
         synchronize_source(
             controller,
             cast(VNextResolvedIngestPolicy, object()),
-            cast(VNextIngestSourceAdapter, object()),
+            cast(VNextIngestSourceAdapter, _SourceAdapter()),
         )
     except RuntimeError as error:
         assert "sealed source receipt" in str(error)
@@ -444,6 +460,88 @@ def test_synchronization_results_reject_invalid_deferred_counts(value: object) -
             VNextIngestAdvanceResult(VNextIngestPhase.FINALIZATION, 0, True, False),
             cast(int, value),
         )
+
+
+@pytest.mark.parametrize("deferred, waiting", [(None, 0), (0, None)])
+def test_unknown_inventory_requires_both_counts_to_be_unknown(
+    deferred: int | None, waiting: int | None
+) -> None:
+    source = VNextIngestSourceReceipt(b"s" * 16, 1, 1, True, True)
+    with pytest.raises(ValueError, match="both counts"):
+        VNextIngestSourceSynchronizationResult(source, deferred, waiting)
+    with pytest.raises(ValueError, match="both counts"):
+        VNextIngestSynchronizationResult(
+            source,
+            VNextAnalysisAdvanceResult(
+                b"a" * 16, b"snapshot_manifest", 1, True, True, False, b"m" * 32
+            ),
+            VNextIngestAdvanceResult(VNextIngestPhase.FINALIZATION, 0, True, False),
+            deferred,
+            waiting,
+        )
+
+
+@pytest.mark.parametrize("refresh", ["none", "targeted", "all"])
+def test_source_resume_preserves_the_cut_unless_reobservation_is_required(
+    refresh: str,
+) -> None:
+    events: list[object] = []
+    hints = (("changed",),) if refresh == "targeted" else ()
+    reuse = refresh != "all"
+    prepared_resume = object()
+
+    class ResumeFacade:
+        def prepare_source_resume(
+            self,
+            *,
+            policy: object,
+            source_root_components: tuple[str, ...],
+        ) -> object:
+            del policy
+            assert source_root_components == ("source",)
+            events.append("prepare-resume")
+            return prepared_resume
+
+        def commit_source_resume(
+            self, session: VNextIngestSession, prepared: object
+        ) -> VNextIngestSourceReceipt:
+            assert prepared is prepared_resume
+            events.append(("commit-resume", session.ingest_generation))
+            return VNextIngestSourceReceipt(b"r" * 16, 3, 3, True, True)
+
+        def prepare_source(self, adapter: object, **kwargs: object) -> _PreparedSource:
+            del adapter
+            assert kwargs["reobserve_gallery_locators"] == hints
+            assert kwargs["reuse_sealed_observations"] == reuse
+            events.append("fresh-source")
+            raise _IngestStopRequested
+
+    controller = IngestSessionController(
+        cast(VNextIngestFacade, ResumeFacade()),
+        _session(),
+        lease_duration_microseconds=10_000_000,
+        database_type="sqlite",
+    )
+    policy = cast(VNextResolvedIngestPolicy, object())
+    adapter = cast(VNextIngestSourceAdapter, _SourceAdapter())
+    if refresh != "none":
+        with pytest.raises(_IngestStopRequested):
+            synchronize_source(
+                controller,
+                policy,
+                adapter,
+                reobserve_gallery_locators=hints,
+                reuse_sealed_observations=reuse,
+            )
+        assert events == ["fresh-source"]
+    else:
+        result = synchronize_source(controller, policy, adapter)
+        assert result.receipt.build_id == b"r" * 16
+        assert result.receipt.replayed
+        assert result.inventory_scan_pending
+        assert result.deferred_gallery_count is None
+        assert result.waiting_gallery_count is None
+        assert events == ["prepare-resume", ("commit-resume", 2)]
 
 
 class _LibraryActivation:
@@ -1293,7 +1391,7 @@ def test_prepared_resources_close_when_heartbeat_fails_before_return(
         match phase:
             case "source":
                 synchronize_source(
-                    controller, policy, cast(VNextIngestSourceAdapter, object())
+                    controller, policy, cast(VNextIngestSourceAdapter, _SourceAdapter())
                 )
             case "analysis":
                 synchronize_analysis(
@@ -1354,6 +1452,10 @@ def test_heartbeat_failure_interrupts_real_filesystem_inventory_and_closes_it(
             del kwargs
             adapter.list_gallery_locators(after_locator=None, limit=128)
             pytest.fail("inventory finished after heartbeat failure")
+
+        def prepare_source_resume(self, **kwargs: object) -> None:
+            del kwargs
+            return None
 
     controller = IngestSessionController(
         cast(VNextIngestFacade, _PolicyFacade()),
