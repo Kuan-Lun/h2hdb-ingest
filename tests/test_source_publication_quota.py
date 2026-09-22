@@ -9,7 +9,9 @@ from h2hdb import (
     VNextCurrentOnlyMaintenanceOutcome,
     VNextIngestFacade,
     VNextIngestSourceAdapter,
+    VNextIssuedSourceStep,
     VNextPreparedSource,
+    VNextPreparedSourceStep,
     VNextResolvedIngestPolicy,
     VNextSourcePreparationObserver,
 )
@@ -32,7 +34,9 @@ def test_runtime_honors_full_source_and_explicit_quota(
         update={"resident": ResidentConfig(publication_batch_galleries=quota)}
     )
     admissions: list[tuple[int | None, int, int]] = []
+    pending: dict[VNextPreparedSource, int | None] = {}
     original = VNextIngestFacade.prepare_source
+    original_prepare_step = VNextIngestFacade.prepare_source_step
 
     def prepare(
         facade: VNextIngestFacade,
@@ -53,12 +57,35 @@ def test_runtime_honors_full_source_and_explicit_quota(
             reuse_sealed_observations=reuse_sealed_observations,
             progress=progress,
         )
-        admissions.append(
-            (max_new_galleries, result.gallery_count, result.deferred_gallery_count)
-        )
+        assert not result.observation_complete
+        for count_name in (
+            "gallery_count",
+            "deferred_gallery_count",
+            "waiting_gallery_count",
+        ):
+            with pytest.raises(ValueError, match="inventory counts are pending"):
+                getattr(result, count_name)
+        pending[result] = max_new_galleries
+        return result
+
+    def prepare_step(
+        facade: VNextIngestFacade,
+        prepared: VNextPreparedSource,
+        issued: VNextIssuedSourceStep,
+    ) -> VNextPreparedSourceStep:
+        result = original_prepare_step(facade, prepared, issued)
+        if prepared.observation_complete and prepared in pending:
+            admissions.append(
+                (
+                    pending.pop(prepared),
+                    prepared.gallery_count,
+                    prepared.deferred_gallery_count,
+                )
+            )
         return result
 
     monkeypatch.setattr(VNextIngestFacade, "prepare_source", prepare)
+    monkeypatch.setattr(VNextIngestFacade, "prepare_source_step", prepare_step)
     messages: list[str] = []
     expected = galleries if quota is None else min(galleries, quota)
     with build_runtime(config, event_logger=messages.append) as runtime:
@@ -75,6 +102,7 @@ def test_runtime_honors_full_source_and_explicit_quota(
         assert outcome.deferred_gallery_count == galleries - expected
         assert outcome.waiting_gallery_count == 0
         assert runtime.database_admin.check().state == "READY"
+    assert not pending
     assert admissions == [(quota, expected, galleries - expected)]
     description = (
         "all complete galleries selected before publication"
