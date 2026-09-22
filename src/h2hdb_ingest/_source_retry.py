@@ -27,6 +27,8 @@ class SourceReobservation:
     def record_failure(self, error: BaseException) -> None:
         try:
             context = get_artifact_failure_context(error)
+            if context is not None:
+                self.record(context.gallery_locator_components)
         except Exception:
             # Optional diagnostics cannot prevent releasing the ingest lease.
             # Refreshing all observations also prevents an unknown stale cache
@@ -34,8 +36,6 @@ class SourceReobservation:
             self._locators.clear()
             self._full_refresh = True
             return
-        if context is not None:
-            self.record(context.gallery_locator_components)
 
     def record(self, locator: tuple[str, ...]) -> None:
         if self._full_refresh or locator in self._locators:

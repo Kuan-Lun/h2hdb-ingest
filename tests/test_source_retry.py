@@ -79,3 +79,25 @@ def test_resident_accumulates_failures_until_publication_then_clears(
         ((("first",), ("second",)), True),
         ((), True),
     ]
+
+
+@pytest.mark.parametrize("malformed_context", [False, True])
+def test_unavailable_hint_metadata_falls_back_to_full_reobservation(
+    monkeypatch: pytest.MonkeyPatch, malformed_context: bool
+) -> None:
+    context = ArtifactFailureContext(1001, ("root",), ("first",))
+    if malformed_context:
+        # Failure diagnostics are optional and are not accepted as source authority.
+        object.__setattr__(context, "gallery_locator_components", ["unhashable"])
+
+    def read_context(_error: BaseException) -> ArtifactFailureContext:
+        if not malformed_context:
+            raise ValueError("optional diagnostic unavailable")
+        return context
+
+    monkeypatch.setattr(retry_module, "get_artifact_failure_context", read_context)
+    hints = SourceReobservation()
+    hints.record(("previous",))
+    hints.record_failure(VNextSourceChangedError("original source mismatch"))
+    assert len(hints.locators) == 0
+    assert not hints.reuse_sealed_observations
