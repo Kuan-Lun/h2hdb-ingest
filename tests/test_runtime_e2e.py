@@ -1099,7 +1099,7 @@ def test_restart_recovers_durable_publication_before_applying_new_policy(
         # cannot acknowledge a clean writer; startup must wait for the real lease.
         raise failure.value
 
-    # The old snapshot stays unchanged.  Changing only the byte-affecting
+    # The observed source facts stay unchanged. Changing only the byte-affecting
     # policy must still produce a successor after the pending old-policy
     # commit has been activated and finalized in this same synchronization.
     requested_config = config(page_jpeg_quality=55)

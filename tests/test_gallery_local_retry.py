@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+from io import BytesIO
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, cast
+from zipfile import ZipFile
 
 import pytest
 from h2hdb import (
@@ -159,7 +161,7 @@ def test_missing_marker_retains_published_gallery_across_restart(
         restarted.database_admin.check()
 
 
-def test_source_update_during_render_uses_snapshot_then_converges(
+def test_source_update_during_render_retains_published_bytes_then_converges(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(tmp_path)
@@ -179,22 +181,50 @@ def test_source_update_during_render_uses_snapshot_then_converges(
         nonlocal changed
         if not changed:
             changed = True
-            _page(folder, "blue", stamp=20)
-            _marker(folder, stamp=20)
+            _page(folder, "blue", stamp=30)
+            _marker(folder, stamp=30)
         return render(adapter, members, destination, gid=gid)
 
-    monkeypatch.setattr(
-        ManagedFilesystemLibraryAdapter, "render_archive", update_source
-    )
     with build_runtime(config) as runtime:
         runtime.database_admin.initialize()
         runtime.resident.initialize()
         _synchronize(runtime)
         original = _archive(tmp_path, 1001)
-        assert changed
+        original_revision = runtime.catalog.get_catalog_revision()
+        original_result = runtime.resident.last_synchronization_result
+        # The candidate observes green bytes, but the producer replaces them
+        # after Core has spooled the gallery and before rendering returns.
+        _page(folder, "green", stamp=20)
+        _marker(folder, stamp=20)
+        monkeypatch.setattr(
+            ManagedFilesystemLibraryAdapter, "render_archive", update_source
+        )
+        for _ in range(128):
+            progressed = runtime.resident.process_available(periodic_scan=True)
+            if changed:
+                assert not progressed
+                break
+            assert progressed
+        else:
+            pytest.fail("artifact preparation never reached the injected source update")
+        # Post-render source verification rejects the candidate: neither its
+        # frozen green spool nor the new blue source may advance current yet.
+        assert runtime.resident.last_synchronization_result is original_result
+        assert runtime.catalog.get_catalog_revision() == original_revision
+        assert _archive(tmp_path, 1001) == original
+        runtime.database_admin.check()
+
         _synchronize(runtime)
-        assert _archive(tmp_path, 1001) != original
+        replacement = _archive(tmp_path, 1001)
+        assert replacement != original
         revision = runtime.catalog.get_catalog_revision()
+        # Abandoned candidates can consume revision IDs without publishing.
+        assert revision.revision > original_revision.revision
+        with ZipFile(BytesIO(replacement)) as archive:
+            with Image.open(BytesIO(archive.read("pages/0000.jpg"))) as image:
+                red, green, blue = cast(tuple[int, int, int], image.getpixel((0, 0)))
+                assert blue > red + green
         _synchronize(runtime)
         assert runtime.catalog.get_catalog_revision() == revision
+        assert _archive(tmp_path, 1001) == replacement
         runtime.database_admin.check()
