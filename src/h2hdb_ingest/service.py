@@ -591,10 +591,7 @@ def synchronize_source(
             progress.operation("source_resume_prepare")
         _raise_if_stopping(should_stop)
         resumable = session.outside_session(
-            lambda facade: facade.prepare_source_resume(
-                policy=policy,
-                source_root_components=adapter.source_root_components,
-            )
+            lambda facade: facade.prepare_source_resume(adapter, policy=policy)
         )
         _raise_if_stopping(should_stop)
         if resumable is not None:

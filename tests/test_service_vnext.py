@@ -307,12 +307,12 @@ class _Facade:
 
     def prepare_source_resume(
         self,
+        adapter: _SourceAdapter,
         *,
         policy: object,
-        source_root_components: tuple[str, ...],
     ) -> None:
         del policy
-        assert source_root_components == ("source",)
+        assert adapter.source_root_components == ("source",)
         self._events.append("prepare-source-resume")
         return None
 
@@ -493,12 +493,12 @@ def test_source_resume_preserves_the_cut_unless_reobservation_is_required(
     class ResumeFacade:
         def prepare_source_resume(
             self,
+            adapter: _SourceAdapter,
             *,
             policy: object,
-            source_root_components: tuple[str, ...],
         ) -> object:
             del policy
-            assert source_root_components == ("source",)
+            assert adapter.source_root_components == ("source",)
             events.append("prepare-resume")
             return prepared_resume
 
@@ -1453,8 +1453,8 @@ def test_heartbeat_failure_interrupts_real_filesystem_inventory_and_closes_it(
             adapter.list_gallery_locators(after_locator=None, limit=128)
             pytest.fail("inventory finished after heartbeat failure")
 
-        def prepare_source_resume(self, **kwargs: object) -> None:
-            del kwargs
+        def prepare_source_resume(self, adapter: object, **kwargs: object) -> None:
+            del adapter, kwargs
             return None
 
     controller = IngestSessionController(

@@ -614,8 +614,9 @@ def _assert_no_published_head(config: IngestConfig) -> None:
 def _assert_resumed_source_without_rescan(evidence: _Evidence) -> None:
     assert evidence.inventory_scan_pending == [True]
     assert evidence.observed_galleries == []
-    assert evidence.marker_calls == evidence.locator_page_calls == 0
-    assert evidence.source_calls_at_publication == [(0, 0, 0)]
+    assert evidence.marker_calls == len(_INITIAL_GIDS)
+    assert evidence.locator_page_calls == 0
+    assert evidence.source_calls_at_publication == [(0, len(_INITIAL_GIDS), 0)]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX SIGTERM/SIGKILL process evidence")
@@ -704,7 +705,7 @@ def test_prepared_archive_survives_restart_and_new_gallery_waits_for_next_turn(
     )
     assert resumed.snapshots[0] == expected.snapshots[0]
     assert resumed.inventory_scan_pending == [True, False]
-    assert resumed.source_calls_at_publication[0] == (0, 0, 0)
+    assert resumed.source_calls_at_publication[0] == (0, len(_INITIAL_GIDS), 0)
     assert resumed.observed_galleries == [("4203",)]
     assert resumed.marker_calls > 0 and resumed.locator_page_calls > 0
     assert sorted(
