@@ -201,6 +201,8 @@ class _FaultService:
         session: IngestSessionController,
         *,
         should_stop: Callable[[], bool] | None = None,
+        reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+        reuse_sealed_observations: bool = True,
     ) -> VNextIngestSynchronizationResult:
         del session, should_stop
         raise RuntimeError("not published")

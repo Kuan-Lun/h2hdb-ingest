@@ -74,7 +74,6 @@ from .maintenance import LibraryMaintenanceOutcome, _LibraryStagingSlotConflictE
 from .metrics import IngestMetricSink
 from .page_workers import resolve_page_render_workers
 from .progress import IngestProgress
-from .source_snapshot import SourceSnapshotStore
 from .storage import (
     STORAGE_OBJECT_CODEC,
     storage_key_gid,
@@ -298,7 +297,6 @@ class ManagedFilesystemLibraryAdapter:
         self._pinned_root_identity: tuple[int, int] | None = None
         self._guard_owner: int | None = None
         self._publication_descriptor: int | None = None
-        self._source_snapshot: SourceSnapshotStore | None = None
 
     @property
     def current_path(self) -> Path:
@@ -355,19 +353,7 @@ class ManagedFilesystemLibraryAdapter:
                 self._release_publication_lock()
                 self._guard_owner = None
 
-    @contextmanager
-    def source_snapshot_context(self) -> Iterator[SourceSnapshotStore]:
-        """Keep this turn's exact source bytes until publication completes."""
-
-        if self._source_snapshot is not None:
-            raise RuntimeError("source snapshot context is not reentrant")
-        with SourceSnapshotStore() as snapshot:
-            self._source_snapshot = snapshot
-            try:
-                yield snapshot
-            finally:
-                self._source_snapshot = None
-
+    @adapter_operation("source_open")
     def open_source(
         self,
         *,
@@ -375,7 +361,11 @@ class ManagedFilesystemLibraryAdapter:
         gallery_locator_components: tuple[str, ...],
         source_name: bytes,
     ) -> BinaryIO:
-        """Open one exact observed source below the configured no-follow root."""
+        """Reopen live bytes below the pinned no-follow root.
+
+        Core verifies this stream against the sealed source size and digest,
+        then reopens it after rendering; this adapter retains no old byte copy.
+        """
 
         if source_root_components != self._source_root_components:
             raise RuntimeError("source request names another configured root")
@@ -384,12 +374,6 @@ class ManagedFilesystemLibraryAdapter:
         _require_source_leaf(source_name)
         for component in gallery_locator_components:
             _require_source_component(component)
-        if self._source_snapshot is not None:
-            captured = self._source_snapshot.open_source(
-                gallery_locator_components, source_name
-            )
-            if captured is not None:
-                return captured
         root_flags = (
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         )

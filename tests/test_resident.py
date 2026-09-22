@@ -210,6 +210,8 @@ class _Service:
         session: IngestSessionController,
         *,
         should_stop: Callable[[], bool] | None = None,
+        reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+        reuse_sealed_observations: bool = True,
     ) -> VNextIngestSynchronizationResult:
         del should_stop
         self._events.append("synchronize")
@@ -226,6 +228,8 @@ class _ManifestMismatchService:
         session: IngestSessionController,
         *,
         should_stop: Callable[[], bool] | None = None,
+        reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+        reuse_sealed_observations: bool = True,
     ) -> VNextIngestSynchronizationResult:
         del session, should_stop
         self._events.append("synchronize")
@@ -241,6 +245,8 @@ class _StagingCapacityService:
         session: IngestSessionController,
         *,
         should_stop: Callable[[], bool] | None = None,
+        reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+        reuse_sealed_observations: bool = True,
     ) -> VNextIngestSynchronizationResult:
         del session, should_stop
         self._events.append("synchronize")
@@ -256,6 +262,8 @@ class _StagingSlotConflictService:
         session: IngestSessionController,
         *,
         should_stop: Callable[[], bool] | None = None,
+        reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+        reuse_sealed_observations: bool = True,
     ) -> VNextIngestSynchronizationResult:
         del session, should_stop
         self._events.append("synchronize")
@@ -345,7 +353,7 @@ def test_startup_only_checks_existing_epoch_and_processes_one_session(
         "synchronize",
         (
             "log",
-            "Catalog batch published: 1 gallery in the source snapshot",
+            "Catalog batch published: 1 gallery in the selected source set",
         ),
     ]
     assert events[6] == ("complete", 2)
@@ -1227,7 +1235,7 @@ def test_maintenance_failure_does_not_undo_completed_ingest(
     assert ("complete", 2) in events
     assert (
         "log",
-        "Catalog batch published: 1 gallery in the source snapshot",
+        "Catalog batch published: 1 gallery in the selected source set",
     ) in events
 
 
@@ -1323,6 +1331,8 @@ def test_run_forever_publishes_pending_batches_without_waiting_for_source_change
             session: IngestSessionController,
             *,
             should_stop: Callable[[], bool] | None = None,
+            reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+            reuse_sealed_observations: bool = True,
         ) -> VNextIngestSynchronizationResult:
             del session, should_stop
             scans.append(now)
@@ -1469,6 +1479,8 @@ def test_transient_source_mutation_completes_after_heartbeat_shutdown(
             session: IngestSessionController,
             *,
             should_stop: Callable[[], bool] | None = None,
+            reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+            reuse_sealed_observations: bool = True,
         ) -> VNextIngestSynchronizationResult:
             del session, should_stop
             events.append("synchronize")
@@ -1514,6 +1526,8 @@ def test_source_retry_does_not_announce_success_when_completion_or_cleanup_fails
             session: IngestSessionController,
             *,
             should_stop: Callable[[], bool] | None = None,
+            reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+            reuse_sealed_observations: bool = True,
         ) -> VNextIngestSynchronizationResult:
             del session, should_stop
             raise original
@@ -1564,6 +1578,8 @@ def test_retry_warning_delivery_failure_preserves_retry_outcome(
             session: IngestSessionController,
             *,
             should_stop: Callable[[], bool] | None = None,
+            reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+            reuse_sealed_observations: bool = True,
         ) -> VNextIngestSynchronizationResult:
             del session, should_stop
             raise FilesystemSourceChangedError("incomplete marker")
@@ -1601,6 +1617,8 @@ def test_unavailable_retry_metadata_does_not_prevent_session_completion(
             session: IngestSessionController,
             *,
             should_stop: Callable[[], bool] | None = None,
+            reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+            reuse_sealed_observations: bool = True,
         ) -> VNextIngestSynchronizationResult:
             del session, should_stop
             raise _MetadataError("incomplete /source/1001/galleryinfo.txt")
@@ -1647,6 +1665,8 @@ def test_run_forever_retries_mutation_after_quiet_period_without_process_restart
             session: IngestSessionController,
             *,
             should_stop: Callable[[], bool] | None = None,
+            reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+            reuse_sealed_observations: bool = True,
         ) -> VNextIngestSynchronizationResult:
             del session, should_stop
             scans.append(now[0])
@@ -1705,6 +1725,8 @@ def test_run_forever_preserves_scan_time_change_and_then_stays_clean(
             session: IngestSessionController,
             *,
             should_stop: Callable[[], bool] | None = None,
+            reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+            reuse_sealed_observations: bool = True,
         ) -> VNextIngestSynchronizationResult:
             del session, should_stop
             scans.append(now[0])
@@ -1748,6 +1770,8 @@ def test_fatal_artifact_failure_logs_exact_context_and_preserves_error(
             session: IngestSessionController,
             *,
             should_stop: Callable[[], bool] | None = None,
+            reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+            reuse_sealed_observations: bool = True,
         ) -> VNextIngestSynchronizationResult:
             del session, should_stop
             raise failure

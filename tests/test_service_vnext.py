@@ -307,10 +307,14 @@ class _Facade:
         *,
         policy: object,
         max_new_galleries: int | None,
+        reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+        reuse_sealed_observations: bool = True,
         progress: object = None,
     ) -> _PreparedSource:
         del policy
         assert progress is None
+        assert not reobserve_gallery_locators
+        assert reuse_sealed_observations
         self._events.append(("prepare-source", adapter, max_new_galleries))
         return _PreparedSource(self._events)
 
@@ -985,12 +989,10 @@ def test_complete_service_recovers_before_source_and_guards_publication(
         source: object,
         *,
         qualify_gallery: object,
-        snapshot: object,
         performance: SourcePerformance,
     ) -> object:
         assert isinstance(performance, SourcePerformance)
         assert qualify_gallery is None
-        assert snapshot is None
         events.append("adapter")
         return source
 
@@ -1106,12 +1108,10 @@ def test_complete_service_stop_during_source_preparation_closes_without_success(
         source: object,
         *,
         qualify_gallery: object,
-        snapshot: object,
         performance: SourcePerformance,
     ) -> object:
         assert isinstance(performance, SourcePerformance)
         assert qualify_gallery is None
-        assert snapshot is None
         events.append("adapter")
         return source
 

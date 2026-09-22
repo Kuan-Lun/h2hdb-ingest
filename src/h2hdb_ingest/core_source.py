@@ -7,8 +7,7 @@ __all__ = ["VNextFilesystemSourceAdapter"]
 import logging
 from collections.abc import Callable
 from functools import wraps
-from itertools import batched
-from typing import Concatenate, cast
+from typing import Concatenate
 
 from h2hdb import (
     ArtifactSourceRole,
@@ -27,7 +26,6 @@ from h2hdb import (
 
 from .filesystem import (
     FILESYSTEM_OBSERVATION_VERSION,
-    FilesystemArtifactSourceRole,
     FilesystemDirectoryObservation,
     FilesystemFileObservation,
     FilesystemGalleryMetadata,
@@ -36,7 +34,6 @@ from .filesystem import (
     FilesystemSourceChangedError,
 )
 from .source_performance import SourcePerformance
-from .source_snapshot import SNAPSHOT_CAPTURE_PAGE_SIZE, SourceSnapshotStore
 
 logger = logging.getLogger(__name__)
 
@@ -59,15 +56,6 @@ def _defer_source_changes[**Parameters, Result](
         try:
             return operation(adapter, *args, **kwargs)
         except FilesystemSourceChangedError as error:
-            # All wrapped methods take a locator or its immutable observation.
-            target = (
-                args[0]
-                if args
-                else kwargs.get("locator_components", kwargs.get("observation"))
-            )
-            adapter._discard_snapshot(
-                cast("tuple[str, ...] | VNextIngestGalleryObservation", target)
-            )
             logger.debug(
                 "Gallery source deferred: operation=%s reason=%s",
                 operation.__name__,
@@ -86,31 +74,17 @@ class VNextFilesystemSourceAdapter:
         source: FilesystemSource,
         *,
         qualify_gallery: SourceGalleryQualifier | None = None,
-        snapshot: SourceSnapshotStore | None = None,
         performance: SourcePerformance | None = None,
     ) -> None:
         self._source = source
         self._qualify_gallery = qualify_gallery
-        self._snapshot = snapshot
         self._source_performance = (
             performance if performance is not None else SourcePerformance()
         )
 
-    def _discard_snapshot(
-        self, target: tuple[str, ...] | VNextIngestGalleryObservation
-    ) -> None:
-        """Drop this turn's bytes when any stage defers the gallery."""
-        if self._snapshot is not None:
-            self._snapshot.discard_gallery(
-                target.locator_components
-                if isinstance(target, VNextIngestGalleryObservation)
-                else target
-            )
-
     def discard_gallery_observation(self, locator_components: tuple[str, ...]) -> None:
-        """Release rejected attempt bytes even when the core detects the change."""
-        if self._snapshot is not None:
-            self._snapshot.discard_gallery(locator_components)
+        """No source bytes are retained between bounded observation calls."""
+        del locator_components
 
     @property
     def source_root_components(self) -> tuple[str, ...]:
@@ -183,33 +157,7 @@ class VNextFilesystemSourceAdapter:
             limit=limit,
         )
         self._require_metadata(observation, observed)
-        captured: dict[bytes, FileContentReceipt] = {}
-        if self._snapshot is not None:
-            members = tuple(
-                item
-                for item in page.items
-                if item.artifact_role is not FilesystemArtifactSourceRole.OTHER
-            )
-            with self._source_performance.phase("snapshot"):
-                # Core FILE pages hold 256 rows. The disposable snapshot index
-                # commits at most 128 members without changing that outer page.
-                for batch in batched(members, SNAPSHOT_CAPTURE_PAGE_SIZE, strict=False):
-                    contents = self._snapshot.capture_many(
-                        observation.locator_components,
-                        batch,
-                        performance=self._source_performance,
-                    )
-                    captured.update(
-                        (item.name_bytes, content)
-                        for item, content in zip(batch, contents, strict=True)
-                    )
-                    self._source_performance.add(
-                        "snapshot_bytes", sum(item.size_bytes for item in contents)
-                    )
-                    self._source_performance.add("snapshot_files", len(contents))
-        items = tuple(
-            _file(item, content=captured.get(item.name_bytes)) for item in page.items
-        )
+        items = tuple(_file(item) for item in page.items)
         self._source_performance.add("file_rows", len(items))
         return VNextIngestPage(
             items,
@@ -292,11 +240,8 @@ def _metadata(value: FilesystemGalleryMetadata) -> GalleryObservationMetadata:
     )
 
 
-def _file(
-    value: FilesystemFileObservation, *, content: FileContentReceipt | None = None
-) -> FileObservation:
-    if content is None:
-        content = FileContentReceipt.from_parts(value.content_parts())
+def _file(value: FilesystemFileObservation) -> FileObservation:
+    content = FileContentReceipt.from_parts(value.content_parts())
     source_stat = value.stat
     return FileObservation(
         name_bytes=value.name_bytes,

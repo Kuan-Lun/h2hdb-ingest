@@ -177,6 +177,8 @@ class _CapacityThenSuccessService:
         session: IngestSessionController,
         *,
         should_stop: Callable[[], bool] | None = None,
+        reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+        reuse_sealed_observations: bool = True,
     ) -> VNextIngestSynchronizationResult:
         del session, should_stop
         self.calls += 1
@@ -673,10 +675,12 @@ def test_incomplete_completion_marker_retries_without_publishing_partial_source(
         assert runtime.database_admin.check().state == "READY"
 
 
-def test_artifact_render_uses_frozen_source_then_observes_the_later_marker(
+@pytest.mark.parametrize("change", ("replacement", "deletion"))
+def test_artifact_source_change_retains_head_until_fresh_observation(
     tmp_path: Path,
     runtime_core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
+    change: str,
 ) -> None:
     source = tmp_path / "download"
     _gallery(source, 1001, "first")
@@ -705,7 +709,10 @@ def test_artifact_render_uses_frozen_source_then_observes_the_later_marker(
         nonlocal armed, changed
         if armed and source_name == b"001.jpg":
             armed = False
-            Image.new("RGB", (8, 12), "green").save(page_path)
+            if change == "deletion":
+                page_path.unlink()
+            else:
+                Image.new("RGB", (8, 12), "green").save(page_path)
             _rewrite_completion_marker(source / "1001")
             changed = True
         return original_open(
@@ -728,29 +735,24 @@ def test_artifact_render_uses_frozen_source_then_observes_the_later_marker(
         for _attempt in range(32):
             progressed = runtime.resident.process_available(periodic_scan=True)
             if changed:
-                assert progressed
+                assert not progressed
                 break
             assert progressed
         else:
             pytest.fail("artifact preparation never observed the changed source")
-        captured = runtime.catalog.get_catalog_revision()
-        assert captured.revision == baseline.revision + 1
-        captured_archive = next((library / "current").rglob("*.cbz")).read_bytes()
-        assert captured_archive != original_archive
-        with (
-            ZipFile(BytesIO(captured_archive)) as archive,
-            Image.open(BytesIO(archive.read("pages/0000.jpg"))) as image,
-        ):
-            red, green, blue = cast(tuple[int, int, int], image.getpixel((0, 0)))
-            assert blue > red + green
+        assert runtime.catalog.get_catalog_revision() == baseline
+        assert (
+            next((library / "current").rglob("*.cbz")).read_bytes() == original_archive
+        )
+        if change == "deletion":
+            Image.new("RGB", (8, 12), "green").save(page_path)
+            _rewrite_completion_marker(source / "1001")
         for _attempt in range(32):
             assert runtime.resident.process_available(periodic_scan=True)
-            if runtime.catalog.get_catalog_revision() != captured:
+            if runtime.catalog.get_catalog_revision() != baseline:
                 break
         else:
-            pytest.fail(
-                "changed artifact source did not recover through a new snapshot"
-            )
+            pytest.fail("changed source did not recover through fresh observation")
         archives = tuple((library / "current").rglob("*.cbz"))
         assert len(archives) == 1
         with ZipFile(archives[0]) as archive:
@@ -893,7 +895,7 @@ def test_fresh_artifact_runtime_publishes_one_current_cbz(
         assert not (library_root / ".h2hdb-coordination" / "ACTIVATING").exists()
 
 
-def test_source_snapshot_page_boundaries_publish_complete_cbz_and_replay(
+def test_source_page_boundaries_publish_complete_cbz_and_replay(
     tmp_path: Path,
     runtime_core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
@@ -901,7 +903,7 @@ def test_source_snapshot_page_boundaries_publish_complete_cbz_and_replay(
     source = tmp_path / "download"
     gid = 2701
     page_count = 257
-    _gallery(source, gid, "snapshot-boundary")
+    _gallery(source, gid, "source-boundary")
     folder = source / str(gid)
     (folder / "001.jpg").unlink()
     expected_source: list[tuple[bytes, int, bytes]] = []

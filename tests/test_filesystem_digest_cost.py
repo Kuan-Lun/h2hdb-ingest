@@ -3,19 +3,29 @@
 from __future__ import annotations
 
 import os
-import runpy
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
 
 import pytest
 from h2hdb import FileContentReceipt
-from test_source_snapshot import _observation
 
-from h2hdb_ingest.filesystem import FilesystemSourceChangedError
+from h2hdb_ingest.filesystem import (
+    FilesystemArtifactSourceRole,
+    FilesystemFileObservation,
+    FilesystemSourceChangedError,
+    FilesystemStat,
+)
 from h2hdb_ingest.source_performance import SourcePerformance
-from h2hdb_ingest.source_snapshot import SourceSnapshotStore
+
+
+def _observation(path: Path) -> FilesystemFileObservation:
+    return FilesystemFileObservation(
+        folder=path.parent,
+        name_bytes=path.name.encode(),
+        stat=FilesystemStat.from_os_stat(path.stat()),
+        artifact_role=FilesystemArtifactSourceRole.PAGE,
+    )
 
 
 def _hash_calls(performance: SourcePerformance) -> int:
@@ -42,18 +52,16 @@ def test_receipt_always_hashes_exact_bytes_and_expected_digest_still_rejects(
     observed = replace(
         _observation(path), expected_sha256=digest, _source_performance=performance
     )
-    with SourceSnapshotStore() as store:
-        if expected == "different":
-            with pytest.raises(
-                FilesystemSourceChangedError, match="metadata bytes changed"
-            ):
-                store.capture(("gallery",), observed, performance=performance)
-            assert store.open_source(("gallery",), path.name.encode()) is None
-        else:
-            receipt = store.capture(("gallery",), observed, performance=performance)
-            assert receipt == FileContentReceipt.from_parts((payload,))
-            assert receipt.file_sha256 == sha256(payload).digest()
-        assert (_hash_calls(performance) > 0) == (expected != "absent")
+    if expected == "different":
+        with pytest.raises(
+            FilesystemSourceChangedError, match="metadata bytes changed"
+        ):
+            FileContentReceipt.from_parts(observed.content_parts())
+    else:
+        receipt = FileContentReceipt.from_parts(observed.content_parts())
+        assert receipt == FileContentReceipt.from_parts((payload,))
+        assert receipt.file_sha256 == sha256(payload).digest()
+    assert (_hash_calls(performance) > 0) == (expected != "absent")
 
 
 @pytest.mark.parametrize("has_expected_digest", (False, True))
@@ -80,33 +88,8 @@ def test_stat_change_during_actual_read_fails_with_or_without_expected_hash(
         return part
 
     monkeypatch.setattr(os, "read", mutate)
-    with SourceSnapshotStore() as store:
-        with pytest.raises(FilesystemSourceChangedError, match="changed after read"):
-            store.capture(("gallery",), observed)
-        assert store.open_source(("gallery",), path.name.encode()) is None
-
-
-def test_historical_same_output_hash_is_rejected_by_actual_cost_oracle(
-    tmp_path: Path,
-) -> None:
-    module: dict[str, Any] = runpy.run_path(
-        str(Path(__file__).parents[1] / "scripts/probe-source-snapshot.py")
-    )
-    historical = module["_observation_type"]("batch_only")
-    path = tmp_path / "001.jpg"
-    path.write_bytes(b"exact unchanged bytes")
-    original = _observation(path)
-    performance = SourcePerformance()
-    observed = historical(
-        original.folder,
-        original.name_bytes,
-        original.stat,
-        original.artifact_role,
-        _source_performance=performance,
-    )
-    assert b"".join(observed.content_parts()) == b"exact unchanged bytes"
-    with pytest.raises(AssertionError):
-        assert _hash_calls(performance) == 0
+    with pytest.raises(FilesystemSourceChangedError, match="changed after read"):
+        FileContentReceipt.from_parts(observed.content_parts())
 
 
 @pytest.mark.parametrize("has_expected_digest", (False, True))

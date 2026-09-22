@@ -147,9 +147,13 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
         *,
         policy: VNextResolvedIngestPolicy,
         max_new_galleries: int | None = None,
+        reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+        reuse_sealed_observations: bool = True,
         progress: VNextSourcePreparationObserver | None = None,
     ) -> VNextPreparedSource:
         assert max_new_galleries == 10
+        assert not reobserve_gallery_locators
+        assert reuse_sealed_observations
         assert progress is not None
         tracker = tracked[0]
 
@@ -198,6 +202,8 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
             adapter,
             policy=policy,
             max_new_galleries=max_new_galleries,
+            reobserve_gallery_locators=reobserve_gallery_locators,
+            reuse_sealed_observations=reuse_sealed_observations,
             progress=observe,
         )
         if observer_errors:
@@ -214,6 +220,8 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
         adapter: VNextIngestSourceAdapter,
         *,
         max_new_galleries: int | None = None,
+        reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+        reuse_sealed_observations: bool = True,
         should_stop: Callable[[], bool],
         progress: ProgressWork | None = None,
     ) -> VNextIngestSourceSynchronizationResult:
@@ -222,6 +230,8 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
             policy,
             adapter,
             max_new_galleries=max_new_galleries,
+            reobserve_gallery_locators=reobserve_gallery_locators,
+            reuse_sealed_observations=reuse_sealed_observations,
             should_stop=should_stop,
             progress=progress,
         )

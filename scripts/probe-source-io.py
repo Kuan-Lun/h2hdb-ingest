@@ -42,7 +42,6 @@ from h2hdb_ingest.metrics import IngestMetric, TextIngestMetricSink
 from h2hdb_ingest.policy import build_ingest_policy
 from h2hdb_ingest.runtime import build_runtime
 from h2hdb_ingest.source_performance import SourcePerformance
-from h2hdb_ingest.source_snapshot import SourceSnapshotStore
 
 _PHASE: ContextVar[str] = ContextVar("source_io_probe_phase", default="observation")
 _COUNTERS = ("read_calls", "read_bytes", "write_calls", "write_bytes")
@@ -99,7 +98,6 @@ class _Meter:
         self.decode_calls = 0
         self.qualified_galleries = 0
         self.accepted_galleries = 0
-        self.captured_files = 0
         self.qualification_disk_spools = 0
         self.operation_seconds: dict[str, float] = defaultdict(float)
         self.file_reads: dict[str, dict[str, int]] = defaultdict(
@@ -127,8 +125,6 @@ class _Meter:
         original_temporary = qualification.SpooledTemporaryFile
         original_decode = qualification.load_source_page_image
         original_qualify = ImageGalleryQualifier.__call__
-        original_capture = SourceSnapshotStore.capture_many
-        original_open = Path.open
 
         def read(descriptor: int, size: int) -> bytes:
             value = os.fstat(descriptor)
@@ -175,23 +171,6 @@ class _Meter:
                 self.accepted_galleries += int(result.accepted)
             return result
 
-        def capture(store: SourceSnapshotStore, *args: Any, **kwargs: Any) -> Any:
-            token = _PHASE.set("snapshot_capture")
-            try:
-                with self.timed("snapshot_capture"):
-                    result = original_capture(store, *args, **kwargs)
-                with self.lock:
-                    self.captured_files += len(result)
-                return result
-            finally:
-                _PHASE.reset(token)
-
-        def opened(path: Path, *args: Any, **kwargs: Any) -> Any:
-            stream = original_open(path, *args, **kwargs)
-            if _PHASE.get() == "snapshot_capture" and path.name.isdecimal():
-                return _CountedStream(stream, self, "snapshot_buffer")
-            return stream
-
         with ExitStack() as stack:
             for owner, name, replacement in (
                 (os, "read", read),
@@ -199,8 +178,6 @@ class _Meter:
                 (qualification, "SpooledTemporaryFile", temporary),
                 (qualification, "load_source_page_image", decode),
                 (ImageGalleryQualifier, "__call__", qualify),
-                (SourceSnapshotStore, "capture_many", capture),
-                (Path, "open", opened),
             ):
                 stack.enter_context(patch.object(owner, name, replacement))
             yield
@@ -212,7 +189,6 @@ class _Meter:
             "decode_calls": self.decode_calls,
             "qualified_galleries": self.qualified_galleries,
             "accepted_galleries": self.accepted_galleries,
-            "captured_files": self.captured_files,
             "qualification_disk_spools": self.qualification_disk_spools,
             "operation_seconds_nonadditive": dict(self.operation_seconds),
         }
@@ -352,10 +328,6 @@ def _attach_production_metric(
             if name.startswith("source.")
         ),
         "qualified_galleries": measured["qualified_galleries"],
-        "snapshot_files": measured["captured_files"],
-        "snapshot_bytes": measured["io"]
-        .get("snapshot_buffer", {})
-        .get("write_bytes", 0),
     }
     for name, expected in actual.items():
         if counters.get(name, 0) != expected:
@@ -499,7 +471,6 @@ def _run_matrix(
                     )
                     performance = SourcePerformance()
                     with (
-                        SourceSnapshotStore() as captured,
                         FilesystemSource(source, performance=performance) as fs,
                     ):
                         adapter = VNextFilesystemSourceAdapter(
@@ -507,7 +478,6 @@ def _run_matrix(
                             qualify_gallery=ImageGalleryQualifier(
                                 selected.paths.artifact_render_policy(), workers=workers
                             ),
-                            snapshot=captured,
                             performance=performance,
                         )
 
@@ -519,9 +489,6 @@ def _run_matrix(
                             performance=performance,
                         )
                         try:
-                            result["captured_pages_verified"] = _verify_captures(
-                                source, captured
-                            )
                             cases[name] = result
                         finally:
                             prepared.close()
@@ -533,7 +500,7 @@ def _run_matrix(
                 raise RuntimeError("probe left invalid database authority")
         return {
             "status": "ok",
-            "format_version": 3,
+            "format_version": 4,
             "provenance": _provenance(),
             "fixture": {
                 "galleries": galleries,
@@ -561,12 +528,12 @@ def _run_matrix(
                 "policy_changed": "page_jpeg_quality 90 -> 89; source unchanged",
                 "source_io": "actual os.read bytes/calls, including EOF calls, by inode and exclusive phase",
                 "source_files": "a second view of the same raw reads; do not add it to phase totals",
-                "production_telemetry": "actual SourcePerformance metrics; exact read bytes/calls, snapshot bytes/files and qualification counts checked against independent meter",
+                "production_telemetry": "actual SourcePerformance metrics; exact read bytes/calls and qualification counts checked against independent meter",
                 "production_metric_timing": "baseline source metric includes source issue/commit after preparation; comparison metrics cover prepare_source only; inclusive phase times overlap and cannot be summed",
                 "buffer_io": "logical stream reads/writes, not physical disk I/O; memory qualification spools included",
                 "qualification_disk_spools": "count of rolled spools when _spool returns, before decoding; not all native/scratch disk I/O",
                 "native_io_limit": "only observed Python stream boundaries; native reads bypassing these wrappers are not counted",
-                "excluded": "I/O counters omit SQLite and discovery/core spools; preparation wall includes their work; later rendering, snapshot verification and prepared-resource teardown are outside measured preparation",
+                "excluded": "I/O counters omit SQLite and discovery/core spools; preparation wall includes their work; later rendering and prepared-resource teardown are outside measured preparation",
                 "timing": "observational; instrumentation overhead included; no wall-time pass threshold",
                 "cache_state": "freshly generated local fixtures followed by baseline publication; no cache flush or NAS throughput claim",
                 "operation_timing": "nested totals and concurrent decode sums overlap; never sum as wall time",
@@ -575,22 +542,6 @@ def _run_matrix(
             "seed_publication_seconds": seed_seconds,
             "cases": cases,
         }
-
-
-def _verify_captures(root: Path, captured: SourceSnapshotStore) -> int:
-    checked = 0
-    for path in sorted(root.rglob("*")):
-        if path.suffix not in {".png", ".jpeg"}:
-            continue
-        stream = captured.open_source((path.parent.name,), path.name.encode())
-        if stream is not None:
-            with stream:
-                if stream.read() != path.read_bytes():
-                    raise RuntimeError(
-                        "captured snapshot differs from exact source bytes"
-                    )
-            checked += 1
-    return checked
 
 
 def _provenance() -> dict[str, object]:
@@ -735,7 +686,7 @@ def main() -> int:
         if (
             not isinstance(report, dict)
             or report.get("status") != "ok"
-            or report.get("format_version") != 3
+            or report.get("format_version") != 4
             or not isinstance(report.get("cases"), dict)
             or set(report["cases"])
             != {"baseline", "unchanged", "policy_changed", "source_changed"}
@@ -744,7 +695,7 @@ def main() -> int:
     except (subprocess.SubprocessError, ValueError) as error:
         report = {
             "status": "error",
-            "format_version": 3,
+            "format_version": 4,
             "error_type": type(error).__name__,
             "error": str(error),
             "provenance": _provenance(),
