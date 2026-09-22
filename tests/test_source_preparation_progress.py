@@ -1,4 +1,4 @@
-"""Real batch admission and reporter visibility before source ingestion starts."""
+"""Real batch admission and reporter visibility during durable source preparation."""
 
 from __future__ import annotations
 
@@ -164,6 +164,7 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
                 not in (
                     VNextSourcePreparationOperation.DISCOVERY_TRANSFER,
                     VNextSourcePreparationOperation.SOURCE_FREEZE,
+                    VNextSourcePreparationOperation.SOURCE_CHECKPOINT,
                 )
                 or update.completed == 0
             ):
@@ -209,7 +210,9 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
         if observer_errors:
             prepared.close()
             raise observer_errors[0]
-        assert prepared.deferred_gallery_count == galleries - 10
+        assert not prepared.observation_complete
+        with pytest.raises(ValueError, match="inventory counts are pending"):
+            _ = prepared.deferred_gallery_count
         return prepared
 
     original_synchronize = service_module.synchronize_source
@@ -235,8 +238,13 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
             should_stop=should_stop,
             progress=progress,
         )
+        assert not observer_errors, observer_errors
+        assert result.deferred_gallery_count == galleries - 10
+        assert result.waiting_gallery_count == 0
+        assert result.receipt.staged_galleries == 10
+        assert not result.inventory_scan_pending
         # Admission skips updating galleries without consuming a batch slot.
-        # Its final selected count is known once source preparation finishes.
+        # Final counts are known after durable source synchronization finishes.
         snapshot = tracked[0].snapshot()
         assert snapshot is not None
         frozen.append(snapshot)
@@ -265,6 +273,7 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
     assert set(stages) == {
         VNextSourcePreparationOperation.DISCOVERY_TRANSFER,
         VNextSourcePreparationOperation.SOURCE_FREEZE,
+        VNextSourcePreparationOperation.SOURCE_CHECKPOINT,
     }
     assert (
         "Copying the gallery inventory into the batch plan"
@@ -273,6 +282,10 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
     assert (
         "Checking gallery completion and freezing source observations"
         in stages[VNextSourcePreparationOperation.SOURCE_FREEZE][1]
+    )
+    assert (
+        "Saving completed gallery checkpoints"
+        in stages[VNextSourcePreparationOperation.SOURCE_CHECKPOINT][1]
     )
     assert all(
         "current activity elapsed 1m 0s" in message for _, message in stages.values()

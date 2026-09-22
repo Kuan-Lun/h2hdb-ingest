@@ -17,7 +17,7 @@ You need:
 - A nonempty download directory containing completed galleries with
   `galleryinfo.txt` metadata. Nested collection folders are supported.
 - An H2HDB database, using SQLite or MariaDB. This release requires
-  `h2hdb>=0.40.0,<0.41.0` and schema epoch 3, version 7.
+  `h2hdb>=0.41.0,<0.42.0` and schema epoch 3, version 8.
 - For CBZ output, a separate writable library directory and enough disk space
   for image processing, one gallery's verified render input, database plans,
   and all output awaiting publication.
@@ -212,6 +212,40 @@ render-input spool while preparing its artifact, then releases it. Changed or
 missing source bytes cannot be published under the earlier observation and must
 be observed again. Keep the source collection available throughout the turn.
 
+After interruption, ingest first checks an unpublished, sealed source batch.
+Its root and policies must match, and each existing gallery's completion marker
+is reread in pages of at most 128 galleries. This recovery pass takes
+O(G + marker bytes) source work for G galleries in that batch: it reads SQL and
+`galleryinfo.txt` markers, without enumerating new galleries or deeply reading
+images. Missing marker evidence, changed markers, or a temporarily incomplete
+source requires a fresh scan. Other source or database errors remain failures.
+Newly downloaded galleries are picked up after a successfully resumed batch
+publishes; their arrival does not discard already committed analysis or prepared
+CBZs. Rendering still verifies live source bytes. A source failure requests fresh
+observation and can require a replacement batch.
+
+The resumed batch has no fresh deferred/waiting inventory counts. INFO reports
+that a new inventory is pending, and resident mode immediately schedules it after
+publication instead of declaring initial catch-up complete. For Python callers,
+Core's `prepare_source_resume(adapter, policy=...)` requires the source adapter;
+source-root components alone are insufficient to authorize recovery.
+`VNextIngestSourceSynchronizationResult`, `VNextIngestSynchronizationResult` and
+`ResidentIngestor.deferred_gallery_count` can now report `None` for these unknown
+counts. Both result counts are `None` together, and `inventory_scan_pending`
+identifies that state. A one-shot run completes the resumed batch; use resident
+mode or another invocation to include newly arrived galleries.
+
+During the first scan, each gallery's completed image checks and source facts
+are persisted before checking the next gallery. Restart performs a fresh marker
+inventory and reuses matching completed observations. At most the current
+gallery's unsealed checks are lost when markers remain stable; changed galleries
+must be checked again. These checkpoints retain metadata and hashes, not copies
+of the entire source image collection.
+
+This update requires the Core schema-7-to-8 offline converter. It preserves the
+database contents and complete library, including CBZs and private state; do not
+clear the database or rebuild the library to perform this upgrade.
+
 Keep `galleryinfo.txt` as the completion marker: finish writing a gallery's
 images before writing its metadata. Incomplete or changing galleries wait for
 a later turn while other complete galleries continue. A completed gallery is
@@ -267,6 +301,11 @@ process can leave a turn without a terminal summary; absence is not zero cost.
 Source progress at INFO states whether selection covers all complete galleries
 or admits up to the explicit number of new galleries. Unbounded admission is not
 reported as a zero-gallery quota.
+Core's initial `source_prepare` record contains inventory size and
+`observation_complete=false`. Its terminal `source_step` record supplies admitted
+files/galleries, discovered/staged galleries, deferred/waiting counts, and
+completed inventory observation under the same correlation ID. Initial inventory
+size therefore must not be interpreted as already observed or admitted work.
 
 Background inventory emits its own INFO `scope=source_monitor operation=inventory`
 summary, including status, completed marker rows, logical read bytes, discovery,
@@ -393,11 +432,17 @@ inspection instead of being silently removed.
 Upgrade ingest and H2HDB together within their declared dependency ranges.
 Back up the database and the complete library before offline maintenance.
 Existing CBZs and the format-v4 library journal do not need rebuilding for the
-current database audit-scheduling feature.
+source observation checkpoint feature.
 
-An exact H2HDB schema-version-6 database can use the core project's one-time
-offline `upgrade-audit-schema.py` tool to reach schema version 7. Stop consumers
+An exact H2HDB schema-version-7 database can use the core project's one-time
+offline `upgrade-source-collection-schema.py` tool to reach schema version 8.
+Use the schema-8 Core checkout and its matching environment, stop all consumers,
 and follow the [core upgrade instructions](https://github.com/Kuan-Lun/h2hdb#readme).
+Keep the database, CBZs, thumbnails, and complete private library state in place;
+this conversion changes database schema, not artifact bytes or the library layout.
+For schema 6, first use Core 0.40.0's `upgrade-audit-schema.py` and its environment
+to reach schema 7, then use the new converter. Leave all consumers stopped
+throughout both conversions and retain the original database/library backup.
 Other older schemas require a new database and catalog rebuild from the source;
 normal ingest startup does not convert them.
 

@@ -109,7 +109,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                             f"publications={published.publication_count}."
                         )
                         break
-                    if not runtime.resident.deferred_gallery_count:
+                    if runtime.resident.deferred_gallery_count == 0:
                         parser.exit(
                             1,
                             "Initial reconciliation did not publish a non-empty catalog."

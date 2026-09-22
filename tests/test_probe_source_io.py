@@ -66,7 +66,7 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
     )
     report = json.loads(report_path.read_text())
     assert report["status"] == "ok"
-    assert report["format_version"] == 4
+    assert report["format_version"] == 5
     assert report["fixture"]["workers"] == workers
     assert report["fixture"]["codec"] == codec
     assert report["provenance"]["h2hdb"]["python_source_sha256"]

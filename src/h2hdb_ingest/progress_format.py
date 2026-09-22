@@ -39,6 +39,8 @@ _OPERATION_LABELS = {
     "catalog_cleanup": "Cleaning up unused database records",
     "waiting_publication_guard": "Waiting for permission to publish the library",
     "source_prepare": "Preparing the complete gallery inventory and selecting this batch",
+    "source_resume_prepare": "Checking a sealed source batch for restart",
+    "source_resume_commit": "Resuming the interrupted source batch",
     "source_discovery": "Discovering gallery folders",
     "source_discovery_verify": "Rechecking discovered folders",
     "source_discovery_commit": "Finishing the folder inventory",
@@ -49,6 +51,7 @@ _OPERATION_LABELS = {
     "source_batch_order": "Sorting the selected galleries",
     "source_discovery_cleanup": "Removing the temporary gallery inventory",
     "source_source_freeze": "Checking gallery completion and freezing source observations",
+    "source_source_checkpoint": "Saving completed gallery checkpoints",
     "source_freeze": "Checking gallery completion and freezing source observations",
     "source_completion_marker": "Checking whether gallery metadata has changed",
     "source_gallery_observation": "Reading gallery metadata and indexing its files",
@@ -137,11 +140,16 @@ _COUNTER_LABELS = {
 }
 
 
-def format_batch_published(*, galleries: int, deferred: int, waiting: int) -> str:
+def format_batch_published(
+    *, galleries: int, deferred: int | None, waiting: int | None
+) -> str:
     unit = "gallery" if galleries == 1 else "galleries"
     parts = [
         f"Catalog batch published: {galleries:,} {unit} in the selected source set"
     ]
+    if deferred is None or waiting is None:
+        parts.append("resumed sealed batch; a fresh source inventory is pending")
+        return "; ".join(parts)
     if deferred:
         unit = "gallery" if deferred == 1 else "galleries"
         parts.append(f"{deferred:,} new {unit} left for later batches")
@@ -181,7 +189,9 @@ def format_progress(
     parts = [f"{lead}: {label}"]
     if snapshot.phase == "source":
         counters = dict(snapshot.counters)
-        if counters.get("full_source_selection") == 1:
+        if counters.get("source_inventory_scan_pending") == 1:
+            parts.append("resuming the sealed batch before a fresh source inventory")
+        elif counters.get("full_source_selection") == 1:
             parts.append("all complete galleries selected before publication")
         elif (limit := counters.get("batch_new_gallery_limit")) is not None:
             parts.append(f"up to {limit:,} new galleries selected before publication")
@@ -311,6 +321,8 @@ def _interval_summary(
 def _results(snapshot: ProgressSnapshot) -> list[str]:
     counts = dict(snapshot.counters)
     parts = []
+    if counts.get("source_inventory_scan_pending") == 1:
+        parts.append("fresh source inventory pending after this resumed batch")
     if snapshot.phase == "source" and "batch_selected_galleries" in counts:
         parts.append(
             f"galleries in this batch {counts['batch_selected_galleries']:,} (existing and new)"

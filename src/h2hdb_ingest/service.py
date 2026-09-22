@@ -74,8 +74,8 @@ class VNextIngestSourceSynchronizationResult:
     """One sealed cumulative source batch and its remaining discovery work."""
 
     receipt: VNextIngestSourceReceipt
-    deferred_gallery_count: int
-    waiting_gallery_count: int = 0
+    deferred_gallery_count: int | None
+    waiting_gallery_count: int | None = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.receipt, VNextIngestSourceReceipt):
@@ -83,8 +83,14 @@ class VNextIngestSourceSynchronizationResult:
         self.receipt.__post_init__()
         if not self.receipt.sealed:
             raise ValueError("synchronization source receipt must be sealed")
-        _require_deferred_gallery_count(self.deferred_gallery_count)
-        _require_deferred_gallery_count(self.waiting_gallery_count)
+        _require_inventory_counts(
+            self.deferred_gallery_count, self.waiting_gallery_count
+        )
+
+    @property
+    def inventory_scan_pending(self) -> bool:
+        """A resumed cut has no fresh inventory counts until the next scan."""
+        return self.deferred_gallery_count is None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,12 +100,13 @@ class VNextIngestSynchronizationResult:
     source: VNextIngestSourceReceipt
     analysis: VNextAnalysisAdvanceResult
     publication: VNextIngestAdvanceResult
-    deferred_gallery_count: int
-    waiting_gallery_count: int = 0
+    deferred_gallery_count: int | None
+    waiting_gallery_count: int | None = 0
 
     def __post_init__(self) -> None:
-        _require_deferred_gallery_count(self.deferred_gallery_count)
-        _require_deferred_gallery_count(self.waiting_gallery_count)
+        _require_inventory_counts(
+            self.deferred_gallery_count, self.waiting_gallery_count
+        )
         if not isinstance(self.source, VNextIngestSourceReceipt):
             raise TypeError("source must be VNextIngestSourceReceipt")
         self.source.__post_init__()
@@ -118,6 +125,11 @@ class VNextIngestSynchronizationResult:
             or self.publication.phase is not VNextIngestPhase.FINALIZATION
         ):
             raise ValueError("synchronization publication result must be terminal")
+
+    @property
+    def inventory_scan_pending(self) -> bool:
+        """Finish the interrupted cut before discovering newly arrived sources."""
+        return self.deferred_gallery_count is None
 
 
 class VNextIngestService:
@@ -187,7 +199,7 @@ class VNextIngestService:
         reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
         reuse_sealed_observations: bool = True,
     ) -> VNextIngestSynchronizationResult:
-        """Observe exact source facts, then reread each gallery when rendering."""
+        """Resume a sealed cut or observe a new cut, then verify live render bytes."""
 
         if not isinstance(session, IngestSessionController):
             raise TypeError("session must be IngestSessionController")
@@ -261,17 +273,32 @@ class VNextIngestService:
             source_performance.add(
                 "selected_galleries", source_result.receipt.staged_galleries
             )
-            source_performance.add(
-                "waiting_galleries", source_result.waiting_gallery_count
-            )
-            source_performance.add(
-                "deferred_galleries", source_result.deferred_gallery_count
-            )
+            if source_result.inventory_scan_pending:
+                source_performance.add("resumed_sealed_source")
+                source_performance.add("inventory_scan_pending")
+            else:
+                assert source_result.waiting_gallery_count is not None
+                assert source_result.deferred_gallery_count is not None
+                source_performance.add(
+                    "waiting_galleries", source_result.waiting_gallery_count
+                )
+                source_performance.add(
+                    "deferred_galleries", source_result.deferred_gallery_count
+                )
         source_receipt = source_result.receipt
         if work is not None:
             work.set_counter("source_galleries", source_receipt.staged_galleries)
-            work.set_counter("deferred_galleries", source_result.deferred_gallery_count)
-            work.set_counter("waiting_galleries", source_result.waiting_gallery_count)
+            if source_result.inventory_scan_pending:
+                work.set_counter("source_inventory_scan_pending", 1)
+            else:
+                assert source_result.deferred_gallery_count is not None
+                assert source_result.waiting_gallery_count is not None
+                work.set_counter(
+                    "deferred_galleries", source_result.deferred_gallery_count
+                )
+                work.set_counter(
+                    "waiting_galleries", source_result.waiting_gallery_count
+                )
             work.phase("analysis")
         analysis = synchronize_analysis(
             session,
@@ -559,6 +586,21 @@ def synchronize_source(
 
     if not isinstance(session, IngestSessionController):
         raise TypeError("session must be IngestSessionController")
+    if reuse_sealed_observations and not reobserve_gallery_locators:
+        if progress is not None:
+            progress.operation("source_resume_prepare")
+        _raise_if_stopping(should_stop)
+        resumable = session.outside_session(
+            lambda facade: facade.prepare_source_resume(adapter, policy=policy)
+        )
+        _raise_if_stopping(should_stop)
+        if resumable is not None:
+            if progress is not None:
+                progress.operation("source_resume_commit")
+            receipt = session.call(
+                lambda facade, current: facade.commit_source_resume(current, resumable)
+            )
+            return VNextIngestSourceSynchronizationResult(receipt, None, None)
     if progress is not None:
         progress.operation("source_prepare")
 
@@ -582,10 +624,6 @@ def synchronize_source(
             progress=observe if progress is not None else None,
         )
     ) as prepared:
-        if progress is not None:
-            progress.set_counter("batch_selected_galleries", prepared.gallery_count)
-            progress.set_counter("deferred_galleries", prepared.deferred_gallery_count)
-            progress.set_counter("waiting_galleries", prepared.waiting_gallery_count)
         while True:
             _raise_if_stopping(should_stop)
             if progress is not None:
@@ -624,6 +662,14 @@ def synchronize_source(
             if source_receipt is None or not source_receipt.sealed:
                 raise RuntimeError(
                     "terminal source advancement lacks a sealed source receipt"
+                )
+            if progress is not None:
+                progress.set_counter("batch_selected_galleries", prepared.gallery_count)
+                progress.set_counter(
+                    "deferred_galleries", prepared.deferred_gallery_count
+                )
+                progress.set_counter(
+                    "waiting_galleries", prepared.waiting_gallery_count
                 )
             return VNextIngestSourceSynchronizationResult(
                 source_receipt,
@@ -728,6 +774,15 @@ def _emit_publication_metric(
 def _raise_if_stopping(should_stop: Callable[[], bool]) -> None:
     if should_stop():
         raise _IngestStopRequested
+
+
+def _require_inventory_counts(deferred: int | None, waiting: int | None) -> None:
+    if deferred is None or waiting is None:
+        if deferred is not None or waiting is not None:
+            raise ValueError("unknown inventory requires both counts to be None")
+        return
+    _require_deferred_gallery_count(deferred)
+    _require_deferred_gallery_count(waiting)
 
 
 def _require_deferred_gallery_count(value: int) -> None:

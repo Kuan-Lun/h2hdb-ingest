@@ -7,12 +7,17 @@ import os
 from pathlib import Path
 
 import pytest
-from h2hdb import ArtifactFailureContext, VNextSourceChangedError
+from h2hdb import (
+    ArtifactFailureContext,
+    VNextIngestGalleryObservation,
+    VNextSourceChangedError,
+)
 from PIL import Image
 from test_gallery_local_retry import _archive, _config, _marker, _page, _synchronize
 
 from h2hdb_ingest._retry_diagnostics import retry_diagnostic
 from h2hdb_ingest.artifact_errors import attach_qualification_failure_context
+from h2hdb_ingest.core_source import VNextFilesystemSourceAdapter
 from h2hdb_ingest.runtime import build_runtime
 
 
@@ -34,7 +39,7 @@ def _complete(folder: Path, artist: str, *, stamp: int) -> None:
 
 
 def test_global_spam_change_waits_for_unavailable_published_source_then_converges(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _config(tmp_path)
     source = config.paths.download_path
@@ -98,9 +103,27 @@ def test_global_spam_change_waits_for_unavailable_published_source_then_converge
     # H@H's final marker admits the replacement and the next source turn can
     # render every artifact under the new global analysis, then advance the head.
     _complete(first, "ann", stamp=20)
+    observed_galleries: list[tuple[str, ...]] = []
+    observe = VNextFilesystemSourceAdapter.observe_gallery
+
+    def record_observation(
+        adapter: VNextFilesystemSourceAdapter, locator: tuple[str, ...]
+    ) -> VNextIngestGalleryObservation:
+        observed_galleries.append(locator)
+        return observe(adapter, locator)
+
+    monkeypatch.setattr(
+        VNextFilesystemSourceAdapter, "observe_gallery", record_observation
+    )
     with build_runtime(config) as restarted:
         restarted.resident.initialize()
         _synchronize(restarted)
+        result = restarted.resident.last_synchronization_result
+        assert result is not None and not result.inventory_scan_pending
+        # Recheck the durable cut's marker before attempting artifact work.
+        # Only the changed gallery is deeply observed; unchanged sealed facts
+        # remain reusable even though the prior process-local retry hint is gone.
+        assert observed_galleries == [("1001",)]
         revision = restarted.catalog.get_catalog_revision()
         assert revision.publication_count == 3
         assert revision != original_revision
