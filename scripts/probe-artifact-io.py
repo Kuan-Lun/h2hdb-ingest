@@ -14,11 +14,12 @@ import os
 import platform
 import random
 import resource
+import runpy
 import stat
 import subprocess
 import sys
 import tempfile
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from hashlib import file_digest, sha256
 from io import BytesIO
@@ -35,9 +36,11 @@ from PIL import Image
 import h2hdb_ingest
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
 from h2hdb_ingest import _adapter_performance as adapter_performance
+from h2hdb_ingest import library as library_module
 from h2hdb_ingest.runtime import build_runtime, configure_logging
 from h2hdb_ingest.scratch import DiskScratch
 
+_ENVIRONMENT = runpy.run_path(str(Path(__file__).with_name("_probe_environment.py")))
 _SEED = 20260919
 
 
@@ -261,9 +264,154 @@ def _provenance():
     return result
 
 
+class _CleanupMeasurement:
+    """Fixed operation totals from actual maintenance, with no retained paths."""
+
+    def __init__(self, journal_delay_ms: int = 0) -> None:
+        self.journal_delay_ms = journal_delay_ms
+        self.calls = self.received = self.checkpoints = self.clock_failures = 0
+        self.elapsed_ns = self.injected_calls = 0
+        self.statuses = {"completed": 0, "failed": 0, "interrupted": 0}
+        self.operations = {}
+        self.sink_errors = []
+
+    def _sink(self, metric) -> None:
+        # Runtime telemetry deliberately suppresses sink exceptions. Retain a
+        # bounded error flag and reject incomplete evidence after the runtime.
+        try:
+            if metric.scope != "adapter_io":
+                raise ValueError("unexpected cleanup metric scope")
+            if metric.operation == "checkpoint":
+                self.checkpoints += 1
+                return  # Cumulative snapshots must not be added to final totals.
+            if metric.operation != "publication":
+                raise ValueError("missing final cleanup adapter measurement")
+            self.received += 1
+            self.elapsed_ns += metric.elapsed_ns
+            self.statuses[metric.status] += 1
+            counters = {item.name: item.value for item in metric.counters}
+            self.clock_failures += counters["clock_failures"]
+            for operation in metric.operations:
+                if operation.operation not in self.operations:
+                    if len(self.operations) >= 32:
+                        raise ValueError("cleanup operation vocabulary grew unbounded")
+                    self.operations[operation.operation] = {}
+                total = self.operations[operation.operation]
+                for item in operation.phases_ns:
+                    total[item.name + "_ns"] = (
+                        total.get(item.name + "_ns", 0) + item.value
+                    )
+                for item in operation.counters:
+                    total[item.name] = total.get(item.name, 0) + item.value
+        except Exception as error:
+            if not self.sink_errors:
+                self.sink_errors.append(str(error))
+
+    @contextmanager
+    def observe(self):
+        original = library_module.ManagedFilesystemLibraryAdapter.maintain_cleanup
+        original_phase = library_module.adapter_phase
+
+        @contextmanager
+        def delayed_phase(operation):
+            with original_phase(operation):
+                if operation == "journal_session" and self.journal_delay_ms:
+                    self.injected_calls += 1
+                    sleep(self.journal_delay_ms / 1000)
+                yield
+
+        def observed(adapter):
+            self.calls += 1
+            # The existing measurement emits a final operation named publication.
+            # This private sink relabels its scope as maintenance in the report;
+            # it never forwards these records into publication INFO totals.
+            with (
+                adapter_performance.summarize_adapter_io(self._sink, generation=0),
+                patch.object(library_module, "adapter_phase", delayed_phase),
+            ):
+                return original(adapter)
+
+        with patch.object(
+            library_module.ManagedFilesystemLibraryAdapter,
+            "maintain_cleanup",
+            observed,
+        ):
+            yield
+
+    def report(self):
+        complete = (
+            self.calls > 0
+            and self.received == self.calls
+            and not self.clock_failures
+            and not self.sink_errors
+            and self.statuses["completed"] == self.calls
+            and bool(self.operations.get("journal_session", {}).get("calls"))
+        )
+        attributed_ns = sum(
+            operation.get("exclusive_ns", 0) for operation in self.operations.values()
+        )
+        return {
+            "status": "completed" if complete else "incomplete",
+            "scope": "actual_library_maintenance_calls",
+            "calls": self.calls,
+            "terminal_measurements": self.received,
+            "ignored_cumulative_checkpoints": self.checkpoints,
+            "elapsed_ns": self.elapsed_ns,
+            "attributed_exclusive_ns": attributed_ns,
+            "unattributed_ns": max(0, self.elapsed_ns - attributed_ns),
+            "clock_failures": self.clock_failures,
+            "statuses": self.statuses,
+            "operations": self.operations,
+            "sink_errors": self.sink_errors,
+            "injected_journal_delay_ms": self.journal_delay_ms,
+            "injected_journal_calls": self.injected_calls,
+            "limits": [
+                "Independent dev-only scope around real maintain_cleanup; all safety checks still execute",
+                "Includes startup, pre-claim and post-session maintenance, overlapping enclosing process_available timings",
+                "Exclusive same-thread phases add; inclusive phases overlap; bytes are logical instrumented transfers",
+                "No source, render or publication metrics are included; uninstrumented cleanup work remains residual",
+                "Controlled journal delay tests attribution and is not a NAS latency model",
+            ],
+        }
+
+
+def _validate_source_evidence(report):
+    before = report.get("provenance")
+    after = report.get("provenance_after")
+    complete = (
+        isinstance(before, dict)
+        and set(before) == {"h2hdb", "h2hdb_ingest"}
+        and before == after
+        and all(
+            isinstance(value, dict)
+            and isinstance(value.get("source_sha256"), str)
+            and len(value["source_sha256"]) == 64
+            for value in before.values()
+        )
+        and report.get("source_unchanged_during_experiment") is True
+        and isinstance(report.get("probe_sha256"), str)
+        and len(report["probe_sha256"]) == 64
+        and report["probe_sha256"] == report.get("probe_sha256_after")
+        and isinstance(report.get("environment_helper_sha256"), str)
+        and len(report["environment_helper_sha256"]) == 64
+        and report["environment_helper_sha256"]
+        == report.get("environment_helper_sha256_after")
+    )
+    report["source_unchanged_during_experiment"] = complete
+    if not complete:
+        # Preserve oracle, measured timings and both digests for diagnosis.
+        report["status"] = "error"
+        report["acceptance"] = {"status": "incomplete"}
+        report["error_type"] = "SourceProvenanceError"
+        report["error"] = "runtime or probe source changed, or provenance is incomplete"
+    return report
+
+
 def _run(args, root: Path):
     provenance_before = _provenance()
     probe_sha256 = sha256(Path(__file__).read_bytes()).hexdigest()
+    environment_helper = Path(__file__).with_name("_probe_environment.py")
+    environment_sha256 = sha256(environment_helper.read_bytes()).hexdigest()
     fixture_started = perf_counter_ns()
     fixture = _fixture(root, args.galleries, args.pages, args.edge)
     fixture_ns = perf_counter_ns() - fixture_started
@@ -288,7 +436,9 @@ def _run(args, root: Path):
     )
     configure_logging(config)
     load_before = os.getloadavg()
+    cleanup_measurement = _CleanupMeasurement(args.cleanup_journal_delay_ms)
     with ExitStack() as resources:
+        resources.enter_context(cleanup_measurement.observe())
         if args.fsync_delay_ms:
             # Only this adapter helper's os reference is replaced. SQLite native
             # sync, Core transactions and unrelated Python os users remain real.
@@ -358,7 +508,7 @@ def _run(args, root: Path):
     text = log_file.read_text()
     logging.shutdown()
     provenance_after = _provenance()
-    return {
+    report = {
         "status": "completed",
         "format_version": 2,
         "fixture": {
@@ -380,6 +530,7 @@ def _run(args, root: Path):
         "oracle": oracle,
         "logical_amplification": amplification,
         "publication_metrics": publication_metrics,
+        "library_cleanup_adapter": cleanup_measurement.report(),
         "all_metrics": _metrics(text),
         "cycle_events": [
             line.split("[INFO] ", 1)[1]
@@ -400,6 +551,11 @@ def _run(args, root: Path):
         "provenance_after": provenance_after,
         "source_unchanged_during_experiment": provenance_before == provenance_after,
         "probe_sha256": probe_sha256,
+        "environment_helper_sha256": environment_sha256,
+        "environment_helper_sha256_after": sha256(
+            environment_helper.read_bytes()
+        ).hexdigest(),
+        "probe_sha256_after": sha256(Path(__file__).read_bytes()).hexdigest(),
         "injected_adapter_fsync_delay": {
             "milliseconds": args.fsync_delay_ms,
             "kind": args.fsync_delay_kind,
@@ -421,6 +577,15 @@ def _run(args, root: Path):
         ],
     }
 
+    if report["library_cleanup_adapter"]["status"] != "completed":
+        report.update(
+            status="error",
+            acceptance={"status": "incomplete"},
+            error_type="CleanupMeasurementError",
+            error="cleanup adapter measurements are incomplete",
+        )
+    return _validate_source_evidence(report)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -430,6 +595,7 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--fsync-delay-ms", type=int, default=0)
+    parser.add_argument("--cleanup-journal-delay-ms", type=int, default=0)
     parser.add_argument(
         "--fsync-delay-kind", choices=("file", "directory", "all"), default="all"
     )
@@ -445,16 +611,19 @@ def main() -> int:
         and 1 <= args.workers <= 4
         and 10 <= args.timeout <= 3600
         and 0 <= args.fsync_delay_ms <= 5
+        and 0 <= args.cleanup_journal_delay_ms <= 5
     ):
         parser.error("fixture/worker/deadline exceeds bounded probe limits")
     if args.galleries * args.pages * args.edge**2 > 2_147_483_648:
         parser.error("aggregate fixture exceeds two billion pixels")
     if args.worker:
+        binding = _ENVIRONMENT["worker_binding"](args.workspace)
         with tempfile.TemporaryDirectory(
             prefix="artifact-io-fixture-", dir=args.workspace
         ) as folder:
             report = _run(args, Path(folder))
         report["fixture_removed"] = not Path(folder).exists()
+        report["execution_binding"] = binding
         print(json.dumps(report))
         return 0
     if args.output.exists() or args.output.is_symlink():
@@ -463,7 +632,7 @@ def main() -> int:
         prefix="artifact-io-owner-", dir=args.workspace
     ) as workspace:
         try:
-            completed = subprocess.run(
+            command, environment = _ENVIRONMENT["fresh_python_environment"](
                 [
                     sys.executable,
                     str(Path(__file__).resolve()),
@@ -472,15 +641,34 @@ def main() -> int:
                     "--workspace",
                     workspace,
                 ],
+                Path(workspace),
+            )
+            completed = subprocess.run(
+                command,
+                env=environment,
                 capture_output=True,
                 text=True,
                 check=True,
                 timeout=args.timeout,
             )
             report = json.loads(completed.stdout)
-            if report.get("status") != "completed":
-                raise ValueError("worker omitted completed evidence")
-        except (subprocess.SubprocessError, ValueError) as error:
+            if not isinstance(report, dict):
+                raise ValueError("worker omitted report object")
+            _validate_source_evidence(report)
+            if report["status"] == "completed" and report.get("execution_binding") != {
+                "bytecode": "fresh supervisor-owned cache; compile source without existing .pyc",
+                "pycache_prefix": str(Path(workspace) / "pycache"),
+                "temporary_root": str(Path(workspace) / "temporary"),
+            }:
+                report.update(
+                    status="error",
+                    acceptance={"status": "incomplete"},
+                    error_type="WorkerBindingError",
+                    error="worker runtime binding differs from supervisor ownership",
+                )
+            if report.get("status") not in {"completed", "error"}:
+                raise ValueError("worker omitted completed or incomplete evidence")
+        except (subprocess.SubprocessError, ValueError, OSError) as error:
             report = {
                 "status": "failed",
                 "error_type": type(error).__name__,

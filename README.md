@@ -392,6 +392,16 @@ wall time is not a NAS throughput prediction. A small fixture with
 `--fsync-delay-ms 2 --fsync-delay-kind directory` or `file` injects a known delay
 at the adapter boundary to check attribution. It still executes the actual
 fsync and all publication checks; the artificial delay is not a device model.
+The independent `library_cleanup_adapter` report wraps actual resident library
+maintenance separately, counting its journal, locks, fsync and logical byte
+operations. It includes pre-claim and post-session calls; its wall time overlaps
+the enclosing resident timings and must not be added to them. Publication INFO
+metrics retain their original scope. `--cleanup-journal-delay-ms 2` injects a
+bounded delay only inside cleanup journal sessions to test that attribution;
+production logging and execution semantics are unchanged. Runtime or probe-source
+drift makes the probe exit nonzero with incomplete evidence while retaining
+measurements and oracle results. A completed diagnostic does not prove the source
+cost budgets or the full-library time objective.
 
 Core records source actions, ingest permission checks and cleanup candidate
 checks separately. Long-operation progress identifies a pending connector call;
@@ -489,6 +499,75 @@ For background on the verification evidence and its limits, see
 package versions, database backend, command, and relevant error context in the
 [issue tracker](https://github.com/Kuan-Lun/h2hdb-ingest/issues), with credentials
 and private paths removed.
+
+## Local source-cost acceptance
+
+From a development checkout with its environment installed, run this manual,
+POSIX-only acceptance before drawing conclusions from a source optimization:
+
+```bash
+.venv/bin/python scripts/check-source-cost.py --output /tmp/source-cost.json
+```
+
+The report path must not already exist. Exit `0` means the declared work budgets
+are satisfied, `1` means measured work violates a budget, and `2` means evidence
+is incomplete or execution failed. A completed experiment is not necessarily a
+passing acceptance. The current duplicate source reads and repeated whole-gallery
+entry validation are expected to produce violations; the checker preserves these
+targets instead of relabelling existing costs as acceptable.
+
+The default matrix uses deterministic PNG and JPEG fixtures with 127, 128, 129,
+and 512 pages, plus 1024-pixel and 2048-pixel images that exercise real decoding
+and disk-spool boundaries. It repeats fresh observations and metadata-only
+comparisons, measures completion-marker probes, and injects an interruption before
+a fresh source retry. It records logical read bytes, decoder calls, actual entry
+stat/revalidation work, CPU and wall time, and independently reconciles production
+telemetry. Fixture generation is timed separately. Runtime source digests must
+match the checkout; report provenance includes dependency digests and the commit.
+
+The work targets are one source-byte pass per complete observation, at most eight
+entry-stat passes independent of gallery size, and exactly one qualification
+decode per page when enabled. They are improvement targets, not a claim that
+the present implementation already meets them. Qualification includes decoding
+and resizing before CBZ generation. Inclusive decoder, I/O and revalidation times
+overlap; they cannot be added to wall time.
+
+This adapter acceptance does not exercise durable database reuse, full catalog
+analysis, publication, CBZ generation or library cleanup. Its marker-only case
+must not be described as an end-to-end unchanged-run result. The existing
+`probe-source-io.py` remains a diagnostic for actual published-baseline reuse.
+Local synthetic timings do not establish the full-library targets of 24 hours
+without CBZ work (12 hours desired), or seven days total including CBZ work.
+
+## Local library-cleanup cost acceptance
+
+Run the isolated journal experiment separately from source or database benchmarks:
+
+```bash
+.venv/bin/python scripts/check-library-cleanup-cost.py \
+  --full-inventory --output /tmp/library-cleanup-cost.json
+```
+
+This measures the two actual production cleanup-selection queries against the
+production SQLite journal schema. Default retained-token counts are 0, 127, 128,
+129, 4,096 and 32,768; `--full-inventory` adds 264,092 tokens, representing two
+resources per 132,046 galleries. Each size has no-eligible and sparse-eligible
+cases, with three reset/replay cycles and exact selected-row checks.
+
+The acceptance unit is SQLite VM instructions, including work that returns no
+rows. A fixed input-derived budget rejects repeated full-table scans. The same
+queries also run with an index added only to disposable fixtures and with a
+forced scan: the index control must pass, and the forced scan must fail at large
+sizes. These controls verify that the checker distinguishes efficient access
+from the measured regression. Runtime code and journal format are unchanged.
+
+The report separates experiment `status` from `acceptance.status` and uses the
+same exit codes `0`, `1`, and `2` as source acceptance. Wall time includes the
+per-instruction measurement callback and is not a production latency estimate.
+The seeded engine fixture does not exercise filesystem locking, hashing, unlink,
+fsync, journal-open validation, or the complete public cleanup lifecycle. Core
+publication/cleanup acceptance is a separate command in an explicitly supplied
+Core checkout; neither isolated measurement establishes the full-library SLO.
 
 ## License
 

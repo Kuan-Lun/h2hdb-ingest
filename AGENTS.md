@@ -342,6 +342,13 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
 
 ### Verification
 
+- Source與library cleanup效能使用手動 `scripts/check-source-cost.py`及
+  `scripts/check-library-cleanup-cost.py`驗收；Core SQL工作另使用明確提供的
+  Core checkout之database performance驗收。使用固定成本預算、真實執行計數
+  與退化反例，分開回報量測完整性、成本滿足與全庫工期證據。exit 0只代表
+  所選成本契約滿足，1代表違反，2代表證據不足或執行失敗；工具測試通過不能
+  覆蓋成本驗收失敗。這些手動結果不屬於bounded merge receipt，亦不證明NAS
+  12/24小時或含CBZ七日目標。後續效能修改不得由當次測量推導或放寬驗收預算。
 - 一般 tests 必須離線且使用 temporary roots/fakes；private corpus 永遠
   opt-in，不得進入自動 merge gate。
 - MariaDB resident-lifecycle E2E 使用 testcontainers 的 MariaDB 10.11.11，
