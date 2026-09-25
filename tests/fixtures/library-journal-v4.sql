@@ -1,16 +1,7 @@
-"""Single authoring surface for the private activation journal, format 5."""
 
-from __future__ import annotations
-
-import sqlite3
-from uuid import UUID
-
-FORMAT_VERSION = 5
-
-SCHEMA = """
 CREATE TABLE IF NOT EXISTS library_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    format_version INTEGER NOT NULL CHECK (format_version = 5),
+    format_version INTEGER NOT NULL CHECK (format_version = 4),
     current_revision INTEGER NULL,
     current_receipt_id BLOB NULL,
     pending_revision INTEGER NULL,
@@ -23,7 +14,7 @@ CREATE TABLE IF NOT EXISTS library_state (
     )
 );
 INSERT OR IGNORE INTO library_state
-    (singleton, format_version, phase) VALUES (1, 5, 'IDLE');
+    (singleton, format_version, phase) VALUES (1, 4, 'IDLE');
 CREATE TABLE IF NOT EXISTS library_storage_identity (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     storage_instance_uuid BLOB NOT NULL CHECK (length(storage_instance_uuid) = 16)
@@ -53,9 +44,6 @@ CREATE INDEX IF NOT EXISTS protection_object_idx ON protection_tokens (
 CREATE UNIQUE INDEX IF NOT EXISTS protection_one_active_stage_idx
     ON protection_tokens(storage_path)
     WHERE state IN ('WRITING', 'STAGED');
-CREATE INDEX IF NOT EXISTS protection_cleanup_eligible_idx
-    ON protection_tokens(token)
-    WHERE state = 'RELEASED' AND staging_leaf IS NOT NULL;
 CREATE TABLE IF NOT EXISTS current_entries (
     publication_key BLOB NOT NULL CHECK (length(publication_key) = 32),
     resource_kind TEXT NOT NULL CHECK (
@@ -154,57 +142,3 @@ CREATE TABLE IF NOT EXISTS library_relocation_files (
     old_changed_ns INTEGER NULL,
     PRIMARY KEY (session_id, relative_path)
 );
-"""
-
-
-def create_fresh_journal(
-    connection: sqlite3.Connection, storage_instance_uuid: bytes
-) -> None:
-    """Create one journal and its identity in an atomic transaction."""
-    identity = UUID(bytes=storage_instance_uuid)
-    if identity.version != 4:
-        raise ValueError("library storage identity must be UUIDv4")
-    connection.executescript(
-        "BEGIN IMMEDIATE;\n" + SCHEMA + "\nINSERT INTO library_storage_identity "
-        "(singleton, storage_instance_uuid) VALUES "
-        f"(1, X'{identity.hex}');\nCOMMIT;\n"
-    )
-
-
-def require_exact_schema(connection: sqlite3.Connection) -> None:
-    """Reject unknown tables, indexes, triggers, views and altered SQL."""
-    query = (
-        "SELECT type, name, tbl_name, sql FROM sqlite_master "
-        "WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name"
-    )
-    reference = sqlite3.connect(":memory:")
-    try:
-        create_fresh_journal(
-            reference, bytes.fromhex("00000000000040008000000000000001")
-        )
-        expected = reference.execute(query).fetchmany(128)
-        actual = connection.execute(query).fetchmany(128)
-        if actual != expected:
-            raise RuntimeError(
-                "unsupported library activation journal shape (expected v5)"
-            )
-    finally:
-        reference.close()
-    row = connection.execute(
-        "SELECT singleton, format_version FROM library_state LIMIT 2"
-    ).fetchmany(2)
-    if row != [(1, FORMAT_VERSION)]:
-        raise RuntimeError(
-            "unsupported library activation journal format (expected v5)"
-        )
-
-
-def require_no_relocation(connection: sqlite3.Connection) -> None:
-    """Normal runtime must not modify a maintenance session after a crash."""
-    row = connection.execute(
-        "SELECT phase FROM library_relocation_session WHERE singleton = 1"
-    ).fetchone()
-    if row is not None and row[0] != "COMPLETE":
-        raise RuntimeError(
-            "library relocation is unfinished; rerun the library relocation tool"
-        )

@@ -1,7 +1,8 @@
 """Measure cleanup-selection VM work on isolated, seeded production journals.
 
 This is an SQLite engine cost experiment, not public end-to-end library cleanup.
-Only disposable fixtures receive the counterfactual index. Runtime is unchanged.
+Production uses its exact v5 index; an extra fixture index and forced scans
+independently exercise the unchanged cost budget and negative control.
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ MODEL = {
         "targets, not a SQLite opcode theorem or a budget fitted to current scans."
     ),
     "controls": (
-        "Same real SQL, data and exact row oracle: an index only in the disposable "
+        "Same real SQL, data and exact row oracle: an additional index in the disposable "
         "fixture must satisfy the target; NOT INDEXED must violate it at N >= 4096."
     ),
     "limits": (

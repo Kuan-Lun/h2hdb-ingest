@@ -3834,6 +3834,11 @@ def _storage_key(value: StorageObjectKey) -> StorageObjectKey:
 def _require_runtime_journal_format(row: object) -> None:
     if row == (_JOURNAL_FORMAT_VERSION,):
         return
+    if row == (4,):
+        raise RuntimeError(
+            "library journal v4 requires the offline journal-v4-to-v5 upgrade tool; "
+            "stop consumers and preserve the existing library"
+        )
     raise RuntimeError(
         "unsupported library activation journal format; a fresh library root is required"
     )

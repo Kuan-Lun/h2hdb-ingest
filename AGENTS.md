@@ -250,9 +250,12 @@ ID；建立 immutable natural `VNextIngestPolicy` facts，由 core 配置 author
   其他類型都必須在修改 private state 前 fail closed；不得 migrate、fallback
   或接納舊 coordination layout。
 - Legacy `current/hash-v1`與 activation journal format v1/v2/v3必須明確 fail
-  closed並要求 fresh rebuild；不得自動刪除、migrate或和v4 journal混合啟動。
-  Normal runtime與搬移CLI都只接受journal v4的exact schema；不得保留舊格式
-  reader、升級工具或自動fallback。
+  closed並要求 fresh rebuild；不得自動刪除、migrate或和v5 journal混合啟動。
+  Normal runtime與搬移CLI都只接受journal v5的exact schema；不得保留舊格式
+  runtime reader或自動fallback。Exact v4只能透過一次性離線
+  `upgrade-library-journal-v4-to-v5.py`新增cleanup partial index並原子更新
+  version control；工具須保留UUID、publication/relocation facts與所有artifact
+  bytes，拒絕foreign或v1/v2/v3，且必須在consumers停止後執行。
   完整library搬移保留既有UUID與core binding，以獨立durable relocation session
   保存目的地、進度與驗證結果，不得覆寫publication phase、receipt或cursor。
   搬移期間阻擋normal publication與cleanup；每批最多128個logical resources，

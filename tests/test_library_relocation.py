@@ -207,7 +207,7 @@ def _activate(
         adapter.complete(2, b"s" * 16)
 
 
-def test_relocation_verifies_complete_v4_copy_preserving_catalog_and_bytes(
+def test_relocation_verifies_complete_v5_copy_preserving_catalog_and_bytes(
     tmp_path: Path,
 ) -> None:
     original = tmp_path / "original"
@@ -227,7 +227,7 @@ def test_relocation_verifies_complete_v4_copy_preserving_catalog_and_bytes(
         assert connection.execute(
             "SELECT format_version, current_revision, current_receipt_id, "
             "pending_revision, phase FROM library_state"
-        ).fetchone() == (4, 1, _RECEIPT, None, "IDLE")
+        ).fetchone() == (5, 1, _RECEIPT, None, "IDLE")
         assert connection.execute(
             "SELECT storage_instance_uuid FROM library_storage_identity"
         ).fetchone() == (_STORAGE_UUID,)
@@ -383,7 +383,7 @@ def test_relocation_rejects_batch_outside_hard_cap(
     with sqlite3.connect(_journal(root)) as connection:
         assert connection.execute(
             "SELECT format_version FROM library_state"
-        ).fetchone() == (4,)
+        ).fetchone() == (5,)
 
 
 @pytest.mark.parametrize("corruption", ("bytes", "size", "symlink", "missing", "link"))
@@ -667,7 +667,7 @@ def test_relocation_rejects_contended_publication_lock_before_session_start(
     with sqlite3.connect(_journal(root)) as connection:
         assert connection.execute(
             "SELECT format_version FROM library_state"
-        ).fetchone() == (4,)
+        ).fetchone() == (5,)
 
 
 def test_relocation_refuses_replaced_root_during_unfinished_session(
@@ -976,4 +976,4 @@ def test_relocation_rejects_invalid_storage_uuid_before_authorizing(
     with sqlite3.connect(_journal(root)) as connection:
         assert connection.execute(
             "SELECT format_version FROM library_state"
-        ).fetchone() == (4,)
+        ).fetchone() == (5,)
