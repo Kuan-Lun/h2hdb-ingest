@@ -34,7 +34,7 @@ def test_real_production_queries_on_exact_journal_have_three_cycle_boundary_evid
     probe: dict[str, Any], measured: dict[str, Any]
 ) -> None:
     assert measured["status"] == "completed"
-    assert measured["acceptance"]["status"] == "violated"
+    assert measured["acceptance"]["status"] == "satisfied"
     assert measured["acceptance"]["controls"] == "passed"
     assert measured["evidence_profile"] == "seeded_isolated_sqlite_engine"
     assert measured["cleanup_limit"] == 8
@@ -45,7 +45,7 @@ def test_real_production_queries_on_exact_journal_have_three_cycle_boundary_evid
             len(c["pages"]) == (3 if case["eligible_tokens"] else 1)
             for c in case["cycles"]
         )
-        if case["variant"] == "fixture_index":
+        if case["variant"] in {"production", "fixture_index"}:
             assert case["acceptance"]["status"] == "satisfied"
         elif case["retained_tokens"] >= 4096:
             assert case["acceptance"]["status"] == "violated"
@@ -179,6 +179,8 @@ def test_aggregate_recomputes_complete_matrix_and_controls(
         report["acceptance"] = {"status": "satisfied"}
         for case in report["cases"]:
             case["acceptance"] = {"status": "satisfied"}
+        production = next(c for c in report["cases"] if c["variant"] == "production")
+        production["cycles"][0]["pages"][0]["page"]["vm_instructions"] = 10**9
     assessed = probe["_assess"](
         report,
         sizes=probe["DEFAULT_SIZES"],
@@ -212,7 +214,7 @@ def test_foreign_imported_code_is_rejected(
 @pytest.mark.parametrize(
     ("dimensions", "status", "acceptance", "exit_code"),
     (
-        ("0,4096", "completed", "violated", 1),
+        ("0,4096", "completed", "satisfied", 0),
         ("0", "completed", "incomplete", 2),
         ("invalid", "error", "incomplete", 2),
     ),

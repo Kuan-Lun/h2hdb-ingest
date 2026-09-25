@@ -1,9 +1,10 @@
-"""Bounded publication-local I/O attribution, independent of storage authority.
+"""Bounded operation-local I/O attribution, independent of storage authority.
 
 Inclusive durations include nested operations and must not be added. Exclusive
 durations subtract measured children on the same thread; their sum is bounded
-by publication wall time. Bytes are logical bytes, including repeated reads,
-not physical disk traffic. No path, object key or protection token is retained.
+by operation wall time. Bytes are logical bytes, including repeated reads,
+not physical disk traffic. Query rows count returned rows, never rows examined
+by the database engine. No path, object key or protection token is retained.
 """
 
 from __future__ import annotations
@@ -42,6 +43,8 @@ AdapterOperation = Literal[
     "journal_session",
     "journal_commit",
     "journal_rollback",
+    "journal_cleanup_select",
+    "journal_cleanup_exists",
     "state_lock_wait",
     "publication_lock_wait",
     "protection_lock_wait",
@@ -49,6 +52,7 @@ AdapterOperation = Literal[
     "file_fsync",
     "directory_fsync",
     "rename",
+    "scratch_cleanup",
 ]
 
 
@@ -59,6 +63,7 @@ class _Total:
     calls: int = 0
     failed_calls: int = 0
     logical_bytes: int = 0
+    rows_returned: int = 0
 
 
 @dataclass
@@ -157,6 +162,7 @@ class AdapterPerformance:
                             IngestMetricValue("calls", total.calls),
                             IngestMetricValue("failed_calls", total.failed_calls),
                             IngestMetricValue("logical_bytes", total.logical_bytes),
+                            IngestMetricValue("rows_returned", total.rows_returned),
                         ),
                     )
                     for name, total in sorted(self.totals.items())
@@ -190,6 +196,7 @@ def summarize_adapter_io(
     sink: IngestMetricSink | None,
     *,
     generation: int,
+    operation: str = "publication",
     clock: Callable[[], int] = monotonic_ns,
     interval_ns: int = 60_000_000_000,
 ) -> Iterator[None]:
@@ -215,7 +222,7 @@ def summarize_adapter_io(
     finally:
         measured.active = False
         _current.reset(token)
-        measured.emit("publication", status)
+        measured.emit(operation, status)
 
 
 @contextmanager
@@ -246,6 +253,13 @@ def adapter_bytes(operation: AdapterOperation, size: int) -> None:
     measured = _owned_measurement()
     if measured is not None:
         measured.totals.setdefault(operation, _Total()).logical_bytes += size
+
+
+def adapter_rows(operation: AdapterOperation, count: int) -> None:
+    """Count actual fetched query rows without claiming database scan work."""
+    measured = _owned_measurement()
+    if measured is not None:
+        measured.totals.setdefault(operation, _Total()).rows_returned += count
 
 
 def adapter_read(stream: BinaryIO, size: int, operation: AdapterOperation) -> bytes:

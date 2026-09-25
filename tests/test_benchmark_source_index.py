@@ -126,10 +126,11 @@ def test_resource_monitor_does_not_pollute_source_scan_count(
     result = run_pipeline(1, progress_seconds=0.05)
 
     assert monitor_scans > scans_before
-    # Qualification enumerates PAGE inputs before freezing; the final marker
-    # probe adds one full entry-set audit after the source bytes are captured.
+    # Build the initial entry index once and fully audit it at the final marker
+    # probe. Intermediate source/qualification pages must not rescan the gallery;
+    # the resource monitor's unrelated directory walks must not enter this count.
     gallery_scans = baseline["gallery_scans_including_discovery"]
-    assert gallery_scans == 6
+    assert gallery_scans == 2
     assert result["gallery_scans_including_discovery"] == gallery_scans
     assert result["observation_gallery_scans"] == baseline["observation_gallery_scans"]
     assert result["acquisition_count"] == 1

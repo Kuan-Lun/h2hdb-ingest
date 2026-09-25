@@ -236,6 +236,13 @@ class FilesystemGalleryMetadata:
 
 @dataclass(frozen=True, slots=True)
 class FilesystemGalleryObservation:
+    """An indexed observation handle, not a completed source snapshot.
+
+    Pages revalidate their own entries. A complete observation must finish with
+    ``revalidate_observed_gallery`` (also performed by the core adapter's final
+    completion-marker probe) before it can be accepted as a frozen snapshot.
+    """
+
     metadata: FilesystemGalleryMetadata
 
 
@@ -683,7 +690,13 @@ class FilesystemSource:
             )
             for row in rows[:bound]
         )
-        self._require_gallery_unchanged(index)
+        self._require_gallery_page_unchanged(
+            index,
+            tuple(
+                (bytes(row[0]), _stat_from_row(row[1:]), FilesystemEntryType.REGULAR)
+                for row in rows
+            ),
+        )
         return index.observation, FilesystemPage(items, len(rows) <= bound)
 
     def list_directories(
@@ -724,7 +737,17 @@ class FilesystemSource:
             )
             for row in rows[:bound]
         )
-        self._require_gallery_unchanged(index)
+        self._require_gallery_page_unchanged(
+            index,
+            tuple(
+                (
+                    bytes(row[0]),
+                    _stat_from_row(row[1:6]),
+                    FilesystemEntryType(int(row[6])),
+                )
+                for row in rows
+            ),
+        )
         return index.observation, FilesystemPage(items, len(rows) <= bound)
 
     def list_tags(
@@ -752,7 +775,7 @@ class FilesystemSource:
             .fetchall()
         )
         selected = tuple((_exact_text(row[0]), _exact_text(row[1])) for row in rows)
-        self._require_gallery_unchanged(index)
+        self._require_gallery_page_unchanged(index, ())
         return index.observation, FilesystemPage(
             selected[:bound], len(selected) <= bound
         )
@@ -1271,7 +1294,64 @@ class FilesystemSource:
             entry_count=entry_count,
         )
 
+    def _require_gallery_page_unchanged(
+        self,
+        index: _FilesystemGalleryIndex,
+        entries: tuple[tuple[bytes, FilesystemStat, FilesystemEntryType], ...],
+    ) -> None:
+        """Validate one bounded page, including its lookahead and metadata.
+
+        Directory identity detects additions/removals/replacements; individual
+        no-follow stats validate every returned entry and the lookahead. An
+        in-place edit to an earlier page can be detected at the final complete
+        audit instead of the next page. This method is deliberately not a seal:
+        the adapter's final marker probe must still call the full audit below.
+        """
+
+        self._checkpoint()
+        self._require_root_identity()
+        if self._directory_stat(index.folder) != index.directory_stat:
+            raise _gallery_changed(index.folder)
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                index.folder,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or FilesystemStat.from_os_stat(opened) != index.directory_stat
+            ):
+                raise _gallery_changed(index.folder)
+            for name, expected, kind in entries:
+                self._checkpoint()
+                value = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                if (
+                    FilesystemStat.from_os_stat(value) != expected
+                    or _entry_type(value.st_mode) != kind
+                ):
+                    raise _gallery_changed(index.folder)
+            self._require_gallery_metadata_unchanged(index)
+            if (
+                FilesystemStat.from_os_stat(os.fstat(descriptor))
+                != index.directory_stat
+                or self._directory_stat(index.folder) != index.directory_stat
+            ):
+                raise _gallery_changed(index.folder)
+        except OSError as error:
+            raise _source_io_error(
+                f"unable to revalidate gallery page {index.folder}: {error}", error
+            ) from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        self._require_root_identity()
+
     def _require_gallery_unchanged(self, index: _FilesystemGalleryIndex) -> None:
+        """Final complete audit; never replace it with a successful page check."""
         self._checkpoint()
         self._require_root_identity()
         connection = self._discovery_index()
@@ -1333,6 +1413,12 @@ class FilesystemSource:
             or current_audit != index.entry_audit_sha256
         ):
             raise _gallery_changed(index.folder)
+        self._require_gallery_metadata_unchanged(index)
+        self._require_root_identity()
+
+    def _require_gallery_metadata_unchanged(
+        self, index: _FilesystemGalleryIndex
+    ) -> None:
         try:
             metadata_digest = self._hash_path(
                 index.folder / GALLERY_INFO_NAME,
@@ -1342,7 +1428,6 @@ class FilesystemSource:
             raise _gallery_changed(index.folder) from error
         if metadata_digest != index.metadata_sha256:
             raise _gallery_changed(index.folder)
-        self._require_root_identity()
 
     def _require_open(self) -> None:
         if self._closed:

@@ -8,17 +8,15 @@ bytes, and it preserves the publication state machine and receipt.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
-import stat
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from uuid import UUID, uuid4
 
 from ._library_journal import require_exact_schema
+from ._library_maintenance import locked_library
 from ._relocation_files import LibraryFiles, ObservedFile, Signature, unsigned
 from ._storage_paths import validate_storage_path
 
@@ -113,7 +111,7 @@ def relocate_library_step(
     """
     if type(batch_size) is not int or not 1 <= batch_size <= _MAX_BATCH:
         raise ValueError("relocation batch_size must be between 1 and 128")
-    with _locked_library(root) as (files, connection):
+    with locked_library(root) as (files, connection, _revalidate):
         require_exact_schema(connection)
         session = _session(connection)
         if session is None or (
@@ -157,88 +155,6 @@ def relocate_library_step(
         return RelocationResult(
             current.session_id, current.verified_files, current.phase == "COMPLETE"
         )
-
-
-@contextmanager
-def _locked_library(root: Path) -> Iterator[tuple[LibraryFiles, sqlite3.Connection]]:
-    # The deployment uses POSIX flock for both ingest and OPDS readers.
-    import fcntl
-
-    files = LibraryFiles(root)
-    descriptors: list[int] = []
-    connection: sqlite3.Connection | None = None
-    try:
-        for path in (
-            ".h2hdb-coordination/publication.lock",
-            ".h2hdb-state/locks/state.lock",
-        ):
-            with files.parent(path) as (parent, leaf):
-                if parent is None:
-                    raise RuntimeError(f"library lock directory is missing: {path}")
-                descriptor = os.open(
-                    leaf, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent
-                )
-                descriptors.append(descriptor)
-                value = os.fstat(descriptor)
-                if not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
-                    raise RuntimeError(
-                        f"library lock is not a single-link regular file: {path}"
-                    )
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                named = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
-                if value.st_nlink != 1 or (value.st_dev, value.st_ino) != (
-                    named.st_dev,
-                    named.st_ino,
-                ):
-                    raise RuntimeError(
-                        f"library relocation lock changed identity: {path}"
-                    )
-                os.fsync(descriptor)
-                os.fsync(parent)
-        with files.parent(_DATABASE) as (parent, leaf):
-            if parent is None:
-                raise RuntimeError("existing library journal is missing")
-            descriptor = os.open(
-                leaf, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent
-            )
-            descriptors.append(descriptor)
-            database_identity = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(database_identity.st_mode)
-                or database_identity.st_nlink != 1
-            ):
-                raise RuntimeError("library journal is not a single-link regular file")
-            connection = sqlite3.connect(
-                (files.root / _DATABASE).as_uri() + "?mode=rw",
-                uri=True,
-                isolation_level=None,
-            )
-            named = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
-            if (named.st_dev, named.st_ino) != (
-                database_identity.st_dev,
-                database_identity.st_ino,
-            ):
-                raise RuntimeError("library journal changed while opening SQLite")
-            if connection.execute("PRAGMA journal_mode").fetchone() != ("delete",):
-                raise RuntimeError("relocation requires SQLite DELETE journal mode")
-            connection.execute("PRAGMA synchronous = FULL")
-            if connection.execute("PRAGMA synchronous").fetchone() != (2,):
-                raise RuntimeError("relocation requires SQLite FULL synchronization")
-            yield files, connection
-            named = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
-            if (named.st_dev, named.st_ino) != (
-                database_identity.st_dev,
-                database_identity.st_ino,
-            ):
-                raise RuntimeError("library journal changed identity during relocation")
-            os.fsync(descriptor)
-            os.fsync(parent)
-    finally:
-        if connection is not None:
-            connection.close()
-        for descriptor in reversed(descriptors):
-            os.close(descriptor)
-        files.close()
 
 
 def _session(connection: sqlite3.Connection) -> _Session | None:

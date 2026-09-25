@@ -146,7 +146,7 @@ def test_storage_identity_is_created_once_and_replayed_after_reopen(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT format_version FROM library_state WHERE singleton = 1"
-        ).fetchone() == (4,)
+        ).fetchone() == (5,)
         assert connection.execute(
             "SELECT singleton, storage_instance_uuid FROM library_storage_identity"
         ).fetchall() == [(1, created.storage_instance_uuid)]
@@ -4132,7 +4132,7 @@ def test_release_rejects_stage_suffix_swapped_in_journal(tmp_path: Path) -> None
     assert staged.read_bytes() == payload
 
 
-def test_journal_rejects_extra_v4_schema_surface(tmp_path: Path) -> None:
+def test_journal_rejects_extra_v5_schema_surface(tmp_path: Path) -> None:
     root = tmp_path / "library"
     adapter = _adapter(root)
     adapter._ensure_layout()
@@ -4145,7 +4145,7 @@ def test_journal_rejects_extra_v4_schema_surface(tmp_path: Path) -> None:
         _adapter(root)._ensure_layout()
 
 
-def test_journal_rejects_missing_v4_schema_without_repairing_it(
+def test_journal_rejects_missing_v5_schema_without_repairing_it(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "library"

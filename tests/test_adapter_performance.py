@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from hashlib import sha256
@@ -17,6 +18,7 @@ from h2hdb_ingest._adapter_performance import (
     adapter_bytes,
     adapter_phase,
     adapter_read,
+    adapter_rows,
     summarize_adapter_io,
 )
 from h2hdb_ingest.library import _publish_resumable_file
@@ -64,6 +66,40 @@ def test_nested_wall_attribution_and_checkpoint_are_cumulative() -> None:
     assert {item.name: item.value for item in terminal.counters}[
         "ingest_generation"
     ] == 91
+
+
+def test_cleanup_query_rows_include_only_actual_results_in_the_owner_scope() -> None:
+    records: list[IngestMetric] = []
+    with sqlite3.connect(":memory:") as connection:
+        connection.execute("CREATE TABLE candidates (position INTEGER PRIMARY KEY)")
+        connection.executemany(
+            "INSERT INTO candidates VALUES (?)", ((position,) for position in range(9))
+        )
+        with summarize_adapter_io(
+            records.append, generation=0, operation="library_cleanup"
+        ):
+            with adapter_phase("journal_cleanup_select"):
+                rows = connection.execute(
+                    "SELECT position FROM candidates ORDER BY position LIMIT 8"
+                ).fetchall()
+                adapter_rows("journal_cleanup_select", len(rows))
+            with adapter_phase("journal_cleanup_exists"):
+                exists = connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM candidates WHERE position > 7)"
+                ).fetchone()
+                adapter_rows("journal_cleanup_exists", int(exists is not None))
+            copied = copy_context()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                executor.submit(
+                    copied.run, adapter_rows, "journal_cleanup_select", 1000
+                ).result()
+        copied.run(adapter_rows, "journal_cleanup_select", 1000)
+    assert len(records) == 1
+    assert records[0].operation == "library_cleanup"
+    assert _values(records[0], "journal_cleanup_select")["rows_returned"] == 8
+    assert _values(records[0], "journal_cleanup_exists")["rows_returned"] == 1
+    assert _values(records[0], "journal_cleanup_select")["calls"] == 1
+    assert _values(records[0], "journal_cleanup_exists")["calls"] == 1
 
 
 @pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt])

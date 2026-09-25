@@ -6,6 +6,7 @@ import tempfile
 from collections.abc import Iterator
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 import pytest
 from h2h_galleryinfo_parser import parse_galleryinfo
@@ -161,7 +162,10 @@ def test_source_observation_is_sorted_bounded_and_replayable(tmp_path: Path) -> 
     assert checkpoints > 0
 
 
-def test_observation_replay_rejects_changed_source(tmp_path: Path) -> None:
+@pytest.mark.parametrize("component", ("files", "directories", "tags"))
+def test_prior_page_change_is_rejected_by_final_snapshot_barrier(
+    tmp_path: Path, component: str
+) -> None:
     root = tmp_path / "download"
     folder = _gallery(root, "1002")
     source = FilesystemSource(root)
@@ -169,10 +173,95 @@ def test_observation_replay_rejects_changed_source(tmp_path: Path) -> None:
 
     (folder / "001.jpg").write_bytes(b"changed")
 
+    # Earlier page edits need not be rediscovered on every later page. This
+    # intermediate page is not a frozen snapshot; final admission must reject.
+    if component == "tags":
+        source.list_tags(("1002",), after_position=0, limit=1)
+    else:
+        method = source.list_files if component == "files" else source.list_directories
+        method(("1002",), after_name=b"001.jpg", limit=1)
     with pytest.raises(
         FilesystemObservationError, match="changed between bounded pages"
     ):
-        source.list_files(("1002",), after_name=b"001.jpg", limit=1)
+        source.revalidate_observed_gallery(("1002",))
+
+
+@pytest.mark.parametrize("component", ("files", "directories"))
+@pytest.mark.parametrize("target_name", ("001.jpg", "002.jpg"))
+def test_page_checks_returned_entry_and_lookahead_without_rescanning(
+    tmp_path: Path, component: str, target_name: str
+) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "1002")
+    with FilesystemSource(root) as source:
+        source.observe_gallery(("1002",))
+        target = folder / target_name
+        before = target.stat()
+        # Restore mtime and preserve size: ctime still proves the indexed entry
+        # was modified, including the lookahead which is not returned yet.
+        target.write_bytes(b"!" * before.st_size)
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        method = source.list_files if component == "files" else source.list_directories
+        with pytest.raises(FilesystemSourceChangedError):
+            method(("1002",), after_name=None, limit=1)
+
+
+@pytest.mark.parametrize("mutation", ("add", "remove", "replace", "symlink"))
+def test_page_directory_guard_rejects_entry_namespace_changes(
+    tmp_path: Path, mutation: str
+) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "1002")
+    with FilesystemSource(root) as source:
+        source.list_files(("1002",), after_name=None, limit=1)
+        target = folder / "001.jpg"
+        match mutation:
+            case "add":
+                (folder / "new.jpg").write_bytes(b"new")
+            case "remove":
+                target.unlink()
+            case "replace":
+                replacement = folder / "temporary.jpg"
+                replacement.write_bytes(target.read_bytes())
+                replacement.replace(target)
+            case "symlink":
+                target.unlink()
+                target.symlink_to(folder / "002.jpg")
+        with pytest.raises(FilesystemSourceChangedError):
+            # The changed entry is outside this page; the directory guard must
+            # reject namespace edits before the next entry can be accepted.
+            source.list_files(("1002",), after_name=b"001.jpg", limit=1)
+
+
+@pytest.mark.parametrize("component", ("files", "directories", "tags", "marker"))
+@pytest.mark.parametrize("mutation", ("bytes", "mtime"))
+def test_metadata_marker_changes_reject_every_observation_boundary(
+    tmp_path: Path, component: str, mutation: str
+) -> None:
+    root = tmp_path / "download"
+    folder = _gallery(root, "1002")
+    with FilesystemSource(root) as source:
+        adapter = VNextFilesystemSourceAdapter(source)
+        observed = adapter.observe_gallery(("1002",))
+        marker = folder / "galleryinfo.txt"
+        before = marker.stat()
+        if mutation == "bytes":
+            marker.write_bytes(marker.read_bytes().replace(b"A title", b"B title"))
+        os.utime(marker, ns=(before.st_atime_ns, before.st_mtime_ns - 1))
+        with pytest.raises(VNextSourceDeferredError):
+            match component:
+                case "files":
+                    adapter.list_file_observations(
+                        observed, after_name_bytes=None, limit=1
+                    )
+                case "directories":
+                    adapter.list_directory_observations(
+                        observed, after_name_bytes=None, limit=1
+                    )
+                case "tags":
+                    adapter.list_tag_observations(observed, after_ordinal=None, limit=1)
+                case "marker":
+                    adapter.observe_completion_marker(("1002",))
 
 
 def test_artifact_roles_and_page_count_are_adapter_owned(tmp_path: Path) -> None:
@@ -569,18 +658,9 @@ def test_gallery_index_is_reused_across_pages_with_exact_reference_output(
     assert observation.metadata.source_file_count == len(expected_file_names)
     assert observation.metadata.page_count == 260
     assert (file_page_count, directory_page_count, tag_page_count) == (2, 3, 2)
-    # The legacy implementation built and audited three entry indexes for every
-    # named page, while tags rebuilt once.  The immutable active index is built
-    # once and every returned page performs one fresh, exact directory audit.
-    legacy_scan_count = (
-        1 + 3 * file_page_count + 3 * directory_page_count + (tag_page_count)
-    )
-    assert legacy_scan_count == 18
-    assert (
-        target_scans
-        == (1 + file_page_count + directory_page_count + tag_page_count)
-        == 8
-    )
+    assert target_scans == 1  # One immutable index; pages stat only their entries.
+    adapter.observe_completion_marker(("1005",))
+    assert target_scans == 2  # Mandatory fresh full audit closes the observation.
     source.close()
 
 
@@ -647,7 +727,7 @@ def test_gallery_index_keeps_only_one_payload_and_rebuilds_against_fixed_audit(
     )
 
 
-def test_gallery_page_boundary_rejects_mutation_during_fresh_audit(
+def test_gallery_page_boundary_rejects_mutation_during_entry_revalidation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -656,23 +736,21 @@ def test_gallery_page_boundary_rejects_mutation_during_fresh_audit(
     source = FilesystemSource(root)
     source.list_gallery_locators(after_locator=None, limit=1)
     source.observe_gallery(("1008",))
-    original_scandir = os.scandir
-    mutate_on_next_gallery_scan = True
+    original_stat = os.stat
+    mutate_on_next_page_entry = True
 
-    def mutating_scandir(
-        path: int | os.PathLike[str] | str,
-    ) -> Iterator[os.DirEntry[str]]:
-        nonlocal mutate_on_next_gallery_scan
+    def mutating_stat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        nonlocal mutate_on_next_page_entry
         if (
-            mutate_on_next_gallery_scan
-            and not isinstance(path, int)
-            and Path(path) == folder
+            mutate_on_next_page_entry
+            and path == b"002.jpg"
+            and kwargs.get("dir_fd") is not None
         ):
-            mutate_on_next_gallery_scan = False
-            (folder / "002.jpg").write_bytes(b"changed during boundary audit")
-        return original_scandir(path)
+            mutate_on_next_page_entry = False
+            (folder / "002.jpg").write_bytes(b"changed during page check")
+        return original_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "scandir", mutating_scandir)
+    monkeypatch.setattr(os, "stat", mutating_stat)
 
     with pytest.raises(
         FilesystemObservationError,

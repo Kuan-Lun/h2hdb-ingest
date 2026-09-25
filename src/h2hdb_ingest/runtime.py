@@ -99,6 +99,8 @@ class IngestRuntime:
             except BaseException:
                 object.__setattr__(self, "_unclean", True)
                 raise
+            finally:
+                self.resident.flush_performance()
             object.__setattr__(self, "_closed", True)
 
     def __enter__(self) -> Self:

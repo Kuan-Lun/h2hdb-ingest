@@ -94,7 +94,7 @@ def test_relocation_cli_verifies_current_journal_and_preserves_artifact(
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT format_version FROM library_state"
-        ).fetchone() == (4,)
+        ).fetchone() == (5,)
         assert connection.execute(
             "SELECT storage_instance_uuid FROM library_storage_identity"
         ).fetchone() == (identity,)

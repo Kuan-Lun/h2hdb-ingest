@@ -212,6 +212,16 @@ render-input spool while preparing its artifact, then releases it. Changed or
 missing source bytes cannot be published under the earlier observation and must
 be observed again. Keep the source collection available throughout the turn.
 
+Each source page validates its returned entries and lookahead against the initial
+index, while directory and metadata guards reject namespace or marker changes.
+A page is an intermediate observation, not a sealed snapshot. If another process
+modifies a file from an earlier page in place, a later page may return before the
+change is detected. The final completion-marker probe always performs a fresh
+audit of the complete observed entry set; both metadata-only and image-qualified
+observations are deferred before sealing if that audit fails. This replaces the
+previous full-gallery audit on every page, so entry stat probes grow linearly
+with the gallery size while preserving the final snapshot check.
+
 After interruption, ingest first checks an unpublished, sealed source batch.
 Its root and policies must match, and each existing gallery's completion marker
 is reread in pages of at most 128 galleries. This recovery pass takes
@@ -377,6 +387,22 @@ adapter measurements describe overlapping layers and must not be added together.
 Foreground source, publication, artifact totals and adapter I/O remain distinct
 summaries; the background monitor is a concurrent measurement.
 
+Library maintenance emits a separate INFO `scope=library_cleanup_io` report at
+outcome transitions and at the configured progress interval. It includes startup,
+pre-claim and post-session calls, scratch cleanup, and failed or interrupted work.
+Pending totals are flushed at a successful claim, after a single-cycle call and
+at orderly shutdown; repeated idle polls do not each produce an INFO record.
+`process_id` plus `observer_started_ns` identifies one process-local cumulative
+series; use `snapshot_sequence` and subtract consecutive snapshots. `elapsed_ns`
+sums only active maintenance calls, excluding polling and other ingest stages.
+Outcome counts describe completed adapter results, not a new cleanup authority.
+Exclusive operation totals and the unattributed residual partition active time;
+inclusive timings overlap. An in-flight call appears after it returns. These
+records use INFO without changing the configured log level. Cleanup candidate
+selection and existence probes expose separate query time, calls and
+`rows_returned`; the latter is the result size, not SQLite rows examined. The
+manual cleanup cost tool separately counts actual SQLite VM instructions.
+
 To exercise these boundaries with deterministic real JPEG files, public ingest,
 independent archive/raster checks, cleanup and a subsequent work claim:
 
@@ -392,9 +418,9 @@ wall time is not a NAS throughput prediction. A small fixture with
 `--fsync-delay-ms 2 --fsync-delay-kind directory` or `file` injects a known delay
 at the adapter boundary to check attribution. It still executes the actual
 fsync and all publication checks; the artificial delay is not a device model.
-The independent `library_cleanup_adapter` report wraps actual resident library
-maintenance separately, counting its journal, locks, fsync and logical byte
-operations. It includes pre-claim and post-session calls; its wall time overlaps
+The `library_cleanup_adapter` report collects the production maintenance observer's
+per-call measurements, counting its journal, locks, fsync and logical byte
+operations. It includes scratch, pre-claim and post-session calls; its wall time overlaps
 the enclosing resident timings and must not be added to them. Publication INFO
 metrics retain their original scope. `--cleanup-journal-delay-ms 2` injects a
 bounded delay only inside cleanup journal sessions to test that attribution;
@@ -441,13 +467,55 @@ inspection instead of being silently removed.
 
 Upgrade ingest and H2HDB together within their declared dependency ranges.
 Back up the database and the complete library before offline maintenance.
-Existing CBZs and the format-v4 library journal do not need rebuilding for the
-source observation checkpoint feature.
+The runtime and relocation command accept only the exact format-v5 private
+library journal. An existing format-v4 library needs the one-time offline
+conversion below; keep its CBZs, artwork and Core database. The converter adds a
+cleanup-selection index and atomically updates the version control table. It
+preserves the UUID, publication/protection/relocation facts, marker bytes and
+artifact files. It does not run a Core database migration or full database audit.
+
+Stop ingest, OPDS, Komga and every other process that could modify or read the
+library, then run the matching checkout and installed wheel:
+
+```bash
+.venv/bin/python scripts/upgrade-library-journal-v4-to-v5.py \
+  --library /data/h2hdb/library --consumers-stopped
+```
+
+An interrupted conversion can be rerun with the same command. SQLite commits
+the index and version together; an exact v5 replay verifies the journal without
+changing its facts. Foreign structures and v1–v3 are rejected. Normal startup
+does not convert an old journal or fall back to its old format.
+
+For Docker, build the portable bundle from explicit, verified Ingest and Core
+wheels, passing the actual host bind source from your deployment Compose:
+
+```bash
+.venv/bin/python scripts/build-library-journal-upgrade-bundle.py \
+  --wheel /path/to/ingest.whl --core-wheel /path/to/core.whl \
+  --library-root /data/h2hdb/library \
+  --output /tmp/h2hdb-journal-upgrade.tar.gz
+```
+
+Extract the bundle beside the deployment `.env`, then run its `compose.yaml`:
+
+```bash
+sudo docker compose --env-file .env \
+  -f ./h2hdb-journal4-to5-docker-0.28.0/compose.yaml \
+  run --rm --build --no-deps upgrade \
+  --library /hentai/library --consumers-stopped
+```
+
+The container uses `MEDIA_UID` and `MEDIA_GID` from `.env`, requires no Core
+credentials, and has no network access while executing the converter. Building
+the image can download dependencies. Restart consumers only after conversion
+reports completion and all installed application versions are compatible.
 
 An exact H2HDB schema-version-7 database can use the core project's one-time
-offline `upgrade-source-collection-schema.py` tool to reach schema version 8.
-Use the schema-8 Core checkout and its matching environment, stop all consumers,
-and follow the [core upgrade instructions](https://github.com/Kuan-Lun/h2hdb#readme).
+offline `upgrade-source-collection-schema.py` tool from historical Core 0.41.2
+to reach schema version 8. That tool was removed from Core 0.42; use the
+[Core 0.41.2 checkout and its matching environment](https://github.com/Kuan-Lun/h2hdb/tree/64683c5),
+with all consumers stopped.
 Keep the database, CBZs, thumbnails, and complete private library state in place;
 this conversion changes database schema, not artifact bytes or the library layout.
 For schema 6, first use Core 0.40.0's `upgrade-audit-schema.py` and its environment
@@ -556,10 +624,11 @@ cases, with three reset/replay cycles and exact selected-row checks.
 
 The acceptance unit is SQLite VM instructions, including work that returns no
 rows. A fixed input-derived budget rejects repeated full-table scans. The same
-queries also run with an index added only to disposable fixtures and with a
-forced scan: the index control must pass, and the forced scan must fail at large
-sizes. These controls verify that the checker distinguishes efficient access
-from the measured regression. Runtime code and journal format are unchanged.
+queries also run with a fixture-only index control and a forced scan: the index
+control must pass, and the forced scan must fail at large sizes. These controls
+verify that the checker distinguishes efficient access from the measured
+regression. Production journal v5 now has the matching partial index; the
+runtime must pass the original fixed budget independently of either control.
 
 The report separates experiment `status` from `acceptance.status` and uses the
 same exit codes `0`, `1`, and `2` as source acceptance. Wall time includes the

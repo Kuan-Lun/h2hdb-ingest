@@ -194,6 +194,14 @@ def process_logs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, _Process
     return logs
 
 
+def _metric_fields(line: str) -> dict[str, str]:
+    fields = line.split()
+    assert fields[0] == "ingest_metric"
+    values = dict(field.split("=", 1) for field in fields[1:])
+    assert len(values) == len(fields) - 1
+    return values
+
+
 def test_real_native_rendering_keeps_console_and_file_info_volume_per_batch(
     process_logs: dict[str, _ProcessLogs],
 ) -> None:
@@ -211,28 +219,43 @@ def test_real_native_rendering_keeps_console_and_file_info_volume_per_batch(
         assert str(logs.result["log_level"]).upper() == "INFO"
         info = logs.messages("INFO")
         metrics = [line for line in info if line.startswith("ingest_metric ")]
-        assert len(metrics) == 4
-        assert metrics[0].startswith(
+        batch_metrics = [
+            line
+            for line in metrics
+            if _metric_fields(line)["scope"] != "library_cleanup_io"
+        ]
+        assert Counter(
+            (_metric_fields(line)["scope"], _metric_fields(line)["operation"])
+            for line in batch_metrics
+        ) == {
+            ("source", "synchronize"): 1,
+            ("artifact_totals", "publication"): 1,
+            ("adapter_io", "publication"): 1,
+            ("publication", "synchronize"): 1,
+        }
+        assert batch_metrics[0].startswith(
             "ingest_metric scope=source operation=synchronize "
         )
-        assert "status=completed" in metrics[0]
+        assert all(
+            _metric_fields(line)["status"] == "completed" for line in batch_metrics
+        )
         for output in (logs.console, logs.file):
             metric_lines = [
-                line for line in output.splitlines() if "ingest_metric " in line
+                line.split("[INFO] ", 1)[1]
+                for line in output.splitlines()
+                if "[INFO] ingest_metric " in line
             ]
-            assert len(metric_lines) == 4
-            assert all(
-                any(f"[INFO] {metric}" in line for line in metric_lines)
-                for metric in metrics
-            )
+            assert Counter(metric_lines) == Counter(metrics)
         artifact_summary = next(
-            line for line in metrics if "scope=artifact_totals " in line
+            line for line in batch_metrics if "scope=artifact_totals " in line
         )
         assert "operation.render_archive.completed_calls=" in artifact_summary
         assert "operation.render_archive.render_batches_ns=" in artifact_summary
         assert "operation.render_archive.archive_page_write_ns=" in artifact_summary
         assert any("scope=publication " in line for line in logs.messages("INFO"))
-        adapter_summary = next(line for line in metrics if "scope=adapter_io " in line)
+        adapter_summary = next(
+            line for line in batch_metrics if "scope=adapter_io " in line
+        )
         assert "counter.ingest_generation=" in adapter_summary
         assert "operation.protect.inclusive_ns=" in adapter_summary
         assert "operation.stage_read.logical_bytes=" in adapter_summary
@@ -266,6 +289,86 @@ def test_real_native_rendering_keeps_console_and_file_info_volume_per_batch(
     assert [line.split()[0] for line in small.messages("INFO")] == [
         line.split()[0] for line in larger.messages("INFO")
     ]
+
+
+def test_cleanup_info_is_one_cumulative_series_in_both_handlers_and_log_levels(
+    process_logs: dict[str, _ProcessLogs],
+) -> None:
+    for logs in process_logs.values():
+        cleanup = [
+            line
+            for line in logs.messages("INFO")
+            if line.startswith("ingest_metric scope=library_cleanup_io ")
+        ]
+        # Startup and pre-claim are DONE; post-publication removes one page of
+        # pending journal rows and is PROGRESSED. Both fixture sizes fit one
+        # cleanup page, so more images/resources must not add per-artifact logs.
+        assert len(cleanup) == 3
+        records = [_metric_fields(line) for line in cleanup]
+        assert [int(r["counter.snapshot_sequence"]) for r in records] == [1, 2, 3]
+        assert [int(r["counter.calls"]) for r in records] == [1, 2, 3]
+        assert [int(r["counter.outcome_done"]) for r in records] == [1, 2, 2]
+        assert [int(r["counter.outcome_progressed"]) for r in records] == [0, 0, 1]
+        assert (
+            len(
+                {
+                    (r["counter.process_id"], r["counter.observer_started_ns"])
+                    for r in records
+                }
+            )
+            == 1
+        )
+        previous: dict[str, int] = {}
+        for attempt, record in enumerate(records, start=1):
+            assert record["scope"] == "library_cleanup_io"
+            assert record["operation"] == "maintenance"
+            assert record["status"] == "completed"
+            for name in (
+                "cumulative",
+                "active_attempt_time_only",
+                "logical_bytes_only",
+            ):
+                assert record[f"counter.{name}"] == "1"
+            for name in (
+                "failed_calls",
+                "interrupted_calls",
+                "clock_failures",
+                "collection_errors",
+                "outcome_blocked",
+            ):
+                assert record[f"counter.{name}"] == "0"
+            for operation in (
+                "scratch_cleanup",
+                "journal_cleanup_select",
+                "journal_cleanup_exists",
+            ):
+                assert int(record[f"operation.{operation}.calls"]) == attempt
+            assert record["operation.journal_cleanup_select.rows_returned"] == "0"
+            assert (
+                int(record["operation.journal_cleanup_exists.rows_returned"]) == attempt
+            )
+            assert int(record["elapsed_ns"]) == (
+                int(record["phase.attributed_exclusive_ns"])
+                + int(record["phase.unattributed_ns"])
+            )
+            cumulative = {
+                name: int(value)
+                for name, value in record.items()
+                if name == "elapsed_ns"
+                or name.startswith(("phase.", "operation.", "counter."))
+            }
+            assert all(cumulative[name] >= value for name, value in previous.items())
+            previous = cumulative
+        for output in (logs.console, logs.file):
+            actual = [
+                line.split("[INFO] ", 1)[1]
+                for line in output.splitlines()
+                if "[INFO] ingest_metric scope=library_cleanup_io " in line
+            ]
+            assert actual == cleanup
+        assert not any(
+            "scope=library_cleanup_io " in line for line in logs.messages("DEBUG")
+        )
 
 
 def test_debug_retains_native_and_per_artifact_metrics_without_polluting_events(

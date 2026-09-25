@@ -921,6 +921,40 @@ def test_library_maintenance_progress_skips_database_and_ingest() -> None:
     assert events == []
 
 
+def test_cleanup_info_covers_real_attempt_and_scratch_before_next_claim(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="h2hdb_ingest._maintenance_performance")
+    events: list[object] = []
+    maintenance = _LibraryMaintenance(
+        (LibraryMaintenanceOutcome.PROGRESSED, LibraryMaintenanceOutcome.DONE)
+    )
+    resident = _resident(
+        events,
+        available=False,
+        library_maintenance=maintenance,
+        temporary_cleanup=lambda: events.append("scratch-cleanup"),
+    )
+    assert resident.process_available(periodic_scan=False)
+    assert not resident.process_available(periodic_scan=False)
+    records = [
+        r.getMessage()
+        for r in caplog.records
+        if "scope=library_cleanup_io" in r.getMessage()
+    ]
+    assert len(records) == 2
+    assert "counter.calls=2" in records[-1]
+    assert "counter.outcome_progressed=1" in records[-1]
+    assert "counter.outcome_done=1" in records[-1]
+    assert "operation.scratch_cleanup.calls=2" in records[-1]
+    assert events == [
+        "scratch-cleanup",
+        "scratch-cleanup",
+        ("current-only", 10_000_000),
+        ("claim", False, 10_000_000),
+    ]
+
+
 def test_blocked_library_maintenance_uses_ordinary_claim_poll() -> None:
     events: list[object] = []
     library_maintenance = _LibraryMaintenance((LibraryMaintenanceOutcome.BLOCKED,))
@@ -1902,3 +1936,80 @@ def test_postflight_capacity_failure_is_fatal_and_releases_lease(
         _resident(events).process_available(periodic_scan=True, postflight=postflight)
     assert caught.value is failure
     assert events.count(("complete", 2)) == 1
+
+
+def _cleanup_info(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "scope=library_cleanup_io" in record.getMessage()
+    ]
+
+
+def test_idle_forever_flushes_last_attempts_on_stop_without_logging_every_poll(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caplog.set_level(logging.INFO, logger="h2hdb_ingest._maintenance_performance")
+    events: list[object] = []
+    maintenance = _LibraryMaintenance()
+    resident = _resident(events, available=False, library_maintenance=maintenance)
+
+    class Stop:
+        calls = 0
+
+        def is_set(self) -> bool:
+            return self.calls == 20
+
+        def wait(self, _timeout: float) -> bool:
+            self.calls += 1
+            return self.is_set()
+
+    monkeypatch.setattr(resident_module, "monotonic", lambda: 100.0)
+    resident.run_forever(stop=cast(Event, Stop()))
+    records = _cleanup_info(caplog)
+    assert maintenance.calls == 20
+    assert len(records) == 2
+    assert "counter.calls=1 " in records[0]
+    assert "counter.calls=20 " in records[-1]
+    resident.flush_performance()
+    assert _cleanup_info(caplog) == records
+
+
+def test_claim_and_process_available_flush_same_outcome_without_losing_tail(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caplog.set_level(logging.INFO, logger="h2hdb_ingest._maintenance_performance")
+    monkeypatch.setattr(resident_module, "IngestLeaseHeartbeat", _Heartbeat)
+    events: list[object] = []
+    facade = _Facade(events, available=False)
+
+    class CheckingService(_Service):
+        def synchronize_once(
+            self,
+            session: IngestSessionController,
+            *,
+            should_stop: Callable[[], bool] | None = None,
+            reobserve_gallery_locators: tuple[tuple[str, ...], ...] = (),
+            reuse_sealed_observations: bool = True,
+        ) -> VNextIngestSynchronizationResult:
+            assert "counter.calls=2 " in _cleanup_info(caplog)[-1]
+            return super().synchronize_once(
+                session,
+                should_stop=should_stop,
+                reobserve_gallery_locators=reobserve_gallery_locators,
+                reuse_sealed_observations=reuse_sealed_observations,
+            )
+
+    service = CheckingService(events)
+    maintenance = _LibraryMaintenance()
+    resident = _resident(
+        events, facade=facade, service=service, library_maintenance=maintenance
+    )
+    assert not resident.process_available(periodic_scan=False)
+    facade._available = True
+    assert resident.process_available(periodic_scan=True)
+    assert maintenance.calls == 3
+    assert "counter.calls=3 " in _cleanup_info(caplog)[-1]
+    assert len(_cleanup_info(caplog)) == 3

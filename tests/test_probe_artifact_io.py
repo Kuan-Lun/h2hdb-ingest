@@ -292,6 +292,16 @@ def test_real_cleanup_latency_is_separate_and_source_drift_retains_oracles(
     assert publication
     assert all(item["counter.ingest_generation"] > 0 for item in publication)
     assert "directory_fsync" in cleanup["operations"]
+    assert report["cleanup_info_reconciliation"]["status"] == "matched"
+    info = [
+        item for item in report["all_metrics"] if item["scope"] == "library_cleanup_io"
+    ]
+    assert info[-1]["counter.calls"] == cleanup["calls"]
+    assert info[-1]["operation.journal_session.calls"] == journal["calls"]
+    assert (
+        info[-1]["operation.journal_session.exclusive_ns"]
+        >= journal["calls"] * 2_000_000
+    )
 
 
 def test_cleanup_observer_preserves_failure_and_reports_failed_phase(
@@ -307,8 +317,9 @@ def test_cleanup_observer_preserves_failure_and_reports_failed_phase(
 
     monkeypatch.setattr(adapter_type, "maintain_cleanup", failed)
     meter = probe["_CleanupMeasurement"]()
+    observer = probe["LibraryMaintenancePerformance"]()
     with meter.observe(), pytest.raises(OSError, match="cleanup read failure"):
-        adapter_type.maintain_cleanup(object())
+        observer.run(lambda: adapter_type.maintain_cleanup(object()))
     report = meter.report()
     assert report["status"] == "incomplete"
     assert report["calls"] == report["terminal_measurements"] == 1
@@ -396,3 +407,25 @@ def test_artifact_worker_compiles_current_runtime_despite_valid_stale_pyc(
     assert report["oracle"]["full_ready_audit"]
     assert report["oracle"]["raster_pages"] == 1
     assert report["execution_binding"]["pycache_prefix"] == str(workspace / "pycache")
+
+
+@pytest.mark.parametrize("missing", ("all", "last_count", "journal_time"))
+def test_cleanup_info_reconciliation_rejects_missing_production_measurements(
+    artifact_probe_report: dict[str, Any],
+    missing: str,
+) -> None:
+    probe = runpy.run_path(str(_SCRIPT))
+    report = copy.deepcopy(artifact_probe_report)
+    metrics = report["all_metrics"]
+    if missing == "all":
+        metrics = [m for m in metrics if m["scope"] != "library_cleanup_io"]
+    else:
+        last = [m for m in metrics if m["scope"] == "library_cleanup_io"][-1]
+        key = (
+            "counter.calls"
+            if missing == "last_count"
+            else "operation.journal_session.exclusive_ns"
+        )
+        last[key] += 1
+    with pytest.raises(ValueError, match="production INFO"):
+        probe["_validate_cleanup_info"](metrics, report["library_cleanup_adapter"])
