@@ -542,10 +542,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError, TypeError, sqlite3.Error) as error:
         report["status"] = "error"
         report["acceptance"] = {"status": "incomplete", "reasons": [str(error)]}
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("x") as stream:
-        json.dump(report, stream, indent=2, allow_nan=False)
-        stream.write("\n")
+    try:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        # Install only a complete report, without replacing a concurrent writer.
+        with tempfile.TemporaryDirectory(
+            prefix=".journal-cost-", dir=args.output.parent
+        ) as directory:
+            staged = Path(directory) / "report.json"
+            staged.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
+            args.output.hardlink_to(staged)
+    except (OSError, TypeError, ValueError) as error:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "acceptance": "incomplete",
+                    "error_type": type(error).__name__,
+                    "error": f"cannot store journal cost report: {error}",
+                }
+            ),
+            file=sys.stderr,
+        )
+        return 2
     print(
         json.dumps(
             {

@@ -5,15 +5,19 @@ from __future__ import annotations
 import copy
 import json
 import os
+import py_compile
 import runpy
 import signal
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from time import monotonic, sleep
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from h2hdb import ArtifactSourceRole, FileContentReceipt
 
 _SCRIPT = Path(__file__).parents[1] / "scripts" / "check-source-cost.py"
 pytestmark = pytest.mark.skipif(
@@ -91,8 +95,8 @@ def test_actual_extra_adapter_read_is_rejected_without_telemetry_disagreement(
     probe["_HELPERS"]["_fixture"](tmp_path, 1, 1, 16, "png")
     original = probe["_observe"]
 
-    def repeated(adapter: Any, *, mode: str) -> dict[str, int]:
-        result: dict[str, int] = original(adapter, mode=mode)
+    def repeated(adapter: Any, *, mode: str, oracle: dict[str, Any]) -> Any:
+        result = original(adapter, mode=mode, oracle=oracle)
         observation = adapter.observe_gallery(("1000000",))
         adapter.list_file_observations(observation, after_name_bytes=None, limit=256)
         return result
@@ -112,8 +116,8 @@ def test_entry_scan_budget_rejects_a_deliberately_degraded_real_path(
     probe["_HELPERS"]["_fixture"](tmp_path, 1, 1, 16, "png")
     original = probe["_observe"]
 
-    def rescanned(adapter: Any, *, mode: str) -> dict[str, int]:
-        result: dict[str, int] = original(adapter, mode=mode)
+    def rescanned(adapter: Any, *, mode: str, oracle: dict[str, Any]) -> Any:
+        result = original(adapter, mode=mode, oracle=oracle)
         for _ in range(9):
             adapter.observe_gallery(("1000000",))
         return result
@@ -131,6 +135,7 @@ def test_entry_scan_budget_rejects_a_deliberately_degraded_real_path(
         "io",
         "source_files",
         "returned_rows",
+        "content_oracle",
         "decode_calls",
         "production_telemetry",
         "entries",
@@ -458,3 +463,173 @@ def test_cli_io_failure_is_incomplete_not_a_measured_violation(
     assert report["status"] == "error"
     assert report["acceptance"]["status"] == "incomplete"
     assert report["error_type"] == "FileNotFoundError"
+
+
+@pytest.mark.parametrize(
+    ("method", "corruption"),
+    (
+        ("list_file_observations", "duplicate"),
+        ("list_file_observations", "order"),
+        ("list_file_observations", "digest"),
+        ("list_file_observations", "role"),
+        ("list_directory_observations", "duplicate"),
+        ("list_directory_observations", "stat"),
+        ("list_tag_observations", "duplicate"),
+        ("list_tag_observations", "value"),
+        ("list_tag_observations", "cursor"),
+    ),
+)
+def test_independent_fixture_oracle_rejects_same_count_corrupted_pages(
+    probe: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    corruption: str,
+) -> None:
+    probe["_HELPERS"]["_fixture"](tmp_path, 1, 2, 16, "png")
+    adapter_type = probe["VNextFilesystemSourceAdapter"]
+    original = getattr(adapter_type, method)
+
+    def corrupt(*args: Any, **kwargs: Any) -> Any:
+        page = original(*args, **kwargs)
+        items = list(page.items)
+        if corruption == "duplicate":
+            items[1] = items[0]
+        elif corruption == "order":
+            items.reverse()
+        elif corruption == "digest":
+            items[0] = replace(
+                items[0], content=FileContentReceipt.from_parts((b"wrong bytes",))
+            )
+        elif corruption == "role":
+            items[0] = replace(items[0], artifact_role=ArtifactSourceRole.OTHER)
+        elif corruption == "stat":
+            items[0] = replace(items[0], size_bytes=items[0].size_bytes + 1)
+        elif corruption == "value":
+            items[0] = replace(items[0], value="wrong tag")
+        return SimpleNamespace(
+            items=tuple(items),
+            terminal=page.terminal,
+            next_after=1 if corruption == "cursor" else page.next_after,
+        )
+
+    monkeypatch.setattr(adapter_type, method, corrupt)
+    with pytest.raises(ValueError, match="independent fixture oracle"):
+        probe["_case"](tmp_path, mode="metadata_only", workers=1)
+
+
+def test_independent_fixture_oracle_rejects_metadata_changes(
+    probe: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe["_HELPERS"]["_fixture"](tmp_path, 1, 1, 16, "png")
+    adapter_type = probe["VNextFilesystemSourceAdapter"]
+    original = adapter_type.observe_gallery
+
+    def corrupt(*args: Any, **kwargs: Any) -> Any:
+        observed = original(*args, **kwargs)
+        return replace(
+            observed, metadata=replace(observed.metadata, title="wrong title")
+        )
+
+    monkeypatch.setattr(adapter_type, "observe_gallery", corrupt)
+    with pytest.raises(ValueError, match=r"metadata.*independent fixture oracle"):
+        probe["_case"](tmp_path, mode="metadata_only", workers=1)
+
+
+def test_fresh_worker_does_not_load_timestamp_valid_stale_bytecode(
+    probe: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    module = tmp_path / "stale_runtime.py"
+    module.write_text("VALUE = 'old'\n")
+    identity = module.stat()
+    py_compile.compile(str(module), doraise=True)
+    module.write_text("VALUE = 'new'\n")
+    os.utime(module, ns=(identity.st_atime_ns, identity.st_mtime_ns))
+    program = (
+        f"import sys; sys.path.insert(0, {str(tmp_path)!r}); "
+        "import stale_runtime; print(stale_runtime.VALUE)"
+    )
+    command = [sys.executable, "-c", program]
+    baseline_env = dict(os.environ)
+    baseline_env.pop("PYTHONPYCACHEPREFIX", None)
+    stale = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=baseline_env,
+    )
+    assert stale.stdout.strip() == "old"  # Real defect, same source mtime and length.
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    command, environment = probe["_fresh_python_environment"](command, owned)
+    fresh = probe["_bounded_worker"](
+        command, timeout=10, workspace=owned, env=environment
+    )
+    assert fresh.stdout.strip() == "new"
+
+
+def test_forced_timeout_removes_real_discovery_index_with_owned_temporary_root(
+    probe: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    receipt = tmp_path / "discovery-path.txt"
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    source = owned / "source"
+    source.mkdir()
+    program = (
+        "import pathlib, signal, time\n"
+        "from h2hdb_ingest.filesystem import FilesystemSource\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"source = FilesystemSource(pathlib.Path({str(source)!r}))\n"
+        "source.list_gallery_locators(after_locator=None, limit=128)\n"
+        f"pathlib.Path({str(receipt)!r}).write_text(source._discovery_temporary.name)\n"
+        "time.sleep(30)\n"
+    )
+    command, environment = probe["_fresh_python_environment"](
+        [sys.executable, "-c", program], owned
+    )
+    # Match the real supervisor's outer temporary-directory ownership. The
+    # worker ignores SIGTERM, so its FilesystemSource.__exit__ never runs.
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            probe["_bounded_worker"](
+                command, timeout=8, workspace=owned, env=environment
+            )
+        discovery = Path(receipt.read_text())
+        assert discovery.is_relative_to(owned / "temporary")
+        assert (discovery / "locators.sqlite3").is_file()
+    finally:
+        import shutil
+
+        shutil.rmtree(owned)
+    assert not discovery.exists()
+    assert not owned.exists()
+
+
+@pytest.mark.parametrize(("pages", "edge"), ((4, 1024), (1, 2048)))
+def test_real_image_dimension_overlap_runs_each_fixture_only_once(
+    probe: dict[str, Any],
+    tmp_path: Path,
+    pages: int,
+    edge: int,
+) -> None:
+    report = probe["_run"](
+        sizes=(pages,),
+        edge=edge,
+        codecs=("jpeg",),
+        repeats=2,
+        workers=1,
+        image_cases=True,
+        workspace=tmp_path,
+    )
+    expected = {(4, 1024, "jpeg"), (1, 2048, "jpeg")}
+    probe["_validate_report"](report, dimensions=expected, repeats=2)
+    assert len(report["fixture_setup"]) == 2
+    assert len(report["cases"]) == 14
+    assert report["acceptance"]["status"] in {"satisfied", "violated"}
