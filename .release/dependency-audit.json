@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-22T20:10:22+00:00",
-  "manifest_sha256": "d210ad61bef7a54e52df13a7b22334ee51cdba58a300b7b7bfe0f1d3fbb84130",
+  "checked_at": "2026-09-25T09:34:16+00:00",
+  "manifest_sha256": "36d7b4f5c56faf63f227ce85982f0a9c280f8329d3355d2ad2eaa61305ba93bf",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.27.0",
+  "project_version": "0.28.0",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,10 +30,10 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.41.0,<0.42.0",
+      "declared": "h2hdb>=0.41.0,<0.43.0",
       "group": "runtime",
-      "latest": "0.40.0",
-      "latest_satisfies": false,
+      "latest": "0.42.0",
+      "latest_satisfies": true,
       "name": "h2hdb",
       "python_3_14": true,
       "url": "https://pypi.org/project/h2hdb/"
@@ -95,7 +95,7 @@
     {
       "declared": "hypothesis>=6.165.10,<7.0.0",
       "group": "optional:dev",
-      "latest": "6.168.0",
+      "latest": "6.168.1",
       "latest_satisfies": true,
       "name": "hypothesis",
       "python_3_14": true,
@@ -140,7 +140,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.16.8",
+      "latest": "0.16.9",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed fresh public PyPI/npm candidates for every direct build, runtime, development and Node dependency, including versions beyond current upper bounds. All third-party candidate versions are unchanged from the committed Ingest 0.26.0 audit, so their identical-version upstream reviews carry forward; the independent worktree venv contains the current latest direct third-party candidates. Public h2hdb advanced from 0.39.11 to 0.40.0, which remains below the intentionally coordinated h2hdb>=0.41.0,<0.42.0 requirement: schema-7 Core cannot supply the schema-8 initial-scan checkpoint contract. Ingest 0.27.0 permits unknown inventory counts while resuming sealed work, then performs a fresh inventory turn before declaring source catch-up; initial observation checkpoints reuse sealed galleries across process restart. External CBZ byte formats are unchanged. The clean-checkout rebuild must use an explicitly supplied matching Core 0.41.0 wheel until that version is published; no sibling discovery is required. Manual real-process/CBZ/MariaDB evidence and the exact-tree gate are separate. Built candidate wheels h2hdb-0.41.0 and h2hdb_ingest-0.27.0 were explicitly installed together, offline from the existing registry cache, into a newly created independent CPython 3.14.1 virtual environment; uv pip check passed for all 14 runtime packages. Isolated-mode imports resolved only to that environment, direct_url metadata records local wheel files without editable flags, and every installed package file was byte-compared with its wheel (95 Core files and 47 Ingest files). Pillow 12.3.0 and libvips 8.18.6 loaded successfully. This verifies frozen dependency and wheel metadata; implementation work continued after candidate wheel creation, so these candidate hashes do not attest the final runtime tree. The exact-tree gate and final distribution build separately validate the released implementation.",
+    "note": "Fresh registry discovery covers every direct Python build/runtime/development and Node dependency, including candidates outside declared upper bounds. Compared with the committed Ingest 0.27.0 receipt, third-party changes are Hypothesis 6.168.0 to 6.168.1 and Ruff 0.16.8 to 0.16.9; all other third-party latest candidates are identical, so their prior identical-version upstream reviews carry forward. Reviewed Hypothesis official changelog (https://hypothesis.readthedocs.io/en/latest/changelog.html#v6-168-1): this patch adds Linux s390x manylinux and i686 musllinux abi3 wheels. Reviewed Ruff official release notes (https://github.com/astral-sh/ruff/releases/tag/0.16.9): bugbear keyword-argument false-positive fixes affect enabled B rules; the other changes concern unselected/preview rules, Python 3.15 fixes and documentation. Installed both new candidates in the repository CPython 3.14.1 environment. Ruff 0.16.9 readonly lint passed; tests/test_vnext_incremental_state_machine.py passed all 3 tests using Hypothesis 6.168.1; tests/test_package.py passed all 3 package-boundary tests. Public h2hdb advanced from 0.40.0 to 0.42.0 and now satisfies the declared h2hdb>=0.41.0,<0.43.0 range. Core 0.42.0 retires one-time schema-7 checkout conversion tooling and its private offline audit writer; the schema-8 public runtime facades consumed by Ingest are retained. The local Core source change 09ff04b and explicit Core 0.42.0 wheel were reviewed rather than relying on a fixed sibling discovery path. The Ingest environment uses /private/tmp/h2hdb-retired-upgrade-0420-wheels/h2hdb-0.42.0-py3-none-any.whl; after refreshing editable Ingest metadata to 0.28.0, uv pip check passed all 44 installed packages. Every discovered candidate is within its declared bounds and all Python candidates report Python 3.14-compatible distributions. Ingest 0.28.0 is a compatibility-lane release for journal v5 and source page observation timing changes; this dependency review neither supplies a runtime legacy-format fallback nor substitutes for the separately required offline journal conversion evidence. Full exact-tree release checks, manual performance/MariaDB tests and final wheel verification are separate from this dependency receipt.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
