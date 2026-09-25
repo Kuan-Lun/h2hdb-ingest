@@ -31,6 +31,9 @@ from h2hdb_ingest.image_qualification import ImageGalleryQualifier
 from h2hdb_ingest.source_performance import SourcePerformance
 
 _HELPERS = runpy.run_path(str(Path(__file__).with_name("probe-source-io.py")))
+_ENVIRONMENT = runpy.run_path(str(Path(__file__).with_name("_probe_environment.py")))
+_fresh_python_environment = _ENVIRONMENT["fresh_python_environment"]
+_worker_binding = _ENVIRONMENT["worker_binding"]
 _PROCESS = runpy.run_path(str(Path(__file__).with_name("run-pytest.py")))
 _FORMAT = 1
 _GIT_TIMEOUT = 10.0
@@ -709,6 +712,9 @@ def _provenance(*, include_git: bool = True) -> dict[str, Any]:
         result["checkout_commit"] = _git_text(repository, "rev-parse", "HEAD")
         result["checkout_dirty"] = bool(_git_text(repository, "status", "--porcelain"))
     result["acceptance_sha256"] = sha256(Path(__file__).read_bytes()).hexdigest()
+    result["environment_helper_sha256"] = sha256(
+        Path(__file__).with_name("_probe_environment.py").read_bytes()
+    ).hexdigest()
     result["process_owner_sha256"] = sha256(
         Path(__file__).with_name("run-pytest.py").read_bytes()
     ).hexdigest()
@@ -857,40 +863,6 @@ def _bounded_worker(
     )
     result.check_returncode()
     return result
-
-
-def _fresh_python_environment(
-    command: list[str], workspace: Path
-) -> tuple[list[str], dict[str, str]]:
-    # Timestamp-valid stale bytecode in the checkout/site-packages cannot be
-    # consulted. Both native/Python temp data and new caches are owned by the
-    # supervisor and are removed even after SIGKILL skips worker teardown.
-    cache, temporary = workspace / "pycache", workspace / "temporary"
-    cache.mkdir()
-    temporary.mkdir()
-    return (
-        [command[0], "-X", f"pycache_prefix={cache}", *command[1:]],
-        {
-            **os.environ,
-            "TMPDIR": str(temporary),
-            "TMP": str(temporary),
-            "TEMP": str(temporary),
-        },
-    )
-
-
-def _worker_binding(workspace: Path) -> dict[str, str]:
-    expected = {
-        "bytecode": "fresh supervisor-owned cache; compile source without existing .pyc",
-        "pycache_prefix": str(workspace / "pycache"),
-        "temporary_root": str(workspace / "temporary"),
-    }
-    if (
-        sys.pycache_prefix != expected["pycache_prefix"]
-        or tempfile.gettempdir() != expected["temporary_root"]
-    ):
-        raise ValueError("worker lacks fresh bytecode cache and owned temporary root")
-    return expected
 
 
 def main() -> int:

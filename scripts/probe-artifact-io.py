@@ -14,6 +14,7 @@ import os
 import platform
 import random
 import resource
+import runpy
 import stat
 import subprocess
 import sys
@@ -39,6 +40,7 @@ from h2hdb_ingest import library as library_module
 from h2hdb_ingest.runtime import build_runtime, configure_logging
 from h2hdb_ingest.scratch import DiskScratch
 
+_ENVIRONMENT = runpy.run_path(str(Path(__file__).with_name("_probe_environment.py")))
 _SEED = 20260919
 
 
@@ -390,6 +392,10 @@ def _validate_source_evidence(report):
         and isinstance(report.get("probe_sha256"), str)
         and len(report["probe_sha256"]) == 64
         and report["probe_sha256"] == report.get("probe_sha256_after")
+        and isinstance(report.get("environment_helper_sha256"), str)
+        and len(report["environment_helper_sha256"]) == 64
+        and report["environment_helper_sha256"]
+        == report.get("environment_helper_sha256_after")
     )
     report["source_unchanged_during_experiment"] = complete
     if not complete:
@@ -404,6 +410,8 @@ def _validate_source_evidence(report):
 def _run(args, root: Path):
     provenance_before = _provenance()
     probe_sha256 = sha256(Path(__file__).read_bytes()).hexdigest()
+    environment_helper = Path(__file__).with_name("_probe_environment.py")
+    environment_sha256 = sha256(environment_helper.read_bytes()).hexdigest()
     fixture_started = perf_counter_ns()
     fixture = _fixture(root, args.galleries, args.pages, args.edge)
     fixture_ns = perf_counter_ns() - fixture_started
@@ -543,6 +551,10 @@ def _run(args, root: Path):
         "provenance_after": provenance_after,
         "source_unchanged_during_experiment": provenance_before == provenance_after,
         "probe_sha256": probe_sha256,
+        "environment_helper_sha256": environment_sha256,
+        "environment_helper_sha256_after": sha256(
+            environment_helper.read_bytes()
+        ).hexdigest(),
         "probe_sha256_after": sha256(Path(__file__).read_bytes()).hexdigest(),
         "injected_adapter_fsync_delay": {
             "milliseconds": args.fsync_delay_ms,
@@ -605,11 +617,13 @@ def main() -> int:
     if args.galleries * args.pages * args.edge**2 > 2_147_483_648:
         parser.error("aggregate fixture exceeds two billion pixels")
     if args.worker:
+        binding = _ENVIRONMENT["worker_binding"](args.workspace)
         with tempfile.TemporaryDirectory(
             prefix="artifact-io-fixture-", dir=args.workspace
         ) as folder:
             report = _run(args, Path(folder))
         report["fixture_removed"] = not Path(folder).exists()
+        report["execution_binding"] = binding
         print(json.dumps(report))
         return 0
     if args.output.exists() or args.output.is_symlink():
@@ -618,7 +632,7 @@ def main() -> int:
         prefix="artifact-io-owner-", dir=args.workspace
     ) as workspace:
         try:
-            completed = subprocess.run(
+            command, environment = _ENVIRONMENT["fresh_python_environment"](
                 [
                     sys.executable,
                     str(Path(__file__).resolve()),
@@ -627,6 +641,11 @@ def main() -> int:
                     "--workspace",
                     workspace,
                 ],
+                Path(workspace),
+            )
+            completed = subprocess.run(
+                command,
+                env=environment,
                 capture_output=True,
                 text=True,
                 check=True,
@@ -636,6 +655,17 @@ def main() -> int:
             if not isinstance(report, dict):
                 raise ValueError("worker omitted report object")
             _validate_source_evidence(report)
+            if report["status"] == "completed" and report.get("execution_binding") != {
+                "bytecode": "fresh supervisor-owned cache; compile source without existing .pyc",
+                "pycache_prefix": str(Path(workspace) / "pycache"),
+                "temporary_root": str(Path(workspace) / "temporary"),
+            }:
+                report.update(
+                    status="error",
+                    acceptance={"status": "incomplete"},
+                    error_type="WorkerBindingError",
+                    error="worker runtime binding differs from supervisor ownership",
+                )
             if report.get("status") not in {"completed", "error"}:
                 raise ValueError("worker omitted completed or incomplete evidence")
         except (subprocess.SubprocessError, ValueError, OSError) as error:

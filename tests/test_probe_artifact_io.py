@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import py_compile
 import runpy
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +15,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+import h2hdb_ingest
 
 _SCRIPT = Path(__file__).parents[1] / "scripts" / "probe-artifact-io.py"
 
@@ -58,6 +63,10 @@ def test_real_runtime_probe_proves_publication_cleanup_claim_and_rasters(
     assert report["oracle"]["full_ready_audit"]
     assert report["oracle"]["max_mean_pixel_error"] < 32
     assert report["provenance"]["h2hdb"]["source_sha256"]
+    assert "fresh supervisor-owned cache" in report["execution_binding"]["bytecode"]
+    assert (
+        report["environment_helper_sha256"] == report["environment_helper_sha256_after"]
+    )
     assert report["logical_amplification"]["source_reopen_calls"] >= 10
     assert all(value > 0 for value in report["timings_ns"].values())
     events = report["cycle_events"]
@@ -188,7 +197,7 @@ def test_controlled_sync_latency_is_attributed_to_selected_info_phase(
     assert report["source_unchanged_during_experiment"]
 
 
-@pytest.mark.parametrize("mutation", ("runtime", "probe", "missing"))
+@pytest.mark.parametrize("mutation", ("runtime", "probe", "helper", "missing"))
 def test_parent_rejects_source_drift_without_discarding_partial_evidence(
     artifact_probe_report: dict[str, Any],
     tmp_path: Path,
@@ -201,6 +210,8 @@ def test_parent_rejects_source_drift_without_discarding_partial_evidence(
         report["provenance_after"]["h2hdb_ingest"]["source_sha256"] = "0" * 64
     elif mutation == "probe":
         report["probe_sha256_after"] = "0" * 64
+    elif mutation == "helper":
+        report["environment_helper_sha256_after"] = "0" * 64
     else:
         del report["provenance"]
     # Deliberately keep the old claimed success flag: parent must check digests.
@@ -304,3 +315,84 @@ def test_cleanup_observer_preserves_failure_and_reports_failed_phase(
     assert report["statuses"]["failed"] == 1
     assert report["operations"]["journal_session"]["failed_calls"] == 1
     assert adapter_type.maintain_cleanup is failed
+
+
+def test_artifact_worker_compiles_current_runtime_despite_valid_stale_pyc(
+    tmp_path: Path,
+) -> None:
+    probe = runpy.run_path(str(_SCRIPT))
+    copied = tmp_path / "runtime" / "h2hdb_ingest"
+    shutil.copytree(
+        Path(h2hdb_ingest.__file__).parent,
+        copied,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    runtime = copied / "core_source.py"
+    original = runtime.read_text()
+    runtime.write_text(original + "\nSOURCE_BINDING_SENTINEL = 'old'\n")
+    identity = runtime.stat()
+    py_compile.compile(str(runtime), doraise=True)
+    runtime.write_text(original + "\nSOURCE_BINDING_SENTINEL = 'new'\n")
+    os.utime(runtime, ns=(identity.st_atime_ns, identity.st_mtime_ns))
+    environment = {**os.environ, "PYTHONPATH": str(copied.parent)}
+    environment.pop("PYTHONPYCACHEPREFIX", None)
+    baseline = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from h2hdb_ingest.core_source import SOURCE_BINDING_SENTINEL; print(SOURCE_BINDING_SENTINEL)",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    assert baseline.stdout.strip() == "old"
+    workspace = tmp_path / "owned"
+    workspace.mkdir()
+    worker_arguments = [
+        str(_SCRIPT),
+        "--worker",
+        "--workspace",
+        str(workspace),
+        "--galleries",
+        "1",
+        "--pages",
+        "1",
+        "--edge",
+        "32",
+        "--workers",
+        "1",
+        "--timeout",
+        "60",
+        "--output",
+        str(tmp_path / "unused.json"),
+    ]
+    program = (
+        "from h2hdb_ingest.core_source import SOURCE_BINDING_SENTINEL\n"
+        "assert SOURCE_BINDING_SENTINEL == 'new'\n"
+        "import runpy,sys\n"
+        f"sys.argv={worker_arguments!r}\n"
+        f"runpy.run_path({str(_SCRIPT)!r},run_name='__main__')\n"
+    )
+    command, fresh_environment = probe["_ENVIRONMENT"]["fresh_python_environment"](
+        [sys.executable, "-c", program],
+        workspace,
+    )
+    fresh_environment["PYTHONPATH"] = str(copied.parent)
+    # Internal worker mode has no nested supervisor/process group. The test's
+    # existing POSIX owner bounds and cleans this one actual worker tree.
+    owner = runpy.run_path(str(_SCRIPT.with_name("check-source-cost.py")))
+    completed = owner["_bounded_worker"](
+        command,
+        env=fresh_environment,
+        timeout=65,
+        workspace=workspace,
+    )
+    report = json.loads(completed.stdout)
+    assert report["status"] == "completed"
+    assert report["provenance"]["h2hdb_ingest"]["location"] == str(copied)
+    assert report["oracle"]["full_ready_audit"]
+    assert report["oracle"]["raster_pages"] == 1
+    assert report["execution_binding"]["pycache_prefix"] == str(workspace / "pycache")

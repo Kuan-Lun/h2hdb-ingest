@@ -26,6 +26,170 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _process_field(pid: int, field: str) -> str | None:
+    result = subprocess.run(
+        ["ps", "-p", str(pid), "-o", f"{field}="],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=2,
+    )
+    value = result.stdout.strip()
+    if result.returncode == 0 and value:
+        return value
+    if result.returncode == 1 and not value and not result.stderr.strip():
+        return None  # ps reports a nonexistent PID this way on macOS/Linux.
+    raise RuntimeError(
+        f"ps could not establish worker identity: {result.stderr.strip()}"
+    )
+
+
+def _process_identity(pid: int) -> str | None:
+    return _process_field(pid, "lstart")
+
+
+def _reclaim_recorded_groups(root: Path, deadline: float) -> None:
+    errors = []
+    for receipt_path in root.glob("owned-*.json"):
+        try:
+            receipt = json.loads(receipt_path.read_text())
+            pid = receipt["pid"]
+            identity = _process_identity(pid)
+            if identity is None:
+                continue
+            assert receipt["identity"] and identity == receipt["identity"]
+            assert os.getpgid(pid) == pid
+            os.killpg(pid, signal.SIGKILL)
+            # An orphaned zombie has no executing worker and is reaped by the
+            # OS adopter, not by this unrelated pytest process.
+            while monotonic() < deadline:
+                state = _process_field(pid, "stat")
+                if state is None or state.startswith("Z"):
+                    break
+                sleep(0.01)
+            else:
+                raise AssertionError("test left an executing detached worker")
+        except ProcessLookupError:
+            continue  # Exit/reap can race with identity, getpgid or killpg.
+        except Exception as error:
+            errors.append(f"{receipt_path.name}: {error}")
+    if errors:
+        raise AssertionError("test worker cleanup incomplete: " + "; ".join(errors))
+
+
+def _run_owned_cli(
+    root: Path,
+    arguments: list[str],
+    *,
+    timeout: float = 30,
+    injected_program: str | None = None,
+    force_supervisor_kill: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Test owns every detached group, even when it must SIGKILL the supervisor.
+
+    The spawn lock prevents the outer timeout from killing a launcher between
+    Popen and its ownership receipt. No runtime test hook is introduced.
+    """
+    import fcntl
+
+    root.mkdir()
+    launcher = root / "launcher.py"
+    launcher.write_text(
+        "import fcntl,json,os,pathlib,runpy,signal,subprocess,sys\n"
+        f"root=pathlib.Path({str(root)!r})\n"
+        "original=subprocess.Popen\n"
+        "def owned(*args,**kwargs):\n"
+        " with (root/'spawn.lock').open('a') as lock:\n"
+        "  fcntl.flock(lock,fcntl.LOCK_EX)\n"
+        "  if (root/'closed').exists(): raise RuntimeError('outer test owner closed')\n"
+        "  process=original(*args,**kwargs)\n"
+        "  if kwargs.get('start_new_session'):\n"
+        "   ps=None\n"
+        "   try:\n"
+        "    ps=original(['ps','-p',str(process.pid),'-o','lstart='],stdout=subprocess.PIPE,stderr=subprocess.PIPE)\n"
+        "    identity=ps.communicate(timeout=2)[0].decode().strip()\n"
+        "    receipt={'pid':process.pid,'identity':identity}\n"
+        "    (root/f'owned-{process.pid}.json').write_text(json.dumps(receipt))\n"
+        "   except BaseException:\n"
+        "    if ps is not None and ps.poll() is None: ps.kill(); ps.wait(timeout=2)\n"
+        "    try: os.killpg(process.pid,signal.SIGKILL)\n"
+        "    except ProcessLookupError: pass\n"
+        "    process.wait(timeout=2)\n"
+        "    raise\n"
+        "  return process\n"
+        "subprocess.Popen=owned\n"
+        f"sys.argv={[str(_SCRIPT), *arguments]!r}\n"
+        + (
+            injected_program
+            if injected_program is not None
+            else f"runpy.run_path({str(_SCRIPT)!r},run_name='__main__')\n"
+        )
+    )
+    output_path, error_path = root / "stdout", root / "stderr"
+    timed_out = False
+    with output_path.open("w+b") as stdout, error_path.open("w+b") as stderr:
+        process = subprocess.Popen(
+            [sys.executable, str(launcher)],
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+        try:
+            if force_supervisor_kill:
+                # Start the injected outer timeout only after the real worker
+                # exists; import scheduling under xdist is not the fault oracle.
+                ready_deadline = monotonic() + 10
+                while not list(root.glob("owned-*.json")) and process.poll() is None:
+                    if monotonic() >= ready_deadline:
+                        raise AssertionError(
+                            "test worker never reached its owned start boundary"
+                        )
+                    sleep(0.01)
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        finally:
+            # A stopped spawn boundary means every started detached worker has
+            # a receipt before we signal or forcibly terminate its supervisor.
+            with (root / "spawn.lock").open("a") as lock:
+                deadline = monotonic() + 5
+                while True:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if monotonic() >= deadline:
+                            raise AssertionError(
+                                "test could not close the spawn boundary"
+                            ) from None
+                        sleep(0.01)
+                (root / "closed").touch()
+                if process.poll() is None:
+                    process.send_signal(
+                        signal.SIGKILL if force_supervisor_kill else signal.SIGTERM
+                    )
+                    try:
+                        process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=2)
+                _reclaim_recorded_groups(root, deadline)
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+    if timed_out:
+        raise subprocess.TimeoutExpired(process.args, timeout)
+    returncode = process.poll()
+    assert returncode is not None
+    return subprocess.CompletedProcess(
+        process.args,
+        returncode,
+        output_path.read_text(),
+        error_path.read_text(),
+    )
+
+
 @pytest.fixture
 def probe() -> dict[str, Any]:
     return runpy.run_path(str(_SCRIPT))
@@ -186,10 +350,9 @@ def test_parent_recomputes_costs_and_rejects_omitted_matrix_cases(
 
 def test_cli_exit_code_reports_real_acceptance_outcome(tmp_path: Path) -> None:
     output = tmp_path / "report.json"
-    result = subprocess.run(
-        (
-            sys.executable,
-            str(_SCRIPT),
+    result = _run_owned_cli(
+        tmp_path / "cli-owner",
+        [
             "--sizes",
             "1",
             "--edge",
@@ -197,12 +360,11 @@ def test_cli_exit_code_reports_real_acceptance_outcome(tmp_path: Path) -> None:
             "--codec",
             "png",
             "--skip-image-cases",
+            "--timeout",
+            "20",
             "--output",
             str(output),
-        ),
-        check=False,
-        capture_output=True,
-        text=True,
+        ],
         timeout=30,
     )
     report = json.loads(output.read_text())
@@ -633,3 +795,73 @@ def test_real_image_dimension_overlap_runs_each_fixture_only_once(
     assert len(report["fixture_setup"]) == 2
     assert len(report["cases"]) == 14
     assert report["acceptance"]["status"] in {"satisfied", "violated"}
+
+
+def test_cli_outer_timeout_reclaims_detached_worker_after_supervisor_sigkill(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "worker-space"
+    workspace.mkdir()
+    program = (
+        f"module=runpy.run_path({str(_SCRIPT)!r})\n"
+        "worker='import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(30)'\n"
+        f"module['_bounded_worker']([sys.executable,'-c',worker],timeout=20,workspace=pathlib.Path({str(workspace)!r}))\n"
+    )
+    owner = tmp_path / "owner"
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_owned_cli(
+            owner, [], timeout=3, injected_program=program, force_supervisor_kill=True
+        )
+    receipts = list(owner.glob("owned-*.json"))
+    assert len(receipts) == 1
+    pid = json.loads(receipts[0].read_text())["pid"]
+    state = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "stat="],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=2,
+    ).stdout.strip()
+    assert not state or state.startswith("Z")
+
+
+@pytest.mark.parametrize("boundary", ("getpgid", "killpg"))
+def test_test_owner_accepts_exit_races_and_still_checks_other_receipts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    for pid in (100, 101):
+        (tmp_path / f"owned-{pid}.json").write_text(
+            json.dumps({"pid": pid, "identity": "same"})
+        )
+    checked: list[int] = []
+
+    def identity(pid: int) -> str:
+        checked.append(pid)
+        return "same"
+
+    def gone(*_args: object) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setitem(
+        _reclaim_recorded_groups.__globals__, "_process_identity", identity
+    )
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(os, boundary, gone)
+    _reclaim_recorded_groups(tmp_path, monotonic() + 1)
+    assert sorted(checked) == [100, 101]
+
+
+def test_test_owner_rejects_ps_errors_instead_of_claiming_process_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr="permission denied"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="could not establish"):
+        _process_identity(123)
