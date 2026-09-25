@@ -4,6 +4,8 @@ import tomllib
 from importlib import import_module
 from pathlib import Path
 
+from packaging.requirements import Requirement
+
 
 def test_package_exports_only_vnext_consumer_boundaries() -> None:
     package = import_module("h2hdb_ingest")
@@ -32,3 +34,19 @@ def test_distribution_commands_target_vnext_entry_points() -> None:
     assert callable(import_module("h2hdb_ingest.__main__").main)
     assert callable(import_module("h2hdb_ingest.bootstrap").main)
     assert callable(import_module("h2hdb_ingest.relocate").main)
+
+
+def test_core_dependency_admits_verified_schema8_lanes_only() -> None:
+    project = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    dependency = next(
+        item
+        for item in map(Requirement, project["dependencies"])
+        if item.name == "h2hdb"
+    )
+    assert "0.41.0" in dependency.specifier
+    assert "0.41.2" in dependency.specifier
+    assert "0.42.0" in dependency.specifier
+    assert "0.40.9" not in dependency.specifier
+    assert "0.43.0" not in dependency.specifier

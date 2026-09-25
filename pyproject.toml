@@ -13,8 +13,8 @@ license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = [
     "h2h-galleryinfo-parser>=0.5.3,<0.6",
-    # Require schema-8 observation checkpoints and sealed-source recovery.
-    "h2hdb>=0.41.0,<0.42.0",
+    # Core 0.42 removes offline schema-7 tooling; schema-8 public facades are unchanged.
+    "h2hdb>=0.41.0,<0.43.0",
     "pillow>=12.3.0,<13.0.0",
     "pydantic>=2.13.4,<3.0.0",
     # Native decoder/resizer behavior is audited within these tested major lanes.
