@@ -48,6 +48,7 @@ from ._adapter_performance import (
     adapter_operation,
     adapter_phase,
     adapter_read,
+    adapter_rows,
 )
 from ._library_journal import FORMAT_VERSION as _JOURNAL_FORMAT_VERSION
 from ._library_journal import create_fresh_journal as _create_fresh_journal
@@ -1494,14 +1495,16 @@ class ManagedFilesystemLibraryAdapter:
             state = _journal_state(connection)
             if state.pending_revision is not None:
                 return LibraryMaintenanceOutcome.BLOCKED
-            rows = connection.execute(
-                "SELECT token, storage_codec, storage_path, object_sha256, "
-                "size_bytes, staging_leaf, device, inode, modified_ns, changed_ns "
-                "FROM protection_tokens "
-                "WHERE state = 'RELEASED' AND staging_leaf IS NOT NULL "
-                "ORDER BY token LIMIT ?",
-                (_MAX_CLEANUP_ITEMS,),
-            ).fetchall()
+            with adapter_phase("journal_cleanup_select"):
+                rows = connection.execute(
+                    "SELECT token, storage_codec, storage_path, object_sha256, "
+                    "size_bytes, staging_leaf, device, inode, modified_ns, changed_ns "
+                    "FROM protection_tokens "
+                    "WHERE state = 'RELEASED' AND staging_leaf IS NOT NULL "
+                    "ORDER BY token LIMIT ?",
+                    (_MAX_CLEANUP_ITEMS,),
+                ).fetchall()
+            adapter_rows("journal_cleanup_select", len(rows))
         for row in rows:
             token = bytes(row[0])
             key = _key_from_row(str(row[1]), str(row[2]))
@@ -1558,10 +1561,12 @@ class ManagedFilesystemLibraryAdapter:
             state = _journal_state(connection)
             if state.pending_revision is not None:
                 return LibraryMaintenanceOutcome.BLOCKED
-            remaining = connection.execute(
-                "SELECT EXISTS(SELECT 1 FROM protection_tokens "
-                "WHERE state = 'RELEASED' AND staging_leaf IS NOT NULL)"
-            ).fetchone()
+            with adapter_phase("journal_cleanup_exists"):
+                remaining = connection.execute(
+                    "SELECT EXISTS(SELECT 1 FROM protection_tokens "
+                    "WHERE state = 'RELEASED' AND staging_leaf IS NOT NULL)"
+                ).fetchone()
+            adapter_rows("journal_cleanup_exists", int(remaining is not None))
             if remaining not in {(0,), (1,)}:
                 raise RuntimeError("library cleanup state is corrupt")
             if rows:

@@ -235,6 +235,11 @@ def test_startup_failure_is_retained_without_a_session(
     assert audit.failed and audit.session is None
 
 
+class _ResidentDiagnostics:
+    def flush_performance(self) -> None:
+        pass
+
+
 class _Resource:
     def __init__(self, events: list[str], name: str, *, fail: bool = False) -> None:
         self.events, self.name, self.fail = events, name, fail
@@ -252,7 +257,7 @@ def _runtime(
         cast(VNextIngestFacade, _Resource(events, "ingest")),
         cast(VNextDatabaseAdminFacade, _Resource(events, "admin")),
         cast(VNextCatalogFacade, _Resource(events, "catalog")),
-        cast(ResidentIngestor, object()),
+        cast(ResidentIngestor, _ResidentDiagnostics()),
         _audit=audit,
         _owned_resources=scratch,
         _finish_audit=lambda _session: events.append("clean"),

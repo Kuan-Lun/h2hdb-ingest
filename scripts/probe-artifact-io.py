@@ -23,6 +23,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from hashlib import file_digest, sha256
 from io import BytesIO
+from itertools import pairwise
 from pathlib import Path
 from time import perf_counter_ns, process_time_ns, sleep
 from types import SimpleNamespace
@@ -37,6 +38,7 @@ import h2hdb_ingest
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
 from h2hdb_ingest import _adapter_performance as adapter_performance
 from h2hdb_ingest import library as library_module
+from h2hdb_ingest._maintenance_performance import LibraryMaintenancePerformance
 from h2hdb_ingest.runtime import build_runtime, configure_logging
 from h2hdb_ingest.scratch import DiskScratch
 
@@ -284,7 +286,7 @@ class _CleanupMeasurement:
             if metric.operation == "checkpoint":
                 self.checkpoints += 1
                 return  # Cumulative snapshots must not be added to final totals.
-            if metric.operation != "publication":
+            if metric.operation != "library_cleanup":
                 raise ValueError("missing final cleanup adapter measurement")
             self.received += 1
             self.elapsed_ns += metric.elapsed_ns
@@ -311,6 +313,11 @@ class _CleanupMeasurement:
     def observe(self):
         original = library_module.ManagedFilesystemLibraryAdapter.maintain_cleanup
         original_phase = library_module.adapter_phase
+        original_record = LibraryMaintenancePerformance._record
+
+        def record(observer, metric):
+            original_record(observer, metric)
+            self._sink(metric)
 
         @contextmanager
         def delayed_phase(operation):
@@ -322,19 +329,18 @@ class _CleanupMeasurement:
 
         def observed(adapter):
             self.calls += 1
-            # The existing measurement emits a final operation named publication.
-            # This private sink relabels its scope as maintenance in the report;
-            # it never forwards these records into publication INFO totals.
-            with (
-                adapter_performance.summarize_adapter_io(self._sink, generation=0),
-                patch.object(library_module, "adapter_phase", delayed_phase),
-            ):
+            # Use the production maintenance observer; an inner private scope
+            # would steal attribution from the INFO report we are validating.
+            with patch.object(library_module, "adapter_phase", delayed_phase):
                 return original(adapter)
 
-        with patch.object(
-            library_module.ManagedFilesystemLibraryAdapter,
-            "maintain_cleanup",
-            observed,
+        with (
+            patch.object(
+                library_module.ManagedFilesystemLibraryAdapter,
+                "maintain_cleanup",
+                observed,
+            ),
+            patch.object(LibraryMaintenancePerformance, "_record", record),
         ):
             yield
 
@@ -366,13 +372,55 @@ class _CleanupMeasurement:
             "injected_journal_delay_ms": self.journal_delay_ms,
             "injected_journal_calls": self.injected_calls,
             "limits": [
-                "Independent dev-only scope around real maintain_cleanup; all safety checks still execute",
+                "Actual production maintenance observer, including scratch cleanup; all safety checks still execute",
                 "Includes startup, pre-claim and post-session maintenance, overlapping enclosing process_available timings",
                 "Exclusive same-thread phases add; inclusive phases overlap; bytes are logical instrumented transfers",
                 "No source, render or publication metrics are included; uninstrumented cleanup work remains residual",
                 "Controlled journal delay tests attribution and is not a NAS latency model",
             ],
         }
+
+
+def _validate_cleanup_info(metrics, cleanup):
+    records = [value for value in metrics if value["scope"] == "library_cleanup_io"]
+    if not records:
+        raise ValueError("production INFO omitted cleanup measurements")
+    identities = {
+        (r["counter.process_id"], r["counter.observer_started_ns"]) for r in records
+    }
+    if len(identities) != 1:
+        raise ValueError("cleanup INFO mixed independent observer totals")
+    expected_sequence = list(range(1, len(records) + 1))
+    if [r["counter.snapshot_sequence"] for r in records] != expected_sequence:
+        raise ValueError("cleanup INFO snapshot sequence is incomplete")
+    if any(r["counter.cumulative"] != 1 for r in records):
+        raise ValueError("cleanup INFO lacks cumulative semantics")
+    final = records[-1]
+    expected = {
+        "counter.calls": cleanup["terminal_measurements"],
+        "counter.failed_calls": cleanup["statuses"]["failed"],
+        "counter.interrupted_calls": cleanup["statuses"]["interrupted"],
+        "counter.clock_failures": cleanup["clock_failures"],
+        "counter.collection_errors": 0,
+        "elapsed_ns": cleanup["elapsed_ns"],
+        "phase.attributed_exclusive_ns": cleanup["attributed_exclusive_ns"],
+        "phase.unattributed_ns": cleanup["unattributed_ns"],
+    }
+    for operation, fields in cleanup["operations"].items():
+        expected.update(
+            {f"operation.{operation}.{name}": value for name, value in fields.items()}
+        )
+    if any(final[key] != value for key, value in expected.items()):
+        raise ValueError("production INFO differs from actual cleanup attempts")
+    # Differencing the snapshots must cover every completed attempt exactly once.
+    calls = [0, *(r["counter.calls"] for r in records)]
+    if any(after <= before for before, after in pairwise(calls)):
+        raise ValueError("cleanup INFO repeated or decreased cumulative attempt counts")
+    return {
+        "status": "matched",
+        "snapshots": len(records),
+        "completed_attempts": calls[-1],
+    }
 
 
 def _validate_source_evidence(report):
@@ -577,12 +625,18 @@ def _run(args, root: Path):
         ],
     }
 
-    if report["library_cleanup_adapter"]["status"] != "completed":
+    try:
+        report["cleanup_info_reconciliation"] = _validate_cleanup_info(
+            report["all_metrics"], report["library_cleanup_adapter"]
+        )
+        if report["library_cleanup_adapter"]["status"] != "completed":
+            raise ValueError("cleanup adapter measurements are incomplete")
+    except (KeyError, TypeError, ValueError) as error:
         report.update(
             status="error",
             acceptance={"status": "incomplete"},
             error_type="CleanupMeasurementError",
-            error="cleanup adapter measurements are incomplete",
+            error=str(error),
         )
     return _validate_source_evidence(report)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import logging
 from collections.abc import Callable, Mapping
 from hashlib import sha256
 from io import BytesIO
@@ -575,3 +576,72 @@ def test_temporary_cleanup_requires_an_owned_shutdown_resource(tmp_path: Path) -
     config = IngestConfig(paths=IngestPathsConfig(download_path=_source_root(tmp_path)))
     with pytest.raises(ValueError, match="requires transferred owned_resources"):
         build_runtime(config, temporary_cleanup=lambda: None)
+
+
+@pytest.mark.parametrize("fail_close", (False, True))
+def test_runtime_close_flushes_unreported_cleanup_even_on_resource_failure(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_close: bool,
+) -> None:
+    caplog.set_level(logging.INFO, logger="h2hdb_ingest._maintenance_performance")
+    runtime = build_runtime(
+        IngestConfig(paths=IngestPathsConfig(download_path=_source_root(tmp_path)))
+    )
+    runtime.resident._run_library_maintenance()
+    runtime.resident._run_library_maintenance()
+
+    def records() -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if "scope=library_cleanup_io" in r.getMessage()
+        ]
+
+    assert len(records()) == 1
+    original = VNextIngestFacade.close
+    failure = OSError("injected resource close failure")
+
+    def fail(facade: VNextIngestFacade) -> None:
+        original(facade)
+        raise failure
+
+    if fail_close:
+        monkeypatch.setattr(VNextIngestFacade, "close", fail)
+    try:
+        if fail_close:
+            with pytest.raises(OSError) as raised:
+                runtime.close()
+            assert raised.value is failure
+        else:
+            runtime.close()
+        assert len(records()) == 2
+        assert "counter.calls=2 " in records()[-1]
+    finally:
+        monkeypatch.setattr(VNextIngestFacade, "close", original)
+        runtime.close()
+    assert len(records()) == 2
+
+
+def test_runtime_close_diagnostic_failure_keeps_successful_business_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = build_runtime(
+        IngestConfig(paths=IngestPathsConfig(download_path=_source_root(tmp_path)))
+    )
+    runtime.resident._run_library_maintenance()
+    runtime.resident._run_library_maintenance()
+    observer = runtime.resident._library_cleanup_performance
+    attempts = 0
+
+    def fail_emit(_status: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise OSError("cleanup INFO sink unavailable during shutdown")
+
+    monkeypatch.setattr(observer, "_emit", fail_emit)
+    runtime.close()
+    assert runtime._closed and not runtime._unclean
+    runtime.close()
+    assert attempts == 1

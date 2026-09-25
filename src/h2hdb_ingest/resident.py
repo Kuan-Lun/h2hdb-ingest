@@ -24,7 +24,9 @@ from h2hdb import (
     VNextSourceManifestMismatchError,
 )
 
+from ._adapter_performance import adapter_phase
 from ._log_recovery import RecoveryLog
+from ._maintenance_performance import LibraryMaintenancePerformance
 from ._retry_diagnostics import RetryDiagnostic, retry_diagnostic
 from ._source_retry import SourceReobservation
 from .artifact_errors import format_artifact_failure
@@ -142,6 +144,9 @@ class ResidentIngestor:
         )
         self._database_type = database_type.casefold()
         self._event_logger = event_logger or logger.info
+        self._library_cleanup_performance = LibraryMaintenancePerformance(
+            interval_ns=int(config.progress_log_interval_seconds * 1_000_000_000),
+        )
         self._progress = progress
         self._cycle_performance = CyclePerformance()
         self._database_audit = IngestDatabaseAudit(
@@ -238,16 +243,23 @@ class ResidentIngestor:
                 "processing"
             )
 
-        return self._process_cycle(
-            periodic_scan=periodic_scan,
-            preflight=preflight,
-            postflight=postflight,
-            should_stop=should_stop,
-        ) in (
-            _ResidentCycleOutcome.INGESTED,
-            _ResidentCycleOutcome.BATCH_PUBLISHED,
-            _ResidentCycleOutcome.MAINTENANCE_PROGRESSED,
-        )
+        try:
+            return self._process_cycle(
+                periodic_scan=periodic_scan,
+                preflight=preflight,
+                postflight=postflight,
+                should_stop=should_stop,
+            ) in (
+                _ResidentCycleOutcome.INGESTED,
+                _ResidentCycleOutcome.BATCH_PUBLISHED,
+                _ResidentCycleOutcome.MAINTENANCE_PROGRESSED,
+            )
+        finally:
+            self.flush_performance()
+
+    def flush_performance(self) -> None:
+        """Flush pending diagnostics without advancing any maintenance state."""
+        self._library_cleanup_performance.flush()
 
     def _process_cycle(
         self,
@@ -611,6 +623,7 @@ class ResidentIngestor:
             # durable handoff must still be claimable while it blocks that path.
             claimed = self._facade.try_claim_ingest(False, lease_duration)
         if isinstance(claimed, VNextIngestSession):
+            self.flush_performance()
             self._cycle_performance.claimed(claimed.ingest_generation)
         return _ResidentCycleOutcome.IDLE if claimed is None else claimed
 
@@ -675,11 +688,14 @@ class ResidentIngestor:
 
     def _run_library_maintenance(self) -> LibraryMaintenanceOutcome:
         self._progress_operation("library_cleanup")
-        if self._temporary_cleanup is not None:
-            self._temporary_cleanup()
-        outcome = self._library_maintenance.maintain_cleanup()
-        if not isinstance(outcome, LibraryMaintenanceOutcome):
-            raise TypeError("library maintenance returned an invalid outcome")
+
+        def cleanup() -> LibraryMaintenanceOutcome:
+            if self._temporary_cleanup is not None:
+                with adapter_phase("scratch_cleanup"):
+                    self._temporary_cleanup()
+            return self._library_maintenance.maintain_cleanup()
+
+        outcome = self._library_cleanup_performance.run(cleanup)
         if outcome is LibraryMaintenanceOutcome.DONE:
             self._cycle_performance.maintenance_done("library")
         return outcome
@@ -768,6 +784,7 @@ class ResidentIngestor:
             self._finish_progress("failed")
             raise
         finally:
+            self.flush_performance()
             self._scheduled_progress = False
             self._finish_progress("stopped", announce=False)
 
