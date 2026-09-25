@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import py_compile
 import runpy
@@ -18,6 +19,9 @@ from typing import Any
 
 import pytest
 from h2hdb import ArtifactSourceRole, FileContentReceipt
+
+from h2hdb_ingest.filesystem import FilesystemSource
+from h2hdb_ingest.page_workers import MAX_PAGE_RENDER_WORKERS
 
 _SCRIPT = Path(__file__).parents[1] / "scripts" / "check-source-cost.py"
 pytestmark = pytest.mark.skipif(
@@ -293,6 +297,76 @@ def test_entry_scan_budget_rejects_a_deliberately_degraded_real_path(
     assert costs["checks"]["entry_stat_calls"]["met"] is False
 
 
+@pytest.mark.parametrize("entries", (127, 128, 129, 191, 192, 193, 255, 256, 257, 512))
+@pytest.mark.parametrize("mode", ("metadata_only", "first"))
+def test_entry_work_is_linear_across_actual_page_bounds_and_repeated_cycles(
+    probe: dict[str, Any], tmp_path: Path, entries: int, mode: str
+) -> None:
+    """Count returned/lookahead stats, not just the old scandir instrumentation.
+
+    Index and final audit each visit E entries. FILE and DIRECTORY visit every
+    entry plus one lookahead per nonterminal page (limits 256 and 192). Image
+    qualification adds the same bounded traversal with limit 128. The one
+    discovery-directory entry stat is counted too. This exact work model is
+    independent of the fixed acceptance ceiling of 8E.
+    """
+    pages = entries - 1
+    probe["_HELPERS"]["_fixture"](tmp_path, 1, pages, 16, "png")
+    file_pages, directory_pages = math.ceil(entries / 256), math.ceil(entries / 192)
+    page_stats = 2 * entries + file_pages + directory_pages - 2
+    page_calls = file_pages + directory_pages + 1  # One TAG page, with no stats.
+    if mode == "first":
+        qualification_pages = math.ceil(entries / 128)
+        page_stats += entries + qualification_pages - 1
+        page_calls += qualification_pages
+    for _cycle in range(2):
+        case = probe["_case"](tmp_path, mode=mode, workers=1)
+        measured = case["entries"]
+        assert case["content_oracle"]["status"] == "verified"
+        assert case["telemetry_comparison"]["matched"]
+        assert measured["entry_stat_calls"] == 2 * entries + page_stats + 1
+        assert measured["indexed_entry_stat_calls"] == page_stats
+        assert measured["revalidation_stat_calls"] == entries + page_stats
+        assert measured["revalidation_rows"] == entries
+        assert measured["full_audit_calls"] == 1
+        assert measured["page_validation_calls"] == page_calls
+        costs = probe["_costs"](case, pages=pages, page_bytes=1_000_000)
+        assert costs["checks"]["entry_stat_calls"]["bound"] == 8 * entries
+        assert costs["checks"]["entry_stat_calls"]["met"]
+
+
+@pytest.mark.parametrize("mode", ("metadata_only", "first"))
+def test_old_full_gallery_per_page_algorithm_fails_the_same_entry_meter(
+    probe: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """A real old-algorithm control must fail without changing the 8E budget."""
+    entries = 513
+    pages = entries - 1
+    probe["_HELPERS"]["_fixture"](tmp_path, 1, pages, 16, "png")
+    optimized = probe["_case"](tmp_path, mode=mode, workers=1)
+
+    def full_scan_every_page(source: FilesystemSource, index: Any, _rows: Any) -> None:
+        source._require_gallery_unchanged(index)
+
+    monkeypatch.setattr(
+        FilesystemSource, "_require_gallery_page_unchanged", full_scan_every_page
+    )
+    old_algorithm = probe["_case"](tmp_path, mode=mode, workers=1)
+    assert optimized["content_oracle"] == old_algorithm["content_oracle"]
+    assert optimized["returned_rows"] == old_algorithm["returned_rows"]
+    assert optimized["telemetry_comparison"]["matched"]
+    assert old_algorithm["telemetry_comparison"]["matched"]
+    scans = 3 + math.ceil(entries / 256) + math.ceil(entries / 192)
+    if mode == "first":
+        scans += math.ceil(entries / 128)
+    assert old_algorithm["entries"]["entry_stat_calls"] == scans * entries + 1
+    assert old_algorithm["entries"]["indexed_entry_stat_calls"] == 0
+    before = probe["_costs"](old_algorithm, pages=pages, page_bytes=1_000_000)
+    after = probe["_costs"](optimized, pages=pages, page_bytes=1_000_000)
+    assert not before["checks"]["entry_stat_calls"]["met"]
+    assert after["checks"]["entry_stat_calls"]["met"]
+
+
 @pytest.mark.parametrize(
     "missing",
     (
@@ -348,7 +422,10 @@ def test_parent_recomputes_costs_and_rejects_omitted_matrix_cases(
         probe["_validate_report"](report, dimensions={(1, 16, "png")}, repeats=2)
 
 
-def test_cli_exit_code_reports_real_acceptance_outcome(tmp_path: Path) -> None:
+@pytest.mark.parametrize("workers", (1, 8, MAX_PAGE_RENDER_WORKERS))
+def test_cli_exit_code_reports_real_acceptance_outcome(
+    tmp_path: Path, workers: int
+) -> None:
     output = tmp_path / "report.json"
     result = _run_owned_cli(
         tmp_path / "cli-owner",
@@ -360,6 +437,8 @@ def test_cli_exit_code_reports_real_acceptance_outcome(tmp_path: Path) -> None:
             "--codec",
             "png",
             "--skip-image-cases",
+            "--workers",
+            str(workers),
             "--timeout",
             "20",
             "--output",
@@ -375,6 +454,30 @@ def test_cli_exit_code_reports_real_acceptance_outcome(tmp_path: Path) -> None:
             report["acceptance"]["status"]
         ]
     )
+
+
+@pytest.mark.parametrize("workers", (0, MAX_PAGE_RENDER_WORKERS + 1))
+def test_cli_rejects_workers_outside_runtime_bound_before_starting_measurement(
+    probe: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    workers: int,
+) -> None:
+    output = tmp_path / "report.json"
+
+    def unexpected_worker(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("invalid workers started a measurement process")
+
+    monkeypatch.setitem(probe["main"].__globals__, "_bounded_worker", unexpected_worker)
+    monkeypatch.setattr(
+        sys, "argv", [str(_SCRIPT), "--workers", str(workers), "--output", str(output)]
+    )
+    with pytest.raises(SystemExit) as caught:
+        probe["main"]()
+    assert caught.value.code == 2
+    assert "--workers" in capsys.readouterr().err
+    assert not output.exists()
 
 
 def test_cli_timeout_is_incomplete_and_preserves_error_evidence(

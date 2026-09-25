@@ -15,7 +15,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -28,6 +28,7 @@ from h2hdb_ingest.artifact import ArtifactRenderPolicy
 from h2hdb_ingest.core_source import VNextFilesystemSourceAdapter
 from h2hdb_ingest.filesystem import FilesystemSource
 from h2hdb_ingest.image_qualification import ImageGalleryQualifier
+from h2hdb_ingest.page_workers import MAX_PAGE_RENDER_WORKERS
 from h2hdb_ingest.source_performance import SourcePerformance
 
 _HELPERS = runpy.run_path(str(Path(__file__).with_name("probe-source-io.py")))
@@ -39,7 +40,7 @@ _FORMAT = 1
 _GIT_TIMEOUT = 10.0
 _MODEL = {
     "dimensions": "P PAGE files, one completion marker, one gallery; fixed seed 47029",
-    "units": "actual Python os.read bytes/calls, DirEntry.stat calls, scandir rows, decoded PAGE calls; logical I/O, never physical disk bytes",
+    "units": "actual Python os.read bytes/calls, gallery entry signature probes (DirEntry.stat and descriptor-relative page-entry os.stat; excludes existing root/metadata guards), scandir rows, decoded PAGE calls; logical I/O, never physical disk bytes",
     "budgets": {
         "source_page_read_bytes": "<= encoded PAGE bytes for each complete first/retry observation; one source-byte pass is the improvement target",
         "entry_stat_calls": "<= 8 * (P + 1) per complete observation; a constant allowance independent of number of pages returned by the adapter",
@@ -138,13 +139,23 @@ class _Entries:
     def __init__(self) -> None:
         self.rows = self.stat_calls = self.revalidation_calls = 0
         self.revalidation_rows = self.revalidation_stat_calls = 0
+        self.indexed_entry_stat_calls = self.full_audit_calls = (
+            self.page_validation_calls
+        ) = 0
         self.revalidating = False
+        self.validating_page = False
         self.revalidation_seconds = 0.0
 
     @contextmanager
     def instrument(self):
         original_scan = os.scandir
+        original_stat = os.stat
         original_revalidate = FilesystemSource._require_gallery_unchanged
+        # Absence is useful only when applying the identical meter to a retained
+        # pre-optimization checkout; no production fallback path is introduced.
+        original_page = getattr(
+            FilesystemSource, "_require_gallery_page_unchanged", None
+        )
 
         def scan(path: Any = ".") -> _Scan:
             return _Scan(original_scan(path), self)
@@ -153,23 +164,57 @@ class _Entries:
             before = self.revalidating
             self.revalidating = True
             self.revalidation_calls += 1
+            self.full_audit_calls += 1
             started = perf_counter()
             try:
                 original_revalidate(source, index)
             finally:
-                self.revalidation_seconds += perf_counter() - started
+                if not before:
+                    self.revalidation_seconds += perf_counter() - started
                 self.revalidating = before
 
-        with (
-            patch.object(os, "scandir", scan),
-            patch.object(FilesystemSource, "_require_gallery_unchanged", revalidate),
-        ):
+        def page(source: FilesystemSource, index: Any, entries: Any) -> None:
+            before, was_page = self.revalidating, self.validating_page
+            self.revalidating = self.validating_page = True
+            self.revalidation_calls += 1
+            self.page_validation_calls += 1
+            started = perf_counter()
+            try:
+                assert original_page is not None
+                original_page(source, index, entries)
+            finally:
+                if not before:
+                    self.revalidation_seconds += perf_counter() - started
+                self.revalidating, self.validating_page = before, was_page
+
+        def observed_stat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if self.validating_page and kwargs.get("dir_fd") is not None:
+                self.stat_calls += 1
+                self.revalidation_stat_calls += 1
+                self.indexed_entry_stat_calls += 1
+            return original_stat(path, *args, **kwargs)
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(os, "scandir", scan))
+            stack.enter_context(patch.object(os, "stat", observed_stat))
+            stack.enter_context(
+                patch.object(FilesystemSource, "_require_gallery_unchanged", revalidate)
+            )
+            if original_page is not None:
+                stack.enter_context(
+                    patch.object(
+                        FilesystemSource, "_require_gallery_page_unchanged", page
+                    )
+                )
             yield
 
     def report(self) -> dict[str, int | float]:
         return {
             "scandir_rows": self.rows,
             "entry_stat_calls": self.stat_calls,
+            "indexed_entry_stat_calls": self.indexed_entry_stat_calls,
+            "full_audit_calls": self.full_audit_calls,
+            "page_validation_calls": self.page_validation_calls,
             "revalidation_calls": self.revalidation_calls,
             "revalidation_rows": self.revalidation_rows,
             "revalidation_stat_calls": self.revalidation_stat_calls,
@@ -587,7 +632,7 @@ def _costs(case: dict[str, Any], *, pages: int, page_bytes: int) -> dict[str, An
                 "bound": bounds[name],
                 "unit": {
                     "source_page_read_bytes": "logical source PAGE bytes",
-                    "entry_stat_calls": "DirEntry.stat calls",
+                    "entry_stat_calls": "gallery entry signature stat calls",
                     "decode_calls": "decoded PAGE images",
                 }[name],
                 "rationale": _MODEL["budgets"][name],
@@ -872,7 +917,9 @@ def main() -> int:
     parser.add_argument("--edge", type=integer(16, 2048), default=128)
     parser.add_argument("--codec", choices=("png", "jpeg", "both"), default="both")
     parser.add_argument("--repeats", type=integer(2, 4), default=2)
-    parser.add_argument("--workers", type=integer(1, 4), default=1)
+    parser.add_argument(
+        "--workers", type=integer(1, MAX_PAGE_RENDER_WORKERS), default=1
+    )
     parser.add_argument("--skip-image-cases", action="store_true")
     parser.add_argument("--timeout", type=integer(10, 3600), default=300)
     parser.add_argument("--output", type=Path)
