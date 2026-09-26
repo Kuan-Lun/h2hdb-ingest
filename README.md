@@ -17,7 +17,7 @@ You need:
 - A nonempty download directory containing completed galleries with
   `galleryinfo.txt` metadata. Nested collection folders are supported.
 - An H2HDB database, using SQLite or MariaDB. This release requires
-  `h2hdb>=0.41.0,<0.42.0` and schema epoch 3, version 8.
+  `h2hdb>=0.43.0,<0.44.0` and schema epoch 3, version 9.
 - For CBZ output, a separate writable library directory and enough disk space
   for image processing, one gallery's verified render input, database plans,
   and all output awaiting publication.
@@ -511,18 +511,20 @@ credentials, and has no network access while executing the converter. Building
 the image can download dependencies. Restart consumers only after conversion
 reports completion and all installed application versions are compatible.
 
-An exact H2HDB schema-version-7 database can use the core project's one-time
-offline `upgrade-source-collection-schema.py` tool from historical Core 0.41.2
-to reach schema version 8. That tool was removed from Core 0.42; use the
-[Core 0.41.2 checkout and its matching environment](https://github.com/Kuan-Lun/h2hdb/tree/64683c5),
-with all consumers stopped.
-Keep the database, CBZs, thumbnails, and complete private library state in place;
-this conversion changes database schema, not artifact bytes or the library layout.
-For schema 6, first use Core 0.40.0's `upgrade-audit-schema.py` and its environment
-to reach schema 7, then use the new converter. Leave all consumers stopped
-throughout both conversions and retain the original database/library backup.
-Other older schemas require a new database and catalog rebuild from the source;
-normal ingest startup does not convert them.
+An exact H2HDB schema-version-8 database requires Core's one-time offline
+`upgrade-observation-upload-time-schema.py` conversion to schema 9. Stop all
+consumers and follow the Core README or its Docker bundle instructions. Existing
+observations, publications, database contents, CBZs, thumbnails and private
+library state are retained; the library journal remains version 5. A corrected
+source upload time is recorded in a new observation and takes effect for readers
+only when that observation is published. Normal ingest startup does not convert
+the database.
+
+For schema 7, first use the historical Core 0.41.2 source-collection converter
+and its matching environment to reach schema 8. For schema 6, first use Core
+0.40.0's audit converter to reach schema 7. Then use the schema-8-to-9 converter;
+keep consumers stopped throughout and retain the database/library backup.
+Other older schemas require a separate database and catalog rebuild from source.
 
 Legacy libraries containing `current/hash-v1`, `.h2hdb-state/coordination`, or
 activation journals version 1, 2, or 3 are rejected. Keep their files intact and

@@ -36,7 +36,7 @@ def test_distribution_commands_target_vnext_entry_points() -> None:
     assert callable(import_module("h2hdb_ingest.relocate").main)
 
 
-def test_core_dependency_admits_verified_schema8_lanes_only() -> None:
+def test_core_dependency_requires_observation_upload_time_schema9() -> None:
     project = tomllib.loads(
         (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
     )["project"]
@@ -45,8 +45,7 @@ def test_core_dependency_admits_verified_schema8_lanes_only() -> None:
         for item in map(Requirement, project["dependencies"])
         if item.name == "h2hdb"
     )
-    assert "0.41.0" in dependency.specifier
-    assert "0.41.2" in dependency.specifier
-    assert "0.42.0" in dependency.specifier
-    assert "0.40.9" not in dependency.specifier
-    assert "0.43.0" not in dependency.specifier
+    assert "0.43.0" in dependency.specifier
+    assert "0.43.1" in dependency.specifier
+    assert "0.42.2" not in dependency.specifier
+    assert "0.44.0" not in dependency.specifier

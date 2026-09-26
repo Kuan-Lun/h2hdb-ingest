@@ -434,6 +434,67 @@ def test_completion_marker_cache_skips_unchanged_image_bytes_across_restart(
         assert restarted.database_admin.check().state == "READY"
 
 
+@pytest.mark.parametrize("artifacts_enabled", [False, True])
+def test_corrected_source_upload_time_publishes_and_survives_restart(
+    tmp_path: Path,
+    runtime_core_config: CoreConfig,
+    artifacts_enabled: bool,
+) -> None:
+    source = tmp_path / "download"
+    gid = 1_322_802
+    page = BytesIO()
+    Image.new("RGB", (8, 12), "red").save(page, format="JPEG")
+    _gallery(source, gid, "timestamp", page_bytes=page.getvalue())
+    folder = source / str(gid)
+    marker = folder / "galleryinfo.txt"
+    marker.write_text(
+        marker.read_text().replace("2024-01-02 03:04", "2018-12-01 17:53"),
+        encoding="utf-8",
+    )
+    library = tmp_path / "library"
+    if artifacts_enabled:
+        _provision_library_root(library)
+    config = IngestConfig(
+        core=runtime_core_config,
+        paths=IngestPathsConfig(
+            download_path=source,
+            library_path=library if artifacts_enabled else None,
+            page_render_workers=1,
+        ),
+    )
+    original_time = datetime(2018, 12, 1, 17, 53, tzinfo=UTC)
+    corrected_time = datetime(2018, 12, 1, 17, 49, tzinfo=UTC)
+    with build_runtime(config) as runtime:
+        runtime.database_admin.initialize()
+        _synchronize_after_cleanup(runtime)
+        original_revision = runtime.catalog.get_catalog_revision()
+        original = runtime.catalog.discover_publications().publications
+        assert len(original) == 1 and original[0].published_at == original_time
+        marker.write_text(
+            marker.read_text().replace("2018-12-01 17:53", "2018-12-01 17:49"),
+            encoding="utf-8",
+        )
+        _rewrite_completion_marker(folder)
+        assert runtime.catalog.discover_publications().publications == original
+        _synchronize_after_cleanup(runtime)
+        corrected_revision = runtime.catalog.get_catalog_revision()
+        assert corrected_revision.revision == original_revision.revision + 1
+        corrected = runtime.catalog.discover_publications().publications
+        assert len(corrected) == 1
+        assert corrected[0].gid == gid
+        assert corrected[0].published_at == corrected_time
+        assert bool(corrected[0].artifacts) is artifacts_enabled
+        assert (folder / "001.jpg").read_bytes() == page.getvalue()
+        assert runtime.database_admin.check().state == "READY"
+
+    with build_runtime(config) as restarted:
+        restarted.resident.initialize()
+        _synchronize_after_cleanup(restarted)
+        assert restarted.catalog.get_catalog_revision() == corrected_revision
+        assert restarted.catalog.discover_publications().publications == corrected
+        assert restarted.database_admin.check().state == "READY"
+
+
 @pytest.mark.parametrize("marker_change", ["stat", "content"])
 def test_completion_marker_change_reloads_only_the_affected_gallery(
     tmp_path: Path,
