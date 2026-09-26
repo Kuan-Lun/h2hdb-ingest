@@ -1191,7 +1191,11 @@ def _transport_fixture(source_root: Path, destination: Path) -> dict[str, Any]:
     destination.mkdir()
     folder = destination / "1000000"
     folder.mkdir()
-    for record, admitted in zip(manifest["records"], oracle["files"], strict=True):
+    members = zip(manifest["records"], oracle["files"], strict=True)
+    # The completion marker must postdate every recreated PAGE, regardless of name.
+    for record, admitted in sorted(
+        members, key=lambda member: member[0]["name"] == "galleryinfo.txt"
+    ):
         path = source_root / "1000000" / record["name"]
         identity = path.stat(follow_symlinks=False)
         observed = (
@@ -1263,8 +1267,8 @@ def run_case(
         raise ValueError("workers outside the production bound")
     if type(timeout_seconds) is not int or not 10 <= timeout_seconds <= 3600:
         raise ValueError("timeout outside 10..3600 seconds")
-    _require_source_snapshot(_LOADED_SOURCE_SNAPSHOT)
-    expected = _source_snapshot()
+    expected = _LOADED_SOURCE_SNAPSHOT
+    _require_source_snapshot(expected)
     with tempfile.TemporaryDirectory(prefix="qualification-case-") as temporary:
         workspace = Path(temporary).resolve()
         command = [
@@ -1633,8 +1637,8 @@ def main() -> int:
         return 0
     if os.path.lexists(arguments.output):
         parser.error("output already exists")
-    expected = _source_snapshot()
-    _require_source_snapshot(_LOADED_SOURCE_SNAPSHOT)
+    expected = _LOADED_SOURCE_SNAPSHOT
+    _require_source_snapshot(expected)
     with tempfile.TemporaryDirectory(prefix="qualification-phases-") as temporary:
         workspace = Path(temporary).resolve()
         (workspace / "expected-provenance.json").write_text(json.dumps(expected))

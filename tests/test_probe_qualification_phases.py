@@ -1144,3 +1144,63 @@ def test_runtime_imported_before_disk_edit_is_never_reported_as_complete(
     )
     assert result.returncode == 0, result.stderr
     assert "cached old runtime remained unverified" in result.stdout
+
+
+@pytest.mark.parametrize("name", ("page.png", "z.png"))
+@pytest.mark.skipif(
+    os.name != "posix", reason="public probe API owns POSIX worker groups"
+)
+def test_fixture_transport_finishes_marker_after_later_sorted_page_names(
+    tmp_path: Path, probe: dict[str, Any], name: str
+) -> None:
+    root = probe["create_fixture"](tmp_path / "source", [(name, _page())])
+    report = probe["run_case"](root, workers=1)
+    assert report["status"] == "completed"
+    assert report["qualification"]["accepted"] is True
+    members = {
+        bytes.fromhex(row["name_bytes"]): row
+        for row in report["fixture"]["source_oracle"]["files"]
+    }
+    assert (
+        members[b"galleryinfo.txt"]["modified_ns"]
+        >= members[name.encode()]["modified_ns"]
+    )
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="public probe API owns POSIX worker groups"
+)
+def test_source_edit_after_initial_check_cannot_become_a_new_api_baseline(
+    tmp_path: Path, probe: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = probe["create_fixture"](tmp_path / "source", [("000.png", _page())])
+    watched = tmp_path / "retained-helper.py"
+    shutil.copyfile(_SCRIPT.with_name("check-source-cost.py"), watched)
+    original_provenance = probe["_COST"]["_provenance"]
+    original_check = probe["_require_source_snapshot"]
+    changed = False
+
+    def provenance(*args: Any, **kwargs: Any) -> Any:
+        value = original_provenance(*args, **kwargs)
+        value["acceptance_sha256"] = sha256(watched.read_bytes()).hexdigest()
+        return value
+
+    def check_then_edit(expected: dict[str, Any]) -> None:
+        nonlocal changed
+        original_check(expected)
+        if not changed:
+            with watched.open("ab") as stream:
+                stream.write(b"\n# Edit after the first source check.\n")
+            changed = True
+
+    def forbidden_worker(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("source changed after initial admission; worker must not start")
+
+    monkeypatch.setitem(probe["_COST"], "_provenance", provenance)
+    monkeypatch.setitem(
+        probe["run_case"].__globals__, "_require_source_snapshot", check_then_edit
+    )
+    monkeypatch.setitem(probe["_COST"], "_bounded_worker", forbidden_worker)
+    with pytest.raises(RuntimeError, match="source changed"):
+        probe["run_case"](root, workers=1)
+    assert changed
