@@ -8,9 +8,12 @@ import math
 import os
 import py_compile
 import runpy
+import shutil
 import signal
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from time import monotonic, sleep
@@ -52,29 +55,73 @@ def _process_identity(pid: int) -> str | None:
     return _process_field(pid, "lstart")
 
 
+def _group_has_executing_members(pgid: int, *, deadline: float) -> bool:
+    """Observe all group members without reading their arguments or environment.
+
+    Adopted zombies cannot execute and this unrelated test process cannot reap
+    them. This is deliberately weaker than the runner's fully absent-group
+    receipt, but never treats an absent leader as an absent process group.
+    """
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise AssertionError("test group inspection deadline expired")
+    result = subprocess.run(
+        ["ps", "-axo", "pgid=,stat="],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=min(2.0, remaining),
+    )
+    if result.returncode != 0 or result.stderr.strip():
+        raise RuntimeError("ps could not establish owned group membership")
+    members = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            raise RuntimeError("ps returned malformed group membership")
+        if int(fields[0]) == pgid:
+            members.append(fields[1])
+    if members:
+        return any(not state.startswith("Z") for state in members)
+    # A group may acquire a new child while ps collects its process snapshot.
+    # No listed members alone is not enough evidence of group absence.
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def _reclaim_recorded_groups(root: Path, deadline: float) -> None:
     errors = []
     for receipt_path in root.glob("owned-*.json"):
         try:
             receipt = json.loads(receipt_path.read_text())
             pid = receipt["pid"]
+            if type(pid) is not int or pid <= 1:
+                raise AssertionError("owned receipt has an invalid group identity")
+            if not _group_has_executing_members(pid, deadline=deadline):
+                continue
             identity = _process_identity(pid)
             if identity is None:
-                continue
-            assert receipt["identity"] and identity == receipt["identity"]
-            assert os.getpgid(pid) == pid
-            os.killpg(pid, signal.SIGKILL)
-            # An orphaned zombie has no executing worker and is reaped by the
-            # OS adopter, not by this unrelated pytest process.
-            while monotonic() < deadline:
-                state = _process_field(pid, "stat")
-                if state is None or state.startswith("Z"):
-                    break
+                raise AssertionError(
+                    "owned leader identity unavailable while group still executes"
+                )
+            if not receipt["identity"] or identity != receipt["identity"]:
+                raise AssertionError("owned leader identity changed")
+            try:
+                if os.getpgid(pid) != pid:
+                    raise AssertionError("owned leader process group changed")
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                # Leader exit can race either call. We may not signal a group
+                # again without its original leader identity; require evidence
+                # that every group member has stopped before claiming cleanup.
+                pass
+            while _group_has_executing_members(pid, deadline=deadline):
+                if monotonic() >= deadline:
+                    raise AssertionError("test left an executing detached group")
                 sleep(0.01)
-            else:
-                raise AssertionError("test left an executing detached worker")
-        except ProcessLookupError:
-            continue  # Exit/reap can race with identity, getpgid or killpg.
         except Exception as error:
             errors.append(f"{receipt_path.name}: {error}")
     if errors:
@@ -88,15 +135,29 @@ def _run_owned_cli(
     timeout: float = 30,
     injected_program: str | None = None,
     force_supervisor_kill: bool = False,
+    script: Path = _SCRIPT,
+    worker_ready_path: Path | None = None,
+    inherited_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     """Test owns every detached group, even when it must SIGKILL the supervisor.
 
     The spawn lock prevents the outer timeout from killing a launcher between
-    Popen and its ownership receipt. No runtime test hook is introduced.
+    Popen and its ownership receipt. Scratch is removed only after every owned
+    group has no executing members; unavailable identity preserves the scratch.
+    Explicit inherited descriptors support test-only owner-death read pipes.
+    No runtime test hook is introduced.
     """
     import fcntl
 
     root.mkdir()
+    temporary = root / "temporary"
+    temporary.mkdir()
+    environment = {
+        **os.environ,
+        "TMPDIR": str(temporary),
+        "TMP": str(temporary),
+        "TEMP": str(temporary),
+    }
     launcher = root / "launcher.py"
     launcher.write_text(
         "import fcntl,json,os,pathlib,runpy,signal,subprocess,sys\n"
@@ -122,11 +183,11 @@ def _run_owned_cli(
         "    raise\n"
         "  return process\n"
         "subprocess.Popen=owned\n"
-        f"sys.argv={[str(_SCRIPT), *arguments]!r}\n"
+        f"sys.argv={[str(script), *arguments]!r}\n"
         + (
             injected_program
             if injected_program is not None
-            else f"runpy.run_path({str(_SCRIPT)!r},run_name='__main__')\n"
+            else f"runpy.run_path({str(script)!r},run_name='__main__')\n"
         )
     )
     output_path, error_path = root / "stdout", root / "stderr"
@@ -137,18 +198,30 @@ def _run_owned_cli(
             stdout=stdout,
             stderr=stderr,
             start_new_session=True,
+            env=environment,
+            pass_fds=inherited_fds,
         )
         try:
             if force_supervisor_kill:
                 # Start the injected outer timeout only after the real worker
                 # exists; import scheduling under xdist is not the fault oracle.
                 ready_deadline = monotonic() + 10
-                while not list(root.glob("owned-*.json")) and process.poll() is None:
+
+                def ready() -> bool:
+                    return bool(list(root.glob("owned-*.json"))) and (
+                        worker_ready_path is None or worker_ready_path.is_file()
+                    )
+
+                while not ready() and process.poll() is None:
                     if monotonic() >= ready_deadline:
                         raise AssertionError(
                             "test worker never reached its owned start boundary"
                         )
                     sleep(0.01)
+                if not ready():
+                    raise AssertionError(
+                        "test worker never reached its owned start boundary"
+                    )
             try:
                 process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -182,6 +255,9 @@ def _run_owned_cli(
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=2)
+            # Only reclaim scratch after stable identities and detached groups
+            # have been checked. Failed group reclamation preserves evidence.
+            shutil.rmtree(temporary)
     if timed_out:
         raise subprocess.TimeoutExpired(process.args, timeout)
     returncode = process.poll()
@@ -939,6 +1015,12 @@ def test_test_owner_accepts_exit_races_and_still_checks_other_receipts(
             json.dumps({"pid": pid, "identity": "same"})
         )
     checked: list[int] = []
+    inspections: dict[int, int] = {}
+
+    def executing(pid: int, *, deadline: float) -> bool:
+        del deadline
+        inspections[pid] = inspections.get(pid, 0) + 1
+        return inspections[pid] == 1
 
     def identity(pid: int) -> str:
         checked.append(pid)
@@ -949,6 +1031,11 @@ def test_test_owner_accepts_exit_races_and_still_checks_other_receipts(
 
     monkeypatch.setitem(
         _reclaim_recorded_groups.__globals__, "_process_identity", identity
+    )
+    monkeypatch.setitem(
+        _reclaim_recorded_groups.__globals__,
+        "_group_has_executing_members",
+        executing,
     )
     monkeypatch.setattr(os, "getpgid", lambda pid: pid)
     monkeypatch.setattr(os, boundary, gone)
@@ -968,3 +1055,305 @@ def test_test_owner_rejects_ps_errors_instead_of_claiming_process_absence(
     )
     with pytest.raises(RuntimeError, match="could not establish"):
         _process_identity(123)
+
+
+@contextmanager
+def _fixture_owner_death_pipe() -> Iterator[int]:
+    """Only this owner retains a writer; descendants may inherit the read end."""
+    reader, writer = os.pipe()
+    try:
+        yield reader
+    finally:
+        os.close(writer)
+        os.close(reader)
+
+
+def _descendant_owner_program(
+    root: Path, ready: Path, *, exit_leader: bool, owner_read_fd: int
+) -> str:
+    child_record = root / "child.json"
+    child = (
+        "import json,os,pathlib,select,signal,sys,time\n"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        "deadline=time.monotonic()+30\n"
+        "reason='self_deadline'\n"
+        "with pathlib.Path(sys.argv[1]).open('ab') as stream:\n"
+        " while time.monotonic()<deadline:\n"
+        f"  if select.select([{owner_read_fd}],[],[],.05)[0]:\n"
+        f"   if os.read({owner_read_fd},1)==b'': reason='owner_eof'; break\n"
+        "  stream.write(b'.'); stream.flush()\n"
+        f"record=pathlib.Path({str(root / 'child-stopped.json')!r})\n"
+        "record.with_suffix('.writing').write_text(json.dumps({'pid':os.getpid(),'reason':reason}))\n"
+        "record.with_suffix('.writing').replace(record)\n"
+    )
+    worker = (
+        "import json,os,pathlib,signal,subprocess,sys,time\n"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        "scratch=pathlib.Path(os.environ['TMPDIR'])/'active-child.bin'\n"
+        "scratch.write_bytes(b'owned')\n"
+        f"child=subprocess.Popen([sys.executable,'-c',{child!r},str(scratch)],pass_fds=({owner_read_fd},))\n"
+        f"record=pathlib.Path({str(child_record)!r})\n"
+        "identity=subprocess.run(['ps','-p',str(child.pid),'-o','lstart='],capture_output=True,text=True,check=True,timeout=2).stdout.strip()\n"
+        "record.with_suffix('.writing').write_text(json.dumps({'pid':child.pid,'identity':identity}))\n"
+        "record.with_suffix('.writing').replace(record)\n"
+        f"ownership=pathlib.Path({str(root)!r})/f'owned-{{os.getpid()}}.json'\n"
+        "deadline=time.monotonic()+10\n"
+        "while not ownership.exists():\n"
+        " if time.monotonic()>=deadline: raise RuntimeError('ownership not recorded')\n"
+        " time.sleep(.005)\n"
+        + ("raise SystemExit(0)\n" if exit_leader else "time.sleep(30)\n")
+    )
+    return (
+        "import time\n"
+        "launcher_identity=subprocess.run(['ps','-p',str(os.getpid()),'-o','lstart='],capture_output=True,text=True,check=True,timeout=2).stdout.strip()\n"
+        f"(root/'launcher.json').write_text(json.dumps({{'pid':os.getpid(),'identity':launcher_identity}}))\n"
+        f"worker=subprocess.Popen([sys.executable,'-c',{worker!r}],start_new_session=True,pass_fds=({owner_read_fd},))\n"
+        f"record=pathlib.Path({str(child_record)!r})\n"
+        "deadline=time.monotonic()+10\n"
+        "while not record.exists():\n"
+        " if time.monotonic()>=deadline: raise RuntimeError('child not recorded')\n"
+        " time.sleep(.01)\n"
+        "child=json.loads(record.read_text())['pid']\n"
+        + ("worker.wait(timeout=5)\n" if exit_leader else "")
+        + "identity=subprocess.run(['ps','-p',str(child),'-o','lstart='],capture_output=True,text=True,check=True,timeout=2).stdout.strip()\n"
+        + f"ready=pathlib.Path({str(ready)!r})\n"
+        + "ready.with_suffix('.writing').write_text(json.dumps({'child':child,'identity':identity,'leader':worker.pid,'launcher':os.getpid(),'launcher_identity':launcher_identity}))\n"
+        + "ready.with_suffix('.writing').replace(ready)\n"
+        + "time.sleep(30)\n"
+    )
+
+
+def _stop_identified_test_process(pid: int, expected_identity: str) -> None:
+    identity = _process_identity(pid)
+    state = _process_field(pid, "stat")
+    if identity is None or state is None or state.startswith("Z"):
+        return
+    assert identity == expected_identity
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    deadline = monotonic() + 3
+    while monotonic() < deadline:
+        state = _process_field(pid, "stat")
+        if state is None or state.startswith("Z"):
+            return
+        sleep(0.01)
+    raise AssertionError("test fixture left an executing descendant")
+
+
+def _finish_test_child(ready: Path, *, fallback: Path) -> None:
+    """The test retains the child identity even when the group owner cannot."""
+    if ready.exists():
+        receipt = json.loads(ready.read_text())
+        child = receipt["child"]
+    elif fallback.exists():
+        receipt = json.loads(fallback.read_text())
+        child = receipt["pid"]
+    else:
+        return
+    _stop_identified_test_process(child, receipt["identity"])
+
+
+@pytest.mark.parametrize("exit_leader", (False, True))
+def test_outer_owner_requires_whole_group_stop_before_removing_scratch(
+    tmp_path: Path, exit_leader: bool
+) -> None:
+    root, ready = tmp_path / "owner", tmp_path / "ready.json"
+    expected = AssertionError if exit_leader else subprocess.TimeoutExpired
+    with _fixture_owner_death_pipe() as owner_read_fd:
+        try:
+            with pytest.raises(expected) as caught:
+                _run_owned_cli(
+                    root,
+                    [],
+                    timeout=0.2,
+                    force_supervisor_kill=True,
+                    worker_ready_path=ready,
+                    inherited_fds=(owner_read_fd,),
+                    injected_program=_descendant_owner_program(
+                        root,
+                        ready,
+                        exit_leader=exit_leader,
+                        owner_read_fd=owner_read_fd,
+                    ),
+                )
+            receipt = json.loads(ready.read_text())
+            if exit_leader:
+                assert "leader identity unavailable" in str(caught.value)
+                assert _process_identity(receipt["leader"]) is None
+                assert _group_has_executing_members(
+                    receipt["leader"], deadline=monotonic() + 2
+                )
+                assert (root / "temporary" / "active-child.bin").is_file()
+            else:
+                assert not _group_has_executing_members(
+                    receipt["leader"], deadline=monotonic() + 2
+                )
+                assert not (root / "temporary").exists()
+        finally:
+            _finish_test_child(ready, fallback=root / "child.json")
+
+
+def test_outer_owner_preserves_scratch_when_group_inspection_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, ready = tmp_path / "owner", tmp_path / "ready.json"
+    original = _group_has_executing_members
+
+    def unavailable(_pid: int, *, deadline: float) -> bool:
+        del deadline
+        raise RuntimeError("injected unreadable group state")
+
+    monkeypatch.setitem(
+        _reclaim_recorded_groups.__globals__,
+        "_group_has_executing_members",
+        unavailable,
+    )
+    with _fixture_owner_death_pipe() as owner_read_fd:
+        try:
+            with pytest.raises(AssertionError, match="unreadable group state"):
+                _run_owned_cli(
+                    root,
+                    [],
+                    timeout=0.2,
+                    force_supervisor_kill=True,
+                    worker_ready_path=ready,
+                    inherited_fds=(owner_read_fd,),
+                    injected_program=_descendant_owner_program(
+                        root,
+                        ready,
+                        exit_leader=False,
+                        owner_read_fd=owner_read_fd,
+                    ),
+                )
+            assert (root / "temporary" / "active-child.bin").is_file()
+        finally:
+            monkeypatch.setitem(
+                _reclaim_recorded_groups.__globals__,
+                "_group_has_executing_members",
+                original,
+            )
+            try:
+                _reclaim_recorded_groups(root, monotonic() + 5)
+            finally:
+                _finish_test_child(ready, fallback=root / "child.json")
+
+
+def test_detached_writer_stops_on_outer_owner_death_before_self_deadline(
+    tmp_path: Path,
+) -> None:
+    """SIGKILL bypasses the real owner finally; EOF must stop the writer."""
+    root, ready = tmp_path / "owner", tmp_path / "ready.json"
+    program = (
+        "import pathlib,runpy\n"
+        f"api=runpy.run_path({str(Path(__file__).resolve())!r})\n"
+        f"root,ready=pathlib.Path({str(root)!r}),pathlib.Path({str(ready)!r})\n"
+        "with api['_fixture_owner_death_pipe']() as reader:\n"
+        " program=api['_descendant_owner_program'](root,ready,exit_leader=False,owner_read_fd=reader)\n"
+        " api['_run_owned_cli'](root,[],timeout=10,inherited_fds=(reader,),injected_program=program)\n"
+    )
+    # The pipe is created inside this process. This pytest and every descendant
+    # other than this owner have no writer, so SIGKILL must expose EOF directly.
+    with (tmp_path / "outer-stdout").open("w+b") as stdout:
+        owner = subprocess.Popen(
+            [sys.executable, "-c", program], stdout=stdout, stderr=stdout
+        )
+        try:
+            ready_deadline = monotonic() + 8
+            while not ready.is_file():
+                assert owner.poll() is None, "outer fixture owner exited early"
+                assert monotonic() < ready_deadline, "fixture never became ready"
+                sleep(0.01)
+            receipt = json.loads(ready.read_text())
+            scratch = root / "temporary" / "active-child.bin"
+            previous_size = scratch.stat().st_size
+            while scratch.stat().st_size == previous_size:
+                assert monotonic() < ready_deadline, "child never wrote scratch"
+                sleep(0.01)
+            assert not (root / "child-stopped.json").exists()
+            owner.kill()
+            owner.wait(timeout=2)
+            # The fixture TTL is 30 seconds; this requires the independent EOF
+            # route within 2 seconds while both intermediate processes survive.
+            stopped_deadline = monotonic() + 2
+            stopped = root / "child-stopped.json"
+            while not stopped.exists():
+                assert monotonic() < stopped_deadline, "owner EOF did not stop child"
+                sleep(0.01)
+            assert json.loads(stopped.read_text()) == {
+                "pid": receipt["child"],
+                "reason": "owner_eof",
+            }
+            while True:
+                state = _process_field(receipt["child"], "stat")
+                if state is None or state.startswith("Z"):
+                    break
+                assert monotonic() < stopped_deadline, "child continued executing"
+                sleep(0.01)
+            for pid in (receipt["launcher"], receipt["leader"]):
+                state = _process_field(pid, "stat")
+                assert state is not None and not state.startswith("Z")
+            final_size = scratch.stat().st_size
+            sleep(0.15)
+            assert scratch.stat().st_size == final_size
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+            owner.wait(timeout=2)
+            try:
+                _reclaim_recorded_groups(root, monotonic() + 5)
+            finally:
+                try:
+                    _finish_test_child(ready, fallback=root / "child.json")
+                finally:
+                    launcher_record = root / "launcher.json"
+                    if launcher_record.is_file():
+                        launcher = json.loads(launcher_record.read_text())
+                        _stop_identified_test_process(
+                            launcher["pid"], launcher["identity"]
+                        )
+
+
+def test_test_owner_never_signals_reused_leader_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "owned-123.json").write_text(
+        json.dumps({"pid": 123, "identity": "original process"})
+    )
+    monkeypatch.setitem(
+        _reclaim_recorded_groups.__globals__,
+        "_group_has_executing_members",
+        lambda _pid, *, deadline: True,
+    )
+    monkeypatch.setitem(
+        _reclaim_recorded_groups.__globals__,
+        "_process_identity",
+        lambda _pid: "different process",
+    )
+
+    def forbidden(*_args: object) -> None:
+        pytest.fail("test owner must not signal a reused process group")
+
+    monkeypatch.setattr(os, "killpg", forbidden)
+    with pytest.raises(AssertionError, match="leader identity changed"):
+        _reclaim_recorded_groups(tmp_path, monotonic() + 1)
+
+
+@pytest.mark.parametrize(
+    "output",
+    ("123 Z\n123 S\n", "123 Z\n124 S\n", "123 Z\n123 Z+\n"),
+)
+def test_group_state_covers_all_members_including_zombie_leader(
+    monkeypatch: pytest.MonkeyPatch, output: str
+) -> None:
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout=output, stderr=""
+        ),
+    )
+    assert _group_has_executing_members(123, deadline=monotonic() + 1) == (
+        output == "123 Z\n123 S\n"
+    )
