@@ -13,8 +13,8 @@ license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = [
     "h2h-galleryinfo-parser>=0.5.3,<0.6",
-    # Core owns observation-specific and published upload timestamps in schema 9.
-    "h2hdb>=0.43.0,<0.44.0",
+    # Core 0.43/0.44 share schema 9; 0.44 only retires its offline upgrade CLI.
+    "h2hdb>=0.43.0,<0.45.0",
     "pillow>=12.3.0,<13.0.0",
     "pydantic>=2.13.4,<3.0.0",
     # Native decoder/resizer behavior is audited within these tested major lanes.

@@ -243,9 +243,11 @@ def test_relocation_verifies_complete_v5_copy_preserving_catalog_and_bytes(
 
 
 @pytest.mark.parametrize("entrypoint", ("runtime", "relocation"))
+@pytest.mark.parametrize("old_version", (3, 4))
 def test_current_entrypoints_reject_old_journal_without_mutation(
     tmp_path: Path,
     entrypoint: str,
+    old_version: int,
 ) -> None:
     root = tmp_path / "library"
     _provision_root(root)
@@ -254,7 +256,7 @@ def test_current_entrypoints_reject_old_journal_without_mutation(
             "CREATE TABLE library_state "
             "(singleton INTEGER PRIMARY KEY, format_version INTEGER NOT NULL)"
         )
-        connection.execute("INSERT INTO library_state VALUES (1, 3)")
+        connection.execute("INSERT INTO library_state VALUES (1, ?)", (old_version,))
     original_database = _journal(root).read_bytes()
     original_paths = tuple(sorted(path.relative_to(root) for path in root.rglob("*")))
 
@@ -267,7 +269,7 @@ def test_current_entrypoints_reject_old_journal_without_mutation(
     with sqlite3.connect(_journal(root)) as connection:
         assert connection.execute(
             "SELECT format_version FROM library_state"
-        ).fetchone() == (3,)
+        ).fetchone() == (old_version,)
     assert _journal(root).read_bytes() == original_database
     assert (
         tuple(sorted(path.relative_to(root) for path in root.rglob("*")))

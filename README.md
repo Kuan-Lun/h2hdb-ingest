@@ -17,7 +17,7 @@ You need:
 - A nonempty download directory containing completed galleries with
   `galleryinfo.txt` metadata. Nested collection folders are supported.
 - An H2HDB database, using SQLite or MariaDB. This release requires
-  `h2hdb>=0.43.0,<0.44.0` and schema epoch 3, version 9.
+  `h2hdb>=0.43.0,<0.45.0` and schema epoch 3, version 9.
 - For CBZ output, a separate writable library directory and enough disk space
   for image processing, one gallery's verified render input, database plans,
   and all output awaiting publication.
@@ -252,10 +252,6 @@ gallery's unsealed checks are lost when markers remain stable; changed galleries
 must be checked again. These checkpoints retain metadata and hashes, not copies
 of the entire source image collection.
 
-This update requires the Core schema-7-to-8 offline converter. It preserves the
-database contents and complete library, including CBZs and private state; do not
-clear the database or rebuild the library to perform this upgrade.
-
 Keep `galleryinfo.txt` as the completion marker: finish writing a gallery's
 images before writing its metadata. Incomplete or changing galleries wait for
 a later turn while other complete galleries continue. A completed gallery is
@@ -468,61 +464,35 @@ inspection instead of being silently removed.
 Upgrade ingest and H2HDB together within their declared dependency ranges.
 Back up the database and the complete library before offline maintenance.
 The runtime and relocation command accept only the exact format-v5 private
-library journal. An existing format-v4 library needs the one-time offline
-conversion below; keep its CBZs, artwork and Core database. The converter adds a
-cleanup-selection index and atomically updates the version control table. It
-preserves the UUID, publication/protection/relocation facts, marker bytes and
-artifact files. It does not run a Core database migration or full database audit.
+library journal. The completed journal-v4-to-v5 converter, its packaged Python
+module and Docker bundle builder have been removed from this checkout and wheel.
+An already converted v5 library needs no further conversion, database reset or
+CBZ rebuild. Normal startup does not convert an old journal or use a fallback.
 
-Stop ingest, OPDS, Komga and every other process that could modify or read the
-library, then run the matching checkout and installed wheel:
+For an installation that still has an exact v4 journal, stop ingest, OPDS, Komga
+and every other library consumer, and use the historical Ingest **0.28.0**
+checkout's `upgrade-library-journal-v4-to-v5.py` or its Docker bundle builder with
+that release's matching environment. Follow that checkout's README. The tool
+preserves the UUID, publication/protection/relocation facts, marker bytes, CBZs
+and artwork; it does not migrate or audit the Core database. Preserve the
+complete library while resolving any interrupted conversion.
 
-```bash
-.venv/bin/python scripts/upgrade-library-journal-v4-to-v5.py \
-  --library /data/h2hdb/library --consumers-stopped
-```
-
-An interrupted conversion can be rerun with the same command. SQLite commits
-the index and version together; an exact v5 replay verifies the journal without
-changing its facts. Foreign structures and v1–v3 are rejected. Normal startup
-does not convert an old journal or fall back to its old format.
-
-For Docker, build the portable bundle from explicit, verified Ingest and Core
-wheels, passing the actual host bind source from your deployment Compose:
-
-```bash
-.venv/bin/python scripts/build-library-journal-upgrade-bundle.py \
-  --wheel /path/to/ingest.whl --core-wheel /path/to/core.whl \
-  --library-root /data/h2hdb/library \
-  --output /tmp/h2hdb-journal-upgrade.tar.gz
-```
-
-Extract the bundle beside the deployment `.env`, then run its `compose.yaml`:
-
-```bash
-sudo docker compose --env-file .env \
-  -f ./h2hdb-journal4-to5-docker-0.28.0/compose.yaml \
-  run --rm --build --no-deps upgrade \
-  --library /hentai/library --consumers-stopped
-```
-
-The container uses `MEDIA_UID` and `MEDIA_GID` from `.env`, requires no Core
-credentials, and has no network access while executing the converter. Building
-the image can download dependencies. Restart consumers only after conversion
-reports completion and all installed application versions are compatible.
-
-An exact H2HDB schema-version-8 database requires Core's one-time offline
-`upgrade-observation-upload-time-schema.py` conversion to schema 9. Stop all
-consumers and follow the Core README or its Docker bundle instructions. Existing
-observations, publications, database contents, CBZs, thumbnails and private
-library state are retained; the library journal remains version 5. A corrected
-source upload time is recorded in a new observation and takes effect for readers
-only when that observation is published. Normal ingest startup does not convert
-the database.
+Core **0.43.x and 0.44.x** both use schema 9; 0.44 retires Core's completed offline
+upgrade tools without changing that schema or the runtime facade contract.
+Already upgraded schema-9 databases need no further migration. For an exact
+schema-8 database or an interrupted schema-8-to-9 conversion, use the historical
+Core **0.43.0** checkout's `upgrade-observation-upload-time-schema.py` and matching
+environment, following its README or Docker bundle instructions with all
+consumers stopped. That conversion retains observations, publications, database
+contents, CBZs, thumbnails and private library state; the journal remains v5.
+A corrected source upload time is recorded in a new observation and takes effect
+for readers only when that observation is published. Ingest does not convert
+the Core database.
 
 For schema 7, first use the historical Core 0.41.2 source-collection converter
 and its matching environment to reach schema 8. For schema 6, first use Core
-0.40.0's audit converter to reach schema 7. Then use the schema-8-to-9 converter;
+0.40.0's audit converter to reach schema 7. Then use Core 0.43.0's historical
+schema-8-to-9 converter;
 keep consumers stopped throughout and retain the database/library backup.
 Other older schemas require a separate database and catalog rebuild from source.
 

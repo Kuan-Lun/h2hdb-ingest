@@ -3836,7 +3836,8 @@ def _require_runtime_journal_format(row: object) -> None:
         return
     if row == (4,):
         raise RuntimeError(
-            "library journal v4 requires the offline journal-v4-to-v5 upgrade tool; "
+            "library journal v4 requires the historical Ingest 0.28.0 offline "
+            "journal-v4-to-v5 tool, which is absent from this release; "
             "stop consumers and preserve the existing library"
         )
     raise RuntimeError(
