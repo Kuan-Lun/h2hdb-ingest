@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import runpy
 import subprocess
@@ -13,6 +14,81 @@ from typing import Any
 import pytest
 
 _SCRIPT = Path(__file__).parents[1] / "scripts" / "probe-source-backlog.py"
+
+
+@pytest.mark.parametrize("schema", (1, 2))
+def test_core_log_uses_exact_operation_totals_across_attribution_schemas(
+    schema: int,
+) -> None:
+    module = runpy.run_path(str(_SCRIPT))
+    handler = module["_CoreLog"]()
+    attribution = (
+        {"query_top": [{"calls": 2, "seconds": 0.1}]}
+        if schema == 1
+        else {
+            "query_attribution": {
+                "algorithm": "bounded-duration-upper-lower-v1",
+                "top": [
+                    {
+                        "fingerprint": "execute:SELECT:fixture",
+                        "observed_calls": 2,
+                        "seconds_lower": 0.1,
+                        "seconds_upper": 0.2,
+                        "complete": False,
+                    }
+                ],
+            }
+        }
+    )
+    preparation = {
+        "schema": schema,
+        "event": "completed",
+        "operation": "source_prepare",
+        "sql_calls": 3,
+        **attribution,
+    }
+    step = {
+        "schema": schema,
+        "event": "completed",
+        "operation": "source_step",
+        "labels": {"action": "issue", "step_phase": "SOURCE"},
+        "sql_calls": 3,
+        "sql_seconds": 0.25,
+        "read_rows": 7,
+        "elapsed_seconds": 0.5,
+        **attribution,
+    }
+    for payload in (
+        {"schema": schema, "event": "started", "operation": "source_prepare"},
+        preparation,
+        step,
+        step,
+    ):
+        handler.emit(
+            logging.LogRecord(
+                "h2hdb",
+                logging.DEBUG,
+                __file__,
+                0,
+                "database_performance " + json.dumps(payload),
+                (),
+                None,
+            )
+        )
+    report = handler.report()
+    assert report["source_prepare"] == [preparation]
+    assert report["SOURCE_sql_calls"] == 6
+    assert report["SOURCE_sql_seconds"] == 0.5
+    assert report["SOURCE_returned_rows"] == 14
+    assert report["SOURCE_phase_totals"] == {
+        "issue.SOURCE": {
+            "calls": 2,
+            "sql_calls": 6,
+            "sql_seconds": 0.5,
+            "read_rows": 14,
+            "elapsed_seconds": 1.0,
+        }
+    }
 
 
 def _read_pages(paths: list[Path]) -> None:

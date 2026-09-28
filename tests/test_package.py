@@ -50,4 +50,6 @@ def test_core_dependency_requires_observation_upload_time_schema9() -> None:
     assert "0.42.2" not in dependency.specifier
     assert "0.44.0" in dependency.specifier
     assert "0.44.1" in dependency.specifier
-    assert "0.45.0" not in dependency.specifier
+    assert "0.45.0" in dependency.specifier
+    assert "0.45.1" in dependency.specifier
+    assert "0.46.0" not in dependency.specifier

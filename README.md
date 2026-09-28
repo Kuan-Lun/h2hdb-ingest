@@ -17,7 +17,7 @@ You need:
 - A nonempty download directory containing completed galleries with
   `galleryinfo.txt` metadata. Nested collection folders are supported.
 - An H2HDB database, using SQLite or MariaDB. This release requires
-  `h2hdb>=0.43.0,<0.45.0` and schema epoch 3, version 9.
+  `h2hdb>=0.43.0,<0.46.0` and schema epoch 3, version 9.
 - For CBZ output, a separate writable library directory and enough disk space
   for image processing, one gallery's verified render input, database plans,
   and all output awaiting publication.
@@ -477,9 +477,13 @@ preserves the UUID, publication/protection/relocation facts, marker bytes, CBZs
 and artwork; it does not migrate or audit the Core database. Preserve the
 complete library while resolving any interrupted conversion.
 
-Core **0.43.x and 0.44.x** both use schema 9; 0.44 retires Core's completed offline
-upgrade tools without changing that schema or the runtime facade contract.
-Already upgraded schema-9 databases need no further migration. For an exact
+Core **0.43.x, 0.44.x and 0.45.x** share schema 9 and the public runtime facade
+contract. Core 0.44 retires its completed offline upgrade tools. Core 0.45 improves
+content-decision queries and changes its diagnostic query-attribution log format
+to schema 2; this is separate from database schema 9. Ingest's source backlog
+probe uses the unchanged exact operation counters, without summing approximate
+query-attribution entries. Already upgraded schema-9 databases and journal-v5
+libraries need no migration, reset or CBZ/artwork rebuild for Core 0.45. For an exact
 schema-8 database or an interrupted schema-8-to-9 conversion, use the historical
 Core **0.43.0** checkout's `upgrade-observation-upload-time-schema.py` and matching
 environment, following its README or Docker bundle instructions with all
