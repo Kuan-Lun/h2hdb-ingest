@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-09-27T06:16:01+00:00",
-  "manifest_sha256": "15c88b2416e98b408d614de26f622b695bc3fb8be4e79f894a3ddaad95f82fc2",
+  "checked_at": "2026-09-28T12:13:56+00:00",
+  "manifest_sha256": "53d1d7332521001911514e9a11e8a4bcff9db957c0a7462b61af7f424fcb8180",
   "node": [
     {
       "declared": ">=0.23.2",
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.30.0",
+  "project_version": "0.30.1",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -30,10 +30,10 @@
       "url": "https://pypi.org/project/h2h-galleryinfo-parser/"
     },
     {
-      "declared": "h2hdb>=0.43.0,<0.45.0",
+      "declared": "h2hdb>=0.43.0,<0.46.0",
       "group": "runtime",
-      "latest": "0.42.2",
-      "latest_satisfies": false,
+      "latest": "0.44.0",
+      "latest_satisfies": true,
       "name": "h2hdb",
       "python_3_14": true,
       "url": "https://pypi.org/project/h2hdb/"
@@ -95,7 +95,7 @@
     {
       "declared": "hypothesis>=6.165.10,<7.0.0",
       "group": "optional:dev",
-      "latest": "6.168.2",
+      "latest": "6.168.3",
       "latest_satisfies": true,
       "name": "hypothesis",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Retired the completed journal-v4-to-v5 offline CLI and shipped module in Ingest 0.30.0; normal journal v5 and runtime facade contracts are unchanged. The explicit local Core 0.44.0 wheel (SHA256 8c78e6deb328421e5bb0e3c92fe1357f127a899f548267b775d4c006a896db0d) passed all 7 targeted package and v3/v4 journal rejection tests; Core 0.43 remains admitted and its same tests also passed. PyPI Core 0.42.2 remains excluded because it lacks schema 9. All external candidates match the prior audit except Hypothesis 6.168.2: the official changelog still ends at 6.168.1, so checksum-verified PyPI source archives were compared. The change atomically replaces the constants cache to prevent truncated reads between concurrent workers; the optional Windows/Emscripten zoneinfo/all tzdata minimum changed to 2026.4 and these extras are not requested here. Installed 6.168.2 passed all 3 incremental property tests. Final exact-tree full gate and live lifecycle validation remain separate evidence.",
+    "note": "Admit Core 0.45 while retaining the verified 0.43/0.44 public ingest facade and schema-9 contracts; the next unverified 0.46 compatibility lane remains excluded. Core 0.45.0 wheel SHA256 255180d5bd152b4744a6f3932f354e110e6b621c86f211854978780089ffc8ba installed with normal dependency resolution, without --no-deps. Core 0.43.0, 0.44.0 and 0.45.0 each passed 33 focused package, logging, source-probe and real SQLite runtime cases; 0.45 additionally passed all 33 selected MariaDB 10.11.11 resident e2e, process recovery and progress cases (676.27s). Schema-2 query attribution is not an ingest data-format change: the probe consumes unchanged exact operation counters, verified against both log schemas. Registry Core 0.44.0 remains supported; unpublished 0.45 is supplied explicitly for this release. Other registry candidates match the preceding audit except Hypothesis 6.168.3. Its official changelog (https://hypothesis.readthedocs.io/en/latest/changelog.html) fixes quadratic pytest statistics summarization above 100k cases; installed 6.168.3 passed all 3 incremental property tests. No database, journal, CBZ/artwork or runtime facade conversion is needed. Exact final-tree merge gate and clean installed-wheel smoke are separate evidence.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
