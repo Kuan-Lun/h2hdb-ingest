@@ -63,7 +63,7 @@ class IngestMetricOperation:
 
 @dataclass(frozen=True, slots=True)
 class IngestMetric:
-    """One immutable, terminally emitted ingest measurement."""
+    """One immutable ingest measurement; progress records are cumulative snapshots."""
 
     scope: str
     operation: str
@@ -71,10 +71,10 @@ class IngestMetric:
     phases_ns: tuple[IngestMetricValue, ...] = ()
     counters: tuple[IngestMetricValue, ...] = ()
     operations: tuple[IngestMetricOperation, ...] = ()
-    status: Literal["completed", "failed", "interrupted"] = "completed"
+    status: Literal["completed", "failed", "interrupted", "progress"] = "completed"
 
     def __post_init__(self) -> None:
-        if self.status not in {"completed", "failed", "interrupted"}:
+        if self.status not in {"completed", "failed", "interrupted", "progress"}:
             raise ValueError("unknown metric status")
         if type(self.scope) is not str or not self.scope:
             raise ValueError("metric scope must be a non-empty str")
