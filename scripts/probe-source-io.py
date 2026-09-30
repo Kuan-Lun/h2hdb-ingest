@@ -275,7 +275,11 @@ def _manifest(root: Path) -> dict[str, object]:
 
 
 def _measure(
-    root: Path, operation: Any, *, performance: SourcePerformance | None = None
+    root: Path,
+    operation: Any,
+    *,
+    performance: SourcePerformance | None = None,
+    include_source_manifest: bool = True,
 ) -> tuple[Any, dict[str, object]]:
     meter = _Meter(root)
     metrics: list[IngestMetric] = []
@@ -295,9 +299,11 @@ def _measure(
         "galleries": result.receipt.staged_galleries,
         "waiting": result.waiting_gallery_count,
         "deferred": result.deferred_gallery_count,
-        "source_manifest": _manifest(root),
     }
+    if include_source_manifest:
+        measured["source_manifest"] = _manifest(root)
     if performance is not None:
+        metrics = [metric for metric in metrics if metric.scope == "source"]
         if len(metrics) != 1:
             raise RuntimeError("source synchronization must emit one source metric")
         _attach_production_metric(

@@ -10,10 +10,12 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from hashlib import sha256
 from tempfile import SpooledTemporaryFile
-from typing import BinaryIO, cast
+from time import monotonic_ns, thread_time_ns
+from typing import BinaryIO, Literal, cast
 
 from h2hdb import ArtifactFailureContext, VNextSourceQualification
 
+from ._image_performance import current_image_measurement, measure_image_work
 from .artifact import (
     ArtifactRenderPolicy,
     load_source_page_image,
@@ -34,6 +36,11 @@ from .image_diagnostics import SourceImageLogContext, image_log_scope
 from .page_workers import MAX_PAGE_RENDER_WORKERS
 from .progress import IngestProgress, ProgressWork
 from .source_image import SourceImageDecodeError
+from .source_performance import (
+    SourcePerformance,
+    current_qualification_performance,
+    qualification_phase,
+)
 
 logger = logging.getLogger(__name__)
 _SPOOL_MEMORY_BYTES = 4 * 1024 * 1024
@@ -86,27 +93,35 @@ def _pages(
 
 def _spool(member: FilesystemFileObservation, position: int) -> BinaryIO:
     stream = SpooledTemporaryFile(max_size=_SPOOL_MEMORY_BYTES, mode="w+b")
+    performance = current_qualification_performance()
+    expected_size = actual_size = 0
     try:
         # Exhausting content_parts verifies the original no-follow stat and hash
         # after the read. A source change is never a durable image rejection.
         expected_digest = sha256()
-        expected_size = 0
         for part in member.content_parts():
-            expected_digest.update(part)
+            with qualification_phase("owner_source_hash"):
+                expected_digest.update(part)
             expected_size += len(part)
             if expected_size > member.stat.size_bytes:
                 raise FilesystemSourceChangedError(
                     "qualification source grew beyond its observed size"
                 )
-            if stream.write(part) != len(part):
+            with qualification_phase("owner_spool_write"):
+                written = stream.write(part)
+            if written != len(part):
                 raise OSError("qualification spool accepted a partial source write")
         if expected_size != member.stat.size_bytes:
             raise OSError("qualification source read did not match its observed size")
         stream.seek(0)
         actual_digest = sha256()
-        actual_size = 0
-        while part := stream.read(_SPOOL_READ_BYTES):
-            actual_digest.update(part)
+        while True:
+            with qualification_phase("owner_spool_readback"):
+                part = stream.read(_SPOOL_READ_BYTES)
+            if not part:
+                break
+            with qualification_phase("owner_spool_hash"):
+                actual_digest.update(part)
             actual_size += len(part)
         if (
             actual_size != expected_size
@@ -127,9 +142,63 @@ def _spool(member: FilesystemFileObservation, position: int) -> BinaryIO:
             expected_size_bytes=member.stat.size_bytes,
         )
         raise
+    finally:
+        if performance is not None:
+            performance.qualification_count(
+                "source_spooled_logical_bytes", expected_size
+            )
+            performance.qualification_count("spool_readback_logical_bytes", actual_size)
+            performance.qualification_count("spool_attempts")
+            performance.qualification_count(
+                "disk_spool_attempts", int(bool(getattr(stream, "_rolled", False)))
+            )
 
 
 def _decode_page(
+    stream: BinaryIO,
+    member: FilesystemFileObservation,
+    position: int,
+    policy: ArtifactRenderPolicy,
+    work: ProgressWork | None,
+    context: SourceImageLogContext,
+    performance: SourcePerformance | None = None,
+) -> _PageFailure | None:
+    if performance is None:
+        return _decode_page_contents(stream, member, position, policy, work, context)
+    # A dev probe may already own the worker measurement. Reuse that context,
+    # while retaining this call's exact elapsed/CPU boundaries for production.
+    existing = current_image_measurement()
+    performance.qualification_count("worker_started")
+    started, cpu_started = monotonic_ns(), thread_time_ns()
+    outcome: Literal["accepted", "rejected", "failed", "interrupted"] = "failed"
+    with (
+        nullcontext(existing)
+        if existing is not None
+        else measure_image_work() as measured
+    ):
+        previous_detail = measured.qualification_details
+        measured.qualification_details = True
+        try:
+            result = _decode_page_contents(
+                stream, member, position, policy, work, context
+            )
+            outcome = "accepted" if result is None else "rejected"
+            return result
+        except BaseException as error:
+            outcome = "failed" if isinstance(error, Exception) else "interrupted"
+            raise
+        finally:
+            measured.qualification_details = previous_detail
+            performance.record_qualification_worker(
+                measured,
+                elapsed_ns=monotonic_ns() - started,
+                thread_cpu_ns=thread_time_ns() - cpu_started,
+                encoded_bytes=member.stat.size_bytes,
+                outcome=outcome,
+            )
+
+
+def _decode_page_contents(
     stream: BinaryIO,
     member: FilesystemFileObservation,
     position: int,
@@ -193,6 +262,7 @@ class ImageGalleryQualifier:
             else work.activity("source_image_qualification")
         )
         pending: deque[Future[_PageFailure | None]] = deque()
+        performance = current_qualification_performance()
         failure: _PageFailure | None = None
         try:
             with (
@@ -202,7 +272,8 @@ class ImageGalleryQualifier:
                 ) as executor,
             ):
                 for position, member in _pages(source, locator, observed):
-                    stream = _spool(member, position)
+                    with qualification_phase("owner_spool"):
+                        stream = _spool(member, position)
                     try:
                         pending.append(
                             executor.submit(
@@ -221,19 +292,22 @@ class ImageGalleryQualifier:
                                     source_position=position,
                                     expected_size_bytes=member.stat.size_bytes,
                                 ),
+                                performance,
                             )
                         )
                     except BaseException:
                         stream.close()
                         raise
                     if len(pending) >= self._workers:
-                        failure = pending.popleft().result()
+                        with qualification_phase("owner_future_wait"):
+                            failure = pending.popleft().result()
                         if failure is not None:
                             break
                 # Consume all submitted results even after a corrupt page. Storage,
                 # cancellation and programming errors must still propagate.
                 for future in pending:
-                    additional = future.result()
+                    with qualification_phase("owner_future_wait"):
+                        additional = future.result()
                     if failure is None:
                         failure = additional
         except Exception as error:

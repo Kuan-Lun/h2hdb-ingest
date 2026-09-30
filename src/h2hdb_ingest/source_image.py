@@ -20,7 +20,11 @@ from typing import BinaryIO
 import pyvips  # type: ignore[import-untyped]  # pyvips 3.2 ships no PEP 561 marker.
 from PIL import Image
 
-from ._image_performance import current_image_measurement, image_phase
+from ._image_performance import (
+    current_image_measurement,
+    image_phase,
+    qualification_image_phase,
+)
 from .artifact_errors import attach_image_dimensions
 from .image_diagnostics import native_image_log_scope
 
@@ -53,7 +57,7 @@ class _DecodeScheduler:
 
     @contextmanager
     def acquire(self, *, exclusive: bool) -> Iterator[None]:
-        with self._condition:
+        with qualification_image_phase("scheduler_wait"), self._condition:
             if exclusive:
                 self._waiting_exclusive += 1
                 self._condition.notify_all()
@@ -138,11 +142,12 @@ class _SourceHeader:
 
 
 def _read_header(bridge: _SourceBridge) -> _SourceHeader:
-    header = pyvips.Image.new_from_source(
-        bridge.source, "fail_on=error", access="sequential"
-    )
-    bridge.check()
-    return _SourceHeader(
+    with qualification_image_phase("header"):
+        header = pyvips.Image.new_from_source(
+            bridge.source, "fail_on=error", access="sequential"
+        )
+        bridge.check()
+    result = _SourceHeader(
         width=header.width,
         height=header.height,
         orientation=int(header.get("orientation"))
@@ -153,6 +158,13 @@ def _read_header(bridge: _SourceBridge) -> _SourceHeader:
         else False,
         source_kind=str(header.get("vips-loader")),
     )
+    measured = current_image_measurement()
+    if measured is not None:
+        # These scalars come from the required decode header, never a new read.
+        measured.source_width, measured.source_height = result.width, result.height
+        measured.source_kind = result.source_kind
+        measured.source_exclusive = result.exclusive
+    return result
 
 
 def _fit_pixels(

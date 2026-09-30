@@ -23,6 +23,8 @@ ImagePhase = Literal[
     "jpeg_encode",
     "encoded_copy_hash",
     "decoder_input_read",
+    "header",
+    "scheduler_wait",
 ]
 
 
@@ -32,6 +34,11 @@ class ImageWorkMeasurement:
     elapsed_ns: int = 0
     thread_cpu_ns: int = 0
     decoder_input_bytes: int = 0
+    source_width: int = 0
+    source_height: int = 0
+    source_kind: str = "unknown"
+    source_exclusive: bool = False
+    qualification_details: bool = False
 
     @contextmanager
     def phase(self, name: ImagePhase) -> Iterator[None]:
@@ -57,6 +64,19 @@ def current_image_measurement() -> ImageWorkMeasurement | None:
 def image_phase(name: ImagePhase) -> Iterator[None]:
     measured = _current.get()
     if measured is None:
+        yield
+    else:
+        with measured.phase(name):
+            yield
+
+
+@contextmanager
+def qualification_image_phase(
+    name: Literal["header", "scheduler_wait"],
+) -> Iterator[None]:
+    """Extra source attribution without changing archive metric vocabulary."""
+    measured = _current.get()
+    if measured is None or not measured.qualification_details:
         yield
     else:
         with measured.phase(name):

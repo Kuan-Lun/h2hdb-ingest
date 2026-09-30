@@ -916,6 +916,12 @@ def _validate_worker_phases(row: dict[str, Any]) -> None:
         "resize": row["thumbnail_calls"],
         "decoder_input_read": row["decoder_buffer_read_calls"],
     }
+    # The same dev probe measures the pre-instrumentation wheel and candidate.
+    # Require the runtime's declared detail capability, never infer completeness
+    # from whichever phase samples happened to survive instrumentation.
+    if "qualification_details" in ImageWorkMeasurement.__dataclass_fields__:
+        required["header"] = row["header_calls"]
+        required["scheduler_wait"] = calls.get("scheduler_wait", 0)
     if {key: value for key, value in required.items() if value} != dict(phase_counts):
         raise ValueError("actual image operations omitted complete phase timing")
     if row["pipeline_calls"] != 1:
@@ -1399,6 +1405,7 @@ def _run_case(
     intervals["complete_observation_wall_ns"] = monotonic_ns() - wall
     intervals["process_cpu_ns"] = process_time_ns() - cpu
     _require_source_snapshot(_LOADED_SOURCE_SNAPSHOT)
+    metrics = [metric for metric in metrics if metric.scope == "source"]
     if len(metrics) != 1 or metrics[0].status != "completed":
         raise RuntimeError("source operation did not produce its completed telemetry")
     if _admit_fixture(source_root)[0] != manifest:

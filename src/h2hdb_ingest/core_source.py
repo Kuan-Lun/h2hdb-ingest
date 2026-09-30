@@ -119,7 +119,10 @@ class VNextFilesystemSourceAdapter:
         observed = self._source.observe_gallery(locator_components)
         qualification = VNextSourceQualification()
         if self._qualify_gallery is not None:
-            with self._source_performance.phase("qualification"):
+            with (
+                self._source_performance.phase("qualification"),
+                self._source_performance.qualifying(),
+            ):
                 qualification = self._qualify_gallery(
                     self._source, locator_components, observed
                 )
