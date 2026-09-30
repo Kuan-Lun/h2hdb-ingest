@@ -1,4 +1,4 @@
-"""Fixed-inventory source cost probe: three real eight-gallery publications.
+"""Measure independent inventory, admission, retained-set and PAGE dimensions.
 
 This opt-in SQLite fixture never accepts a database URL or existing corpus.
 Cost targets are declared before execution; a violated target remains evidence,
@@ -25,29 +25,127 @@ from unittest.mock import patch
 
 from h2hdb import CoreConfig, DatabaseConfig, LoggerConfig, VNextIngestFacade
 
-from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
+from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig, service
 from h2hdb_ingest.filesystem import FilesystemSource
 from h2hdb_ingest.library import ManagedFilesystemLibraryAdapter
 from h2hdb_ingest.metrics import IngestMetric, TextIngestMetricSink
 from h2hdb_ingest.runtime import build_runtime
 
 _HELPERS = runpy.run_path(str(Path(__file__).with_name("probe-source-io.py")))
-_BATCH = 8
-_ROUNDS = 3
 _MAX_DRIVES = 128
 _MODEL = {
-    "dimensions": "fixed inventory N; new admission B=8; prior publication R=0,8,16; one 16px PNG per gallery; three rounds",
+    "dimensions": "fixed inventory N; new admission B; retained R from real warm-up publications; P 16px PNG pages per gallery; measured and warm-up rounds are separate",
     "units": "actual os.read calls including EOF; logical source bytes including rereads; adapter locator rows; qualified galleries; completed connector-method calls (not server statements)",
     "targets": {
         "one_locator_pass": "locator_rows <= N per preparation",
-        "qualification_tracks_admission": "decode_calls and qualified_galleries <= B",
-        "PAGE_reads_track_admission": "PAGE read bytes <= 2 * encoded bytes of the B newly admitted PAGE files",
+        "qualification_tracks_admission": "qualified_galleries = actual newly admitted galleries",
+        "decode_tracks_new_pages": "decode_calls = actual newly admitted galleries * P",
+        "PAGE_reads_track_admission": "PAGE read bytes <= encoded bytes of newly admitted PAGE files; one-pass engineering target, not an optimum proof",
+        "retained_and_pending_PAGE_reads": "unchanged retained and not-yet-admitted PAGE bytes read = 0",
         "marker_reads_bounded_by_inventory_and_admission": "marker bytes <= 2 * all inventory marker bytes + 8 * newly admitted marker bytes",
     },
     "sql_interpretation": "record source_prepare and SOURCE action SQL counts separately; no unsupported SQL-count bound or NAS latency target is asserted",
     "counterexample": "one additional read of every PAGE in the fixed inventory must violate the PAGE bound",
-    "limits": "N<=1024 is local evidence, not NAS N=130000; inclusive phase times overlap; no wall-time gate; source preparation rereads bytes without retaining a full-turn byte snapshot; this probe measures reads, not scratch retention",
+    "limits": "N<=1024 is local evidence, not NAS N=130000; inclusive phase times overlap; no wall-time gate; source counts include lazy source steps; bytes are logical reads, not scratch retention or device traffic",
 }
+
+
+def _validate_dimensions(
+    inventory: int, batch: int, rounds: int, warmups: int, pages: int
+) -> None:
+    for name, value, low, high in (
+        ("inventory", inventory, 1, 1024),
+        ("batch", batch, 1, 32),
+        ("rounds", rounds, 1, 6),
+        ("warmup-rounds", warmups, 0, 4),
+        ("pages", pages, 1, 129),
+    ):
+        if type(value) is not int or not low <= value <= high:
+            raise ValueError(f"{name} must be {low}..{high}")
+    if (
+        warmups * batch >= inventory
+        or warmups + rounds > (inventory + batch - 1) // batch
+    ):
+        raise ValueError("requested rounds exceed remaining catch-up batches")
+    _HELPERS["_require_fixture_budget"](inventory, pages, 16)
+
+
+def _measure_synchronization(
+    source: Path, operation: Any
+) -> tuple[Any, dict[str, Any]]:
+    """Observe the full lazy source workflow, not only creation of its handle."""
+    original = FilesystemSource.list_gallery_locators
+    locators = {"rows": 0, "calls": 0}
+
+    def list_locators(filesystem: FilesystemSource, *args: Any, **kwargs: Any) -> Any:
+        page = original(filesystem, *args, **kwargs)
+        locators["rows"] += len(page.items)
+        locators["calls"] += 1
+        return page
+
+    with patch.object(FilesystemSource, "list_gallery_locators", list_locators):
+        # The caller already checks the complete fixture outside its outer cycle
+        # timer. Rehashing it here would charge the oracle's O(N*P) work to ingest.
+        result, measured = _HELPERS["_measure"](
+            source, operation, include_source_manifest=False
+        )
+    measured["independent_locators"] = locators
+    return result, measured
+
+
+def _page_read_groups(
+    measured: dict[str, Any],
+    folders: list[Path],
+    retained: set[str],
+    selected: set[str],
+) -> dict[str, int]:
+    known = {path.name for path in folders}
+    if not retained <= selected <= known:
+        raise RuntimeError("published source membership contradicts the fixture")
+    classes = {
+        path.name: "retained"
+        if path.name in retained
+        else "new"
+        if path.name in selected
+        else "pending"
+        for path in folders
+    }
+    totals = dict.fromkeys(("retained", "new", "pending"), 0)
+    for filename, counters in measured["source_files"].items():
+        relative = Path(filename)
+        if relative.name == "galleryinfo.txt":
+            continue
+        if len(relative.parts) != 2 or relative.parts[0] not in classes:
+            raise RuntimeError("meter returned an unknown source PAGE")
+        count = counters["read_bytes"]
+        if type(count) is not int or count < 0:
+            raise RuntimeError("meter returned invalid source PAGE bytes")
+        totals[classes[relative.parts[0]]] += count
+    phase_bytes = sum(
+        value["read_bytes"]
+        for name, value in measured["io"].items()
+        if name.startswith("source.") and name.endswith(".page")
+    )
+    if sum(totals.values()) != phase_bytes:
+        raise RuntimeError("per-file PAGE bytes differ from source phase totals")
+    return totals
+
+
+def _published_names(catalog: Any, revision: Any, inventory: int) -> set[str]:
+    """Read the actual public selection; locator order is not path-name order."""
+    names: set[str] = set()
+    cursor = None
+    for _ in range((inventory + 127) // 128 + 1):
+        page = catalog.discover_publications(revision=revision, limit=128, after=cursor)
+        for item in page.publications:
+            name = str(item.gid)
+            if name in names:
+                raise RuntimeError("public catalog repeated a synthetic gallery")
+            names.add(name)
+        cursor = page.next_cursor
+        if cursor is None:
+            return names
+    raise RuntimeError("public catalog exceeded the inventory oracle bound")
 
 
 class _CoreLog(logging.Handler):
@@ -119,6 +217,8 @@ def _costs(
     measured: dict[str, Any],
     *,
     inventory: int,
+    admitted: int,
+    pages: int,
     selected_page_bytes: int,
     all_marker_bytes: int,
     selected_marker_bytes: int,
@@ -147,18 +247,22 @@ def _costs(
     )
     observed = {
         "one_locator_pass": (measured["independent_locators"]["rows"], inventory),
-        "qualification_tracks_admission": (
-            max(measured["decode_calls"], measured["qualified_galleries"]),
-            _BATCH,
-        ),
-        "PAGE_reads_track_admission": (page_bytes, 2 * selected_page_bytes),
+        "qualification_tracks_admission": (measured["qualified_galleries"], admitted),
+        "decode_tracks_new_pages": (measured["decode_calls"], admitted * pages),
+        "PAGE_reads_track_admission": (page_bytes, selected_page_bytes),
         "marker_reads_bounded_by_inventory_and_admission": (
             marker_bytes,
             2 * all_marker_bytes + 8 * selected_marker_bytes,
         ),
     }
     checks = {
-        key: {"observed": value, "upper_bound": bound, "met": value <= bound}
+        key: {
+            "observed": value,
+            "upper_bound": bound,
+            "met": value == bound
+            if key in {"qualification_tracks_admission", "decode_tracks_new_pages"}
+            else value <= bound,
+        }
         for key, (value, bound) in observed.items()
     }
     return {
@@ -169,19 +273,30 @@ def _costs(
     }
 
 
-def _run(inventory: int, workspace: Path) -> dict[str, Any]:
+def _run(
+    inventory: int,
+    workspace: Path,
+    *,
+    batch: int = 8,
+    measured_rounds: int = 3,
+    warmup_rounds: int = 0,
+    pages: int = 1,
+) -> dict[str, Any]:
+    _validate_dimensions(inventory, batch, measured_rounds, warmup_rounds, pages)
     with tempfile.TemporaryDirectory(
         prefix="fixed-backlog-", dir=workspace
     ) as temporary:
         root = Path(temporary)
         source, library, scratch = root / "source", root / "library", root / "scratch"
         scratch.mkdir()
-        _HELPERS["_fixture"](source, inventory, 1, 16, "png")
+        _HELPERS["_fixture"](source, inventory, pages, 16, "png")
         immutable_manifest = _HELPERS["_manifest"](source)
         folders = sorted(path for path in source.iterdir() if path.is_dir())
         assert len(folders) == inventory
         marker_sizes = [(path / "galleryinfo.txt").stat().st_size for path in folders]
-        page_sizes = [(path / "000.png").stat().st_size for path in folders]
+        page_sizes = [
+            sum(page.stat().st_size for page in path.glob("*.png")) for path in folders
+        ]
         if len(set(marker_sizes)) != 1 or len(set(page_sizes)) != 1:
             raise RuntimeError(
                 "backlog fixture must use equal encoded PAGE and marker sizes"
@@ -193,13 +308,13 @@ def _run(inventory: int, workspace: Path) -> dict[str, Any]:
                 database=DatabaseConfig(
                     sql_type="sqlite", database=str(root / "catalog.sqlite3")
                 ),
-                logger=LoggerConfig(level="DEBUG"),
+                logger=LoggerConfig.model_validate({"level": "DEBUG"}),
             ),
             paths=IngestPathsConfig(
                 download_path=source, library_path=library, page_render_workers=1
             ),
             resident=ResidentConfig(
-                publication_batch_galleries=_BATCH,
+                publication_batch_galleries=batch,
                 lease_seconds=1800,
                 heartbeat_seconds=30,
             ),
@@ -209,8 +324,7 @@ def _run(inventory: int, workspace: Path) -> dict[str, Any]:
         maintenance: dict[str, list[str]] = {"catalog": [], "library": []}
         last_maintenance: dict[str, Any] = {}
         original_metric = TextIngestMetricSink.__call__
-        original_prepare = VNextIngestFacade.prepare_source
-        original_locators = FilesystemSource.list_gallery_locators
+        original_synchronize = service.synchronize_source
         original_catalog_cleanup = VNextIngestFacade.drain_current_only_maintenance
         original_library_cleanup = ManagedFilesystemLibraryAdapter.maintain_cleanup
 
@@ -219,29 +333,17 @@ def _run(inventory: int, workspace: Path) -> dict[str, Any]:
                 source_metrics.append(value)
             original_metric(sink, value)
 
-        def prepare(facade: VNextIngestFacade, *args: Any, **kwargs: Any) -> Any:
-            if kwargs.get("max_new_galleries") != _BATCH:
+        def synchronize(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("max_new_galleries") != batch:
                 raise RuntimeError("backlog probe lost its fixed admission limit")
-            locators = {"rows": 0, "calls": 0}
-
-            def list_locators(
-                filesystem: FilesystemSource, *args: Any, **kwargs: Any
-            ) -> Any:
-                page = original_locators(filesystem, *args, **kwargs)
-                locators["rows"] += len(page.items)
-                locators["calls"] += 1
-                return page
-
-            with patch.object(FilesystemSource, "list_gallery_locators", list_locators):
-                prepared, measured = _HELPERS["_measure"](
-                    source, partial(original_prepare, facade, *args, **kwargs)
-                )
-            measured["independent_locators"] = locators
+            result, measured = _measure_synchronization(
+                source,
+                partial(original_synchronize, *args, **kwargs),
+            )
             if len(preparations) >= 2:
-                prepared.close()
                 raise RuntimeError("multiple source preparations exceeded probe budget")
             preparations.append(measured)
-            return prepared
+            return result
 
         def cleanup(facade: VNextIngestFacade, *args: Any, **kwargs: Any) -> Any:
             result = original_catalog_cleanup(facade, *args, **kwargs)
@@ -261,11 +363,14 @@ def _run(inventory: int, workspace: Path) -> dict[str, Any]:
 
         logs = _CoreLog()
         rounds: list[dict[str, Any]] = []
+        warmups: list[dict[str, Any]] = []
+        ledger_rows: list[dict[str, Any]] = []
+        retained_names: set[str] = set()
         with ExitStack() as stack:
             stack.enter_context(patch.object(tempfile, "tempdir", str(scratch)))
             stack.enter_context(patch.object(TextIngestMetricSink, "__call__", metric))
             stack.enter_context(
-                patch.object(VNextIngestFacade, "prepare_source", prepare)
+                patch.object(service, "synchronize_source", synchronize)
             )
             stack.enter_context(
                 patch.object(
@@ -287,8 +392,10 @@ def _run(inventory: int, workspace: Path) -> dict[str, Any]:
             )
             runtime.database_admin.initialize()
             runtime.resident.initialize()
-            for number in range(1, _ROUNDS + 1):
-                expected = number * _BATCH
+            for number in range(1, warmup_rounds + measured_rounds + 1):
+                retained = (number - 1) * batch
+                expected = min(number * batch, inventory)
+                admitted = expected - retained
                 logs.reset()
                 source_metrics.clear()
                 preparations.clear()
@@ -306,7 +413,7 @@ def _run(inventory: int, workspace: Path) -> dict[str, Any]:
                             break
                     if revision.publication_count != expected:
                         raise RuntimeError(
-                            "publication failed the eight-new-gallery contract"
+                            "publication failed the new-gallery admission contract"
                         )
                     sequence = ["publication_observed"]
                     post_publication_cleanup: dict[str, list[str]] = {
@@ -345,7 +452,7 @@ def _run(inventory: int, workspace: Path) -> dict[str, Any]:
                     or outcome.deferred_gallery_count != inventory - expected
                 ):
                     raise RuntimeError(
-                        "backlog did not shrink by exactly eight galleries"
+                        "backlog did not shrink by exactly the admitted galleries"
                     )
                 if measured["galleries"] != expected or measured["waiting"] != 0:
                     raise RuntimeError(
@@ -371,11 +478,66 @@ def _run(inventory: int, workspace: Path) -> dict[str, Any]:
                     or len(evidence["SOURCE_stage_summaries"]) != 1
                 ):
                     raise RuntimeError("Core source diagnostic evidence is incomplete")
-                rounds.append(
+                selected_names = _published_names(runtime.catalog, revision, inventory)
+                if len(retained_names) != retained or len(selected_names) != expected:
+                    raise RuntimeError(
+                        "catalog membership differs from admission counts"
+                    )
+                page_groups = _page_read_groups(
+                    measured, folders, retained_names, selected_names
+                )
+                new_names = selected_names - retained_names
+                new_page_bytes = sum(
+                    size
+                    for folder, size in zip(folders, page_sizes, strict=True)
+                    if folder.name in new_names
+                )
+                new_marker_bytes = sum(
+                    size
+                    for folder, size in zip(folders, marker_sizes, strict=True)
+                    if folder.name in new_names
+                )
+                costs = _costs(
+                    measured,
+                    inventory=inventory,
+                    admitted=admitted,
+                    pages=pages,
+                    selected_page_bytes=new_page_bytes,
+                    all_marker_bytes=sum(marker_sizes),
+                    selected_marker_bytes=new_marker_bytes,
+                )
+                for kind in ("retained", "pending"):
+                    costs["checks"][kind + "_PAGE_reads"] = {
+                        "observed": page_groups[kind],
+                        "upper_bound": 0,
+                        "met": page_groups[kind] == 0,
+                    }
+                if not all(check["met"] for check in costs["checks"].values()):
+                    costs["status"] = "violated"
+                if number > warmup_rounds:
+                    ledger_rows.append(
+                        {
+                            "new_admitted": admitted,
+                            "retained_before": retained,
+                            "history_depth": None,
+                            "new_page_bytes": new_page_bytes,
+                            "inventory_rows": measured["independent_locators"]["rows"],
+                            "page_read_bytes": sum(page_groups.values()),
+                            "retained_page_read_bytes": page_groups["retained"],
+                            "decode_calls": measured["decode_calls"],
+                            "source_sql_calls": evidence["SOURCE_sql_calls"]
+                            + sum(
+                                entry["sql_calls"]
+                                for entry in evidence["source_prepare"]
+                            ),
+                        }
+                    )
+                (warmups if number <= warmup_rounds else rounds).append(
                     {
                         "round": number,
                         "inventory": inventory,
-                        "new_admitted": _BATCH,
+                        "new_admitted": admitted,
+                        "retained_before": retained,
                         "published": expected,
                         "source_admitted_including_reuse": measured["galleries"],
                         "pending": outcome.deferred_gallery_count,
@@ -393,32 +555,27 @@ def _run(inventory: int, workspace: Path) -> dict[str, Any]:
                         "next_claim_granted": True,
                         "next_claim_generation": grant.ingest_generation,
                         "input_manifest_unchanged": True,
-                        "prepare": measured,
+                        "source_synchronization": measured,
                         "whole_cycle_io_alternate_view": cycle_meter.report(),
                         "core_source_logs": evidence,
-                        "cost_targets": _costs(
-                            measured,
-                            inventory=inventory,
-                            selected_page_bytes=sum(
-                                page_sizes[expected - _BATCH : expected]
-                            ),
-                            all_marker_bytes=sum(marker_sizes),
-                            selected_marker_bytes=sum(
-                                marker_sizes[expected - _BATCH : expected]
-                            ),
-                        ),
+                        "source_PAGE_read_groups": page_groups,
+                        "selected_fixture_galleries": sorted(selected_names),
+                        "cost_targets": costs,
                     }
                 )
+                retained_names = selected_names
         return {
             "status": "completed",
-            "format_version": 1,
+            "format_version": 2,
             "probe_sha256": sha256(Path(__file__).read_bytes()).hexdigest(),
             "model": _MODEL,
             "fixture": {
                 "fixed_inventory": inventory,
-                "max_new_per_batch": _BATCH,
-                "rounds": _ROUNDS,
-                "pages_per_gallery": 1,
+                "max_new_per_batch": batch,
+                "rounds": measured_rounds,
+                "warmup_rounds": warmup_rounds,
+                "initial_retained": warmup_rounds * batch,
+                "pages_per_gallery": pages,
                 "edge": 16,
                 "equal_encoded_sizes_enforced": True,
                 "backend": "sqlite",
@@ -426,29 +583,69 @@ def _run(inventory: int, workspace: Path) -> dict[str, Any]:
             },
             "provenance": _HELPERS["_provenance"](),
             "rounds": rounds,
+            "warmups_excluded_from_measurements": warmups,
+            "ledger": {
+                "schema_version": 1,
+                "input_manifest_sha256": immutable_manifest["sha256"],
+                "dimensions": {
+                    "inventory": inventory,
+                    "batch": batch,
+                    "initial_retained": warmup_rounds * batch,
+                    "pages_per_gallery": pages,
+                },
+                "rounds": ledger_rows,
+            },
             "performance_targets_met": all(
                 item["cost_targets"]["status"] == "satisfied" for item in rounds
             ),
-            "scope": "whole-cycle and preparation I/O are alternate views, never add them; full READY audits and immutable-input hash checks run outside the measured cycle; next-claim proof releases its empty session before the next publication",
+            "scope": "whole-cycle and source-synchronization I/O are alternate views, never add them; full READY audits and immutable-input hash checks run outside the measured cycle; next-claim proof releases its empty session before the next publication",
         }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--inventory", type=_HELPERS["_bounded_integer"](24, 1024), default=129
+        "--inventory", type=_HELPERS["_bounded_integer"](1, 1024), default=129
     )
+    parser.add_argument("--batch", type=_HELPERS["_bounded_integer"](1, 32), default=8)
+    parser.add_argument("--rounds", type=_HELPERS["_bounded_integer"](1, 6), default=3)
+    parser.add_argument(
+        "--warmup-rounds", type=_HELPERS["_bounded_integer"](0, 4), default=0
+    )
+    parser.add_argument("--pages", type=_HELPERS["_bounded_integer"](1, 129), default=1)
     parser.add_argument(
         "--timeout", type=_HELPERS["_bounded_integer"](30, 600), default=240
     )
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--ledger-output", type=Path)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--workspace", type=Path, help=argparse.SUPPRESS)
     arguments = parser.parse_args()
+    try:
+        _validate_dimensions(
+            arguments.inventory,
+            arguments.batch,
+            arguments.rounds,
+            arguments.warmup_rounds,
+            arguments.pages,
+        )
+    except ValueError as error:
+        parser.error(str(error))
     if arguments.worker:
         if arguments.workspace is None:
             parser.error("worker requires supervisor-owned workspace")
-        print(json.dumps(_run(arguments.inventory, arguments.workspace)))
+        print(
+            json.dumps(
+                _run(
+                    arguments.inventory,
+                    arguments.workspace,
+                    batch=arguments.batch,
+                    measured_rounds=arguments.rounds,
+                    warmup_rounds=arguments.warmup_rounds,
+                    pages=arguments.pages,
+                )
+            )
+        )
         return 0
     if (
         arguments.output is None
@@ -456,6 +653,12 @@ def main() -> int:
         or arguments.output.is_symlink()
     ):
         parser.error("a new --output path is required")
+    if arguments.ledger_output is not None and (
+        arguments.ledger_output.exists()
+        or arguments.ledger_output.is_symlink()
+        or arguments.ledger_output.resolve() == arguments.output.resolve()
+    ):
+        parser.error("--ledger-output must be a separate new file")
     try:
         with tempfile.TemporaryDirectory(prefix="h2hdb-backlog-probe-") as workspace:
             result = subprocess.run(
@@ -467,6 +670,14 @@ def main() -> int:
                     workspace,
                     "--inventory",
                     str(arguments.inventory),
+                    "--batch",
+                    str(arguments.batch),
+                    "--rounds",
+                    str(arguments.rounds),
+                    "--warmup-rounds",
+                    str(arguments.warmup_rounds),
+                    "--pages",
+                    str(arguments.pages),
                 ],
                 capture_output=True,
                 text=True,
@@ -476,13 +687,15 @@ def main() -> int:
         report = json.loads(result.stdout)
         if (
             report.get("status") != "completed"
-            or len(report.get("rounds", ())) != _ROUNDS
+            or len(report.get("rounds", ())) != arguments.rounds
+            or len(report.get("warmups_excluded_from_measurements", ()))
+            != arguments.warmup_rounds
         ):
             raise ValueError("worker returned incomplete backlog evidence")
     except (subprocess.SubprocessError, ValueError) as error:
         report = {
             "status": "error",
-            "format_version": 1,
+            "format_version": 2,
             "model": _MODEL,
             "error_type": type(error).__name__,
             "error": str(error),
@@ -490,6 +703,17 @@ def main() -> int:
         if isinstance(error, subprocess.CalledProcessError):
             report["worker_stderr"] = error.stderr[-16000:]
     _HELPERS["_atomic_report"](arguments.output, report)
+    if arguments.ledger_output is not None:
+        _HELPERS["_atomic_report"](
+            arguments.ledger_output,
+            report["ledger"]
+            if report["status"] == "completed"
+            else {
+                "schema_version": 1,
+                "status": "incomplete",
+                "reason": "backlog probe did not complete; no measured ledger",
+            },
+        )
     print(json.dumps({"status": report["status"], "output": str(arguments.output)}))
     return 0 if report["status"] == "completed" else 1
 

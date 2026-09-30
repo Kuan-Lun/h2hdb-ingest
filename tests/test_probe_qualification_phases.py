@@ -22,6 +22,8 @@ from PIL import Image
 import h2hdb_ingest.image_qualification as qualification
 import h2hdb_ingest.source_image as source_image
 from h2hdb_ingest._image_performance import ImageWorkMeasurement
+from h2hdb_ingest.metrics import IngestMetric
+from h2hdb_ingest.source_performance import SourcePerformance
 
 _SCRIPT = Path(__file__).parents[1] / "scripts" / "probe-qualification-phases.py"
 
@@ -36,6 +38,30 @@ def _page(codec: str = "PNG", size: tuple[int, int] = (160, 220)) -> bytes:
 @pytest.fixture
 def probe() -> dict[str, Any]:
     return runpy.run_path(str(_SCRIPT))
+
+
+def test_progress_snapshot_is_not_a_second_completed_source_operation(
+    tmp_path: Path, probe: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = SourcePerformance.operation
+
+    @contextmanager
+    def progress(self: SourcePerformance, sink: Any, **kwargs: Any) -> Iterator[None]:
+        with original(self, sink, **kwargs):
+            sink(
+                IngestMetric(
+                    scope="source_progress",
+                    operation="synchronize",
+                    status="progress",
+                    elapsed_ns=1,
+                )
+            )
+            yield
+
+    monkeypatch.setattr(SourcePerformance, "operation", progress)
+    root = probe["create_fixture"](tmp_path / "source", [("000.png", _page())])
+    result = probe["_measure_case"](root, workers=1)
+    assert result["attribution_status"] == "complete"
 
 
 @pytest.mark.parametrize("workers", (1, 4))
@@ -719,7 +745,15 @@ def test_current_cli_report_cannot_drop_independent_operation_counts(
 
 
 @pytest.mark.parametrize(
-    "phase", ("decoder_input_read", "decode_and_shrink", "resize", "decoder_pipeline")
+    "phase",
+    (
+        "decoder_input_read",
+        "decode_and_shrink",
+        "resize",
+        "decoder_pipeline",
+        "header",
+        "scheduler_wait",
+    ),
 )
 def test_one_real_image_phase_contribution_cannot_disappear_into_residual(
     tmp_path: Path, probe: dict[str, Any], monkeypatch: pytest.MonkeyPatch, phase: str

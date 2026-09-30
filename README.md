@@ -304,6 +304,31 @@ estimate total wall time.
 Logical bytes include rereads and do not measure physical disk traffic. A killed
 process can leave a turn without a terminal summary; absence is not zero cost.
 
+While a source turn is active, INFO `scope=source_progress status=progress`
+records provide cumulative snapshots every 60 seconds, including an increasing
+`progress_sequence`. They are alternate views of the same turn, not extra
+completed work: do not sum progress records or add them to the terminal
+`scope=source` summary. A final interrupted/failed summary includes work observed
+before the interruption; SIGKILL can still prevent that final record.
+Background inventory uses the distinct `scope=source_monitor_progress`.
+Progress delivery uses one process-wide dispatcher with one pending slot;
+`progress_dropped_snapshots` and `progress_cancelled_snapshots` expose backpressure
+and cancellation. Source teardown joins only its snapshot reporter, which never
+calls the sink. An already started sink call cannot be cancelled and may finish
+after the synchronous terminal record; use scope, sequence and work generation
+to interpret snapshots, rather than arrival order. The existing synchronous
+terminal sink behavior is unchanged.
+
+The nested `qualification` operation separates owner source reads, source hash,
+spool write/readback/hash and future waits. Its worker measurements include
+header reads, scheduler waits, fused native decode/shrink and final resize.
+Owner waits overlap concurrent workers; decoder reads overlap native work.
+Worker elapsed sums can exceed wall time, and worker thread CPU excludes native
+helper threads. Logical spool reads can come from memory, so these measurements
+must not be described as HDD traffic. Fixed codec, encoded-size and pixel-count
+bins report counts and worker elapsed sums; they are separate marginal views,
+not a joint distribution. All bins use already required headers and reads.
+
 Source progress at INFO states whether selection covers all complete galleries
 or admits up to the explicit number of new galleries. Unbounded admission is not
 reported as a zero-gallery quota.
@@ -337,10 +362,19 @@ disposable real-image fixtures:
 
 The source matrix compares a new inventory, unchanged markers, a changed policy,
 and changed source bytes. Independent read counters check production telemetry.
-The backlog probe intentionally keeps an eight-gallery quota over three real
-publications, measuring how a fixed inventory affects repeated selection; it
-also checks cleanup and a subsequent work claim. Neither probe measures physical
-disk traffic or proves a NAS completion time. Run without concurrent builds or
+The backlog probe defaults to an eight-gallery quota over three real
+publications. `--batch`, `--rounds`, `--warmup-rounds`, and `--pages` vary admission,
+retained history and page count independently of `--inventory`; a short final
+batch remains part of the measured lifecycle. Warm-up publications are recorded
+separately and excluded from the measured ledger. Each measured round includes
+complete source synchronization, publication, cleanup DONE and a subsequent
+work claim. `--ledger-output NEW_FILE` exports independently counted source work
+for the Core `scripts/source_catchup_cost_model.py` assessor. A completed probe
+does not mean its one-pass PAGE cost target passed; the assessor returns `1` for
+violations and `2` for incomplete evidence. Its `--require-complete` option also
+rejects a measured prefix as evidence of full catch-up.
+Neither probe measures physical disk traffic or proves a NAS completion time.
+Run without concurrent builds or
 benchmarks when comparing wall times. The synthetic controller sensitivity tool
 `probe-publication-budget.py --output /tmp/publication-budget.json` separately
 compares first publication, target misses and total catch-up under fixed/per-gallery
