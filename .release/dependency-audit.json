@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-30T16:37:47+00:00",
+  "checked_at": "2026-10-01T16:26:01+00:00",
   "manifest_sha256": "53d1d7332521001911514e9a11e8a4bcff9db957c0a7462b61af7f424fcb8180",
   "node": [
     {
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.30.2",
+  "project_version": "0.30.3",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -32,7 +32,7 @@
     {
       "declared": "h2hdb>=0.43.0,<0.46.0",
       "group": "runtime",
-      "latest": "0.45.0",
+      "latest": "0.45.2",
       "latest_satisfies": true,
       "name": "h2hdb",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all build/runtime/development/Node direct candidates against the prior receipt. Core 0.45.0 is within the already validated schema9/public-facade range. New pyvips-binary 8.18.7 was reviewed against https://github.com/libvips/libvips/releases/tag/v8.18.7 (TIFF/JP2K and bounds fixes, EXIF header type check); installed in the repository-local environment. Source/qualification/image/artifact targeted suites passed 280 cases; explicit deep source image tests passed both real 100MP JPEG/PNG cases. All other registry candidates match the previously reviewed receipt and installed versions; all latest candidates remain within bounds. No dependency manifest change is required. Telemetry adds cumulative source progress and qualification detail without altering image bytes, native fingerprint rules, schema9 or library journal v5. Cross-package candidate wheel resolution and Compose workflow acceptance are separate evidence.",
+    "note": "Reviewed all build/runtime/development/Node direct candidates against the 0.30.2 receipt; the only new direct candidate is Core 0.45.2 (formerly 0.45.0). Reviewed Core 0.45.1 bounded decision-query and 0.45.2 pre-statement idle-session admission changes in the local release history: schema9, public facade contracts and telemetry2 remain unchanged, within the existing >=0.43,<0.46 lane. The isolated local environment resolves Core 0.45.2 normally. Other direct candidates are unchanged from the previously reviewed receipt and all latest releases remain within declared bounds; no dependency manifest change is warranted. This release exposes the existing cumulative source_progress records at INFO without changing their schema, qualification/image policy, native fingerprint, artifact bytes, or library journal v5. Runtime regression, installed-wheel routing probe and four-role candidate Compose acceptance are recorded separately.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
