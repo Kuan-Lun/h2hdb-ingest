@@ -235,34 +235,52 @@ def test_parent_rejects_source_drift_without_discarding_partial_evidence(
 
 
 def test_real_cleanup_latency_is_separate_and_source_drift_retains_oracles(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    probe = runpy.run_path(str(_SCRIPT))
-    provenance = probe["_provenance"]
-    calls = 0
+    # The real probe owns process-wide logging configuration. Keep that state
+    # (including replacement/closure of handlers) out of the pytest worker.
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """import json
+import runpy
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
-    def drifting() -> dict[str, Any]:
-        nonlocal calls
-        result: dict[str, Any] = provenance()
-        calls += 1
-        if calls > 1:
-            result["h2hdb_ingest"]["source_sha256"] = "0" * 64
-        return result
+probe = runpy.run_path(sys.argv[1])
+provenance = probe["_provenance"]
+calls = 0
 
-    monkeypatch.setitem(probe["_run"].__globals__, "_provenance", drifting)
-    report = probe["_run"](
-        SimpleNamespace(
-            galleries=1,
-            pages=1,
-            edge=32,
-            workers=1,
-            isolated=False,
-            fsync_delay_ms=0,
-            fsync_delay_kind="all",
-            cleanup_journal_delay_ms=2,
-        ),
-        tmp_path,
+def drifting():
+    global calls
+    result = provenance()
+    calls += 1
+    if calls > 1:
+        result["h2hdb_ingest"]["source_sha256"] = "0" * 64
+    return result
+
+probe["_run"].__globals__["_provenance"] = drifting
+report = probe["_run"](
+    SimpleNamespace(
+        galleries=1, pages=1, edge=32, workers=1, isolated=False,
+        fsync_delay_ms=0, fsync_delay_kind="all", cleanup_journal_delay_ms=2,
+    ),
+    Path(sys.argv[2]),
+)
+print(json.dumps(report))
+""",
+            str(_SCRIPT),
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
     )
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads(completed.stdout)
     assert report["status"] == "error"
     assert report["acceptance"]["status"] == "incomplete"
     assert report["error_type"] == "SourceProvenanceError"
