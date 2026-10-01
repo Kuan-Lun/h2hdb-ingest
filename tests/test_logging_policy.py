@@ -7,19 +7,26 @@ import logging
 import subprocess
 import sys
 from collections import Counter
-from contextlib import ExitStack
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import cast
+from unittest.mock import patch
 from zipfile import ZipFile
 
 import pytest
-from h2hdb import CoreConfig, DatabaseConfig, LoggerConfig
+from h2hdb import CoreConfig, DatabaseConfig, LoggerConfig, VNextSourceQualification
 from PIL import Image
 
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
+from h2hdb_ingest.filesystem import FilesystemGalleryObservation, FilesystemSource
+from h2hdb_ingest.image_qualification import ImageGalleryQualifier
+from h2hdb_ingest.metrics import IngestMetricSink
 from h2hdb_ingest.runtime import build_runtime, configure_logging
 from h2hdb_ingest.scratch import DiskScratch
+from h2hdb_ingest.source_performance import SourcePerformance
 
 
 @dataclass(frozen=True)
@@ -66,7 +73,97 @@ def _gallery(source: Path, gid: int, page_count: int, *, corrupt: bool = False) 
     )
 
 
-def _run_workload(root: Path, level: str, gallery_count: int, page_count: int) -> None:
+class _QualificationProgressReceipt(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.received = Event()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        if (
+            record.name == "h2hdb_ingest.metrics"
+            and record.levelno == logging.INFO
+            and message.startswith("ingest_metric scope=source_progress ")
+            and int(
+                _metric_fields(message).get(
+                    "operation.qualification.worker_accepted", 0
+                )
+            )
+            > 0
+        ):
+            self.received.set()
+
+
+@contextmanager
+def _wait_for_qualification_progress() -> Iterator[None]:
+    """Keep genuine source work active until its periodic INFO is delivered.
+
+    Only accelerate the existing reporter's interval. The real qualifier,
+    metric sink, logger levels and console/file handlers remain in use.
+    """
+    original_operation = SourcePerformance.operation
+    original_qualify = ImageGalleryQualifier.__call__
+    receipt = _QualificationProgressReceipt()
+    root_logger = logging.getLogger()
+    # Added after the configured console/file handlers: delivery releases the
+    # qualifier only after both production handlers have seen the same record.
+    root_logger.addHandler(receipt)
+
+    @contextmanager
+    def accelerated_operation(
+        performance: SourcePerformance,
+        sink: IngestMetricSink | None,
+        *,
+        interruptions: tuple[type[BaseException], ...] = (),
+        scope: str = "source",
+        operation: str = "synchronize",
+        progress_interval_seconds: float = 60,
+    ) -> Iterator[None]:
+        with original_operation(
+            performance,
+            sink,
+            interruptions=interruptions,
+            scope=scope,
+            operation=operation,
+            progress_interval_seconds=(
+                0.01 if scope == "source" else progress_interval_seconds
+            ),
+        ):
+            yield
+
+    def qualify_and_wait(
+        qualifier: ImageGalleryQualifier,
+        source: FilesystemSource,
+        locator: tuple[str, ...],
+        observed: FilesystemGalleryObservation,
+    ) -> VNextSourceQualification:
+        result = original_qualify(qualifier, source, locator, observed)
+        if result.accepted:
+            assert receipt.received.wait(timeout=10), (
+                "real source reporter did not deliver qualification progress at INFO"
+            )
+        return result
+
+    try:
+        with (
+            patch.object(SourcePerformance, "operation", accelerated_operation),
+            patch.object(ImageGalleryQualifier, "__call__", qualify_and_wait),
+        ):
+            yield
+        assert receipt.received.is_set()
+    finally:
+        root_logger.removeHandler(receipt)
+        receipt.close()
+
+
+def _run_workload(
+    root: Path,
+    level: str,
+    gallery_count: int,
+    page_count: int,
+    *,
+    progress: bool = False,
+) -> None:
     """Run as a fresh interpreter so pytest cannot install or intercept handlers."""
     source = root / "source"
     library = root / "library"
@@ -116,6 +213,8 @@ def _run_workload(root: Path, level: str, gallery_count: int, page_count: int) -
         dependency.warning("%s warning retained", name)
         dependency.error("%s error retained", name)
     with ExitStack() as resources:
+        if progress:
+            resources.enter_context(_wait_for_qualification_progress())
         scratch = resources.enter_context(DiskScratch(library))
         with build_runtime(
             config,
@@ -200,6 +299,59 @@ def _metric_fields(line: str) -> dict[str, str]:
     values = dict(field.split("=", 1) for field in fields[1:])
     assert len(values) == len(fields) - 1
     return values
+
+
+@pytest.mark.parametrize("level", ("info", "debug"))
+def test_real_source_reporter_delivers_qualification_progress_to_both_info_handlers(
+    tmp_path: Path, level: str
+) -> None:
+    logs = _capture_process(tmp_path, "progress", level)
+    assert logs.result["page_counts"] == [2]
+    assert logs.result["publications"] == 1
+    assert logs.result["progress_interval_seconds"] == 60
+    assert Counter(logs.console.splitlines()) == Counter(logs.file.splitlines())
+    progress = [
+        _metric_fields(line)
+        for line in logs.messages("INFO")
+        if line.startswith("ingest_metric scope=source_progress ")
+    ]
+    assert progress
+    assert all(record["status"] == "progress" for record in progress)
+    assert all(record["operation"] == "synchronize" for record in progress)
+    sequences = [int(record["counter.progress_sequence"]) for record in progress]
+    assert sequences == sorted(set(sequences))
+    assert min(sequences) >= 1
+    assert len({record["counter.work_generation"] for record in progress}) == 1
+    qualified = [
+        record
+        for record in progress
+        if int(record.get("operation.qualification.worker_accepted", 0)) > 0
+    ]
+    assert qualified
+    for record in qualified:
+        for field in (
+            "phase.qualification_ns",
+            "operation.qualification.worker_elapsed_sum_ns",
+            "operation.qualification.source_spooled_logical_bytes",
+            "operation.qualification.decoder_input_logical_bytes",
+        ):
+            assert int(record[field]) > 0
+    summaries = [
+        _metric_fields(line)
+        for line in logs.messages("INFO")
+        if line.startswith("ingest_metric scope=source ")
+    ]
+    assert len(summaries) == 1
+    terminal = summaries[0]
+    assert terminal["status"] == "completed"
+    assert terminal["counter.work_generation"] == progress[0]["counter.work_generation"]
+    assert int(terminal["counter.progress_sequence"]) >= max(sequences)
+    assert terminal["operation.qualification.worker_accepted"] == "2"
+    assert not any("scope=source_progress " in line for line in logs.messages("DEBUG"))
+    assert not any(
+        "scope=source_progress " in event
+        for event in cast(list[str], logs.result["events"])
+    )
 
 
 def test_real_native_rendering_keeps_console_and_file_info_volume_per_batch(
@@ -552,6 +704,8 @@ if __name__ == "__main__":
             _run_workload(
                 Path(sys.argv[1]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
             )
+        case "progress":
+            _run_workload(Path(sys.argv[1]), sys.argv[3], 1, 2, progress=True)
         case "severity":
             _run_severity_probe(Path(sys.argv[1]), sys.argv[3])
         case _:

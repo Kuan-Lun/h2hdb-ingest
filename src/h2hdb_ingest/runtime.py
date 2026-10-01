@@ -159,8 +159,8 @@ def build_runtime(
         catalog = VNextCatalogFacade(config.core)
         owned_closers.append(catalog.close)
         runtime_event_logger = event_logger or logger.info
-        # Timing/counter records are diagnostics, independent of the human
-        # progress callback and its INFO-level delivery.
+        # Batch summaries and periodic source snapshots stay visible at INFO.
+        # Per-artifact details remain DEBUG, independent of human progress.
         metric_logger = logging.getLogger("h2hdb_ingest.metrics")
         detailed_metrics = TextIngestMetricSink(metric_logger.debug)
         summary_metrics = TextIngestMetricSink(metric_logger.info)
@@ -169,7 +169,13 @@ def build_runtime(
             (
                 summary_metrics
                 if metric.scope
-                in {"source", "publication", "artifact_totals", "adapter_io"}
+                in {
+                    "source",
+                    "source_progress",
+                    "publication",
+                    "artifact_totals",
+                    "adapter_io",
+                }
                 else detailed_metrics
             )(metric)
 
