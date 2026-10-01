@@ -856,9 +856,12 @@ def test_maintenance_errors_are_summarized_without_skipping_retries(
     assert events.count(("claim", False, 10_000_000)) == attempts
 
 
+@pytest.mark.parametrize("log_level", (logging.INFO, logging.WARNING))
 def test_maintenance_failure_diagnostics_are_independent_per_operation(
     caplog: pytest.LogCaptureFixture,
+    log_level: int,
 ) -> None:
+    caplog.set_level(log_level)
     events: list[object] = []
 
     class FailingFacade(_Facade):
@@ -878,9 +881,21 @@ def test_maintenance_failure_diagnostics_are_independent_per_operation(
     )
     for _ in range(20):
         assert not resident.process_available(periodic_scan=False)
-    assert len(caplog.records) == 2
-    assert "operation=library_cleanup" in caplog.records[0].getMessage()
-    assert "operation=catalog_cleanup" in caplog.records[1].getMessage()
+    diagnostics = [
+        record for record in caplog.records if record.name == "h2hdb_ingest.resident"
+    ]
+    assert len(diagnostics) == 2
+    assert all(record.levelno == logging.ERROR for record in diagnostics)
+    assert "operation=library_cleanup" in diagnostics[0].getMessage()
+    assert "operation=catalog_cleanup" in diagnostics[1].getMessage()
+    # Per-attempt telemetry remains valid even when repeated diagnostics are
+    # suppressed. Its visibility must not depend on another test's logger setup.
+    metrics = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("ingest_metric scope=library_cleanup_io ")
+    ]
+    assert len(metrics) == (20 if log_level == logging.INFO else 0)
     assert events.count(("claim", False, 10_000_000)) == 20
 
 
