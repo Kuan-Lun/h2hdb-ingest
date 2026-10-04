@@ -22,7 +22,7 @@ from h2hdb_ingest.runtime import IngestRuntime, build_runtime
 
 
 def _config(
-    tmp_path: Path, *, core: CoreConfig, short_interval: bool = False
+    tmp_path: Path, *, core: CoreConfig, resident: ResidentConfig | None = None
 ) -> IngestConfig:
     source = tmp_path / "source"
     gallery = source / "1001"
@@ -46,13 +46,11 @@ def _config(
     return IngestConfig(
         core=core,
         paths=IngestPathsConfig(download_path=source),
-        resident=ResidentConfig(
-            lease_seconds=2,
-            heartbeat_seconds=0.05,
-            poll_seconds=0.01,
-            database_audit_minimum_interval_seconds=1 if short_interval else 604800,
-            database_audit_duration_multiplier=1 if short_interval else 100,
-        ),
+        # Schedule/restart assertions use the production lease policy. Only a
+        # test that actually waits for takeover supplies a short lease below.
+        resident=resident
+        if resident is not None
+        else ResidentConfig(poll_seconds=0.01),
     )
 
 
@@ -69,7 +67,7 @@ def _publish(runtime: IngestRuntime) -> None:
         runtime.resident.process_available(periodic_scan=True)
         if runtime.resident.last_synchronization_result is not None:
             return
-    raise AssertionError("small SQLite fixture did not complete")
+    raise AssertionError("small native database fixture did not complete")
 
 
 def _schedule(runtime: IngestRuntime) -> DatabaseAuditReport:
@@ -129,7 +127,13 @@ def test_escaped_exception_requires_full_audit_after_lease_expiry(
     tmp_path: Path,
     core_config: CoreConfig,
 ) -> None:
-    config = _config(tmp_path, core=core_config)
+    config = _config(
+        tmp_path,
+        core=core_config,
+        resident=ResidentConfig(
+            lease_seconds=2, heartbeat_seconds=0.05, poll_seconds=0.01
+        ),
+    )
     _initialize(config)
     with (
         pytest.raises(ValueError, match="application failed"),
@@ -152,7 +156,15 @@ def test_sqlite_full_audit_serializes_same_process_renewal(
     sqlite_core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path, core=sqlite_core_config, short_interval=True)
+    config = _config(
+        tmp_path,
+        core=sqlite_core_config,
+        resident=ResidentConfig(
+            poll_seconds=0.01,
+            database_audit_minimum_interval_seconds=1,
+            database_audit_duration_multiplier=1,
+        ),
+    )
     _initialize(config)
     admin = VNextDatabaseAdminFacade(config.core)
     audit = IngestDatabaseAudit(
