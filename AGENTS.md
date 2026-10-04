@@ -140,6 +140,8 @@
 
 ## 測試與例外
 
+- `backend_specific` 例外必須在個別測試或參數明示，禁止從 module/class
+  繼承整批豁免；collection 檢查標記來源，內容是否真正專屬仍須 code review。
 - runtime 行為變更必須新增或更新測試；bug fix 必須有 regression test。
 - 新功能涵蓋正常、邊界與錯誤路徑。
 - 數值測試固定隨機種子；容許誤差需有依據。
