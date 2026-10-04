@@ -6,14 +6,15 @@ import os
 import struct
 import zlib
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import file_digest, sha256
 from io import BytesIO
 from pathlib import Path
 from shutil import copytree, rmtree
 from time import time_ns
-from typing import BinaryIO, cast
+from typing import Any, BinaryIO, cast
 from unittest.mock import patch
 from zipfile import ZipFile
 
@@ -30,9 +31,12 @@ from h2hdb import (
     CatalogTimestampRange,
     CoreConfig,
     DatabaseAuditReason,
+    DatabaseAuditSessionLostError,
+    DatabaseAuditSessionUnavailableError,
     GalleryStagingCapacityError,
     VNextAnalysisAdvanceResult,
     VNextCurrentOnlyMaintenanceOutcome,
+    VNextDatabaseAdminFacade,
     VNextIngestAdvanceResult,
     VNextIngestFacade,
     VNextIngestPhase,
@@ -48,6 +52,7 @@ from PIL import Image
 
 import h2hdb_ingest.image_qualification as qualification_module
 import h2hdb_ingest.runtime as runtime_module
+import h2hdb_ingest.session as session_module
 from h2hdb_ingest import (
     ArtifactRenderPolicyConfig,
     IngestConfig,
@@ -1051,10 +1056,58 @@ def test_source_page_boundaries_publish_complete_cbz_and_replay(
         assert restarted.database_admin.check().state == "READY"
 
 
+@dataclass
+class _FaultLeaseClock:
+    """Real ticking clock with an explicit jump only after owners have stopped."""
+
+    offset: int = 0
+    last_database_time: int = 0
+
+    def now(self) -> int:
+        return time_ns() // 1_000 + self.offset
+
+    def expire_stopped_owner(self, duration: int) -> None:
+        # Audit grants use the database clock; ingest grants use the facade
+        # clock. Pass the upper bound of both, not an assumed host/server skew.
+        latest = max(self.now(), self.last_database_time)
+        self.offset += latest + duration + 1 - self.now()
+
+
+@pytest.fixture
+def fault_lease_clock(monkeypatch: pytest.MonkeyPatch) -> _FaultLeaseClock:
+    # The local disposable-database clock seam is an explicit AGENTS exception.
+    # Keep the real database time query, SQL, scheduling and fencing decisions.
+    import h2hdb.database_audit as core_audit_module
+    from h2hdb.database_clock import database_unix_microseconds
+
+    clock = _FaultLeaseClock()
+
+    def database_clock(work: Any) -> int:
+        result = database_unix_microseconds(work) + clock.offset
+        clock.last_database_time = max(clock.last_database_time, result)
+        return result
+
+    def build_facade(config: CoreConfig) -> VNextIngestFacade:
+        return VNextIngestFacade(config, clock=clock.now)
+
+    monkeypatch.setattr(core_audit_module, "database_unix_microseconds", database_clock)
+    monkeypatch.setattr(runtime_module, "VNextIngestFacade", build_facade)
+    monkeypatch.setattr(session_module, "time_ns", lambda: clock.now() * 1_000)
+    return clock
+
+
+def _expire_stopped_audit_owner(config: CoreConfig, clock: _FaultLeaseClock) -> None:
+    with closing(VNextDatabaseAdminFacade(config)) as admin:
+        with pytest.raises(DatabaseAuditSessionUnavailableError):
+            admin.start_ingest_runtime(lease_duration_microseconds=300_000_000)
+    clock.expire_stopped_owner(300_000_000)
+
+
 def test_restart_recovers_durable_publication_before_applying_new_policy(
     tmp_path: Path,
     core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
+    fault_lease_clock: _FaultLeaseClock,
 ) -> None:
     source = tmp_path / "download"
     _gallery(source, 2101, "artist")
@@ -1083,8 +1136,8 @@ def test_restart_recovers_durable_publication_before_applying_new_policy(
                 ),
             ),
             resident=ResidentConfig(
-                lease_seconds=2,
-                heartbeat_seconds=0.1,
+                lease_seconds=300,
+                heartbeat_seconds=60,
                 poll_seconds=0.01,
             ),
         )
@@ -1095,12 +1148,14 @@ def test_restart_recovers_durable_publication_before_applying_new_policy(
     ):
         first.database_admin.initialize()
         first.resident.initialize()
-        claimed = first.facade.try_claim_ingest(True, 30_000_000)
+        old_audit_session = first.resident.database_audit.session
+        assert old_audit_session is not None
+        claimed = first.facade.try_claim_ingest(True, 300_000_000)
         assert claimed is not None
         session = IngestSessionController(
             first.facade,
             claimed,
-            lease_duration_microseconds=30_000_000,
+            lease_duration_microseconds=300_000_000,
             database_type=core_config.database.sql_type,
         )
         service = cast(VNextIngestService, first.resident._service)
@@ -1130,17 +1185,24 @@ def test_restart_recovers_durable_publication_before_applying_new_policy(
             old_policy_page = archive.read("pages/0000.jpg")
         session.complete()
         # Propagate the simulated failure through the runtime owner so shutdown
-        # cannot acknowledge a clean writer; startup must wait for the real lease.
+        # cannot acknowledge a clean writer; the durable lease must still fence restart.
         raise failure.value
 
     # The observed source facts stay unchanged. Changing only the byte-affecting
     # policy must still produce a successor after the pending old-policy
     # commit has been activated and finalized in this same synchronization.
+    assert old_audit_session is not None
+    _expire_stopped_audit_owner(core_config, fault_lease_clock)
     requested_config = config(page_jpeg_quality=55)
     with build_runtime(requested_config) as restarted:
         startup = restarted.resident.initialize()
         assert startup.reason is DatabaseAuditReason.PREVIOUS_INTERRUPTION
         assert startup.full_audit is not None
+        assert startup.session.generation > old_audit_session.generation
+        with pytest.raises(DatabaseAuditSessionLostError):
+            restarted.database_admin.renew_ingest_runtime(
+                old_audit_session, 300_000_000
+            )
         assert restarted.resident.process_available(periodic_scan=True)
 
         revision = restarted.catalog.get_catalog_revision()
@@ -1182,7 +1244,7 @@ class _SimulatedProcessLoss(RuntimeError):
 def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
     tmp_path: Path,
     core_config: CoreConfig,
-    monkeypatch: pytest.MonkeyPatch,
+    fault_lease_clock: _FaultLeaseClock,
 ) -> None:
     source = tmp_path / "download"
     _gallery(source, 1901, "artist")
@@ -1193,15 +1255,6 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
     current_root = library_root / "current"
     staging = library_root / ".h2hdb-state" / "staging"
     core = core_config
-    clock_offset = [0]
-
-    def build_facade(config: CoreConfig) -> VNextIngestFacade:
-        return VNextIngestFacade(
-            config,
-            clock=lambda: time_ns() // 1_000 + clock_offset[0],
-        )
-
-    monkeypatch.setattr(runtime_module, "VNextIngestFacade", build_facade)
     base_config = IngestConfig(
         core=core,
         paths=IngestPathsConfig(
@@ -1209,7 +1262,7 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
             library_path=library_root,
         ),
         resident=ResidentConfig(
-            lease_seconds=2, heartbeat_seconds=0.1, poll_seconds=0.01
+            lease_seconds=300, heartbeat_seconds=60, poll_seconds=0.01
         ),
     )
 
@@ -1254,6 +1307,7 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
     original_commit = VNextIngestFacade.commit_publication_step
     issued_operation = [""]
     protection_committed = [False]
+    abandoned_session: VNextIngestSession | None = None
 
     def record_issued_operation(
         facade: VNextIngestFacade,
@@ -1271,11 +1325,13 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
         session: VNextIngestSession,
         prepared: VNextPreparedPublicationStep,
     ) -> VNextIngestAdvanceResult:
+        nonlocal abandoned_session
         result = original_commit(facade, session, prepared)
         if issued_operation[0] == "PREPARE_ARTIFACT" and any(
             path.is_file() for path in staging.rglob("*")
         ):
             protection_committed[0] = True
+            abandoned_session = session
         return result
 
     with (
@@ -1283,6 +1339,8 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
         build_runtime(abandoned_config) as abandoned,
     ):
         abandoned.resident.initialize()
+        old_audit_session = abandoned.resident.database_audit.session
+        assert old_audit_session is not None
         with (
             patch.object(
                 VNextIngestFacade,
@@ -1300,7 +1358,13 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
     assert any(path.is_file() for path in staging.rglob("*"))
     assert current_files() == initial_current
 
-    clock_offset[0] = 100_000_000
+    assert old_audit_session is not None
+    _expire_stopped_audit_owner(core_config, fault_lease_clock)
+    assert abandoned_session is not None
+    with VNextIngestFacade(core_config, clock=fault_lease_clock.now) as stale:
+        with pytest.raises(RuntimeError, match="stale or expired") as lost:
+            stale.renew_ingest(abandoned_session, 300_000_000)
+        assert type(lost.value).__module__.startswith("h2hdb.")
     successor_config = abandoned_config.model_copy(
         update={
             "paths": abandoned_config.paths.model_copy(
@@ -1315,6 +1379,11 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
         startup = restarted.resident.initialize()
         assert startup.reason is DatabaseAuditReason.PREVIOUS_INTERRUPTION
         assert startup.full_audit is not None
+        assert startup.session.generation > old_audit_session.generation
+        with pytest.raises(DatabaseAuditSessionLostError):
+            restarted.database_admin.renew_ingest_runtime(
+                old_audit_session, 300_000_000
+            )
 
         # Bounded preliminary maintenance may need several polls before the
         # successor encounters the predecessor's slot and releases it under

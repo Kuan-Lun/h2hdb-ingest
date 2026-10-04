@@ -214,7 +214,11 @@ compatibility surface。明確跨 repository 的 dev-only backend coverage guard
 可攔截 Core native connector，以驗證測試實際使用的 backend；不得藉此執行
 consumer runtime SQL。Dev-only 合成資料庫複製 fixture 可讀取 Core generated
 schema provider，以原生 backend 重建 view 依賴順序，且複製後仍須獨立執行
-完整 READY audit。這兩個例外限本機 disposable 測試資料庫，不得用於 shipped
+完整 READY audit。故障接管測試可在停止 owner 後，對 Core 稽核的原生 database
+clock 結果、公開 ingest facade clock 與 adapter session clock 套用同一時間
+偏移；必須保留原生時間查詢、SQL、lease 與 fencing 判斷，不得修改鎖定或
+成功結果，且須驗證到期前拒絕接管及接管後拒絕舊 token。這些例外限本機
+disposable 測試資料庫，不得用於 shipped
 runtime、既有使用者資料庫或 production migration。startup 使用
 `VNextDatabaseAdminFacade` 的 managed audit
 session API，由 core 的持久化排程選擇 quick/full；不得初始化或 migrate core
