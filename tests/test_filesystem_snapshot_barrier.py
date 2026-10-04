@@ -6,7 +6,12 @@ import os
 from pathlib import Path
 
 import pytest
-from h2hdb import TagObservation, VNextIngestGalleryObservation, VNextIngestPage
+from h2hdb import (
+    CoreConfig,
+    TagObservation,
+    VNextIngestGalleryObservation,
+    VNextIngestPage,
+)
 from test_source_preparation_progress import _config
 
 from h2hdb_ingest.core_source import VNextFilesystemSourceAdapter
@@ -17,6 +22,7 @@ from h2hdb_ingest.runtime import build_runtime
 @pytest.mark.parametrize("mutation", ("page", "marker", "add"))
 def test_final_complete_audit_rejects_post_page_mutation_before_core_seal(
     tmp_path: Path,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
     artifacts: bool,
     mutation: str,
@@ -27,7 +33,7 @@ def test_final_complete_audit_rejects_post_page_mutation_before_core_seal(
     page can detect it. Both metadata-only and qualified image pipelines must
     defer this gallery at the final full audit and publish no mixed observation.
     """
-    config = _config(tmp_path, galleries=1, artifacts=artifacts)
+    config = _config(tmp_path, core=core_config, galleries=1, artifacts=artifacts)
     original = VNextFilesystemSourceAdapter.list_tag_observations
     changed = False
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from threading import Event
@@ -8,6 +10,7 @@ from types import ModuleType
 from typing import Protocol, cast
 
 import pytest
+from h2hdb import CoreConfig
 
 
 class _TreeUsage(Protocol):
@@ -22,7 +25,7 @@ class _MonitorResources(Protocol):
         safety_stop: Event,
         interval_seconds: float,
         benchmark_root: Path,
-        database_path: Path,
+        database_path: Path | None,
         failures: list[Exception],
     ) -> None: ...
 
@@ -33,6 +36,7 @@ class _RunPipeline(Protocol):
         gallery_count: int,
         *,
         progress_seconds: float,
+        core: CoreConfig | None = None,
     ) -> dict[str, object]: ...
 
 
@@ -109,6 +113,7 @@ def test_resource_monitor_failure_sets_safety_stop(
 
 def test_resource_monitor_does_not_pollute_source_scan_count(
     monkeypatch: pytest.MonkeyPatch,
+    core_config_factory: Callable[[], AbstractContextManager[CoreConfig]],
 ) -> None:
     module = _benchmark_module()
     run_pipeline = cast(_RunPipeline, module.__dict__["_run_pipeline"])
@@ -121,9 +126,12 @@ def test_resource_monitor_does_not_pollute_source_scan_count(
         return tree_usage(root)
 
     monkeypatch.setitem(module.__dict__, "_tree_usage", counted_usage)
-    baseline = run_pipeline(1, progress_seconds=600.0)
+    with core_config_factory() as core:
+        baseline = run_pipeline(1, progress_seconds=600.0, core=core)
     scans_before = monitor_scans
-    result = run_pipeline(1, progress_seconds=0.05)
+    with core_config_factory() as core:
+        result = run_pipeline(1, progress_seconds=0.05, core=core)
+    assert baseline["backend"] == result["backend"] == core.database.sql_type
 
     assert monitor_scans > scans_before
     # Build the initial entry index once and fully audit it at the final marker
@@ -140,6 +148,7 @@ def test_resource_monitor_does_not_pollute_source_scan_count(
 
 def test_pipeline_surfaces_resource_monitor_failure(
     monkeypatch: pytest.MonkeyPatch,
+    core_config: CoreConfig,
 ) -> None:
     module = _benchmark_module()
     run_pipeline = cast(_RunPipeline, module.__dict__["_run_pipeline"])
@@ -150,7 +159,7 @@ def test_pipeline_surfaces_resource_monitor_failure(
         safety_stop: Event,
         interval_seconds: float,
         benchmark_root: Path,
-        database_path: Path,
+        database_path: Path | None,
         failures: list[Exception],
     ) -> None:
         del stop, interval_seconds, benchmark_root, database_path
@@ -163,7 +172,7 @@ def test_pipeline_surfaces_resource_monitor_failure(
         RuntimeError,
         match="synthetic benchmark resource monitor failed",
     ) as caught:
-        run_pipeline(1, progress_seconds=600.0)
+        run_pipeline(1, progress_seconds=600.0, core=core_config)
 
     assert isinstance(caught.value.__cause__, OSError)
     assert str(caught.value.__cause__) == "synthetic monitor thread failure"

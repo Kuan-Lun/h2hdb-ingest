@@ -63,6 +63,7 @@ _Phase = Literal[
     "source-checkpoint",
     "analysis-partial",
     "catalog-projection",
+    "catalog-validation",
     "artifact-prepared",
 ]
 _Snapshot = tuple[tuple[int, int, str, str, tuple[str, ...]], ...]
@@ -86,22 +87,8 @@ class _Evidence:
     locator_page_calls: int = 0
     file_hash_rows: int = 0
     protected_resources: int = 0
-
-
-@pytest.fixture(
-    params=(
-        "sqlite",
-        pytest.param("mariadb", marks=(pytest.mark.mariadb, pytest.mark.deep)),
-    )
-)
-def process_core_config(request: pytest.FixtureRequest, tmp_path: Path) -> CoreConfig:
-    if request.param == "mariadb":
-        return cast(CoreConfig, request.getfixturevalue("mariadb_config"))
-    return CoreConfig(
-        database=DatabaseConfig(
-            sql_type="sqlite", database=str(tmp_path / "recover.sqlite3")
-        )
-    )
+    catalog_build_rows: int = 0
+    catalog_validate_rows: int = 0
 
 
 def _source(root: Path, gids: tuple[int, ...] = _INITIAL_GIDS) -> None:
@@ -393,9 +380,22 @@ def _runtime_child(
             ) -> VNextIngestAdvanceResult:
                 nonlocal paused
                 result = publication_commit(facade, session, prepared)
+                if not result.replayed:
+                    if last_operation == "BUILD_CATALOG":
+                        evidence.catalog_build_rows += result.processed_rows
+                    elif last_operation == "VALIDATE_CATALOG":
+                        evidence.catalog_validate_rows += result.processed_rows
                 if (
-                    phase == "catalog-projection"
-                    and last_operation == "BUILD_CATALOG"
+                    (
+                        (
+                            phase == "catalog-projection"
+                            and last_operation == "BUILD_CATALOG"
+                        )
+                        or (
+                            phase == "catalog-validation"
+                            and last_operation == "VALIDATE_CATALOG"
+                        )
+                    )
                     and result.processed_rows > 0
                     and not paused
                 ):
@@ -569,10 +569,14 @@ def _run_process(
 
 
 def _initialized_configs(
-    tmp_path: Path, core: CoreConfig, *, max_rows: int = 128
+    tmp_path: Path,
+    core: CoreConfig,
+    *,
+    max_rows: int = 128,
+    gids: tuple[int, ...] = _INITIAL_GIDS,
 ) -> tuple[IngestConfig, IngestConfig]:
     source = tmp_path / "download"
-    _source(source)
+    _source(source, gids)
     reference = _config(
         CoreConfig(
             database=DatabaseConfig(
@@ -611,32 +615,47 @@ def _assert_no_published_head(config: IngestConfig) -> None:
         catalog.close()
 
 
-def _assert_resumed_source_without_rescan(evidence: _Evidence) -> None:
+def _assert_resumed_source_without_rescan(
+    evidence: _Evidence,
+    gids: tuple[int, ...] = _INITIAL_GIDS,
+) -> None:
     assert evidence.inventory_scan_pending == [True]
     assert evidence.observed_galleries == []
-    assert evidence.marker_calls == len(_INITIAL_GIDS)
+    assert evidence.marker_calls == len(gids)
     assert evidence.locator_page_calls == 0
-    assert evidence.source_calls_at_publication == [(0, len(_INITIAL_GIDS), 0)]
+    assert evidence.source_calls_at_publication == [(0, len(gids), 0)]
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX SIGTERM/SIGKILL process evidence")
 @pytest.mark.parametrize("signal_name", ("SIGTERM", "SIGKILL"))
-@pytest.mark.parametrize("phase", ("source-sealed", "catalog-projection"))
+@pytest.mark.parametrize(
+    "phase", ("source-sealed", "catalog-projection", "catalog-validation")
+)
+@pytest.mark.backend_external(
+    reason="Forked runtime processes receive the paired Core database configuration; artifact and restart oracles run in parent"
+)
+@pytest.mark.backend_reference(
+    reason="Uninterrupted independent SQLite reference is compared with the selected backend interrupted/resumed pipeline"
+)
 def test_fresh_runtime_recovers_committed_pipeline_after_process_stop(
     tmp_path: Path,
-    process_core_config: CoreConfig,
+    core_config: CoreConfig,
     signal_name: str,
     phase: _Phase,
 ) -> None:
-    reference, recovered = _initialized_configs(tmp_path, process_core_config)
-    expected = _run_process(reference)
-    interrupted = _run_process(recovered, phase=phase, signal_name=signal_name)
-    assert interrupted.observed_galleries == [(str(gid),) for gid in _INITIAL_GIDS]
+    gids = tuple(range(4201, 4209)) if phase == "catalog-validation" else _INITIAL_GIDS
+    reference, recovered = _initialized_configs(tmp_path, core_config, gids=gids)
+    expected = _run_process(reference, expected_publications=(gids,))
+    interrupted = _run_process(
+        recovered, phase=phase, signal_name=signal_name, expected_publications=(gids,)
+    )
+    assert sorted(interrupted.observed_galleries) == sorted((str(gid),) for gid in gids)
     assert interrupted.locator_page_calls > 0
     assert interrupted.marker_calls > 0
     _assert_no_published_head(recovered)
     resumed = _run_process(
         recovered,
+        expected_publications=(gids,),
         clock_offset=_RESTART_CLOCK_OFFSET_US,
         expected_audit=(
             DatabaseAuditReason.PREVIOUS_INTERRUPTION
@@ -645,17 +664,33 @@ def test_fresh_runtime_recovers_committed_pipeline_after_process_stop(
         ),
     )
     assert resumed.snapshots == expected.snapshots
-    _assert_resumed_source_without_rescan(resumed)
-    assert sorted(resumed.rendered_gids) == list(_INITIAL_GIDS)
+    _assert_resumed_source_without_rescan(resumed, gids)
+    assert sorted(resumed.rendered_gids) == list(gids)
+
+    if phase == "catalog-validation":
+        # Counts group processed_rows by issued operation, not all child SQL writes.
+        assert interrupted.catalog_build_rows == expected.catalog_build_rows
+        assert resumed.catalog_build_rows == 0
+        assert 0 < interrupted.catalog_validate_rows < expected.catalog_validate_rows
+        assert (
+            interrupted.catalog_validate_rows + resumed.catalog_validate_rows
+            == expected.catalog_validate_rows
+        )
+        assert interrupted.file_hash_rows == expected.file_hash_rows
+        assert resumed.file_hash_rows == 0
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX SIGKILL process evidence")
+@pytest.mark.backend_external(
+    reason="Forked runtime processes receive the paired Core database configuration; artifact and restart oracles run in parent"
+)
+@pytest.mark.backend_reference(
+    reason="Uninterrupted independent SQLite reference is compared with the selected backend interrupted/resumed pipeline"
+)
 def test_fresh_process_resumes_partial_analysis_without_repeating_committed_rows(
-    tmp_path: Path, process_core_config: CoreConfig
+    tmp_path: Path, core_config: CoreConfig
 ) -> None:
-    reference, recovered = _initialized_configs(
-        tmp_path, process_core_config, max_rows=1
-    )
+    reference, recovered = _initialized_configs(tmp_path, core_config, max_rows=1)
     expected = _run_process(reference)
     interrupted = _run_process(
         recovered, phase="analysis-partial", signal_name="SIGKILL"
@@ -678,10 +713,16 @@ def test_fresh_process_resumes_partial_analysis_without_repeating_committed_rows
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX SIGKILL process evidence")
+@pytest.mark.backend_external(
+    reason="Forked runtime processes receive the paired Core database configuration; artifact and restart oracles run in parent"
+)
+@pytest.mark.backend_reference(
+    reason="Uninterrupted independent SQLite reference is compared with the selected backend interrupted/resumed pipeline"
+)
 def test_prepared_archive_survives_restart_and_new_gallery_waits_for_next_turn(
-    tmp_path: Path, process_core_config: CoreConfig
+    tmp_path: Path, core_config: CoreConfig
 ) -> None:
-    reference, recovered = _initialized_configs(tmp_path, process_core_config)
+    reference, recovered = _initialized_configs(tmp_path, core_config)
     # A real-clock successor waits for the interrupted lease to expire. This
     # case continues into another source cut, whose database-owned timestamp
     # must remain comparable with the completed publication's timestamp.
@@ -726,10 +767,16 @@ def test_prepared_archive_survives_restart_and_new_gallery_waits_for_next_turn(
     os.name != "posix", reason="POSIX SIGKILL first-scan checkpoint evidence"
 )
 @pytest.mark.parametrize("change_completed_gallery", (False, True))
+@pytest.mark.backend_external(
+    reason="Forked runtime processes receive the paired Core database configuration; artifact and restart oracles run in parent"
+)
+@pytest.mark.backend_reference(
+    reason="Uninterrupted independent SQLite reference is compared with the selected backend interrupted/resumed pipeline"
+)
 def test_first_scan_checkpoint_survives_sigkill_and_revalidates_changed_marker(
-    tmp_path: Path, process_core_config: CoreConfig, change_completed_gallery: bool
+    tmp_path: Path, core_config: CoreConfig, change_completed_gallery: bool
 ) -> None:
-    reference, recovered = _initialized_configs(tmp_path, process_core_config)
+    reference, recovered = _initialized_configs(tmp_path, core_config)
     recovered = recovered.model_copy(
         update={"resident": recovered.resident.model_copy(update={"lease_seconds": 10})}
     )

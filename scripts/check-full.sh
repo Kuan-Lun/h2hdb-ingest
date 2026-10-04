@@ -6,6 +6,7 @@ repository_root="$(git rev-parse --show-toplevel)"
 cd "$repository_root"
 
 scripts/check-fast.sh
+.venv/bin/python -B -m pytest -p no:cacheprovider --collect-only -q -o addopts= --check-backend-pairs
 .venv/bin/python scripts/run-pytest.py merge
 
 .venv/bin/python scripts/verify-formal.py lean

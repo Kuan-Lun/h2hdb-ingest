@@ -128,7 +128,8 @@
   group；Windows 必須在 start gate 開啟前把 supervisor 放入 kill-on-close Job
   Object，`taskkill /T` 只可作為 Job termination 失敗的 bounded fallback。
   `scripts/check-pytest-deep.sh` 是明確手動、不限時的 deep 入口。
-- `scripts/check-full.sh`：fast gate、上述 bounded pytest merge profile、build、
+- `scripts/check-full.sh`：fast gate、完整 collection 的 backend pairing contract、
+  上述 bounded pytest merge profile、build、
   wheel smoke 及本 repository 的特殊檢查；整合候選只跑一次。
 - dependency audit 可連網，但 hooks 只驗證本機 receipt，不在 commit
   過程連網。
@@ -144,6 +145,15 @@
 - 數值測試固定隨機種子；容許誤差需有依據。
 - flaky test 視為失敗，不得以重跑掩蓋。
 - 不設定跨 repository 的統一 coverage 百分比。
+- 會實際存取 Core database 的 portable test 必須透過共用 backend fixture，
+  對其餘每組參數同時收集 SQLite 與 MariaDB；只加 marker 不代表執行了該
+  backend。`tests/backend_contract.py` 在完整 collection 檢查配對，並於測試
+  執行攔截 native connector，拒絕未分類的實際 SQL。真正 engine-specific
+  測試須具體列明 `backend_specific` 理由；跨 backend oracle 與 child-process
+  SQL 分別須有 `backend_reference` 與 `backend_external` 契約。Library journal
+  與 scratch index 固定使用 SQLite，不得假裝成 MariaDB coverage。配對成功
+  只證明測試存在；skip 或 xfail 不算另一 backend 已完成。Manual live MariaDB
+  的執行結果與 invocation 必須另行回報，不屬於 merge receipt。
 - live account、network、production 或 destructive probe 不得進入 hooks、
   一般 pytest 或自動 merge gate。
 - `skip` 或 `xfail` 必須有理由；`xfail` 原則上使用 `strict=True`。
@@ -200,7 +210,17 @@ durable queues、token-fenced coordination、source checkpoints、
 analysis/deduplication policy、catalog repositories、artifact selection 與
 publication。只能依賴公開 vNext facade、protocol 與 domain receipt；不得
 import core repository、connector internals，或重建已移除的 `H2HDB`
-compatibility surface。startup 使用 `VNextDatabaseAdminFacade` 的 managed audit
+compatibility surface。明確跨 repository 的 dev-only backend coverage guard
+可攔截 Core native connector，以驗證測試實際使用的 backend；不得藉此執行
+consumer runtime SQL。Dev-only 合成資料庫複製 fixture 可讀取 Core generated
+schema provider，以原生 backend 重建 view 依賴順序，且複製後仍須獨立執行
+完整 READY audit。故障接管測試可在停止 owner 後，對 Core 稽核的原生 database
+clock 結果、公開 ingest facade clock 與 adapter session clock 套用同一時間
+偏移；必須保留原生時間查詢、SQL、lease 與 fencing 判斷，不得修改鎖定或
+成功結果，且須驗證到期前拒絕接管及接管後拒絕舊 token。這些例外限本機
+disposable 測試資料庫，不得用於 shipped
+runtime、既有使用者資料庫或 production migration。startup 使用
+`VNextDatabaseAdminFacade` 的 managed audit
 session API，由 core 的持久化排程選擇 quick/full；不得初始化或 migrate core
 schema，也不得將 quick admission 宣稱為完整 audit。週期稽核僅在 bounded
 work sessions 之間執行。正常結束須等工作、facade 與暫存資源全部成功清理後

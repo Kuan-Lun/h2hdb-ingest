@@ -6,14 +6,15 @@ import os
 import struct
 import zlib
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import file_digest, sha256
 from io import BytesIO
 from pathlib import Path
 from shutil import copytree, rmtree
 from time import time_ns
-from typing import BinaryIO, cast
+from typing import Any, BinaryIO, cast
 from unittest.mock import patch
 from zipfile import ZipFile
 
@@ -30,10 +31,12 @@ from h2hdb import (
     CatalogTimestampRange,
     CoreConfig,
     DatabaseAuditReason,
-    DatabaseConfig,
+    DatabaseAuditSessionLostError,
+    DatabaseAuditSessionUnavailableError,
     GalleryStagingCapacityError,
     VNextAnalysisAdvanceResult,
     VNextCurrentOnlyMaintenanceOutcome,
+    VNextDatabaseAdminFacade,
     VNextIngestAdvanceResult,
     VNextIngestFacade,
     VNextIngestPhase,
@@ -49,6 +52,7 @@ from PIL import Image
 
 import h2hdb_ingest.image_qualification as qualification_module
 import h2hdb_ingest.runtime as runtime_module
+import h2hdb_ingest.session as session_module
 from h2hdb_ingest import (
     ArtifactRenderPolicyConfig,
     IngestConfig,
@@ -69,26 +73,6 @@ from h2hdb_ingest.filesystem import (
 from h2hdb_ingest.image_qualification import ImageGalleryQualifier
 from h2hdb_ingest.library_relocation import relocate_library
 from h2hdb_ingest.runtime import IngestRuntime, build_runtime
-
-
-@pytest.fixture(
-    params=(
-        "sqlite",
-        pytest.param("mariadb", marks=(pytest.mark.mariadb, pytest.mark.deep)),
-    )
-)
-def runtime_core_config(
-    request: pytest.FixtureRequest,
-    tmp_path: Path,
-) -> CoreConfig:
-    if request.param == "sqlite":
-        return CoreConfig(
-            database=DatabaseConfig(
-                sql_type="sqlite",
-                database=str(tmp_path / "catalog.sqlite3"),
-            )
-        )
-    return cast(CoreConfig, request.getfixturevalue("mariadb_config"))
 
 
 def _gallery(
@@ -196,12 +180,12 @@ class _CapacityThenSuccessService:
 
 def test_capacity_backpressure_releases_real_core_session_for_retry(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
 ) -> None:
     source = tmp_path / "download"
     source.mkdir()
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(download_path=source),
         resident=ResidentConfig(
             lease_seconds=30,
@@ -222,12 +206,12 @@ def test_capacity_backpressure_releases_real_core_session_for_retry(
 
 def test_fresh_epoch_runs_source_analysis_and_publication(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
 ) -> None:
     source = tmp_path / "download"
     _gallery(source, 1001, "first")
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(download_path=source),
         resident=ResidentConfig(
             lease_seconds=30,
@@ -316,13 +300,13 @@ def test_fresh_epoch_runs_source_analysis_and_publication(
 
 def test_same_locator_content_a_b_a_creates_three_revisions_then_replays(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
 ) -> None:
     source = tmp_path / "download"
     _gallery(source, 1001, "artist", page_bytes=b"content-A")
     _gallery(source, 1002, "other", page_bytes=b"stable-content")
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(download_path=source),
         resident=ResidentConfig(
             lease_seconds=30,
@@ -406,14 +390,14 @@ def test_same_locator_content_a_b_a_creates_three_revisions_then_replays(
 
 def test_completion_marker_cache_skips_unchanged_image_bytes_across_restart(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "download"
     _gallery(source, 1001, "first", page_bytes=b"first gallery")
     _gallery(source, 1002, "second", page_bytes=b"second gallery")
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(download_path=source),
     )
     reads = _count_source_image_reads(monkeypatch)
@@ -437,7 +421,7 @@ def test_completion_marker_cache_skips_unchanged_image_bytes_across_restart(
 @pytest.mark.parametrize("artifacts_enabled", [False, True])
 def test_corrected_source_upload_time_publishes_and_survives_restart(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
     artifacts_enabled: bool,
 ) -> None:
     source = tmp_path / "download"
@@ -455,7 +439,7 @@ def test_corrected_source_upload_time_publishes_and_survives_restart(
     if artifacts_enabled:
         _provision_library_root(library)
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=source,
             library_path=library if artifacts_enabled else None,
@@ -498,7 +482,7 @@ def test_corrected_source_upload_time_publishes_and_survives_restart(
 @pytest.mark.parametrize("marker_change", ["stat", "content"])
 def test_completion_marker_change_reloads_only_the_affected_gallery(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
     marker_change: str,
 ) -> None:
@@ -506,7 +490,7 @@ def test_completion_marker_change_reloads_only_the_affected_gallery(
     _gallery(source, 1001, "first", page_bytes=b"first gallery")
     _gallery(source, 1002, "second", page_bytes=b"second gallery")
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(download_path=source),
     )
     reads = _count_source_image_reads(monkeypatch)
@@ -563,14 +547,14 @@ def test_completion_marker_change_reloads_only_the_affected_gallery(
 
 def test_marker_cache_respects_deletion_and_rejects_incomplete_metadata(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "download"
     _gallery(source, 1001, "first", page_bytes=b"first gallery")
     _gallery(source, 1002, "second", page_bytes=b"second gallery")
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(download_path=source),
     )
     reads = _count_source_image_reads(monkeypatch)
@@ -602,7 +586,7 @@ def test_marker_cache_respects_deletion_and_rejects_incomplete_metadata(
 @pytest.mark.parametrize("artifacts_enabled", [False, True])
 def test_progressive_batches_refresh_known_galleries_and_rediscover_added_folders(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
     artifacts_enabled: bool,
 ) -> None:
@@ -624,7 +608,7 @@ def test_progressive_batches_refresh_known_galleries_and_rediscover_added_folder
     if artifacts_enabled:
         _provision_library_root(library)
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=source,
             library_path=library if artifacts_enabled else None,
@@ -709,7 +693,7 @@ def test_progressive_batches_refresh_known_galleries_and_rediscover_added_folder
 @pytest.mark.parametrize("incomplete", [b"", b"Title: Still writing"])
 def test_incomplete_completion_marker_retries_without_publishing_partial_source(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
     incomplete: bytes,
 ) -> None:
     source = tmp_path / "download"
@@ -717,7 +701,7 @@ def test_incomplete_completion_marker_retries_without_publishing_partial_source(
     marker = source / "1001" / "galleryinfo.txt"
     complete = marker.read_bytes()
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(download_path=source),
     )
     with build_runtime(config) as runtime:
@@ -739,7 +723,7 @@ def test_incomplete_completion_marker_retries_without_publishing_partial_source(
 @pytest.mark.parametrize("change", ("replacement", "deletion"))
 def test_artifact_source_change_retains_head_until_fresh_observation(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
     change: str,
 ) -> None:
@@ -751,7 +735,7 @@ def test_artifact_source_change_retains_head_until_fresh_observation(
     library = tmp_path / "library"
     _provision_library_root(library)
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=source, library_path=library, page_render_workers=1
         ),
@@ -834,6 +818,7 @@ def test_artifact_source_change_retains_head_until_fresh_observation(
 
 def test_fresh_artifact_runtime_publishes_one_current_cbz(
     tmp_path: Path,
+    core_config: CoreConfig,
 ) -> None:
     source = tmp_path / "download"
     _gallery(source, 2001, "artist")
@@ -843,12 +828,7 @@ def test_fresh_artifact_runtime_publishes_one_current_cbz(
     _provision_library_root(library_root)
     current_root = library_root / "current"
     config = IngestConfig(
-        core=CoreConfig(
-            database=DatabaseConfig(
-                sql_type="sqlite",
-                database=str(tmp_path / "catalog.sqlite3"),
-            )
-        ),
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=source,
             library_path=library_root,
@@ -958,7 +938,7 @@ def test_fresh_artifact_runtime_publishes_one_current_cbz(
 
 def test_source_page_boundaries_publish_complete_cbz_and_replay(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "download"
@@ -990,7 +970,7 @@ def test_source_page_boundaries_publish_complete_cbz_and_replay(
     library = tmp_path / "library"
     _provision_library_root(library)
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=source,
             library_path=library,
@@ -1076,9 +1056,58 @@ def test_source_page_boundaries_publish_complete_cbz_and_replay(
         assert restarted.database_admin.check().state == "READY"
 
 
+@dataclass
+class _FaultLeaseClock:
+    """Real ticking clock with an explicit jump only after owners have stopped."""
+
+    offset: int = 0
+    last_database_time: int = 0
+
+    def now(self) -> int:
+        return time_ns() // 1_000 + self.offset
+
+    def expire_stopped_owner(self, duration: int) -> None:
+        # Audit grants use the database clock; ingest grants use the facade
+        # clock. Pass the upper bound of both, not an assumed host/server skew.
+        latest = max(self.now(), self.last_database_time)
+        self.offset += latest + duration + 1 - self.now()
+
+
+@pytest.fixture
+def fault_lease_clock(monkeypatch: pytest.MonkeyPatch) -> _FaultLeaseClock:
+    # The local disposable-database clock seam is an explicit AGENTS exception.
+    # Keep the real database time query, SQL, scheduling and fencing decisions.
+    import h2hdb.database_audit as core_audit_module
+    from h2hdb.database_clock import database_unix_microseconds
+
+    clock = _FaultLeaseClock()
+
+    def database_clock(work: Any) -> int:
+        result = database_unix_microseconds(work) + clock.offset
+        clock.last_database_time = max(clock.last_database_time, result)
+        return result
+
+    def build_facade(config: CoreConfig) -> VNextIngestFacade:
+        return VNextIngestFacade(config, clock=clock.now)
+
+    monkeypatch.setattr(core_audit_module, "database_unix_microseconds", database_clock)
+    monkeypatch.setattr(runtime_module, "VNextIngestFacade", build_facade)
+    monkeypatch.setattr(session_module, "time_ns", lambda: clock.now() * 1_000)
+    return clock
+
+
+def _expire_stopped_audit_owner(config: CoreConfig, clock: _FaultLeaseClock) -> None:
+    with closing(VNextDatabaseAdminFacade(config)) as admin:
+        with pytest.raises(DatabaseAuditSessionUnavailableError):
+            admin.start_ingest_runtime(lease_duration_microseconds=300_000_000)
+    clock.expire_stopped_owner(300_000_000)
+
+
 def test_restart_recovers_durable_publication_before_applying_new_policy(
     tmp_path: Path,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
+    fault_lease_clock: _FaultLeaseClock,
 ) -> None:
     source = tmp_path / "download"
     _gallery(source, 2101, "artist")
@@ -1094,13 +1123,10 @@ def test_restart_recovers_durable_publication_before_applying_new_policy(
     _rewrite_completion_marker(source / "2101")
     library_root = tmp_path / "library"
     _provision_library_root(library_root)
-    database = str(tmp_path / "catalog.sqlite3")
 
     def config(*, page_jpeg_quality: int) -> IngestConfig:
         return IngestConfig(
-            core=CoreConfig(
-                database=DatabaseConfig(sql_type="sqlite", database=database)
-            ),
+            core=core_config,
             paths=IngestPathsConfig(
                 download_path=source,
                 library_path=library_root,
@@ -1110,8 +1136,8 @@ def test_restart_recovers_durable_publication_before_applying_new_policy(
                 ),
             ),
             resident=ResidentConfig(
-                lease_seconds=2,
-                heartbeat_seconds=0.1,
+                lease_seconds=300,
+                heartbeat_seconds=60,
                 poll_seconds=0.01,
             ),
         )
@@ -1122,13 +1148,15 @@ def test_restart_recovers_durable_publication_before_applying_new_policy(
     ):
         first.database_admin.initialize()
         first.resident.initialize()
-        claimed = first.facade.try_claim_ingest(True, 30_000_000)
+        old_audit_session = first.resident.database_audit.session
+        assert old_audit_session is not None
+        claimed = first.facade.try_claim_ingest(True, 300_000_000)
         assert claimed is not None
         session = IngestSessionController(
             first.facade,
             claimed,
-            lease_duration_microseconds=30_000_000,
-            database_type="sqlite",
+            lease_duration_microseconds=300_000_000,
+            database_type=core_config.database.sql_type,
         )
         service = cast(VNextIngestService, first.resident._service)
         activation = service._library_activation
@@ -1157,17 +1185,24 @@ def test_restart_recovers_durable_publication_before_applying_new_policy(
             old_policy_page = archive.read("pages/0000.jpg")
         session.complete()
         # Propagate the simulated failure through the runtime owner so shutdown
-        # cannot acknowledge a clean writer; startup must wait for the real lease.
+        # cannot acknowledge a clean writer; the durable lease must still fence restart.
         raise failure.value
 
     # The observed source facts stay unchanged. Changing only the byte-affecting
     # policy must still produce a successor after the pending old-policy
     # commit has been activated and finalized in this same synchronization.
+    assert old_audit_session is not None
+    _expire_stopped_audit_owner(core_config, fault_lease_clock)
     requested_config = config(page_jpeg_quality=55)
     with build_runtime(requested_config) as restarted:
         startup = restarted.resident.initialize()
         assert startup.reason is DatabaseAuditReason.PREVIOUS_INTERRUPTION
         assert startup.full_audit is not None
+        assert startup.session.generation > old_audit_session.generation
+        with pytest.raises(DatabaseAuditSessionLostError):
+            restarted.database_admin.renew_ingest_runtime(
+                old_audit_session, 300_000_000
+            )
         assert restarted.resident.process_available(periodic_scan=True)
 
         revision = restarted.catalog.get_catalog_revision()
@@ -1208,7 +1243,8 @@ class _SimulatedProcessLoss(RuntimeError):
 
 def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    core_config: CoreConfig,
+    fault_lease_clock: _FaultLeaseClock,
 ) -> None:
     source = tmp_path / "download"
     _gallery(source, 1901, "artist")
@@ -1218,21 +1254,7 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
     _provision_library_root(library_root)
     current_root = library_root / "current"
     staging = library_root / ".h2hdb-state" / "staging"
-    core = CoreConfig(
-        database=DatabaseConfig(
-            sql_type="sqlite",
-            database=str(tmp_path / "catalog.sqlite3"),
-        )
-    )
-    clock_offset = [0]
-
-    def build_facade(config: CoreConfig) -> VNextIngestFacade:
-        return VNextIngestFacade(
-            config,
-            clock=lambda: time_ns() // 1_000 + clock_offset[0],
-        )
-
-    monkeypatch.setattr(runtime_module, "VNextIngestFacade", build_facade)
+    core = core_config
     base_config = IngestConfig(
         core=core,
         paths=IngestPathsConfig(
@@ -1240,7 +1262,7 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
             library_path=library_root,
         ),
         resident=ResidentConfig(
-            lease_seconds=2, heartbeat_seconds=0.1, poll_seconds=0.01
+            lease_seconds=300, heartbeat_seconds=60, poll_seconds=0.01
         ),
     )
 
@@ -1285,6 +1307,7 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
     original_commit = VNextIngestFacade.commit_publication_step
     issued_operation = [""]
     protection_committed = [False]
+    abandoned_session: VNextIngestSession | None = None
 
     def record_issued_operation(
         facade: VNextIngestFacade,
@@ -1302,11 +1325,13 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
         session: VNextIngestSession,
         prepared: VNextPreparedPublicationStep,
     ) -> VNextIngestAdvanceResult:
+        nonlocal abandoned_session
         result = original_commit(facade, session, prepared)
         if issued_operation[0] == "PREPARE_ARTIFACT" and any(
             path.is_file() for path in staging.rglob("*")
         ):
             protection_committed[0] = True
+            abandoned_session = session
         return result
 
     with (
@@ -1314,6 +1339,8 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
         build_runtime(abandoned_config) as abandoned,
     ):
         abandoned.resident.initialize()
+        old_audit_session = abandoned.resident.database_audit.session
+        assert old_audit_session is not None
         with (
             patch.object(
                 VNextIngestFacade,
@@ -1331,7 +1358,13 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
     assert any(path.is_file() for path in staging.rglob("*"))
     assert current_files() == initial_current
 
-    clock_offset[0] = 100_000_000
+    assert old_audit_session is not None
+    _expire_stopped_audit_owner(core_config, fault_lease_clock)
+    assert abandoned_session is not None
+    with VNextIngestFacade(core_config, clock=fault_lease_clock.now) as stale:
+        with pytest.raises(RuntimeError, match="stale or expired") as lost:
+            stale.renew_ingest(abandoned_session, 300_000_000)
+        assert type(lost.value).__module__.startswith("h2hdb.")
     successor_config = abandoned_config.model_copy(
         update={
             "paths": abandoned_config.paths.model_copy(
@@ -1346,6 +1379,11 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
         startup = restarted.resident.initialize()
         assert startup.reason is DatabaseAuditReason.PREVIOUS_INTERRUPTION
         assert startup.full_audit is not None
+        assert startup.session.generation > old_audit_session.generation
+        with pytest.raises(DatabaseAuditSessionLostError):
+            restarted.database_admin.renew_ingest_runtime(
+                old_audit_session, 300_000_000
+            )
 
         # Bounded preliminary maintenance may need several polls before the
         # successor encounters the predecessor's slot and releases it under
@@ -1387,7 +1425,7 @@ def test_policy_takeover_releases_only_abandoned_staging_and_keeps_current(
 
 def test_complete_library_relocation_keeps_catalog_and_reuses_artifact(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "download"
@@ -1397,7 +1435,7 @@ def test_complete_library_relocation_keeps_catalog_and_reuses_artifact(
     library_root = tmp_path / "library"
     _provision_library_root(library_root)
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=source,
             library_path=library_root,
@@ -1461,7 +1499,7 @@ def test_complete_library_relocation_keeps_catalog_and_reuses_artifact(
 
 def test_deleted_gallery_reconciles_catalog_library_and_historical_cleanup(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
 ) -> None:
     source = tmp_path / "download"
     _gallery(source, 2501, "artist")
@@ -1471,7 +1509,7 @@ def test_deleted_gallery_reconciles_catalog_library_and_historical_cleanup(
     _provision_library_root(library_root)
     current_root = library_root / "current"
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=source,
             library_path=library_root,
@@ -1528,6 +1566,7 @@ def test_deleted_gallery_reconciles_catalog_library_and_historical_cleanup(
 
 def test_many_replacements_keep_one_stable_current_file_per_gid(
     tmp_path: Path,
+    core_config: CoreConfig,
 ) -> None:
     source = tmp_path / "download"
     library_root = tmp_path / "library"
@@ -1542,12 +1581,7 @@ def test_many_replacements_keep_one_stable_current_file_per_gid(
         )
         _rewrite_completion_marker(source / str(gid))
     config = IngestConfig(
-        core=CoreConfig(
-            database=DatabaseConfig(
-                sql_type="sqlite",
-                database=str(tmp_path / "catalog.sqlite3"),
-            )
-        ),
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=source,
             library_path=library_root,
@@ -1665,7 +1699,7 @@ def _assert_current_gallery_ids(
 
 def test_progressive_mixed_images_publish_restart_repair_and_remove_rejected_gallery(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1687,7 +1721,7 @@ def test_progressive_mixed_images_publish_restart_repair_and_remove_rejected_gal
     library = tmp_path / "library"
     _provision_library_root(library)
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=source, library_path=library, page_render_workers=4
         ),
@@ -1750,7 +1784,7 @@ def test_progressive_mixed_images_publish_restart_repair_and_remove_rejected_gal
 
 def test_all_invalid_source_publishes_empty_catalog_and_policy_change_rechecks(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = tmp_path / "download"
@@ -1758,7 +1792,7 @@ def test_all_invalid_source_publishes_empty_catalog_and_policy_change_rechecks(
     library = tmp_path / "library"
     _provision_library_root(library)
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(download_path=source, library_path=library),
         resident=ResidentConfig(lease_seconds=30, heartbeat_seconds=5),
     )
@@ -1805,7 +1839,7 @@ def test_all_invalid_source_publishes_empty_catalog_and_policy_change_rechecks(
 
 def test_large_encoded_source_publishes_from_empty_database(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A genuine >32 MiB source is qualified, sealed and published from scratch."""
@@ -1821,7 +1855,7 @@ def test_large_encoded_source_publishes_from_empty_database(
     library = tmp_path / "library"
     _provision_library_root(library)
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=source, library_path=library, page_render_workers=2
         ),
@@ -1875,7 +1909,7 @@ def test_large_encoded_source_publishes_from_empty_database(
 @pytest.mark.parametrize("capacity_errno", (errno.ENOSPC, errno.EDQUOT))
 def test_render_storage_pressure_preserves_gallery_and_publishes_after_retry(
     tmp_path: Path,
-    runtime_core_config: CoreConfig,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     capacity_errno: int,
@@ -1887,7 +1921,7 @@ def test_render_storage_pressure_preserves_gallery_and_publishes_after_retry(
     library = tmp_path / "library"
     _provision_library_root(library)
     config = IngestConfig(
-        core=runtime_core_config,
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=source, library_path=library, page_render_workers=2
         ),
@@ -1947,6 +1981,7 @@ def test_render_storage_pressure_preserves_gallery_and_publishes_after_retry(
 
 def test_repeated_qualification_storage_pressure_reports_once_and_retries_same_marker(
     tmp_path: Path,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1963,11 +1998,7 @@ def test_repeated_qualification_storage_pressure_reports_once_and_retries_same_m
     library = tmp_path / "library"
     _provision_library_root(library)
     config = IngestConfig(
-        core=CoreConfig(
-            database=DatabaseConfig(
-                sql_type="sqlite", database=str(tmp_path / "catalog.sqlite3")
-            )
-        ),
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=source, library_path=library, page_render_workers=2
         ),

@@ -1,6 +1,6 @@
 """Measure independent inventory, admission, retained-set and PAGE dimensions.
 
-This opt-in SQLite fixture never accepts a database URL or existing corpus.
+This synthetic fixture accepts only private SQLite or pytest-owned local MariaDB.
 Cost targets are declared before execution; a violated target remains evidence,
 not an execution failure or a claim that production is already optimized.
 """
@@ -23,7 +23,7 @@ from time import perf_counter
 from typing import Any
 from unittest.mock import patch
 
-from h2hdb import CoreConfig, DatabaseConfig, LoggerConfig, VNextIngestFacade
+from h2hdb import CoreConfig, LoggerConfig, VNextIngestFacade, VNextIngestSession
 
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig, service
 from h2hdb_ingest.filesystem import FilesystemSource
@@ -32,6 +32,7 @@ from h2hdb_ingest.metrics import IngestMetric, TextIngestMetricSink
 from h2hdb_ingest.runtime import build_runtime
 
 _HELPERS = runpy.run_path(str(Path(__file__).with_name("probe-source-io.py")))
+_DATABASE = runpy.run_path(str(Path(__file__).with_name("_probe_database.py")))
 _MAX_DRIVES = 128
 _MODEL = {
     "dimensions": "fixed inventory N; new admission B; retained R from real warm-up publications; P 16px PNG pages per gallery; measured and warm-up rounds are separate",
@@ -273,6 +274,11 @@ def _costs(
     }
 
 
+def _require_next_generation(generation: int, previous: int | None) -> None:
+    if generation < 1 or (previous is not None and generation != previous + 1):
+        raise RuntimeError("unexpected ingest generation: an extra claim changed state")
+
+
 def _run(
     inventory: int,
     workspace: Path,
@@ -281,6 +287,7 @@ def _run(
     measured_rounds: int = 3,
     warmup_rounds: int = 0,
     pages: int = 1,
+    core: CoreConfig | None = None,
 ) -> dict[str, Any]:
     _validate_dimensions(inventory, batch, measured_rounds, warmup_rounds, pages)
     with tempfile.TemporaryDirectory(
@@ -304,11 +311,8 @@ def _run(
         for child in ("current/acquisitions", "current/artwork", ".h2hdb-coordination"):
             (library / child).mkdir(parents=True, exist_ok=True)
         config = IngestConfig(
-            core=CoreConfig(
-                database=DatabaseConfig(
-                    sql_type="sqlite", database=str(root / "catalog.sqlite3")
-                ),
-                logger=LoggerConfig.model_validate({"level": "DEBUG"}),
+            core=(core or _DATABASE["default_config"](root)).model_copy(
+                update={"logger": LoggerConfig.model_validate({"level": "DEBUG"})}
             ),
             paths=IngestPathsConfig(
                 download_path=source, library_path=library, page_render_workers=1
@@ -323,10 +327,20 @@ def _run(
         preparations: list[dict[str, Any]] = []
         maintenance: dict[str, list[str]] = {"catalog": [], "library": []}
         last_maintenance: dict[str, Any] = {}
+        claim_generations: list[int] = []
+        original_claim = VNextIngestFacade.try_claim_ingest
         original_metric = TextIngestMetricSink.__call__
         original_synchronize = service.synchronize_source
         original_catalog_cleanup = VNextIngestFacade.drain_current_only_maintenance
         original_library_cleanup = ManagedFilesystemLibraryAdapter.maintain_cleanup
+
+        def claim(
+            facade: VNextIngestFacade, periodic: bool, lease_duration_microseconds: int
+        ) -> VNextIngestSession | None:
+            result = original_claim(facade, periodic, lease_duration_microseconds)
+            if result is not None:
+                claim_generations.append(result.ingest_generation)
+            return result
 
         def metric(sink: TextIngestMetricSink, value: IngestMetric) -> None:
             if value.scope == "source" and len(source_metrics) < 2:
@@ -366,8 +380,13 @@ def _run(
         warmups: list[dict[str, Any]] = []
         ledger_rows: list[dict[str, Any]] = []
         retained_names: set[str] = set()
+        previous_row: dict[str, Any] | None = None
+        previous_generation: int | None = None
         with ExitStack() as stack:
             stack.enter_context(patch.object(tempfile, "tempdir", str(scratch)))
+            stack.enter_context(
+                patch.object(VNextIngestFacade, "try_claim_ingest", claim)
+            )
             stack.enter_context(patch.object(TextIngestMetricSink, "__call__", metric))
             stack.enter_context(
                 patch.object(service, "synchronize_source", synchronize)
@@ -402,6 +421,7 @@ def _run(
                 for values in maintenance.values():
                     values.clear()
                 cycle_meter = _HELPERS["_Meter"](source)
+                claims_before = len(claim_generations)
                 started = perf_counter()
                 drives = 0
                 with cycle_meter.instrument():
@@ -415,7 +435,7 @@ def _run(
                         raise RuntimeError(
                             "publication failed the new-gallery admission contract"
                         )
-                    sequence = ["publication_observed"]
+                    sequence = ["real_claim_granted", "publication_observed"]
                     post_publication_cleanup: dict[str, list[str]] = {
                         "library": [],
                         "catalog": [],
@@ -429,13 +449,21 @@ def _run(
                                 break
                         else:
                             raise RuntimeError(f"{kind} cleanup did not reach DONE")
-                    grant = runtime.facade.try_claim_ingest(True, 1_800_000_000)
-                    if grant is None:
-                        raise RuntimeError("cleanup DONE did not permit the next claim")
-                    sequence.append("next_claim_granted")
-                    runtime.facade.complete_ingest(grant)
-                    sequence.append("next_claim_released")
                 elapsed = perf_counter() - started
+                if len(claim_generations) != claims_before + 1:
+                    raise RuntimeError(
+                        "one real publication must claim exactly one generation"
+                    )
+                generation = claim_generations[-1]
+                _require_next_generation(generation, previous_generation)
+                if previous_row is not None:
+                    previous_row["next_claim"] = {
+                        "proof": "next_real_round",
+                        "generation": generation,
+                        "measured_in_round": number,
+                        "state_changed_by_probe": False,
+                    }
+                previous_generation = generation
                 if len(preparations) != 1 or len(source_metrics) != 1:
                     raise RuntimeError(
                         "one publication must produce exactly one source observation"
@@ -532,41 +560,70 @@ def _run(
                             ),
                         }
                     )
-                (warmups if number <= warmup_rounds else rounds).append(
-                    {
-                        "round": number,
-                        "inventory": inventory,
-                        "new_admitted": admitted,
-                        "retained_before": retained,
-                        "published": expected,
-                        "source_admitted_including_reuse": measured["galleries"],
-                        "pending": outcome.deferred_gallery_count,
-                        "waiting": outcome.waiting_gallery_count,
-                        "catalog_schema_state": "READY",
-                        "catalog_revision": revision.revision,
-                        "resident_drives": drives,
-                        "cycle_elapsed_seconds": elapsed,
-                        "validation_audit_seconds_excluded": audit_seconds,
-                        "cleanup": {
-                            key: list(value) for key, value in maintenance.items()
-                        },
-                        "post_publication_cleanup": post_publication_cleanup,
-                        "lifecycle_sequence": sequence,
-                        "next_claim_granted": True,
-                        "next_claim_generation": grant.ingest_generation,
-                        "input_manifest_unchanged": True,
-                        "source_synchronization": measured,
-                        "whole_cycle_io_alternate_view": cycle_meter.report(),
-                        "core_source_logs": evidence,
-                        "source_PAGE_read_groups": page_groups,
-                        "selected_fixture_galleries": sorted(selected_names),
-                        "cost_targets": costs,
-                    }
-                )
+                row = {
+                    "round": number,
+                    "inventory": inventory,
+                    "new_admitted": admitted,
+                    "retained_before": retained,
+                    "published": expected,
+                    "source_admitted_including_reuse": measured["galleries"],
+                    "pending": outcome.deferred_gallery_count,
+                    "waiting": outcome.waiting_gallery_count,
+                    "catalog_schema_state": "READY",
+                    "catalog_revision": revision.revision,
+                    "resident_drives": drives,
+                    "cycle_elapsed_seconds": elapsed,
+                    "validation_audit_seconds_excluded": audit_seconds,
+                    "cleanup": {key: list(value) for key, value in maintenance.items()},
+                    "post_publication_cleanup": post_publication_cleanup,
+                    "lifecycle_sequence": sequence,
+                    "ingest_generation": generation,
+                    "next_claim": None,
+                    "input_manifest_unchanged": True,
+                    "source_synchronization": measured,
+                    "whole_cycle_io_alternate_view": cycle_meter.report(),
+                    "core_source_logs": evidence,
+                    "source_PAGE_read_groups": page_groups,
+                    "selected_fixture_galleries": sorted(selected_names),
+                    "cost_targets": costs,
+                }
+                (warmups if number <= warmup_rounds else rounds).append(row)
+                previous_row = row
                 retained_names = selected_names
+            # Audit above describes the measured state. This one final claim
+            # changes generation and is never followed by another measured round.
+            terminal_started = perf_counter()
+            grant = runtime.facade.try_claim_ingest(True, 1_800_000_000)
+            if grant is None:
+                raise RuntimeError(
+                    "cleanup DONE did not permit the terminal next claim"
+                )
+            _require_next_generation(grant.ingest_generation, previous_generation)
+            if len(claim_generations) != warmup_rounds + measured_rounds + 1:
+                raise RuntimeError(
+                    "claim count exceeds real rounds plus terminal proof"
+                )
+            if previous_row is None:
+                raise RuntimeError("terminal claim has no measured predecessor")
+            previous_row["next_claim"] = {
+                "proof": "terminal_postmeasurement_probe",
+                "generation": grant.ingest_generation,
+                "measured_in_round": None,
+                "state_changed_by_probe": True,
+            }
+            runtime.facade.complete_ingest(grant)
+            terminal = {
+                "status": "passed",
+                "generation": grant.ingest_generation,
+                "state_changed": True,
+                "after_last_round_ready_audit": True,
+                "no_subsequent_measured_round_or_ready_audit": True,
+                "elapsed_seconds_excluded": perf_counter() - terminal_started,
+            }
         return {
             "status": "completed",
-            "format_version": 2,
+            "format_version": 3,
+            "terminal_next_claim": terminal,
             "probe_sha256": sha256(Path(__file__).read_bytes()).hexdigest(),
             "model": _MODEL,
             "fixture": {
@@ -578,7 +635,7 @@ def _run(
                 "pages_per_gallery": pages,
                 "edge": 16,
                 "equal_encoded_sizes_enforced": True,
-                "backend": "sqlite",
+                "backend": config.core.database.sql_type,
                 "manifest": immutable_manifest,
             },
             "provenance": _HELPERS["_provenance"](),
@@ -598,7 +655,7 @@ def _run(
             "performance_targets_met": all(
                 item["cost_targets"]["status"] == "satisfied" for item in rounds
             ),
-            "scope": "whole-cycle and source-synchronization I/O are alternate views, never add them; full READY audits and immutable-input hash checks run outside the measured cycle; next-claim proof releases its empty session before the next publication",
+            "scope": "whole-cycle and source-synchronization I/O are alternate views, never add them; full READY audits and immutable-input hash checks run outside the measured cycle; next real round proves the previous next-claim without an intervening empty session; one terminal postmeasurement claim follows the final READY audit and explicitly changes state",
         }
 
 
@@ -620,7 +677,13 @@ def main() -> int:
     parser.add_argument("--ledger-output", type=Path)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--workspace", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--database-config-stdin",
+        action="store_true",
+        help="read one pytest-owned local database configuration from stdin",
+    )
     arguments = parser.parse_args()
+
     try:
         _validate_dimensions(
             arguments.inventory,
@@ -631,6 +694,12 @@ def main() -> int:
         )
     except ValueError as error:
         parser.error(str(error))
+    database_input = sys.stdin.read() if arguments.database_config_stdin else None
+    cores = (
+        _DATABASE["parse_configs"](database_input, count=1)
+        if database_input is not None
+        else ()
+    )
     if arguments.worker:
         if arguments.workspace is None:
             parser.error("worker requires supervisor-owned workspace")
@@ -643,6 +712,7 @@ def main() -> int:
                     measured_rounds=arguments.rounds,
                     warmup_rounds=arguments.warmup_rounds,
                     pages=arguments.pages,
+                    core=cores[0] if cores else None,
                 )
             )
         )
@@ -678,8 +748,10 @@ def main() -> int:
                     str(arguments.warmup_rounds),
                     "--pages",
                     str(arguments.pages),
+                    *(["--database-config-stdin"] if cores else []),
                 ],
                 capture_output=True,
+                input=database_input,
                 text=True,
                 check=True,
                 timeout=arguments.timeout,
@@ -695,7 +767,7 @@ def main() -> int:
     except (subprocess.SubprocessError, ValueError) as error:
         report = {
             "status": "error",
-            "format_version": 2,
+            "format_version": 3,
             "model": _MODEL,
             "error_type": type(error).__name__,
             "error": str(error),

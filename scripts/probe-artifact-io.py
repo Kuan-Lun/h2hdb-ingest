@@ -31,7 +31,7 @@ from unittest.mock import patch
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 import h2hdb
-from h2hdb import CoreConfig, DatabaseConfig, LoggerConfig
+from h2hdb import CoreConfig, LoggerConfig
 from PIL import Image
 
 import h2hdb_ingest
@@ -43,6 +43,7 @@ from h2hdb_ingest.runtime import build_runtime, configure_logging
 from h2hdb_ingest.scratch import DiskScratch
 
 _ENVIRONMENT = runpy.run_path(str(Path(__file__).with_name("_probe_environment.py")))
+_DATABASE = runpy.run_path(str(Path(__file__).with_name("_probe_database.py")))
 _SEED = 20260919
 
 
@@ -444,6 +445,10 @@ def _validate_source_evidence(report):
         and len(report["environment_helper_sha256"]) == 64
         and report["environment_helper_sha256"]
         == report.get("environment_helper_sha256_after")
+        and isinstance(report.get("database_helper_sha256"), str)
+        and len(report["database_helper_sha256"]) == 64
+        and report["database_helper_sha256"]
+        == report.get("database_helper_sha256_after")
     )
     report["source_unchanged_during_experiment"] = complete
     if not complete:
@@ -455,21 +460,24 @@ def _validate_source_evidence(report):
     return report
 
 
-def _run(args, root: Path):
+def _run(args, root: Path, *, core: CoreConfig | None = None):
     provenance_before = _provenance()
     probe_sha256 = sha256(Path(__file__).read_bytes()).hexdigest()
     environment_helper = Path(__file__).with_name("_probe_environment.py")
     environment_sha256 = sha256(environment_helper.read_bytes()).hexdigest()
+    database_helper = Path(__file__).with_name("_probe_database.py")
+    database_sha256 = sha256(database_helper.read_bytes()).hexdigest()
     fixture_started = perf_counter_ns()
     fixture = _fixture(root, args.galleries, args.pages, args.edge)
     fixture_ns = perf_counter_ns() - fixture_started
     log_file = root / "ingest.log"
     config = IngestConfig(
-        core=CoreConfig(
-            database=DatabaseConfig(
-                sql_type="sqlite", database=str(root / "catalog.sqlite3")
-            ),
-            logger=LoggerConfig.model_validate({"file": log_file, "level": "info"}),
+        core=(core or _DATABASE["default_config"](root)).model_copy(
+            update={
+                "logger": LoggerConfig.model_validate(
+                    {"file": log_file, "level": "info"}
+                )
+            }
         ),
         paths=IngestPathsConfig(
             download_path=root / "source",
@@ -561,6 +569,7 @@ def _run(args, root: Path):
         "format_version": 2,
         "fixture": {
             "galleries": args.galleries,
+            "backend": config.core.database.sql_type,
             "pages_per_gallery": args.pages,
             "edge": args.edge,
             "workers": args.workers,
@@ -599,6 +608,10 @@ def _run(args, root: Path):
         "provenance_after": provenance_after,
         "source_unchanged_during_experiment": provenance_before == provenance_after,
         "probe_sha256": probe_sha256,
+        "database_helper_sha256": database_sha256,
+        "database_helper_sha256_after": sha256(
+            database_helper.read_bytes()
+        ).hexdigest(),
         "environment_helper_sha256": environment_sha256,
         "environment_helper_sha256_after": sha256(
             environment_helper.read_bytes()
@@ -657,7 +670,13 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--isolated", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--database-config-stdin",
+        action="store_true",
+        help="read one pytest-owned local database configuration from stdin",
+    )
     args = parser.parse_args()
+
     if not (
         1 <= args.galleries <= 128
         and 1 <= args.pages <= 256
@@ -670,12 +689,18 @@ def main() -> int:
         parser.error("fixture/worker/deadline exceeds bounded probe limits")
     if args.galleries * args.pages * args.edge**2 > 2_147_483_648:
         parser.error("aggregate fixture exceeds two billion pixels")
+    database_input = sys.stdin.read() if args.database_config_stdin else None
+    cores = (
+        _DATABASE["parse_configs"](database_input, count=1)
+        if database_input is not None
+        else ()
+    )
     if args.worker:
         binding = _ENVIRONMENT["worker_binding"](args.workspace)
         with tempfile.TemporaryDirectory(
             prefix="artifact-io-fixture-", dir=args.workspace
         ) as folder:
-            report = _run(args, Path(folder))
+            report = _run(args, Path(folder), core=cores[0] if cores else None)
         report["fixture_removed"] = not Path(folder).exists()
         report["execution_binding"] = binding
         print(json.dumps(report))
@@ -701,6 +726,7 @@ def main() -> int:
                 command,
                 env=environment,
                 capture_output=True,
+                input=database_input,
                 text=True,
                 check=True,
                 timeout=args.timeout,

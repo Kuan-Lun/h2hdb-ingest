@@ -10,11 +10,14 @@ import runpy
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from h2hdb import CoreConfig
 
 import h2hdb_ingest
 
@@ -22,35 +25,46 @@ _SCRIPT = Path(__file__).parents[1] / "scripts" / "probe-artifact-io.py"
 
 
 @pytest.fixture(scope="module")
-def artifact_probe_report(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+def artifact_probe_report(
+    tmp_path_factory: pytest.TempPathFactory,
+    core_config_factory: Callable[[], AbstractContextManager[CoreConfig]],
+) -> dict[str, Any]:
     output = tmp_path_factory.mktemp("artifact-io-probe") / "report.json"
-    subprocess.run(
-        [
-            sys.executable,
-            str(_SCRIPT),
-            "--galleries",
-            "2",
-            "--pages",
-            "4",
-            "--edge",
-            "64",
-            "--workers",
-            "2",
-            "--timeout",
-            "120",
-            "--output",
-            str(output),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=130,
-    )
+    with core_config_factory() as core:
+        probe_database_input = json.dumps([core.model_dump(mode="json")])
+        subprocess.run(
+            [
+                sys.executable,
+                str(_SCRIPT),
+                "--database-config-stdin",
+                "--galleries",
+                "2",
+                "--pages",
+                "4",
+                "--edge",
+                "64",
+                "--workers",
+                "2",
+                "--timeout",
+                "120",
+                "--output",
+                str(output),
+            ],
+            check=True,
+            input=probe_database_input,
+            capture_output=True,
+            text=True,
+            timeout=130,
+        )
     result = json.loads(output.read_text())
     assert isinstance(result, dict)
+    assert result["fixture"]["backend"] == core.database.sql_type
     return result
 
 
+@pytest.mark.backend_external(
+    reason="Artifact probe child receives the fixture-owned Core database and verifies the real publication and full READY oracle"
+)
 def test_real_runtime_probe_proves_publication_cleanup_claim_and_rasters(
     artifact_probe_report: dict[str, Any],
 ) -> None:
@@ -103,6 +117,9 @@ def test_real_runtime_probe_proves_publication_cleanup_claim_and_rasters(
         ("operation.source_open.calls", "source members"),
     ],
 )
+@pytest.mark.backend_external(
+    reason="Artifact probe child receives the fixture-owned Core database and verifies the real publication and full READY oracle"
+)
 def test_probe_negative_control_rejects_missing_measured_work(
     artifact_probe_report: dict[str, Any], field: str, reason: str
 ) -> None:
@@ -153,14 +170,18 @@ def test_probe_rejects_unbounded_fixture_before_writing_output(
 
 
 @pytest.mark.parametrize("kind", ["file", "directory"])
+@pytest.mark.backend_external(
+    reason="Artifact probe child receives the fixture-owned Core database and verifies the real publication and full READY oracle"
+)
 def test_controlled_sync_latency_is_attributed_to_selected_info_phase(
-    tmp_path: Path, kind: str
+    tmp_path: Path, kind: str, probe_database_input: str
 ) -> None:
     output = tmp_path / "latency.json"
     subprocess.run(
         [
             sys.executable,
             str(_SCRIPT),
+            "--database-config-stdin",
             "--galleries",
             "1",
             "--pages",
@@ -179,6 +200,7 @@ def test_controlled_sync_latency_is_attributed_to_selected_info_phase(
             "120",
         ],
         check=True,
+        input=probe_database_input,
         capture_output=True,
         text=True,
         timeout=130,
@@ -197,7 +219,12 @@ def test_controlled_sync_latency_is_attributed_to_selected_info_phase(
     assert report["source_unchanged_during_experiment"]
 
 
-@pytest.mark.parametrize("mutation", ("runtime", "probe", "helper", "missing"))
+@pytest.mark.parametrize(
+    "mutation", ("runtime", "probe", "helper", "database_helper", "missing")
+)
+@pytest.mark.backend_external(
+    reason="Artifact probe child receives the fixture-owned Core database and verifies the real publication and full READY oracle"
+)
 def test_parent_rejects_source_drift_without_discarding_partial_evidence(
     artifact_probe_report: dict[str, Any],
     tmp_path: Path,
@@ -212,6 +239,8 @@ def test_parent_rejects_source_drift_without_discarding_partial_evidence(
         report["probe_sha256_after"] = "0" * 64
     elif mutation == "helper":
         report["environment_helper_sha256_after"] = "0" * 64
+    elif mutation == "database_helper":
+        report["database_helper_sha256_after"] = "0" * 64
     else:
         del report["provenance"]
     # Deliberately keep the old claimed success flag: parent must check digests.
@@ -234,8 +263,12 @@ def test_parent_rejects_source_drift_without_discarding_partial_evidence(
     assert result["publication_metrics"] == report["publication_metrics"]
 
 
+@pytest.mark.backend_external(
+    reason="Artifact probe child receives the fixture-owned Core database and verifies the real publication and full READY oracle"
+)
 def test_real_cleanup_latency_is_separate_and_source_drift_retains_oracles(
     tmp_path: Path,
+    probe_database_input: str,
 ) -> None:
     # The real probe owns process-wide logging configuration. Keep that state
     # (including replacement/closure of handlers) out of the pytest worker.
@@ -246,6 +279,8 @@ def test_real_cleanup_latency_is_separate_and_source_drift_retains_oracles(
             """import json
 import runpy
 import sys
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -268,6 +303,7 @@ report = probe["_run"](
         fsync_delay_ms=0, fsync_delay_kind="all", cleanup_journal_delay_ms=2,
     ),
     Path(sys.argv[2]),
+    core=probe["_DATABASE"]["parse_configs"](sys.stdin.read(), count=1)[0],
 )
 print(json.dumps(report))
 """,
@@ -276,6 +312,7 @@ print(json.dumps(report))
         ],
         capture_output=True,
         text=True,
+        input=probe_database_input,
         timeout=60,
         check=False,
     )
@@ -346,8 +383,12 @@ def test_cleanup_observer_preserves_failure_and_reports_failed_phase(
     assert adapter_type.maintain_cleanup is failed
 
 
+@pytest.mark.backend_external(
+    reason="Artifact probe child receives the fixture-owned Core database and verifies the real publication and full READY oracle"
+)
 def test_artifact_worker_compiles_current_runtime_despite_valid_stale_pyc(
     tmp_path: Path,
+    probe_database_input: str,
 ) -> None:
     probe = runpy.run_path(str(_SCRIPT))
     copied = tmp_path / "runtime" / "h2hdb_ingest"
@@ -360,7 +401,14 @@ def test_artifact_worker_compiles_current_runtime_despite_valid_stale_pyc(
     original = runtime.read_text()
     runtime.write_text(original + "\nSOURCE_BINDING_SENTINEL = 'old'\n")
     identity = runtime.stat()
-    py_compile.compile(str(runtime), doraise=True)
+    # Deliberately seed the adjacent cache that the baseline interpreter reads,
+    # independently of this pytest process's PYTHONPYCACHEPREFIX setting.
+    cache = (
+        runtime.parent
+        / "__pycache__"
+        / (f"{runtime.stem}.{sys.implementation.cache_tag}.pyc")
+    )
+    py_compile.compile(str(runtime), cfile=str(cache), doraise=True)
     runtime.write_text(original + "\nSOURCE_BINDING_SENTINEL = 'new'\n")
     os.utime(runtime, ns=(identity.st_atime_ns, identity.st_mtime_ns))
     environment = {**os.environ, "PYTHONPATH": str(copied.parent)}
@@ -383,6 +431,7 @@ def test_artifact_worker_compiles_current_runtime_despite_valid_stale_pyc(
     worker_arguments = [
         str(_SCRIPT),
         "--worker",
+        "--database-config-stdin",
         "--workspace",
         str(workspace),
         "--galleries",
@@ -398,10 +447,15 @@ def test_artifact_worker_compiles_current_runtime_despite_valid_stale_pyc(
         "--output",
         str(tmp_path / "unused.json"),
     ]
+    database_input_path = tmp_path / "database-input.json"
+    database_input_path.touch(mode=0o600)
+    database_input_path.write_text(probe_database_input)
     program = (
         "from h2hdb_ingest.core_source import SOURCE_BINDING_SENTINEL\n"
         "assert SOURCE_BINDING_SENTINEL == 'new'\n"
-        "import runpy,sys\n"
+        "import runpy,sys,io\n"
+        "from pathlib import Path\n"
+        f"sys.stdin=io.StringIO(Path({str(database_input_path)!r}).read_text())\n"
         f"sys.argv={worker_arguments!r}\n"
         f"runpy.run_path({str(_SCRIPT)!r},run_name='__main__')\n"
     )
@@ -428,6 +482,9 @@ def test_artifact_worker_compiles_current_runtime_despite_valid_stale_pyc(
 
 
 @pytest.mark.parametrize("missing", ("all", "last_count", "journal_time"))
+@pytest.mark.backend_external(
+    reason="Artifact probe child receives the fixture-owned Core database and verifies the real publication and full READY oracle"
+)
 def test_cleanup_info_reconciliation_rejects_missing_production_measurements(
     artifact_probe_report: dict[str, Any],
     missing: str,

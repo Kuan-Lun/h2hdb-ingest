@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from h2hdb import (
     ArtifactFailureContext,
+    CoreConfig,
     VNextIngestGalleryObservation,
     VNextSourceChangedError,
 )
@@ -39,9 +40,12 @@ def _complete(folder: Path, artist: str, *, stamp: int) -> None:
 
 
 def test_global_spam_change_waits_for_unavailable_published_source_then_converges(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    core_config: CoreConfig,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
+    config = _config(tmp_path, core=core_config)
     source = config.paths.download_path
     first, second, third = (source / str(gid) for gid in (1001, 1002, 1003))
     for folder, artist, color in ((first, "ann", "blue"), (second, "ben", "green")):

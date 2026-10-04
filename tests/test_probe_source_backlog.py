@@ -14,6 +14,13 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from h2hdb import (
+    CoreConfig,
+    VNextCurrentOnlyMaintenanceOutcome,
+    VNextIngestCompletionReceipt,
+    VNextIngestFacade,
+    VNextIngestSession,
+)
 
 _SCRIPT = Path(__file__).parents[1] / "scripts" / "probe-source-backlog.py"
 
@@ -195,16 +202,107 @@ def test_locator_counter_must_match_independent_results() -> None:
         )
 
 
+def _assert_natural_claim_sequence(report: dict[str, Any]) -> None:
+    assert report["format_version"] == 3
+    all_rounds = report["warmups_excluded_from_measurements"] + report["rounds"]
+    generations = [row["ingest_generation"] for row in all_rounds]
+    assert generations == list(range(generations[0], generations[0] + len(generations)))
+    for index, row in enumerate(all_rounds):
+        assert row["catalog_schema_state"] == "READY"
+        assert row["lifecycle_sequence"][:2] == [
+            "real_claim_granted",
+            "publication_observed",
+        ]
+        assert row["lifecycle_sequence"][-1] == "catalog_cleanup:DONE"
+        proof = row["next_claim"]
+        assert proof["generation"] == row["ingest_generation"] + 1
+        assert "next_claim_granted" not in row
+        assert "next_claim_generation" not in row
+        if index + 1 < len(all_rounds):
+            assert proof == {
+                "proof": "next_real_round",
+                "generation": all_rounds[index + 1]["ingest_generation"],
+                "measured_in_round": all_rounds[index + 1]["round"],
+                "state_changed_by_probe": False,
+            }
+        else:
+            assert proof["proof"] == "terminal_postmeasurement_probe"
+            assert proof["measured_in_round"] is None
+            assert proof["state_changed_by_probe"]
+    terminal = report["terminal_next_claim"]
+    assert terminal["status"] == "passed"
+    assert terminal["generation"] == generations[-1] + 1
+    assert terminal["state_changed"]
+    assert terminal["after_last_round_ready_audit"]
+    assert terminal["no_subsequent_measured_round_or_ready_audit"]
+
+
+def test_extra_empty_claim_between_real_rounds_is_rejected(
+    tmp_path: Path, core_config: CoreConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = runpy.run_path(str(_SCRIPT))
+    original_claim = VNextIngestFacade.try_claim_ingest
+    original_complete = VNextIngestFacade.complete_ingest
+    original_cleanup = VNextIngestFacade.drain_current_only_maintenance
+    completed_real_round = False
+    injected = False
+
+    def complete(
+        facade: VNextIngestFacade, session: VNextIngestSession
+    ) -> VNextIngestCompletionReceipt:
+        nonlocal completed_real_round
+        result = original_complete(facade, session)
+        completed_real_round = True
+        return result
+
+    def cleanup(
+        facade: VNextIngestFacade, *args: Any, **kwargs: Any
+    ) -> VNextCurrentOnlyMaintenanceOutcome:
+        nonlocal injected
+        result = original_cleanup(facade, *args, **kwargs)
+        if (
+            result is VNextCurrentOnlyMaintenanceOutcome.DONE
+            and completed_real_round
+            and not injected
+        ):
+            injected = True
+            # Reproduce the removed tool behavior with actual public SQL work.
+            # Bypass the observation wrapper so the durable generation gap,
+            # rather than an observer's call counter, must detect the mutation.
+            grant = original_claim(facade, True, 1_800_000_000)
+            assert grant is not None
+            original_complete(facade, grant)
+        return result
+
+    monkeypatch.setattr(VNextIngestFacade, "complete_ingest", complete)
+    monkeypatch.setattr(VNextIngestFacade, "drain_current_only_maintenance", cleanup)
+    with pytest.raises(RuntimeError, match="unexpected ingest generation"):
+        module["_run"](
+            3,
+            tmp_path,
+            batch=1,
+            measured_rounds=2,
+            warmup_rounds=0,
+            pages=1,
+            core=core_config,
+        )
+    assert injected
+
+
+@pytest.mark.backend_external(
+    reason="Probe child receives its fixture-owned database via stdin and returns the actual backend with its full lifecycle oracle"
+)
 @pytest.mark.deep
 @pytest.mark.parametrize("inventory", (127, 128, 129, 255, 256, 257, 1024))
 def test_real_fixed_backlog_three_publications_cleanup_and_next_claim(
-    tmp_path: Path, inventory: int
+    tmp_path: Path, inventory: int, core_config: CoreConfig, probe_database_input: str
 ) -> None:
     output = tmp_path / "report.json"
     subprocess.run(
         [
             sys.executable,
             str(_SCRIPT),
+            "--database-config-stdin",
             "--inventory",
             str(inventory),
             "--timeout",
@@ -215,10 +313,13 @@ def test_real_fixed_backlog_three_publications_cleanup_and_next_claim(
         check=True,
         capture_output=True,
         text=True,
+        input=probe_database_input,
         timeout=260,
     )
     report = json.loads(output.read_text())
     assert report["status"] == "completed"
+    _assert_natural_claim_sequence(report)
+    assert report["fixture"]["backend"] == core_config.database.sql_type
     assert report["fixture"]["fixed_inventory"] == inventory
     assert report["fixture"]["max_new_per_batch"] == 8
     assert report["probe_sha256"]
@@ -233,12 +334,6 @@ def test_real_fixed_backlog_three_publications_cleanup_and_next_claim(
         assert item["waiting"] == 0
         assert item["input_manifest_unchanged"]
         assert item["catalog_schema_state"] == "READY"
-        assert item["next_claim_granted"]
-        assert item["lifecycle_sequence"][0] == "publication_observed"
-        assert item["lifecycle_sequence"][-2:] == [
-            "next_claim_granted",
-            "next_claim_released",
-        ]
         assert (
             item["post_publication_cleanup"]["library"][-1]
             == item["post_publication_cleanup"]["catalog"][-1]
@@ -270,6 +365,7 @@ def test_backlog_cli_bounds_are_checked_before_work(
         [
             sys.executable,
             str(_SCRIPT),
+            "--database-config-stdin",
             "--inventory",
             inventory,
             "--output",
@@ -398,13 +494,19 @@ def test_new_dimension_bounds_fail_before_fixture_creation(
     assert not output.exists()
 
 
+@pytest.mark.backend_external(
+    reason="Probe child receives its fixture-owned database via stdin and returns the actual backend with its full lifecycle oracle"
+)
 @pytest.mark.deep
-def test_real_warmup_partial_final_batch_and_standalone_ledger(tmp_path: Path) -> None:
+def test_real_warmup_partial_final_batch_and_standalone_ledger(
+    tmp_path: Path, core_config: CoreConfig, probe_database_input: str
+) -> None:
     output, ledger = tmp_path / "report.json", tmp_path / "ledger.json"
     subprocess.run(
         [
             sys.executable,
             str(_SCRIPT),
+            "--database-config-stdin",
             "--inventory",
             "5",
             "--batch",
@@ -423,11 +525,14 @@ def test_real_warmup_partial_final_batch_and_standalone_ledger(tmp_path: Path) -
         capture_output=True,
         text=True,
         check=True,
+        input=probe_database_input,
         timeout=260,
     )
     report = json.loads(output.read_text())
     model_input = json.loads(ledger.read_text())
     assert report["status"] == "completed"
+    _assert_natural_claim_sequence(report)
+    assert report["fixture"]["backend"] == core_config.database.sql_type
     assert report["ledger"] == model_input
     assert len(report["warmups_excluded_from_measurements"]) == 1
     assert model_input["dimensions"] == {
@@ -448,5 +553,5 @@ def test_real_warmup_partial_final_batch_and_standalone_ledger(tmp_path: Path) -
         assert row["source_sql_calls"] > 0
         assert evidence["source_PAGE_read_groups"]["pending"] == 0
         assert evidence["source_synchronization"]["telemetry_comparison"]["matched"]
-        assert evidence["lifecycle_sequence"][-1] == "next_claim_released"
+        assert evidence["lifecycle_sequence"][-1] == "catalog_cleanup:DONE"
     assert report["rounds"][-1]["pending"] == 0

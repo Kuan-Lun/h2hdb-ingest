@@ -1,4 +1,4 @@
-"""Measure real source synchronization I/O against a bounded published SQLite baseline.
+"""Measure real source synchronization I/O against a bounded published database baseline.
 
 Only synthetic files are accepted. A child process bounds the complete matrix;
 the report is replaced atomically only after a complete success/error document.
@@ -11,13 +11,13 @@ import json
 import os
 import platform
 import random
-import sqlite3
+import runpy
 import subprocess
 import sys
 import tempfile
 import tomllib
 from collections import defaultdict
-from contextlib import ExitStack, closing, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import partial
 from hashlib import sha256
@@ -29,7 +29,7 @@ from typing import Any, BinaryIO
 from unittest.mock import patch
 
 import h2hdb
-from h2hdb import CoreConfig, DatabaseConfig, VNextCurrentOnlyMaintenanceOutcome
+from h2hdb import CoreConfig, VNextCurrentOnlyMaintenanceOutcome
 from PIL import Image
 
 import h2hdb_ingest
@@ -45,6 +45,8 @@ from h2hdb_ingest.policy import build_ingest_policy
 from h2hdb_ingest.runtime import build_runtime
 from h2hdb_ingest.session import IngestSessionController
 from h2hdb_ingest.source_performance import SourcePerformance
+
+_DATABASE = runpy.run_path(str(Path(__file__).with_name("_probe_database.py")))
 
 _PHASE: ContextVar[str] = ContextVar("source_io_probe_phase", default="observation")
 _COUNTERS = ("read_calls", "read_bytes", "write_calls", "write_bytes")
@@ -368,6 +370,7 @@ def _run_matrix(
     *,
     codec: str,
     workspace: Path,
+    cores: tuple[CoreConfig, ...] = (),
 ) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="matrix-", dir=workspace) as temporary:
         root = Path(temporary)
@@ -379,11 +382,7 @@ def _run_matrix(
         for child in ("current/acquisitions", "current/artwork", ".h2hdb-coordination"):
             (library / child).mkdir(parents=True, exist_ok=True)
         config = IngestConfig(
-            core=CoreConfig(
-                database=DatabaseConfig(
-                    sql_type="sqlite", database=str(root / "catalog.sqlite3")
-                )
-            ),
+            core=cores[0] if cores else _DATABASE["default_config"](root),
             paths=IngestPathsConfig(
                 download_path=source,
                 library_path=library,
@@ -456,10 +455,13 @@ def _run_matrix(
                     )
                 }
             )
-            for name, selected in (
-                ("unchanged", config),
-                ("policy_changed", changed),
-                ("source_changed", config),
+            for index, (name, selected) in enumerate(
+                (
+                    ("unchanged", config),
+                    ("policy_changed", changed),
+                    ("source_changed", config),
+                ),
+                start=1,
             ):
                 if name == "source_changed":
                     folder = source / "1000000"
@@ -469,27 +471,13 @@ def _run_matrix(
                     (folder / "galleryinfo.txt").write_bytes(
                         _metadata(1_000_000, changed=True)
                     )
-                # A completed source pass now writes durable checkpoints. Give
-                # each comparison an independent, exact copy of the published
-                # baseline so policy invalidation cannot contaminate the next
-                # case's qualification authority. SQLite backup includes WAL.
-                comparison_database = root / f"{name}.sqlite3"
-                with (
-                    closing(sqlite3.connect(config.core.database.database)) as original,
-                    closing(sqlite3.connect(comparison_database)) as copied,
-                ):
-                    original.backup(copied)
-                selected = selected.model_copy(
-                    update={
-                        "core": selected.core.model_copy(
-                            update={
-                                "database": selected.core.database.model_copy(
-                                    update={"database": str(comparison_database)}
-                                )
-                            }
-                        )
-                    }
+                # Isolate each changed-policy/marker pass from checkpoints
+                # committed by the preceding comparison. The baseline is quiescent.
+                target = (
+                    cores[index] if cores else _DATABASE["default_config"](root, name)
                 )
+                _DATABASE["clone_database"](config.core, target)
+                selected = selected.model_copy(update={"core": target})
                 with build_runtime(
                     selected, event_logger=lambda _message: None
                 ) as comparison:
@@ -516,7 +504,7 @@ def _run_matrix(
                         comparison.facade,
                         session,
                         lease_duration_microseconds=1_800_000_000,
-                        database_type="sqlite",
+                        database_type=selected.core.database.sql_type,
                     )
                     try:
                         policy = comparison.facade.ensure_policy(
@@ -572,7 +560,7 @@ def _run_matrix(
                 "seed": 47029,
                 "source_change_seed": 87029,
                 "workers": workers,
-                "backend": "sqlite",
+                "backend": config.core.database.sql_type,
                 "aggregate_pixels": galleries * pages * edge * edge,
                 "max_fixture_pixels": _MAX_FIXTURE_PIXELS,
                 "max_fixture_encoded_bytes": _MAX_FIXTURE_ENCODED_BYTES,
@@ -580,7 +568,7 @@ def _run_matrix(
             },
             "scope": {
                 "measured": "complete source synchronization, including durable observation checkpoints; one real published baseline",
-                "comparisons": "all source-only cases use independent SQLite backups of the same published baseline",
+                "comparisons": "all source-only cases use independent same-backend fixture clones of the same published baseline",
                 "source_changed": "one PAGE plus its producer completion marker",
                 "policy_changed": "page_jpeg_quality 90 -> 89; source unchanged",
                 "source_io": "actual os.read bytes/calls, including EOF calls, by inode and exclusive phase",
@@ -612,6 +600,9 @@ def _provenance() -> dict[str, object]:
             "machine": platform.machine(),
         },
         "probe_sha256": sha256(Path(__file__).read_bytes()).hexdigest(),
+        "database_helper_sha256": sha256(
+            Path(__file__).with_name("_probe_database.py").read_bytes()
+        ).hexdigest(),
         "checkout_project_version": manifest["project"]["version"],
         "h2hdb": {
             "distribution_version": version("h2hdb"),
@@ -688,11 +679,23 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--workspace", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--database-config-stdin",
+        action="store_true",
+        help="read four pytest-owned local database configurations from stdin",
+    )
     arguments = parser.parse_args()
+
     try:
         _require_fixture_budget(arguments.galleries, arguments.pages, arguments.edge)
     except ValueError as error:
         parser.error(str(error))
+    database_input = sys.stdin.read() if arguments.database_config_stdin else None
+    cores = (
+        _DATABASE["parse_configs"](database_input, count=4)
+        if database_input is not None
+        else ()
+    )
     if arguments.worker:
         if arguments.workspace is None:
             parser.error("internal worker requires its supervisor-owned workspace")
@@ -705,6 +708,7 @@ def main() -> int:
                     arguments.workers,
                     codec=arguments.codec,
                     workspace=arguments.workspace,
+                    cores=cores,
                 )
             )
         )
@@ -727,6 +731,7 @@ def main() -> int:
         str(arguments.workers),
         "--codec",
         arguments.codec,
+        *(["--database-config-stdin"] if cores else []),
     ]
     try:
         # Parent ownership ensures cleanup after timeout kills the worker before
@@ -735,6 +740,7 @@ def main() -> int:
             result = subprocess.run(
                 [*command, "--workspace", workspace],
                 capture_output=True,
+                input=database_input,
                 text=True,
                 timeout=arguments.timeout,
                 check=True,

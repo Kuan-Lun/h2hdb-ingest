@@ -94,27 +94,17 @@ def _progress_records(messages: list[str]) -> list[dict[str, str]]:
     ]
 
 
-@pytest.mark.parametrize(
-    "backend",
-    ["sqlite", pytest.param("mariadb", marks=(pytest.mark.mariadb, pytest.mark.deep))],
-)
 @pytest.mark.parametrize("artifacts", [False, True])
 def test_runtime_reports_real_source_database_and_parallel_cbz_progress(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    request: pytest.FixtureRequest,
+    core_config: CoreConfig,
     artifacts: bool,
-    backend: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.DEBUG, logger="h2hdb_ingest.runtime")
     config = _config(tmp_path, artifacts=artifacts)
-    if backend == "mariadb":
-        config = IngestConfig(
-            core=cast(CoreConfig, request.getfixturevalue("mariadb_config")),
-            paths=config.paths,
-            resident=config.resident,
-        )
+    config = config.model_copy(update={"core": core_config})
     _gallery(config.paths.download_path)
     messages: list[str] = []
     worker_ids: set[int] = set()

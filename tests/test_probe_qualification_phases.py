@@ -1140,6 +1140,7 @@ def test_runtime_imported_before_disk_edit_is_never_reported_as_complete(
         "probe-qualification-phases.py",
         "check-source-cost.py",
         "probe-source-io.py",
+        "_probe_database.py",
         "_probe_environment.py",
         "run-pytest.py",
     ):

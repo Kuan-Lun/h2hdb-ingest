@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
+from h2hdb import CoreConfig
 from test_source_preparation_progress import _config
 
 from h2hdb_ingest.filesystem import (
@@ -128,9 +129,10 @@ def test_oracle_rejects_removed_scope_even_when_bytes_are_correct(
 
 def test_real_source_summary_is_visible_at_info_and_separates_adapter_work(
     tmp_path: Path,
+    core_config: CoreConfig,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    config = _config(tmp_path, galleries=2, artifacts=True)
+    config = _config(tmp_path, core=core_config, galleries=2, artifacts=True)
     with caplog.at_level(logging.INFO, logger="h2hdb_ingest.metrics"):
         with build_runtime(config, event_logger=lambda _message: None) as runtime:
             runtime.database_admin.initialize()
