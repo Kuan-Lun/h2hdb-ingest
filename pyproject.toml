@@ -77,6 +77,7 @@ warn_unused_configs = true
 warn_unreachable = true
 
 [tool.pytest.ini_options]
+backend_contract_fixtures = ["database_backend"]
 addopts = "-m 'not deep' --numprocesses=auto --max-worker-restart=0 --dist=loadgroup"
 required_plugins = ["pytest-xdist>=3.8.0,<4.0.0"]
 testpaths = ["tests"]

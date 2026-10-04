@@ -13,7 +13,6 @@ from h2hdb import (
     ArtifactArchiveRenderEvidence,
     ArtifactSourceMember,
     CoreConfig,
-    DatabaseConfig,
 )
 from PIL import Image
 
@@ -45,18 +44,14 @@ def _page(folder: Path, color: str, *, stamp: int) -> None:
     os.utime(path, ns=(stamp, stamp))
 
 
-def _config(tmp_path: Path, *, batch: int = 100) -> IngestConfig:
+def _config(tmp_path: Path, *, core: CoreConfig, batch: int = 100) -> IngestConfig:
     source = tmp_path / "download"
     source.mkdir(exist_ok=True)
     library = tmp_path / "library"
     for child in ("current/acquisitions", "current/artwork", ".h2hdb-coordination"):
         (library / child).mkdir(parents=True, exist_ok=True)
     return IngestConfig(
-        core=CoreConfig(
-            database=DatabaseConfig(
-                sql_type="sqlite", database=str(tmp_path / "catalog.sqlite3")
-            )
-        ),
+        core=core,
         paths=IngestPathsConfig(
             download_path=source, library_path=library, page_render_workers=1
         ),
@@ -86,8 +81,9 @@ def _synchronize(runtime: IngestRuntime) -> None:
 
 def test_markerless_new_gallery_does_not_consume_quota_or_force_retries(
     tmp_path: Path,
+    core_config: CoreConfig,
 ) -> None:
-    config = _config(tmp_path, batch=1)
+    config = _config(tmp_path, core=core_config, batch=1)
     source = config.paths.download_path
     _page(source / "1000", "green", stamp=10)
     _page(source / "1001", "red", stamp=10)
@@ -113,8 +109,9 @@ def test_markerless_new_gallery_does_not_consume_quota_or_force_retries(
 
 def test_numeric_collection_does_not_create_a_permanent_waiting_gallery(
     tmp_path: Path,
+    core_config: CoreConfig,
 ) -> None:
-    config = _config(tmp_path)
+    config = _config(tmp_path, core=core_config)
     gallery = config.paths.download_path / "2024" / "1001"
     _page(gallery, "red", stamp=10)
     _marker(gallery, stamp=10)
@@ -132,8 +129,9 @@ def test_numeric_collection_does_not_create_a_permanent_waiting_gallery(
 
 def test_missing_marker_retains_published_gallery_across_restart(
     tmp_path: Path,
+    core_config: CoreConfig,
 ) -> None:
-    config = _config(tmp_path)
+    config = _config(tmp_path, core=core_config)
     source = config.paths.download_path
     first = source / "1001"
     _page(first, "red", stamp=10)
@@ -162,9 +160,9 @@ def test_missing_marker_retains_published_gallery_across_restart(
 
 
 def test_source_update_during_render_retains_published_bytes_then_converges(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, core_config: CoreConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = _config(tmp_path)
+    config = _config(tmp_path, core=core_config)
     folder = config.paths.download_path / "1001"
     _page(folder, "red", stamp=10)
     _marker(folder, stamp=10)

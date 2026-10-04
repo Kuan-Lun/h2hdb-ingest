@@ -1,4 +1,4 @@
-"""Real SQLite scheduler integration through public core and resident entry points."""
+"""Real backend scheduler integration through public core and resident entry points."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from h2hdb import (
     DatabaseAuditReason,
     DatabaseAuditReport,
     DatabaseAuditSession,
-    DatabaseConfig,
     VNextDatabaseAdminFacade,
 )
 
@@ -22,7 +21,9 @@ from h2hdb_ingest.database_audit import IngestDatabaseAudit
 from h2hdb_ingest.runtime import IngestRuntime, build_runtime
 
 
-def _config(tmp_path: Path, *, short_interval: bool = False) -> IngestConfig:
+def _config(
+    tmp_path: Path, *, core: CoreConfig, short_interval: bool = False
+) -> IngestConfig:
     source = tmp_path / "source"
     gallery = source / "1001"
     gallery.mkdir(parents=True)
@@ -43,11 +44,7 @@ def _config(tmp_path: Path, *, short_interval: bool = False) -> IngestConfig:
         encoding="utf-8",
     )
     return IngestConfig(
-        core=CoreConfig(
-            database=DatabaseConfig(
-                sql_type="sqlite", database=str(tmp_path / "catalog.sqlite3")
-            )
-        ),
+        core=core,
         paths=IngestPathsConfig(download_path=source),
         resident=ResidentConfig(
             lease_seconds=2,
@@ -83,8 +80,9 @@ def _schedule(runtime: IngestRuntime) -> DatabaseAuditReport:
 
 def test_completed_catchup_clean_restart_reuses_successful_audit(
     tmp_path: Path,
+    core_config: CoreConfig,
 ) -> None:
-    config = _config(tmp_path)
+    config = _config(tmp_path, core=core_config)
     _initialize(config)
     with build_runtime(config) as first:
         startup = first.resident.initialize()
@@ -106,8 +104,10 @@ def test_completed_catchup_clean_restart_reuses_successful_audit(
         assert restarted.catalog.get_catalog_revision() == revision
 
 
-def test_incomplete_folder_does_not_block_initial_catchup_hint(tmp_path: Path) -> None:
-    config = _config(tmp_path)
+def test_incomplete_folder_does_not_block_initial_catchup_hint(
+    tmp_path: Path, core_config: CoreConfig
+) -> None:
+    config = _config(tmp_path, core=core_config)
     incomplete = config.paths.download_path / "1002"
     incomplete.mkdir()
     (incomplete / "galleryinfo.txt").write_text(
@@ -127,8 +127,9 @@ def test_incomplete_folder_does_not_block_initial_catchup_hint(tmp_path: Path) -
 
 def test_escaped_exception_requires_full_audit_after_lease_expiry(
     tmp_path: Path,
+    core_config: CoreConfig,
 ) -> None:
-    config = _config(tmp_path)
+    config = _config(tmp_path, core=core_config)
     _initialize(config)
     with (
         pytest.raises(ValueError, match="application failed"),
@@ -142,11 +143,16 @@ def test_escaped_exception_requires_full_audit_after_lease_expiry(
         assert report.full_audit is not None
 
 
+@pytest.mark.backend_specific(
+    backend="sqlite",
+    reason="SQLite shares a same-process connection serialization lock; MariaDB audit renewal uses independent server connections",
+)
 def test_sqlite_full_audit_serializes_same_process_renewal(
     tmp_path: Path,
+    sqlite_core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path, short_interval=True)
+    config = _config(tmp_path, core=sqlite_core_config, short_interval=True)
     _initialize(config)
     admin = VNextDatabaseAdminFacade(config.core)
     audit = IngestDatabaseAudit(

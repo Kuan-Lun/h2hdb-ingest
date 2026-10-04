@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import resource
+import runpy
 import stat
 import sys
 import tempfile
@@ -17,7 +18,7 @@ from time import perf_counter
 from typing import Protocol, cast
 from unittest.mock import patch
 
-from h2hdb import CoreConfig, DatabaseConfig
+from h2hdb import CoreConfig
 from PIL import Image
 
 from h2hdb_ingest.config import (
@@ -31,6 +32,7 @@ from h2hdb_ingest.core_source import VNextFilesystemSourceAdapter
 from h2hdb_ingest.filesystem import FilesystemSource
 from h2hdb_ingest.runtime import build_runtime
 
+_DATABASE = runpy.run_path(str(Path(__file__).with_name("_probe_database.py")))
 _FIRST_GID = 1_000_000
 
 
@@ -264,14 +266,14 @@ def _monitor_resources(
     safety_stop: Event,
     interval_seconds: float,
     benchmark_root: Path,
-    database_path: Path,
+    database_path: Path | None,
     failures: list[Exception],
 ) -> None:
     try:
         while not stop.wait(interval_seconds):
             file_count, tree_bytes = _tree_usage(benchmark_root)
             rss_bytes = _rss_bytes()
-            database_bytes = database_path.stat().st_size
+            database_bytes = database_path.stat().st_size if database_path else None
             print(
                 json.dumps(
                     {
@@ -347,6 +349,7 @@ def _run_pipeline(
     gallery_count: int,
     *,
     progress_seconds: float,
+    core: CoreConfig | None = None,
 ) -> dict[str, object]:
     started = perf_counter()
     with tempfile.TemporaryDirectory(
@@ -355,18 +358,18 @@ def _run_pipeline(
         benchmark_root = Path(temporary)
         source_root = benchmark_root / "source"
         library_root = benchmark_root / "library"
-        database_path = benchmark_root / "catalog.sqlite3"
+        selected_core = core or _DATABASE["default_config"](benchmark_root)
+        database_path = (
+            Path(selected_core.database.database)
+            if selected_core.database.sql_type == "sqlite"
+            else None
+        )
         create_started = perf_counter()
         _build_source(source_root, gallery_count)
         _provision_library(library_root)
         create_seconds = perf_counter() - create_started
         config = IngestConfig(
-            core=CoreConfig(
-                database=DatabaseConfig(
-                    sql_type="sqlite",
-                    database=str(database_path),
-                )
-            ),
+            core=selected_core,
             paths=IngestPathsConfig(
                 download_path=source_root,
                 library_path=library_root,
@@ -431,7 +434,9 @@ def _run_pipeline(
                         "event": "pipeline-start",
                         "gallery_count": gallery_count,
                         "scratch_root": str(benchmark_root),
-                        "database_size_bytes": database_path.stat().st_size,
+                        "database_size_bytes": database_path.stat().st_size
+                        if database_path
+                        else None,
                         "ru_maxrss_bytes": _rss_bytes(),
                     },
                     sort_keys=True,
@@ -489,6 +494,8 @@ def _run_pipeline(
                 )
             return {
                 "gallery_count": gallery_count,
+                "backend": config.core.database.sql_type,
+                "database_size_scope": "SQLite file only; remote engine storage is not measured",
                 "workload": "synthetic-one-2x2-page-low-cost",
                 "create_seconds": create_seconds,
                 "schema_seconds": schema_seconds,
@@ -504,7 +511,9 @@ def _run_pipeline(
                 "acquisition_count": acquisition_count,
                 "artwork_count": artwork_count,
                 "output_manifest_sha256": manifest,
-                "database_size_bytes": database_path.stat().st_size,
+                "database_size_bytes": database_path.stat().st_size
+                if database_path
+                else None,
                 "ru_maxrss_raw": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
                 "ru_maxrss_bytes": _rss_bytes(),
             }

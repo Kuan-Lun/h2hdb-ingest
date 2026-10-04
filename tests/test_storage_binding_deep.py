@@ -23,7 +23,7 @@ from h2hdb_ingest import (
 )
 from h2hdb_ingest.runtime import build_runtime
 
-pytestmark = [pytest.mark.deep, pytest.mark.mariadb]
+pytestmark = pytest.mark.deep
 
 _CHILD_DEADLINE_SECONDS = 30.0
 
@@ -64,9 +64,12 @@ def _crash_after_local_identity_before_core_bind(config: IngestConfig) -> NoRetu
 
 
 @pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="POSIX SIGKILL only")
-def test_live_mariadb_restart_replays_uuid_after_process_loss(
+@pytest.mark.backend_external(
+    reason="Storage-binding crash child receives the paired Core configuration; parent verifies durable binding and local journal replay"
+)
+def test_restart_replays_uuid_after_process_loss(
     tmp_path: Path,
-    mariadb_config: CoreConfig,
+    core_config: CoreConfig,
 ) -> None:
     source = tmp_path / "download"
     gallery = source / "7001"
@@ -89,7 +92,7 @@ def test_live_mariadb_restart_replays_uuid_after_process_loss(
     library_root = tmp_path / "library"
     _provision_library_root(library_root)
     config = IngestConfig(
-        core=mariadb_config,
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=source,
             library_path=library_root,
@@ -99,7 +102,7 @@ def test_live_mariadb_restart_replays_uuid_after_process_loss(
             lease_seconds=2, heartbeat_seconds=0.2, poll_seconds=0.05
         ),
     )
-    VNextDatabaseAdminFacade(mariadb_config).initialize()
+    VNextDatabaseAdminFacade(core_config).initialize()
 
     process = multiprocessing.get_context("spawn").Process(
         target=_crash_after_local_identity_before_core_bind,

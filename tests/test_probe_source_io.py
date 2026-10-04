@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from h2hdb import FileContentReceipt
+from h2hdb import CoreConfig, FileContentReceipt
 from PIL import Image
 
 from h2hdb_ingest.filesystem import (
@@ -34,16 +34,20 @@ def _io(case: dict[str, Any], category: str, counter: str) -> int:
     return result
 
 
+@pytest.mark.backend_external(
+    reason="Probe child receives four fixture-owned configurations via stdin and asserts its actual backend in the report"
+)
 @pytest.mark.parametrize("workers", (1, 4))
 @pytest.mark.parametrize("codec", ("png", "jpeg"))
 def test_real_source_matrix_measures_reuse_and_independent_invalidation(
-    tmp_path: Path, workers: int, codec: str
+    tmp_path: Path, workers: int, codec: str, probe_core_configs: tuple[CoreConfig, ...]
 ) -> None:
     report_path = tmp_path / "report.json"
     subprocess.run(
         (
             sys.executable,
             str(_SCRIPT),
+            "--database-config-stdin",
             "--galleries",
             "2",
             "--pages",
@@ -60,6 +64,7 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
             str(report_path),
         ),
         check=True,
+        input=json.dumps([core.model_dump(mode="json") for core in probe_core_configs]),
         capture_output=True,
         text=True,
         timeout=100,
@@ -67,6 +72,7 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
     report = json.loads(report_path.read_text())
     assert report["status"] == "ok"
     assert report["format_version"] == 5
+    assert report["fixture"]["backend"] == probe_core_configs[0].database.sql_type
     assert report["fixture"]["workers"] == workers
     assert report["fixture"]["codec"] == codec
     assert report["provenance"]["h2hdb"]["python_source_sha256"]
@@ -135,7 +141,10 @@ def test_real_source_matrix_measures_reuse_and_independent_invalidation(
 
 @pytest.mark.parametrize("omitted", ("read", "logical_bytes_read"))
 def test_real_negative_control_rejects_missing_production_read_measurement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, omitted: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    omitted: str,
+    probe_core_configs: tuple[CoreConfig, ...],
 ) -> None:
     module = runpy.run_path(str(_SCRIPT))
     original_phase = SourcePerformance.phase
@@ -158,7 +167,9 @@ def test_real_negative_control_rejects_missing_production_read_measurement(
     with pytest.raises(
         RuntimeError, match="production source telemetry differs from independent meter"
     ):
-        module["_run_matrix"](1, 1, 16, 1, codec="png", workspace=tmp_path)
+        module["_run_matrix"](
+            1, 1, 16, 1, codec="png", workspace=tmp_path, cores=probe_core_configs
+        )
 
 
 def test_meter_calibrates_actual_reads_and_separate_buffer_boundary(
@@ -238,6 +249,7 @@ def test_cli_rejects_aggregate_pixels_before_launching_worker(
         "argv",
         [
             str(_SCRIPT),
+            "--database-config-stdin",
             "--galleries",
             "4",
             "--pages",

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import json
 import os
 import uuid
-from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, ExitStack, contextmanager
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from h2hdb import CoreConfig
+
+pytest_plugins = ("backend_contract",)
 
 _MARIADB_IMAGE = "mariadb:10.11.11"
 _MARIADB_VERSION_PREFIX = "10.11.11-"
@@ -50,8 +56,9 @@ def mariadb_container() -> Iterator[Any]:
         container.stop()
 
 
-@pytest.fixture
-def mariadb_config(mariadb_container: Any) -> Iterator[CoreConfig]:
+@contextmanager
+def _mariadb_config(mariadb_container: Any) -> Iterator[CoreConfig]:
+
     from h2hdb import CoreConfig, DatabaseConfig
 
     try:
@@ -115,3 +122,66 @@ def mariadb_config(mariadb_container: Any) -> Iterator[CoreConfig]:
             admin_connection.commit()
         finally:
             admin_connection.close()
+
+
+@pytest.fixture(
+    scope="session",
+    params=(
+        "sqlite",
+        pytest.param("mariadb", marks=(pytest.mark.mariadb, pytest.mark.deep)),
+    ),
+)
+def database_backend(request: pytest.FixtureRequest) -> str:
+    return cast(str, request.param)
+
+
+@pytest.fixture(scope="session")
+def core_config_factory(
+    database_backend: str,
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Callable[[], AbstractContextManager[CoreConfig]]:
+    if database_backend == "mariadb":
+        container = request.getfixturevalue("mariadb_container")
+        return lambda: _mariadb_config(container)
+
+    @contextmanager
+    def sqlite_database() -> Iterator[CoreConfig]:
+        from h2hdb import CoreConfig, DatabaseConfig
+
+        path = tmp_path_factory.mktemp("core-sqlite") / "catalog.sqlite3"
+        yield CoreConfig(database=DatabaseConfig(sql_type="sqlite", database=str(path)))
+
+    return sqlite_database
+
+
+@pytest.fixture
+def core_config(
+    core_config_factory: Callable[[], AbstractContextManager[CoreConfig]],
+) -> Iterator[CoreConfig]:
+    with core_config_factory() as config:
+        yield config
+
+
+@pytest.fixture
+def sqlite_core_config(tmp_path: Path) -> CoreConfig:
+    from h2hdb import CoreConfig, DatabaseConfig
+
+    return CoreConfig(
+        database=DatabaseConfig(
+            sql_type="sqlite", database=str(tmp_path / "catalog.sqlite3")
+        )
+    )
+
+
+@pytest.fixture
+def probe_core_configs(
+    core_config_factory: Callable[[], AbstractContextManager[CoreConfig]],
+) -> Iterator[tuple[CoreConfig, ...]]:
+    with ExitStack() as stack:
+        yield tuple(stack.enter_context(core_config_factory()) for _ in range(4))
+
+
+@pytest.fixture
+def probe_database_input(core_config: CoreConfig) -> str:
+    return json.dumps([core_config.model_dump(mode="json")])

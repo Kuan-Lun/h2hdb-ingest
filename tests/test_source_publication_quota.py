@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from h2hdb import (
+    CoreConfig,
     VNextCurrentOnlyMaintenanceOutcome,
     VNextIngestFacade,
     VNextIngestSourceAdapter,
@@ -26,13 +27,14 @@ from h2hdb_ingest.runtime import build_runtime
 @pytest.mark.parametrize("galleries", (2, 3, 4))
 def test_runtime_honors_full_source_and_explicit_quota(
     tmp_path: Path,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
     quota: int | None,
     galleries: int,
 ) -> None:
-    config = _config(tmp_path, galleries=galleries, artifacts=False).model_copy(
-        update={"resident": ResidentConfig(publication_batch_galleries=quota)}
-    )
+    config = _config(
+        tmp_path, core=core_config, galleries=galleries, artifacts=False
+    ).model_copy(update={"resident": ResidentConfig(publication_batch_galleries=quota)})
     admissions: list[tuple[int | None, int, int]] = []
     pending: dict[VNextPreparedSource, int | None] = {}
     original = VNextIngestFacade.prepare_source
@@ -115,10 +117,11 @@ def test_runtime_honors_full_source_and_explicit_quota(
 
 def test_full_source_waiting_gallery_does_not_require_another_publication_batch(
     tmp_path: Path,
+    core_config: CoreConfig,
 ) -> None:
-    config = _config(tmp_path, galleries=4, artifacts=False).model_copy(
-        update={"resident": ResidentConfig()}
-    )
+    config = _config(
+        tmp_path, core=core_config, galleries=4, artifacts=False
+    ).model_copy(update={"resident": ResidentConfig()})
     (config.paths.download_path / "10000" / "galleryinfo.txt").write_bytes(b"")
     with build_runtime(config, event_logger=lambda _message: None) as runtime:
         runtime.database_admin.initialize()
@@ -142,11 +145,11 @@ def test_full_source_waiting_gallery_does_not_require_another_publication_batch(
 @pytest.mark.deep
 @pytest.mark.parametrize("galleries", (127, 128, 129, 1024))
 def test_complete_inventory_publishes_once_across_page_boundaries(
-    tmp_path: Path, galleries: int
+    tmp_path: Path, core_config: CoreConfig, galleries: int
 ) -> None:
-    config = _config(tmp_path, galleries=galleries, artifacts=False).model_copy(
-        update={"resident": ResidentConfig()}
-    )
+    config = _config(
+        tmp_path, core=core_config, galleries=galleries, artifacts=False
+    ).model_copy(update={"resident": ResidentConfig()})
     with build_runtime(config, event_logger=lambda _message: None) as runtime:
         runtime.database_admin.initialize()
         runtime.resident.initialize()

@@ -280,18 +280,18 @@ def test_opt_in_local_download_corpus_is_bounded_and_replayable() -> None:
 
 
 @_PRIVATE_CORPUS_OPT_IN
-def test_private_corpus_completes_mariadb_resident_cycle_and_restart_replay(
-    mariadb_config: CoreConfig,
+def test_private_corpus_completes_resident_cycle_and_restart_replay(
+    core_config: CoreConfig,
     tmp_path: Path,
 ) -> None:
-    """Build and replay the exact private corpus CBZ tree through MariaDB."""
+    """Build and replay the opt-in private corpus through the selected backend."""
 
     download_path = _opt_in_local_download_path()
     source_authority = _tree_authority(download_path)
     library_path = tmp_path / "library"
     _provision_library_root(library_path)
     config = IngestConfig(
-        core=mariadb_config,
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=download_path,
             library_path=library_path,

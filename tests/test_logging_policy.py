@@ -1,4 +1,4 @@
-"""Exercise the process logging policy with real SQLite and native image work."""
+"""Exercise the process logging policy with real backend and native image work."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import logging
 import subprocess
 import sys
 from collections import Counter
-from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -163,6 +163,7 @@ def _run_workload(
     page_count: int,
     *,
     progress: bool = False,
+    core: CoreConfig,
 ) -> None:
     """Run as a fresh interpreter so pytest cannot install or intercept handlers."""
     source = root / "source"
@@ -180,15 +181,14 @@ def _run_workload(
     _gallery(source, 9001, 1, corrupt=True)
     log_file = root / "ingest.log"
     config = IngestConfig(
-        core=CoreConfig(
-            database=DatabaseConfig(
-                sql_type="sqlite", database=str(root / "catalog.sqlite3")
-            ),
-            logger=LoggerConfig.model_validate(
-                {"file": log_file}
-                if level == "info"
-                else {"level": level, "file": log_file}
-            ),
+        core=core.model_copy(
+            update={
+                "logger": LoggerConfig.model_validate(
+                    {"file": log_file}
+                    if level == "info"
+                    else {"level": level, "file": log_file}
+                )
+            }
         ),
         paths=IngestPathsConfig(
             download_path=source, library_path=library, page_render_workers=2
@@ -247,6 +247,7 @@ def _run_workload(
     print(
         json.dumps(
             {
+                "database_backend": config.core.database.sql_type,
                 "publications": len(archives),
                 "page_counts": actual_page_counts,
                 "progress_interval_seconds": config.resident.progress_log_interval_seconds,
@@ -257,7 +258,9 @@ def _run_workload(
     )
 
 
-def _capture_process(root: Path, *arguments: str) -> _ProcessLogs:
+def _capture_process(
+    root: Path, *arguments: str, core: CoreConfig | None = None
+) -> _ProcessLogs:
     completed = subprocess.run(
         (
             sys.executable,
@@ -266,20 +269,54 @@ def _capture_process(root: Path, *arguments: str) -> _ProcessLogs:
             *arguments,
         ),
         capture_output=True,
+        input=None if core is None else core.model_dump_json(),
         text=True,
         timeout=60,
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+    result = cast(dict[str, object], json.loads(completed.stdout))
+    if core is not None:
+        assert result.get("database_backend") == core.database.sql_type, (
+            "logging child did not use the requested database backend"
+        )
     return _ProcessLogs(
         console=completed.stderr,
         file=(root / "ingest.log").read_text(encoding="utf-8"),
-        result=cast(dict[str, object], json.loads(completed.stdout)),
+        result=result,
     )
 
 
+@pytest.mark.parametrize(
+    ("requested_backend", "reported_backend"),
+    (("sqlite", "mariadb"), ("mariadb", "sqlite")),
+)
+def test_logging_child_backend_mismatch_is_rejected(
+    tmp_path: Path, requested_backend: str, reported_backend: str
+) -> None:
+    core = CoreConfig(
+        database=DatabaseConfig.model_validate(
+            {"sql_type": requested_backend, "database": "unused-fixture"}
+        )
+    )
+    completed = subprocess.CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout=json.dumps({"database_backend": reported_backend}),
+        stderr="",
+    )
+    with (
+        patch.object(subprocess, "run", return_value=completed),
+        pytest.raises(AssertionError, match="requested database backend"),
+    ):
+        _capture_process(tmp_path, "workload", core=core)
+
+
 @pytest.fixture(scope="module")
-def process_logs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, _ProcessLogs]:
+def process_logs(
+    tmp_path_factory: pytest.TempPathFactory,
+    core_config_factory: Callable[[], AbstractContextManager[CoreConfig]],
+) -> dict[str, _ProcessLogs]:
     logs: dict[str, _ProcessLogs] = {}
     for name, level, gallery_count, page_count in (
         ("small", "info", 1, 2),
@@ -287,9 +324,15 @@ def process_logs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, _Process
         ("debug", "debug", 3, 4),
     ):
         root = tmp_path_factory.mktemp(f"logging-{name}")
-        logs[name] = _capture_process(
-            root, "workload", level, str(gallery_count), str(page_count)
-        )
+        with core_config_factory() as core:
+            logs[name] = _capture_process(
+                root,
+                "workload",
+                level,
+                str(gallery_count),
+                str(page_count),
+                core=core,
+            )
     return logs
 
 
@@ -302,10 +345,13 @@ def _metric_fields(line: str) -> dict[str, str]:
 
 
 @pytest.mark.parametrize("level", ("info", "debug"))
+@pytest.mark.backend_external(
+    reason="Real logging workload child receives its paired Core configuration on stdin; log and native rendering assertions use its completed pipeline"
+)
 def test_real_source_reporter_delivers_qualification_progress_to_both_info_handlers(
-    tmp_path: Path, level: str
+    tmp_path: Path, level: str, core_config: CoreConfig
 ) -> None:
-    logs = _capture_process(tmp_path, "progress", level)
+    logs = _capture_process(tmp_path, "progress", level, core=core_config)
     assert logs.result["page_counts"] == [2]
     assert logs.result["publications"] == 1
     assert logs.result["progress_interval_seconds"] == 60
@@ -354,6 +400,9 @@ def test_real_source_reporter_delivers_qualification_progress_to_both_info_handl
     )
 
 
+@pytest.mark.backend_external(
+    reason="Real logging workload child receives its paired Core configuration on stdin; log and native rendering assertions use its completed pipeline"
+)
 def test_real_native_rendering_keeps_console_and_file_info_volume_per_batch(
     process_logs: dict[str, _ProcessLogs],
 ) -> None:
@@ -443,6 +492,9 @@ def test_real_native_rendering_keeps_console_and_file_info_volume_per_batch(
     ]
 
 
+@pytest.mark.backend_external(
+    reason="Real logging workload child receives its paired Core configuration on stdin; log and native rendering assertions use its completed pipeline"
+)
 def test_cleanup_info_is_one_cumulative_series_in_both_handlers_and_log_levels(
     process_logs: dict[str, _ProcessLogs],
 ) -> None:
@@ -523,6 +575,9 @@ def test_cleanup_info_is_one_cumulative_series_in_both_handlers_and_log_levels(
         )
 
 
+@pytest.mark.backend_external(
+    reason="Real logging workload child receives its paired Core configuration on stdin; log and native rendering assertions use its completed pipeline"
+)
 def test_debug_retains_native_and_per_artifact_metrics_without_polluting_events(
     process_logs: dict[str, _ProcessLogs],
 ) -> None:
@@ -567,6 +622,9 @@ def test_debug_retains_native_and_per_artifact_metrics_without_polluting_events(
     assert not any(message.startswith("page_render_workers ") for message in events)
 
 
+@pytest.mark.backend_external(
+    reason="Real logging workload child receives its paired Core configuration on stdin; log and native rendering assertions use its completed pipeline"
+)
 def test_dependency_and_real_rejection_diagnostics_remain_visible_with_context(
     process_logs: dict[str, _ProcessLogs],
 ) -> None:
@@ -581,8 +639,11 @@ def test_dependency_and_real_rejection_diagnostics_remain_visible_with_context(
                 assert f'logger="{name}"' in message
                 assert 'source_root="' in message
                 assert 'library_root="' in message
-                assert 'database_backend="sqlite"' in message
-                assert 'database_path="' in message
+                backend = logs.result["database_backend"]
+                assert f'database_backend="{backend}"' in message
+                assert (
+                    'database_path="' if backend == "sqlite" else 'database_host="'
+                ) in message
         rejected = [
             line
             for line in logs.messages("WARNING")
@@ -702,10 +763,21 @@ if __name__ == "__main__":
     match sys.argv[2]:
         case "workload":
             _run_workload(
-                Path(sys.argv[1]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+                Path(sys.argv[1]),
+                sys.argv[3],
+                int(sys.argv[4]),
+                int(sys.argv[5]),
+                core=CoreConfig.model_validate_json(sys.stdin.read()),
             )
         case "progress":
-            _run_workload(Path(sys.argv[1]), sys.argv[3], 1, 2, progress=True)
+            _run_workload(
+                Path(sys.argv[1]),
+                sys.argv[3],
+                1,
+                2,
+                progress=True,
+                core=CoreConfig.model_validate_json(sys.stdin.read()),
+            )
         case "severity":
             _run_severity_probe(Path(sys.argv[1]), sys.argv[3])
         case _:

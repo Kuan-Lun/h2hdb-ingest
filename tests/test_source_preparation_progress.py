@@ -12,7 +12,6 @@ from zipfile import ZipFile
 import pytest
 from h2hdb import (
     CoreConfig,
-    DatabaseConfig,
     VNextIngestFacade,
     VNextIngestSourceAdapter,
     VNextPreparedSource,
@@ -39,7 +38,9 @@ class _Clock:
         return self.now
 
 
-def _config(tmp_path: Path, *, galleries: int, artifacts: bool) -> IngestConfig:
+def _config(
+    tmp_path: Path, *, core: CoreConfig, galleries: int, artifacts: bool
+) -> IngestConfig:
     source = tmp_path / "source"
     source.mkdir()
     for index in range(galleries):
@@ -78,11 +79,7 @@ def _config(tmp_path: Path, *, galleries: int, artifacts: bool) -> IngestConfig:
         ):
             (library / relative).mkdir()
     return IngestConfig(
-        core=CoreConfig(
-            database=DatabaseConfig(
-                sql_type="sqlite", database=str(tmp_path / "catalog.sqlite3")
-            )
-        ),
+        core=core,
         paths=IngestPathsConfig(
             download_path=source,
             library_path=library,
@@ -95,6 +92,7 @@ def _config(tmp_path: Path, *, galleries: int, artifacts: bool) -> IngestConfig:
 @pytest.mark.parametrize("artifacts,galleries", [(False, 1001), (True, 12)])
 def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
     tmp_path: Path,
+    core_config: CoreConfig,
     monkeypatch: pytest.MonkeyPatch,
     artifacts: bool,
     galleries: int,
@@ -106,7 +104,9 @@ def test_batch_of_ten_reports_source_preparation_and_publishes_real_galleries(
     the installed archives; this is not a mocked gallery-count unit test.
     """
 
-    config = _config(tmp_path, galleries=galleries, artifacts=artifacts)
+    config = _config(
+        tmp_path, core=core_config, galleries=galleries, artifacts=artifacts
+    )
     clock = _Clock()
     messages: list[str] = []
     messages_lock = Lock()

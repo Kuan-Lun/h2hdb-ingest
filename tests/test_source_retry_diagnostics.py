@@ -5,7 +5,7 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
-from h2hdb import CoreConfig, DatabaseConfig
+from h2hdb import CoreConfig
 from PIL import Image
 
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
@@ -35,6 +35,7 @@ def _source_snapshot(
 
 def test_incomplete_gallery_waits_with_original_diagnostic_and_releases_its_lease(
     tmp_path: Path,
+    core_config: CoreConfig,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     source = tmp_path / "download"
@@ -64,11 +65,7 @@ def test_incomplete_gallery_waits_with_original_diagnostic_and_releases_its_leas
     ):
         (library / relative).mkdir(parents=True)
     config = IngestConfig(
-        core=CoreConfig(
-            database=DatabaseConfig(
-                sql_type="sqlite", database=str(tmp_path / "catalog.sqlite3")
-            )
-        ),
+        core=core_config,
         paths=IngestPathsConfig(
             download_path=source,
             library_path=library,
