@@ -77,5 +77,25 @@ profile, backend, tested boundaries, and any skipped cases. A result from a
 small synthetic SQLite library is different evidence from a live MariaDB run
 or a measurement of your own collection.
 
+## Performance investigation tools
+
+These manual tools use disposable fixtures and are separate from the normal
+merge checks. Run them from a development environment; each script's `--help`
+describes its inputs and output options.
+
+| Investigation | Entry point |
+| --- | --- |
+| Source reads and marker reuse | [probe-source-io.py](../scripts/probe-source-io.py) |
+| Publication backlog, cleanup and subsequent work claims | [probe-source-backlog.py](../scripts/probe-source-backlog.py) |
+| CBZ/thumbnail processing and adapter I/O | [probe-artifact-io.py](../scripts/probe-artifact-io.py) |
+| Source observation cost budgets | [check-source-cost.py](../scripts/check-source-cost.py) |
+| Library journal cleanup-selection cost budgets | [check-library-cleanup-cost.py](../scripts/check-library-cleanup-cost.py) |
+
+The two cost-acceptance tools return `0` for satisfied budgets, `1` for a budget
+violation, and `2` for incomplete evidence or execution failure. Source-only and
+journal-query measurements do not measure the complete publication lifecycle;
+neither they nor local synthetic timings establish production NAS throughput or
+full-library completion time. Core database costs require separate measurement.
+
 For startup failures, interrupted work, and upgrade instructions, return to the
-[troubleshooting and maintenance guide](../README.md#troubleshooting).
+[troubleshooting and maintenance guide](../README.md#日常維護與問題排查).
