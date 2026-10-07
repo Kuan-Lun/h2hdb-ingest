@@ -39,7 +39,8 @@
 - 工作樹不乾淨時，從 committed primary 建立獨立 worktree。
 - task branch 可包含多個邏輯 Conventional Commits。避免巨大 commit；小而
   內聚的任務仍可只有一個 commit。
-- 任務完成後執行 `scripts/git-flow-merge.sh`。該腳本負責完整 gate、
+- 任務完成後執行 `scripts/git-flow-merge.sh`。該腳本負責依 candidate 分類執行
+  文件或完整 gate、
   `--no-ff` merge、安全移除 task worktree，以及以 `git branch -d`
   刪除已合併的本機 branch。
 - primary 在任務期間可以推進；整合只要求 primary 與 task branch 有共同
@@ -119,9 +120,19 @@
 
 ## 檢查分層
 
+- `scripts/check_change_scope.py` 是自動檢查 profile 的唯一分類入口；文件路徑
+  清單與模式限制以該工具為準，不在政策另複製一份。非 merge commit 比較
+  HEAD 與 staged index；merge 比較 primary parent 與完整 staged candidate，
+  不依 commit message、最後一筆 commit 或 unstaged 內容判定。
+- 只有工具確認為 `documentation` 的純文件變更使用
+  `scripts/check-docs.py`：從 exact candidate 匯出 Markdown 與其設定，執行
+  diff whitespace 及 repository-local Markdown 檢查，完成後重驗 candidate
+  與 base 未改變；不觸發 Ruff、mypy、pytest、build 或 formal checks。
+  控制政策、程式、測試、工具、設定、未知路徑或不符文件模式的變更仍走
+  `full`，分類錯誤直接阻止提交或合併。分支、提交格式與版本政策仍適用。
 - `scripts/format.sh`：明確執行會修改檔案的 formatter 或 fixer。
 - `scripts/check-fast.sh`：離線、唯讀的 Ruff、format check、mypy 與
-  markdownlint；每次非 merge commit 執行。
+  markdownlint；非純文件的非 merge commit 執行。
 - `scripts/run-pytest.py merge`：以 auto-xdist 執行 `not deep`，包含 collection、
   execution、teardown 與 owned process-tree cleanup 的 absolute 總時間上限為
   300 秒；不得啟動 live MariaDB 或 private corpus。POSIX 使用新 session/process
@@ -130,7 +141,9 @@
   `scripts/check-pytest-deep.sh` 是明確手動、不限時的 deep 入口。
 - `scripts/check-full.sh`：fast gate、完整 collection 的 backend pairing contract、
   上述 bounded pytest merge profile、build、
-  wheel smoke 及本 repository 的特殊檢查；整合候選只跑一次。
+  wheel smoke 及本 repository 的特殊檢查；非純文件整合候選只跑一次。
+  明確手動執行 `check-fast.sh` 或 `check-full.sh` 仍執行全部既定檢查，
+  不因文件分類而縮減。
 - dependency audit 可連網，但 hooks 只驗證本機 receipt，不在 commit
   過程連網。
 - GitHub Actions 只呼叫相同 scripts，並保留 trusted publishing、平台特有

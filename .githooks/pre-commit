@@ -13,4 +13,9 @@ if [[ "$current" == "$primary" ]]; then
     exit 1
 fi
 
-exec scripts/check-fast.sh
+scope="$(.venv/bin/python scripts/check_change_scope.py --index)"
+case "$scope" in
+    documentation) exec .venv/bin/python scripts/check-docs.py --index ;;
+    full) exec scripts/check-fast.sh ;;
+    *) printf 'Unknown check scope: %s\n' "$scope" >&2; exit 1 ;;
+esac
