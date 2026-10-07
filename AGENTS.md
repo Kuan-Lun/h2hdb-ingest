@@ -126,8 +126,10 @@
   不依 commit message、最後一筆 commit 或 unstaged 內容判定。
 - 只有工具確認為 `documentation` 的純文件變更使用
   `scripts/check-docs.py`：從 exact candidate 匯出 Markdown 與其設定，執行
-  diff whitespace 及 repository-local Markdown 檢查，完成後重驗 candidate
-  與 base 未改變；不觸發 Ruff、mypy、pytest、build 或 formal checks。
+  diff whitespace 及 repository-local Markdown 檢查，並從 candidate metadata
+  驗證套件 README 引用仍存在且為 regular file；inline text 不要求外部文件。
+  完成後重驗 candidate 與 base 未改變；不觸發 Ruff、mypy、pytest、build
+  或 formal checks。
   控制政策、程式、測試、工具、設定、未知路徑或不符文件模式的變更仍走
   `full`，分類錯誤直接阻止提交或合併。分支、提交格式與版本政策仍適用。
 - `scripts/format.sh`：明確執行會修改檔案的 formatter 或 fixer。
