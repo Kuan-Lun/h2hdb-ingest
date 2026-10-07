@@ -1,49 +1,44 @@
 # h2hdb-ingest
 
-`h2hdb-ingest` turns completed Hentai@Home downloads into an H2HDB catalog and
-an optional comic library for Komga and OPDS readers. It watches your download
-folders, updates the catalog as the collection changes, and produces CBZ files
-and thumbnails. Your original downloads remain the source collection.
+`h2hdb-ingest` 將 Hentai@Home 下載的作品整理成 H2HDB 目錄，並可產生供
+Komga 與 OPDS 閱讀器使用的 CBZ 和縮圖。它會持續觀察下載目錄，處理新增、
+變更與刪除的作品，保留原始下載檔案作為來源。
 
-Use this service to prepare and maintain the library. Use Komga or
-[`h2hdb-opds`](https://github.com/Kuan-Lun/h2hdb-opds) to browse and read it.
-Readers receive read-only access to the published files.
+這個服務負責整理與發布書庫；瀏覽和閱讀請搭配 Komga 或
+[`h2hdb-opds`](https://github.com/Kuan-Lun/h2hdb-opds)。
+若只需要目錄資料，也能關閉 CBZ 輸出。
 
-## Before you start
+## 使用前準備
 
-You need:
+- Python 3.14 以上。
+- 已有下載內容的目錄；每個完成的作品包含圖片與 `galleryinfo.txt`。
+  可使用多層分類目錄。
+- 已初始化的 SQLite 或 MariaDB 資料庫。本 checkout 的相依範圍是
+  `h2hdb>=0.43.0,<0.46.0`，使用 schema epoch 3、version 9。
+- 啟用 CBZ 時，另備可寫入的書庫目錄，以及處理圖片、暫存工作和待發布
+  CBZ／縮圖所需的空間。下載目錄與書庫目錄不得相同或互相包含。
 
-- Python 3.14 or newer.
-- A nonempty download directory containing completed galleries with
-  `galleryinfo.txt` metadata. Nested collection folders are supported.
-- An H2HDB database, using SQLite or MariaDB. This release requires
-  `h2hdb>=0.43.0,<0.46.0` and schema epoch 3, version 9.
-- For CBZ output, a separate writable library directory and enough disk space
-  for image processing, one gallery's verified render input, database plans,
-  and all output awaiting publication.
+書庫由 ingest 單獨寫入，閱讀器只能唯讀存取。請勿手動改名或修改 ingest
+產生的檔案，也不要讓其他程式管理同一個輸出目錄。
 
-Ingest writes to the database and library. Do not point it at a library managed
-by another writer, and do not edit its generated files manually. The download
-and library directories must be distinct; neither may contain the other.
+## 安裝
 
-## Install
-
-Create a Python environment and install the package:
+在這份 checkout 的根目錄執行以下 Bash／Zsh 指令：
 
 ```bash
 python3.14 -m venv .venv
 source .venv/bin/activate
-python -m pip install h2hdb-ingest
+python -m pip install .
 h2hdb-ingest --help
 ```
 
-The package installs its compatible H2HDB and image-processing dependencies.
-Run the following commands from this activated environment. Replace the example
-paths with paths available to your service account or container.
+安裝程式會一起解析相容的 H2HDB 與影像處理相依套件。下列指令皆在已啟用
+的環境執行；請將 `/data/...` 換成服務帳號或容器內實際可見的路徑。
 
-## Set up the database
+## 建立資料庫
 
-For a new SQLite catalog, save this as `core.json`:
+若已有相容的資料庫，可沿用它並跳到書庫設定。新 SQLite 資料庫的設定
+存成 `core.json`：
 
 ```json
 {
@@ -54,7 +49,7 @@ For a new SQLite catalog, save this as `core.json`:
 }
 ```
 
-Create `/data/h2hdb` first, then initialize the empty database:
+建立父目錄，再初始化與檢查：
 
 ```bash
 mkdir -p /data/h2hdb
@@ -62,19 +57,16 @@ python -m h2hdb migrate --config core.json
 python -m h2hdb check --config core.json
 ```
 
-`migrate` creates a new schema or resumes its matching interrupted
-initialization. It does not upgrade arbitrary existing databases. Ingest itself
-never initializes or migrates the schema.
+`migrate` 適用於新資料庫或續做同一次初始化，不會升級任意舊資料庫。
+Ingest 本身不建立或升級 schema。
 
-For MariaDB, set `sql_type` to `mariadb` and supply `host`, `port`, `user`,
-`password`, and `database`. Use the same connection in the ingest configuration
-below, with an account that can write to the catalog. See the
-[H2HDB administration guide](https://github.com/Kuan-Lun/h2hdb#readme)
-for database setup and upgrades.
+MariaDB 使用 `"sql_type": "mariadb"`，並設定 `host`、`port`、`user`、
+`password` 和 `database`；先建立資料庫及具備所需寫入權限的帳號。
+完整管理方式見 [H2HDB 說明](https://github.com/Kuan-Lun/h2hdb#readme)。
 
-## Prepare the library
+## 準備書庫目錄
 
-For CBZs and thumbnails, create these directories before starting ingest:
+需要 CBZ 與縮圖時，先建立以下目錄：
 
 ```bash
 mkdir -p /data/h2hdb/library/current/acquisitions
@@ -82,29 +74,23 @@ mkdir -p /data/h2hdb/library/current/artwork
 mkdir -p /data/h2hdb/library/.h2hdb-coordination
 ```
 
-They must be real directories, not symlinks, on the same filesystem. For a
-container deployment, create them on the host before creating the reader
-containers. Ensure the ingest account can write to them. Ingest creates its own
-private `.h2hdb-state` directory; do not create or modify that directory yourself.
+這些目錄必須是真實目錄而非符號連結，位於相同檔案系統，並允許 ingest
+帳號寫入。容器部署須先在主機建立，再建立閱讀器容器。Ingest 會自行建立
+私有的 `.h2hdb-state`，請勿手動建立或修改其內容。
 
-Mount these paths for the respective services:
-
-| Service | Host library subtree | Access |
+| 服務 | 掛載的書庫子目錄 | 權限 |
 | --- | --- | --- |
-| `h2hdb-ingest` | Entire `library/` directory | Read-write |
-| Komga | `library/current/acquisitions/` | Read-only |
-| `h2hdb-opds` | `library/current/` | Read-only |
-| `h2hdb-opds` | `library/.h2hdb-coordination/` | Read-only |
+| ingest | 整個 `library/` | 讀寫 |
+| Komga | `library/current/acquisitions/` | 唯讀 |
+| OPDS | `library/current/` | 唯讀 |
+| OPDS | `library/.h2hdb-coordination/` | 唯讀 |
 
-Komga should receive only `acquisitions/`; `artwork/` contains standalone
-thumbnails, not comic books. Keep `.h2hdb-state` private to ingest. Other
-processes must not modify the library, including its coordination directory.
+Komga 只應讀取 `acquisitions/`，避免將 `artwork/` 的縮圖當成書籍。
+`.h2hdb-state` 只供 ingest 使用。只發布目錄資料時可略過本步驟。
 
-Skip library preparation if you only want catalog metadata.
+## 設定 ingest
 
-## Configure ingest
-
-Save this as `ingest.json`:
+將下列內容存成 `ingest.json`：
 
 ```json
 {
@@ -121,533 +107,163 @@ Save this as `ingest.json`:
 }
 ```
 
-The database settings match `core.json`, but ingest places them inside `core`.
-Use paths as seen by the ingest process. `download_path` must already exist and
-be nonempty. Set `library_path` to `null` to publish metadata without decoding
-images or producing CBZs and thumbnails.
+資料庫設定與 `core.json` 相同，但須放在 `core` 內。`download_path` 必須
+已存在且非空。將 `library_path` 設成 `null`，即可只發布目錄資料，
+不解碼圖片、不產生 CBZ 或縮圖。
 
-Optional settings can be added to `paths` or a top-level `resident` object:
+通常保留預設值即可。需要調整時，在 `paths` 或頂層 `resident` 加入設定：
 
-| Setting | Default | When to change it |
+| 設定 | 預設值 | 用途 |
 | --- | --- | --- |
-| `paths.max_image_short_side` | `768` | Choose the maximum short-side pixels for generated pages; accepts 1–8192. Images keep their aspect ratio and are never enlarged. |
-| `paths.page_render_workers` | `null` | Set 1–16 concurrent page workers, or leave automatic selection enabled. Lower it if image processing puts too much pressure on memory. |
-| `resident.publication_batch_galleries` | `null` | Select all eligible complete galleries before publication. An explicit integer from 1 through 1,000,000 limits newly admitted galleries per publication. |
-| `resident.progress_log_interval_seconds` | `60` | Set the interval, in positive seconds, between progress summaries while work is active. |
-| `resident.source_quiet_seconds` | `300` | Wait this long without another observed source change before synchronizing. |
-| `resident.source_max_wait_seconds` | `1800` | Synchronize after this maximum wait despite continuing source changes. Must be at least the quiet interval. |
-| `resident.source_probe_interval_seconds` | `30` | Pause this long between completed source-monitor passes. |
+| `paths.max_image_short_side` | `768` | 輸出頁面的短邊上限，接受 1–8192 像素；維持比例且不放大圖片。 |
+| `paths.page_render_workers` | `null` | 自動選擇圖片工作數，最多 16；可明確設為 1–16，記憶體吃緊時降低。 |
+| `resident.publication_batch_galleries` | `null` | 每輪納入全部符合條件的完整作品；設為 1–1,000,000 可限制每輪新納入作品數。 |
+| `resident.progress_log_interval_seconds` | `60` | 工作中的進度摘要間隔，單位為秒。 |
+| `resident.source_quiet_seconds` | `300` | 觀察到變更後，等待來源安靜這麼多秒再同步。 |
+| `resident.source_max_wait_seconds` | `1800` | 即使持續變動，最遲等待這麼多秒便同步；不得小於安靜間隔。 |
+| `resident.source_probe_interval_seconds` | `30` | 背景來源檢查完成後，到下一次檢查的間隔。 |
 
-For image output, `paths.render_policy` accepts `page_jpeg_quality` (default
-90), `thumbnail_jpeg_quality` (85), `optimize` (`true`), and `resampler`
-(`"lanczos"`). Quality values are integers from 0 through 95. Other resamplers
-are `nearest`, `box`, `bilinear`, `hamming`, and `bicubic`. Changing rendering
-settings can require galleries to be checked and artifacts rebuilt.
+`paths.render_policy` 可設定 `page_jpeg_quality`（預設 90）、
+`thumbnail_jpeg_quality`（85）、`optimize`（`true`）和
+`resampler`（`"lanczos"`）。JPEG 品質接受 0–95；重採樣另支援
+`nearest`、`box`、`bilinear`、`hamming`、`bicubic`。
+變更圖片設定可能需要重新檢查來源和產生輸出。
 
-Automatic worker selection is capped at 16 and logged at startup. A Docker
-container uses the CPU availability visible inside the container; it cannot
-infer the host's macOS performance-core count. An explicit worker count
-provides control when the automatic choice does not suit your host.
+完整字串 `${ENV_NAME}` 可讀取環境變數，例如
+`"password": "${H2HDB_PASSWORD}"`；不支援 `"db-${INSTANCE}"` 這類
+字串內插。缺少環境變數或不明設定欄位都會使啟動失敗。
 
-JSON strings consisting exactly of `${ENV_NAME}` can read environment variables,
-for example `"password": "${H2HDB_PASSWORD}"`. Inline substitution such as
-`"db-${INSTANCE}"` is unsupported. Missing variables and unknown configuration
-fields cause startup to fail.
+## 啟動與停止
 
-## Run
-
-Start the resident service to process existing downloads and watch for changes:
+持續處理既有下載並觀察後續變更：
 
 ```bash
 h2hdb-ingest --config ingest.json
 ```
 
-For a single coordinated publication attempt:
+只嘗試完成一輪發布：
 
 ```bash
 h2hdb-ingest --config ingest.json --once
 ```
 
-A one-shot run selects the complete inventory by default. An explicit admission
-limit still applies, and incomplete or changing galleries require a later turn.
-Use resident mode to continue processing that pending work.
-A one-shot run fails if it cannot complete a publication, for example because
-of lease contention or insufficient storage.
+單次執行仍遵守作品數限制；不完整或仍在變動的作品留待下次。
+若因工作租約衝突或空間不足而未完成發布，指令會失敗。
+中斷後若先續做舊的一輪，新抵達的作品須由下一次執行處理。
 
-To require a nonempty first publication in a fresh, initialized catalog:
+若要在已初始化、尚無發布的資料庫建立第一個非空目錄：
 
 ```bash
 h2hdb-ingest-bootstrap --config ingest.json
 ```
 
-Bootstrap refuses a catalog that already has a publication. It stops after the
-first nonempty catalog; start the resident service afterward to process the
-remaining galleries. The equivalent resident module command is
-`python -m h2hdb_ingest --config ingest.json`.
+Bootstrap 遇到已有發布的資料庫會拒絕執行；完成首次非空發布後便結束。
+後續請啟動常駐模式。也可用
+`python -m h2hdb_ingest --config ingest.json` 啟動同一個常駐服務。
 
-Use `Ctrl+C` or send `SIGTERM` for a graceful stop. Shutdown completes the
-current bounded step and resource cleanup. A full database audit already in
-progress must finish before a graceful stop can take effect.
+以 `Ctrl+C` 或 `SIGTERM` 正常停止。服務會完成目前的小步驟及資源清理後
+離開；已開始的完整資料庫稽核可能使停止需要較長時間。
 
-## What to expect
+## 何時能在閱讀器看到作品
 
-The first run inventories the source collection. By default,
-`resident.publication_batch_galleries` is `null`: ingest selects all eligible
-complete galleries in one turn before global analysis and publication. This
-prioritizes total catch-up time by avoiding repeated whole-collection analysis
-and validation after small additions. Readers see the result after the complete
-turn; database operations and filesystem pages retain their own bounded limits.
+第一次執行預設先處理全部符合條件的完整作品，再分析與發布。
+閱讀器要等整輪發布完成才會看到結果，單一 CBZ 渲染完成不代表已發布。
+如果希望分批看到成果，可設定 `resident.publication_batch_galleries`；
+例如 `100` 限制每輪新增作品數，但不限制書庫總數、處理時間或磁碟用量。
+大量作品以小批次處理時，重複分析整個目錄可能增加總處理時間。
 
-An explicit positive value preserves incremental publication. For example,
-`100` still admits at most 100 previously unknown galleries per publication,
-while applying changes and confirmed deletions to known galleries. It does not
-limit the inventory or total published books. Existing settings are not silently
-overridden: change an explicit `100` to `null` to select full-collection catch-up.
-This setting does not impose a time or disk-space budget.
+請先完成圖片寫入，再寫入 `galleryinfo.txt` 作為完成標記。來源檔案應在
+整輪工作期間保持可讀；變動或未完成的作品會延後。已完成作品的目錄是
+掃描終點，其中再嵌套的作品不會被發現。暫時移除完成標記會保留上次發布
+內容；確認整個作品目錄已刪除後，才會從來源集合移除。
 
-Source observation retains immutable hashes and metadata, without copying every
-gallery's images until publication ends. Rendering rereads the original files
-and verifies them against that observation. Core keeps one gallery's verified
-render-input spool while preparing its artifact, then releases it. Changed or
-missing source bytes cannot be published under the earlier observation and must
-be observed again. Keep the source collection available throughout the turn.
+啟用圖片輸出時：
 
-Each source page validates its returned entries and lookahead against the initial
-index, while directory and metadata guards reject namespace or marker changes.
-A page is an intermediate observation, not a sealed snapshot. If another process
-modifies a file from an earlier page in place, a later page may return before the
-change is detected. The final completion-marker probe always performs a fresh
-audit of the complete observed entry set; both metadata-only and image-qualified
-observations are deferred before sealing if that audit fails. This replaces the
-previous full-gallery audit on every page, so entry stat probes grow linearly
-with the gallery size while preserving the final snapshot check.
+- 支援 `.avif`、`.bmp`、`.gif`、`.jpeg`、`.jpg`、`.png`、`.webp`，
+  副檔名不分 ASCII 大小寫；其他一般檔案不會渲染為頁面。
+- 每頁轉成 JPEG，GIF 只取第一影格。任一頁無法解碼時會拒絕整本，
+  日誌會指出原因；修好來源並更新 `galleryinfo.txt` 後可重新處理。
+- 輸出為 `h2h-<gid>.cbz`，包含 metadata 和排序後的頁面；第一頁作為封面，
+  另產生最長邊 320 像素的縮圖。沒有合格頁面的作品只有 metadata CBZ。
+- 每本最多 4096 頁、每個輸出 JPEG 最多 32 MiB、長邊最多 8192 像素、
+  每頁最多 40 MP，CBZ 最多 2,147,483,647 bytes。
 
-After interruption, ingest first checks an unpublished, sealed source batch.
-Its root and policies must match, and each existing gallery's completion marker
-is reread in pages of at most 128 galleries. This recovery pass takes
-O(G + marker bytes) source work for G galleries in that batch: it reads SQL and
-`galleryinfo.txt` markers, without enumerating new galleries or deeply reading
-images. Missing marker evidence, changed markers, or a temporarily incomplete
-source requires a fresh scan. Other source or database errors remain failures.
-Newly downloaded galleries are picked up after a successfully resumed batch
-publishes; their arrival does not discard already committed analysis or prepared
-CBZs. Rendering still verifies live source bytes. A source failure requests fresh
-observation and can require a replacement batch.
+大圖會縮小且不放大；部分影像格式仍可能需要大量記憶體，工作數上限不是
+記憶體硬上限。去重和內容篩選會考慮整個已知集合，因此新增作品也可能
+替換或移除舊的發布內容，書籍數不一定每輪增加。
 
-The resumed batch has no fresh deferred/waiting inventory counts. INFO reports
-that a new inventory is pending, and resident mode immediately schedules it after
-publication instead of declaring initial catch-up complete. For Python callers,
-Core's `prepare_source_resume(adapter, policy=...)` requires the source adapter;
-source-root components alone are insufficient to authorize recovery.
-`VNextIngestSourceSynchronizationResult`, `VNextIngestSynchronizationResult` and
-`ResidentIngestor.deferred_gallery_count` can now report `None` for these unknown
-counts. Both result counts are `None` together, and `inventory_scan_pending`
-identifies that state. A one-shot run completes the resumed batch; use resident
-mode or another invocation to include newly arrived galleries.
+## 日常維護與問題排查
 
-During the first scan, each gallery's completed image checks and source facts
-are persisted before checking the next gallery. Restart performs a fresh marker
-inventory and reuses matching completed observations. At most the current
-gallery's unsealed checks are lost when markers remain stable; changed galleries
-must be checked again. These checkpoints retain metadata and hashes, not copies
-of the entire source image collection.
+INFO 日誌會顯示啟動檢查、目前階段、進度及發布結果。空閒時沒有固定
+進度訊息。需要更多診斷時，在 `core` 內加入
+`"logger": {"level": "DEBUG"}`。進度是累計快照；不同階段的時間可能
+重疊，不應直接相加。發布完成、清理完成與下一輪取得工作是不同階段。
 
-Keep `galleryinfo.txt` as the completion marker: finish writing a gallery's
-images before writing its metadata. Incomplete or changing galleries wait for
-a later turn while other complete galleries continue. A completed gallery is
-a discovery leaf, so galleries nested inside it are not discovered. Removing
-a completion marker temporarily retains the last published observation;
-confirmed removal of the gallery removes it from the source collection.
+保留足夠空間供圖片處理、單本來源暫存、資料庫計畫，以及整輪所有待發布
+輸出使用。空間不足時工作保留待重試；釋放空間或調整配額後讓服務重試，
+不要刪除私有 journal、staging 或 coordination 檔案。
 
-After startup, observed changes trigger work using the quiet and maximum-wait
-settings. An unchanged source does not trigger repeated full synchronization.
-The old `periodic_scan_seconds` setting is not accepted.
+意外中斷後，以相同資料庫和完整書庫重新啟動。服務會續做發布與清理；
+未完成時閱讀器可能暫時無法使用。請勿手動刪除 `ACTIVATING` 或鎖檔。
+不明檔案、內容不符或符號連結會被保留並回報，供檢查處理。
 
-With library output enabled:
+服務會定期稽核資料庫；首次啟動、上次未正常停止或稽核到期時可能執行
+完整檢查。也可手動執行 `python -m h2hdb check --config core.json`。
 
-- Supported page suffixes are `.avif`, `.bmp`, `.gif`, `.jpeg`, `.jpg`, `.png`,
-  and `.webp`, ignoring ASCII case. Other regular files are not rendered.
-- Every accepted page becomes a JPEG. Animated GIFs use the first frame.
-- A gallery with an undecodable page is excluded as a whole; ingest does not
-  silently publish a book with missing pages. The logs identify the rejection.
-  Repair the source and rewrite its completion marker to trigger another check.
-- A selected gallery produces `h2h-<gid>.cbz`, with `galleryinfo.txt` and ordered
-  pages. Page zero supplies the full-size cover, and a separate thumbnail has a
-  maximum side of 320 pixels. A gallery without eligible pages has a
-  metadata-only CBZ and no cover or thumbnail.
+| 現象 | 處理方式 |
+| --- | --- |
+| `download_path is empty` | 檢查下載路徑及容器掛載是否正確。 |
+| `must be a pre-existing real directory` | 建立必要的書庫目錄，並確認它們不是符號連結。 |
+| 資料庫不是 `READY` | 新資料庫先初始化；既有資料庫先查看版本或稽核錯誤。 |
+| 圖片被拒絕 | 依日誌修復來源圖片，再更新完成標記。 |
+| 空間不足或配額錯誤 | 檢查回報的檔案系統，保留尚未完成的私有狀態。 |
+| `library relocation is unfinished` | 維持服務停止，在同一目的地重新執行搬移驗證。 |
+| 書庫 identity 改變 | 檢查掛載是否被換掉；刻意搬移完整書庫時使用下述搬移指令。 |
 
-Output is limited to 4096 pages per gallery, 32 MiB per encoded JPEG page,
-8192 pixels on the long side, 40 megapixels per output page, and
-2,147,483,647 bytes per CBZ. Large source images are reduced without enlargement;
-source dimensions and file size alone do not exclude them. Some image codecs
-still need large memory buffers, so worker limits are not a fixed memory ceiling.
+## 升級與搬移
 
-Ingest stores output under `current/acquisitions/` and `current/artwork/` using
-managed paths. Do not rename those files. Deduplication and spam decisions use
-the whole known collection, so adding galleries can replace or remove earlier
-published books; the book count need not increase with every batch.
+離線維護前，停止 ingest、OPDS、Komga 和其他使用書庫的程序，備份資料庫
+與完整書庫。套件須一起符合各自宣告的相依範圍；目前使用 schema 9 與
+library journal v5。已符合這兩個格式的資料可繼續使用，無須重建 CBZ。
 
-## Monitor and maintain the service
+舊安裝須先確認資料格式，再依對應歷史 checkout 的說明及匹配環境處理：
 
-INFO logs show startup checks, the current activity, measured progress, and
-publication results. A rendered CBZ is not necessarily published yet; wait for
-publication completion before expecting it in a reader. An idle service emits
-no periodic progress message. Enable detailed diagnostics with
-`"logger": {"level": "DEBUG"}` inside `core`.
+| 既有格式 | 處理入口 |
+| --- | --- |
+| exact journal v4 | Ingest 0.28.0 的 `upgrade-library-journal-v4-to-v5.py`；保留書庫 UUID、發布狀態、CBZ 和縮圖。 |
+| Core schema 8 或其中斷的轉換 | Core 0.43.0 的 `scripts/upgrade-observation-upload-time-schema.py`，轉到 schema 9。 |
+| Core schema 7 | 先用 Core 0.41.2 的來源集合轉換工具到 schema 8，再處理下一步。 |
+| Core schema 6 | 先用 Core 0.40.0 的稽核轉換工具到 schema 7，再逐步處理。 |
 
-Each finished or failed source turn emits an INFO `ingest_metric` summary with
-its status, work generation, selected/waiting/deferred galleries, source rows,
-and logical bytes read. Adapter timings separate discovery, gallery indexing,
-metadata parsing, reads, hashes, and image qualification. These timings are
-inclusive: qualification can contain reads and hashes, so do not add them to
-estimate total wall time.
-Logical bytes include rereads and do not measure physical disk traffic. A killed
-process can leave a turn without a terminal summary; absence is not zero cost.
+目前 checkout 不含上述一次性轉換工具，正常啟動也不會自動轉換。
+轉換期間保留原始下載和完整備份；Core 轉換與書庫 journal 轉換是不同步驟。
+其他更舊的 Core schema，以及包含 `current/hash-v1`、
+`.h2hdb-state/coordination` 或 journal v1–v3 的舊書庫，須保留原檔，
+另建新資料庫與新書庫，從原始下載重新整理。搬移指令不負責升級舊格式。
 
-While a source turn is active, INFO `scope=source_progress status=progress`
-records provide cumulative snapshots every 60 seconds, including an increasing
-`progress_sequence`. They are alternate views of the same turn, not extra
-completed work: do not sum progress records or add them to the terminal
-`scope=source` summary. A final interrupted/failed summary includes work observed
-before the interruption; SIGKILL can still prevent that final record.
-Background inventory uses the distinct `scope=source_monitor_progress`.
-Progress delivery uses one process-wide dispatcher with one pending slot;
-`progress_dropped_snapshots` and `progress_cancelled_snapshots` expose backpressure
-and cancellation. Source teardown joins only its snapshot reporter, which never
-calls the sink. An already started sink call cannot be cancelled and may finish
-after the synchronous terminal record; use scope, sequence and work generation
-to interpret snapshots, rather than arrival order. The existing synchronous
-terminal sink behavior is unchanged.
+搬移目前格式的書庫到新路徑或檔案系統：
 
-The nested `qualification` operation separates owner source reads, source hash,
-spool write/readback/hash and future waits. Its worker measurements include
-header reads, scheduler waits, fused native decode/shrink and final resize.
-Owner waits overlap concurrent workers; decoder reads overlap native work.
-Worker elapsed sums can exceed wall time, and worker thread CPU excludes native
-helper threads. Logical spool reads can come from memory, so these measurements
-must not be described as HDD traffic. Fixed codec, encoded-size and pixel-count
-bins report counts and worker elapsed sums; they are separate marginal views,
-not a joint distribution. All bins use already required headers and reads.
-
-Source progress at INFO states whether selection covers all complete galleries
-or admits up to the explicit number of new galleries. Unbounded admission is not
-reported as a zero-gallery quota.
-Core's initial `source_prepare` record contains inventory size and
-`observation_complete=false`. Its terminal `source_step` record supplies admitted
-files/galleries, discovered/staged galleries, deferred/waiting counts, and
-completed inventory observation under the same correlation ID. Initial inventory
-size therefore must not be interpreted as already observed or admitted work.
-
-Background inventory emits its own INFO `scope=source_monitor operation=inventory`
-summary, including status, completed marker rows, logical read bytes, discovery,
-read/hash work and total pass time including index reconciliation. These passes
-can overlap foreground ingest; do not add their elapsed times to foreground wall
-time or interpret a failed/interrupted pass as a completed inventory. The
-`completion_marker_files_observed` and `completion_marker_bytes_observed`
-counters identify completed observations of `galleryinfo.txt`, rather than
-images. Read-call counters also include EOF calls.
-Each inventory rereads the markers; the index uses their fingerprints to decide
-which galleries need foreground work. It does not skip marker reads based only
-on an unchanged filesystem timestamp.
-
-From a development checkout, measure source reads and marker reuse with local,
-disposable real-image fixtures:
-
-```bash
-.venv/bin/python scripts/probe-source-io.py --galleries 2 --pages 2 \
-  --codec jpeg --workers 1 --output /tmp/source-io.json
-.venv/bin/python scripts/probe-source-backlog.py --inventory 129 \
-  --output /tmp/source-backlog.json
-```
-
-The source matrix compares a new inventory, unchanged markers, a changed policy,
-and changed source bytes. Independent read counters check production telemetry.
-The backlog probe defaults to an eight-gallery quota over three real
-publications. `--batch`, `--rounds`, `--warmup-rounds`, and `--pages` vary admission,
-retained history and page count independently of `--inventory`; a short final
-batch remains part of the measured lifecycle. Warm-up publications are recorded
-separately and excluded from the measured ledger. Each measured round includes
-complete source synchronization, publication, cleanup DONE and a subsequent
-work claim. `--ledger-output NEW_FILE` exports independently counted source work
-for the Core `scripts/source_catchup_cost_model.py` assessor. A completed probe
-does not mean its one-pass PAGE cost target passed; the assessor returns `1` for
-violations and `2` for incomplete evidence. Its `--require-complete` option also
-rejects a measured prefix as evidence of full catch-up.
-Neither probe measures physical disk traffic or proves a NAS completion time.
-Run without concurrent builds or
-benchmarks when comparing wall times. The synthetic controller sensitivity tool
-`probe-publication-budget.py --output /tmp/publication-budget.json` separately
-compares first publication, target misses and total catch-up under fixed/per-gallery
-cost assumptions; its modeled times are not runtime measurements.
-
-Successful batches also emit `publication` and `artifact_totals` summaries at
-INFO. The latter aggregates all completed render calls in that batch; individual
-artifact metrics remain available at DEBUG. Subtracting the aggregate
-`render_archive.elapsed` from publication elapsed excludes the entire archive
-renderer, including its input checks and final archive inspection, rather than
-only compression and packing. `render_presentation` separately measures thumbnail
-production. These are wall times for completed calls, not the sum of overlapping
-page worker durations. `render_batches` includes source verification, decode,
-resize and JPEG encoding; `archive_page_write` measures serial ZIP_STORED copying.
-The existing `render_pages` is inclusive and may overlap worker execution.
-Partial failed render calls have unknown remaining cost and must not be treated
-as zero.
-
-The INFO archive totals also distinguish worker source verification, native
-decode/shrink, final resize, JPEG encoding, encoded-buffer copying/hashing, and
-main-thread ZIP metadata writes and close. `worker_elapsed_sum` adds elapsed
-worker durations and can exceed archive wall time. `worker_thread_cpu_sum`
-excludes other libvips native threads. The worker decoder pipeline includes
-scheduling/header work, decode/shrink and final resize; decoder input reads are
-inclusive suboperations. Do not add these overlapping measurements or subtract
-parallel JPEG worker durations from publication wall time. A compression-free
-counterfactual requires a separate controlled experiment.
-
-INFO `scope=adapter_io` summaries correlate with the publication generation and
-report source opens, protection, layout checks, staging, journal
-transactions, lock waits, fsync and rename. Snapshots are cumulative, emitted at
-completed outer operation boundaries after 60 seconds and at completion or
-failure; subtract consecutive snapshots when computing interval costs. Inclusive
-wall time contains nested operations; exclusive wall time excludes them. Bytes
-are actual logical transfers, not device traffic. An operation still in progress
-is absent until it returns; the progress heartbeat identifies pending work.
-Core's publication summary separately attributes source copy/rehash, archive and
-presentation verification, and protection-boundary hashing. These Core and
-adapter measurements describe overlapping layers and must not be added together.
-Foreground source, publication, artifact totals and adapter I/O remain distinct
-summaries; the background monitor is a concurrent measurement.
-
-Library maintenance emits a separate INFO `scope=library_cleanup_io` report at
-outcome transitions and at the configured progress interval. It includes startup,
-pre-claim and post-session calls, scratch cleanup, and failed or interrupted work.
-Pending totals are flushed at a successful claim, after a single-cycle call and
-at orderly shutdown; repeated idle polls do not each produce an INFO record.
-`process_id` plus `observer_started_ns` identifies one process-local cumulative
-series; use `snapshot_sequence` and subtract consecutive snapshots. `elapsed_ns`
-sums only active maintenance calls, excluding polling and other ingest stages.
-Outcome counts describe completed adapter results, not a new cleanup authority.
-Exclusive operation totals and the unattributed residual partition active time;
-inclusive timings overlap. An in-flight call appears after it returns. These
-records use INFO without changing the configured log level. Cleanup candidate
-selection and existence probes expose separate query time, calls and
-`rows_returned`; the latter is the result size, not SQLite rows examined. The
-manual cleanup cost tool separately counts actual SQLite VM instructions.
-
-To exercise these boundaries with deterministic real JPEG files, public ingest,
-independent archive/raster checks, cleanup and a subsequent work claim:
-
-```bash
-.venv/bin/python scripts/probe-artifact-io.py --galleries 32 --pages 64 \
-  --edge 512 --workers 4 --isolated --timeout 900 \
-  --output /tmp/artifact-io.json
-```
-
-Only pass `--isolated` when other benchmarks and builds are stopped. The report
-records source hashes, raw INFO measurements and logical amplification; its local
-wall time is not a NAS throughput prediction. A small fixture with
-`--fsync-delay-ms 2 --fsync-delay-kind directory` or `file` injects a known delay
-at the adapter boundary to check attribution. It still executes the actual
-fsync and all publication checks; the artificial delay is not a device model.
-The `library_cleanup_adapter` report collects the production maintenance observer's
-per-call measurements, counting its journal, locks, fsync and logical byte
-operations. It includes scratch, pre-claim and post-session calls; its wall time overlaps
-the enclosing resident timings and must not be added to them. Publication INFO
-metrics retain their original scope. `--cleanup-journal-delay-ms 2` injects a
-bounded delay only inside cleanup journal sessions to test that attribution;
-production logging and execution semantics are unchanged. Runtime or probe-source
-drift makes the probe exit nonzero with incomplete evidence while retaining
-measurements and oracle results. A completed diagnostic does not prove the source
-cost budgets or the full-library time objective.
-
-Core records source actions, ingest permission checks and cleanup candidate
-checks separately. Long-operation progress identifies a pending connector call;
-completed SQL totals exclude that call until it returns. Publication completion,
-cleanup `DONE`, and the next successful work claim are distinct milestones.
-Compare all three when investigating a delay between batches.
-
-Ingest periodically audits the database. A first start, unclean previous shutdown,
-changed validator, or due audit requires a full check. A recent successful audit
-and clean shutdown can allow a quick startup check. For an explicit full check:
-
-```bash
-python -m h2hdb check --config core.json
-```
-
-The default audit interval is the larger of seven days and 100 times the last
-full audit's duration. Advanced deployments can change
-`resident.database_audit_minimum_interval_seconds` and
-`resident.database_audit_duration_multiplier`; audits run between work sessions.
-
-Keep free space available in the library filesystem for one gallery's verified
-source spool, page processing, a CBZ being written, and every prepared CBZ and
-thumbnail awaiting publication. Database and disk-backed discovery/analysis plans
-also require space. Removing the full-turn source-byte copy does not make total
-scratch or pending output constant-sized. Disk-full or quota
-errors keep work pending for retry instead of publishing incomplete files. Free
-space or increase the quota, then let resident mode retry. Do not manually remove
-private journal, staging, or coordination files to clear an error.
-
-After an interruption, restart ingest with the same database and complete library.
-It resumes pending publication and cleanup. Readers may remain unavailable while
-an `ACTIVATING` marker or publication lock protects unfinished work. Unknown
-files, changed bytes, and unexpected symlinks are preserved and reported for
-inspection instead of being silently removed.
-
-## Upgrade or move an existing installation
-
-Upgrade ingest and H2HDB together within their declared dependency ranges.
-Back up the database and the complete library before offline maintenance.
-The runtime and relocation command accept only the exact format-v5 private
-library journal. The completed journal-v4-to-v5 converter, its packaged Python
-module and Docker bundle builder have been removed from this checkout and wheel.
-An already converted v5 library needs no further conversion, database reset or
-CBZ rebuild. Normal startup does not convert an old journal or use a fallback.
-
-For an installation that still has an exact v4 journal, stop ingest, OPDS, Komga
-and every other library consumer, and use the historical Ingest **0.28.0**
-checkout's `upgrade-library-journal-v4-to-v5.py` or its Docker bundle builder with
-that release's matching environment. Follow that checkout's README. The tool
-preserves the UUID, publication/protection/relocation facts, marker bytes, CBZs
-and artwork; it does not migrate or audit the Core database. Preserve the
-complete library while resolving any interrupted conversion.
-
-Core **0.43.x, 0.44.x and 0.45.x** share schema 9 and the public runtime facade
-contract. Core 0.44 retires its completed offline upgrade tools. Core 0.45 improves
-content-decision queries and changes its diagnostic query-attribution log format
-to schema 2; this is separate from database schema 9. Ingest's source backlog
-probe uses the unchanged exact operation counters, without summing approximate
-query-attribution entries. Already upgraded schema-9 databases and journal-v5
-libraries need no migration, reset or CBZ/artwork rebuild for Core 0.45. For an exact
-schema-8 database or an interrupted schema-8-to-9 conversion, use the historical
-Core **0.43.0** checkout's `upgrade-observation-upload-time-schema.py` and matching
-environment, following its README or Docker bundle instructions with all
-consumers stopped. That conversion retains observations, publications, database
-contents, CBZs, thumbnails and private library state; the journal remains v5.
-A corrected source upload time is recorded in a new observation and takes effect
-for readers only when that observation is published. Ingest does not convert
-the Core database.
-
-For schema 7, first use the historical Core 0.41.2 source-collection converter
-and its matching environment to reach schema 8. For schema 6, first use Core
-0.40.0's audit converter to reach schema 7. Then use Core 0.43.0's historical
-schema-8-to-9 converter;
-keep consumers stopped throughout and retain the database/library backup.
-Other older schemas require a separate database and catalog rebuild from source.
-
-Legacy libraries containing `current/hash-v1`, `.h2hdb-state/coordination`, or
-activation journals version 1, 2, or 3 are rejected. Keep their files intact and
-rebuild into a fresh library paired with a fresh database. Preserve the original
-download tree; the relocation command does not upgrade these old layouts.
-
-To move a current-format library to another path or filesystem:
-
-1. Stop ingest, readers, and every other process that could modify the library.
-2. Move the entire library, including `.h2hdb-state` and
-   `.h2hdb-coordination`. Keep the existing core database.
-3. Update all reader and writer paths or mounts to the new location.
-4. Run verification with the new library path visible to the command:
+1. 停止 ingest、閱讀器及任何可能修改書庫的程序。
+2. 搬移整個書庫，包含 `.h2hdb-state` 和 `.h2hdb-coordination`，沿用原資料庫。
+3. 更新所有讀寫服務的路徑或掛載。
+4. 執行驗證：
 
    ```bash
    h2hdb-ingest-relocate --library /new/location/library
    ```
 
-5. Restart ingest and readers only after the command reports completion.
+5. 指令回報完成後，再啟動 ingest 和閱讀器。
 
-Relocation verifies managed files and retains the library identity, catalog,
-and artifact contents. If interrupted, rerun the same command with the same
-destination to resume. It preserves incomplete or ambiguous files and reports
-the condition; it does not adopt or remove unrelated files. Copying only the
-CBZ files into an unrelated library does not preserve the database binding.
+中斷時以相同目的地重跑即可續做。此操作保留書庫 identity、目錄與檔案
+內容；僅複製 CBZ 到另一個空書庫並不能保留原有資料庫綁定。
 
-## Troubleshooting
+## 進一步資訊
 
-| Symptom | Action |
-| --- | --- |
-| `download_path is empty` | Check the source mount and configured path. |
-| `must be a pre-existing real directory` | Create the required library directories and check that none is a symlink. |
-| Database is not `READY` | For a new empty database, run the core administrator's `migrate`; for an existing database, inspect the reported version or audit failure before taking action. |
-| An image is rejected | Read the gallery/file rejection in the logs, repair the source, then update `galleryinfo.txt`. |
-| Storage-capacity error | Check free space and quotas on the reported filesystem; leave pending private state intact. |
-| `library relocation is unfinished` | Keep services stopped and rerun relocation at the same destination. |
-| Library identity changed | Check for a replaced mount or directory. For an intentional complete move, run relocation; do not pair the database with an unrelated root. |
-| Unsupported legacy library | Rebuild into a new library and database from retained downloads. |
+- [可靠性與驗證範圍](verification/README.md)：故障恢復、搬移與模型證據。
+- [設定定義](src/h2hdb_ingest/config.py)：完整欄位、預設值與限制。
+- [問題回報](https://github.com/Kuan-Lun/h2hdb-ingest/issues)：請提供套件版本、
+  資料庫種類、執行指令與錯誤訊息，移除帳密和私有路徑。
 
-For background on the verification evidence and its limits, see
-[Library reliability](verification/README.md). For a problem report, include the
-package versions, database backend, command, and relevant error context in the
-[issue tracker](https://github.com/Kuan-Lun/h2hdb-ingest/issues), with credentials
-and private paths removed.
+## 授權
 
-## Local source-cost acceptance
-
-From a development checkout with its environment installed, run this manual,
-POSIX-only acceptance before drawing conclusions from a source optimization:
-
-```bash
-.venv/bin/python scripts/check-source-cost.py --output /tmp/source-cost.json
-```
-
-The report path must not already exist. Exit `0` means the declared work budgets
-are satisfied, `1` means measured work violates a budget, and `2` means evidence
-is incomplete or execution failed. A completed experiment is not necessarily a
-passing acceptance. The current duplicate source reads and repeated whole-gallery
-entry validation are expected to produce violations; the checker preserves these
-targets instead of relabelling existing costs as acceptable.
-
-The default matrix uses deterministic PNG and JPEG fixtures with 127, 128, 129,
-and 512 pages, plus 1024-pixel and 2048-pixel images that exercise real decoding
-and disk-spool boundaries. It repeats fresh observations and metadata-only
-comparisons, measures completion-marker probes, and injects an interruption before
-a fresh source retry. It records logical read bytes, decoder calls, actual entry
-stat/revalidation work, CPU and wall time, and independently reconciles production
-telemetry. Fixture generation is timed separately. Runtime source digests must
-match the checkout; report provenance includes dependency digests and the commit.
-
-The work targets are one source-byte pass per complete observation, at most eight
-entry-stat passes independent of gallery size, and exactly one qualification
-decode per page when enabled. They are improvement targets, not a claim that
-the present implementation already meets them. Qualification includes decoding
-and resizing before CBZ generation. Inclusive decoder, I/O and revalidation times
-overlap; they cannot be added to wall time.
-
-This adapter acceptance does not exercise durable database reuse, full catalog
-analysis, publication, CBZ generation or library cleanup. Its marker-only case
-must not be described as an end-to-end unchanged-run result. The existing
-`probe-source-io.py` remains a diagnostic for actual published-baseline reuse.
-Local synthetic timings do not establish the full-library targets of 24 hours
-without CBZ work (12 hours desired), or seven days total including CBZ work.
-
-## Local library-cleanup cost acceptance
-
-Run the isolated journal experiment separately from source or database benchmarks:
-
-```bash
-.venv/bin/python scripts/check-library-cleanup-cost.py \
-  --full-inventory --output /tmp/library-cleanup-cost.json
-```
-
-This measures the two actual production cleanup-selection queries against the
-production SQLite journal schema. Default retained-token counts are 0, 127, 128,
-129, 4,096 and 32,768; `--full-inventory` adds 264,092 tokens, representing two
-resources per 132,046 galleries. Each size has no-eligible and sparse-eligible
-cases, with three reset/replay cycles and exact selected-row checks.
-
-The acceptance unit is SQLite VM instructions, including work that returns no
-rows. A fixed input-derived budget rejects repeated full-table scans. The same
-queries also run with a fixture-only index control and a forced scan: the index
-control must pass, and the forced scan must fail at large sizes. These controls
-verify that the checker distinguishes efficient access from the measured
-regression. Production journal v5 now has the matching partial index; the
-runtime must pass the original fixed budget independently of either control.
-
-The report separates experiment `status` from `acceptance.status` and uses the
-same exit codes `0`, `1`, and `2` as source acceptance. Wall time includes the
-per-instruction measurement callback and is not a production latency estimate.
-The seeded engine fixture does not exercise filesystem locking, hashing, unlink,
-fsync, journal-open validation, or the complete public cleanup lifecycle. Core
-publication/cleanup acceptance is a separate command in an explicitly supplied
-Core checkout; neither isolated measurement establishes the full-library SLO.
-
-## License
-
-GNU General Public License v3.0 only. See [LICENSE](LICENSE).
+GPL-3.0-only，詳見 [LICENSE](LICENSE)。
