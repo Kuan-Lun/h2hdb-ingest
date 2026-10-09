@@ -17,6 +17,10 @@ from h2hdb import ArtifactRenderedPage, ArtifactSourceMember, ArtifactSourceRole
 from PIL import Image, ImageOps
 
 import h2hdb_ingest.artifact as artifact_module
+import h2hdb_ingest.artifact._streams as stream_module
+import h2hdb_ingest.artifact.archive as archive_module
+import h2hdb_ingest.artifact.images as images_module
+import h2hdb_ingest.artifact.renderer as renderer_module
 from h2hdb_ingest.artifact import (
     ArtifactPreparationRenderer,
     ArtifactRenderPolicy,
@@ -79,13 +83,13 @@ def test_same_preparation_reuses_only_one_fully_decoded_inspection(
         policy=_POLICY,
     )
     calls: list[bytes] = []
-    verify = artifact_module._verify_canonical_jpeg
+    verify = images_module._verify_canonical_jpeg
 
     def track(content: bytes) -> artifact_module.CanonicalImageEvidence:
         calls.append(sha256(content).digest())
         return verify(content)
 
-    monkeypatch.setattr(artifact_module, "_verify_canonical_jpeg", track)
+    monkeypatch.setattr(archive_module, "_verify_canonical_jpeg", track)
     renderer = _renderer()
     archive, thumbnail = BytesIO(), BytesIO()
     rendered = renderer.render_archive(_members(), archive, gid=42)
@@ -127,7 +131,7 @@ def test_jpeg_validation_fully_decodes_without_pixel_transform_or_copy(
 
     monkeypatch.setattr(ImageOps, "exif_transpose", forbidden)
     monkeypatch.setattr(Image.Image, "copy", forbidden)
-    evidence = artifact_module._verify_canonical_jpeg(content)
+    evidence = images_module._verify_canonical_jpeg(content)
     assert (evidence.width, evidence.height) == (64, 32)
     assert evidence.sha256 == sha256(content).digest()
     # Keep JPEG framing and dimensions, but corrupt the scan header length.
@@ -135,7 +139,7 @@ def test_jpeg_validation_fully_decodes_without_pixel_transform_or_copy(
     scan = content.index(b"\xff\xda")
     malformed = content[:scan] + b"\xff\xda\x00\x08" + content[scan + 4 :]
     with pytest.raises(PresentationImageError, match="truncated or invalid"):
-        artifact_module._verify_canonical_jpeg(malformed)
+        images_module._verify_canonical_jpeg(malformed)
 
 
 @pytest.mark.parametrize("orientation", [1, 3, 5, 6, 7, 8])
@@ -148,9 +152,9 @@ def test_verification_preserves_oriented_dimensions_without_transposing(
     with Image.new("RGB", (64, 32), "blue") as source:
         source.save(output, format="JPEG", exif=exif)
     content = output.getvalue()
-    previous = artifact_module._load_safe_image(BytesIO(content))
+    previous = images_module._load_safe_image(BytesIO(content))
     try:
-        actual = artifact_module._verify_canonical_jpeg(content)
+        actual = images_module._verify_canonical_jpeg(content)
         assert (actual.width, actual.height) == previous.size
     finally:
         previous.close()
@@ -197,7 +201,7 @@ def test_changed_actual_archive_never_uses_retained_inspection(
         calls += 1
         return inspect(stream, names)
 
-    monkeypatch.setattr(artifact_module, "inspect_presentation_archive", track)
+    monkeypatch.setattr(renderer_module, "inspect_presentation_archive", track)
     thumbnail = BytesIO()
     if change == "valid_metadata":
         renderer.render_presentation(
@@ -231,14 +235,14 @@ def test_cover_is_rehashed_after_inspection_before_thumbnail(
     renderer = _renderer()
     archive = BytesIO()
     rendered = renderer.render_archive(_members(), archive, gid=42)
-    read_extent = artifact_module._read_extent
+    read_extent = stream_module._read_extent
 
     def change(stream: BinaryIO, *, offset: int, size: int) -> bytes:
         content = bytearray(read_extent(stream, offset=offset, size=size))
         content[10] ^= 1
         return bytes(content)
 
-    monkeypatch.setattr(artifact_module, "_read_extent", change)
+    monkeypatch.setattr(images_module, "_read_extent", change)
     thumbnail = BytesIO()
     with pytest.raises(PresentationImageError, match="cover changed"):
         renderer.render_presentation(archive, thumbnail, rendered_pages=rendered.pages)
@@ -313,7 +317,7 @@ def test_process_termination_restarts_without_inspection_authority(
         calls += 1
         return inspect(stream, names)
 
-    monkeypatch.setattr(artifact_module, "inspect_presentation_archive", track)
+    monkeypatch.setattr(renderer_module, "inspect_presentation_archive", track)
     restarted = _renderer()
     if phase == "partial":
         with path.open("rb") as damaged, pytest.raises(PresentationImageError):

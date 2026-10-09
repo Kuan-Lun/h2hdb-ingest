@@ -3,7 +3,9 @@ from __future__ import annotations
 import os
 import random
 import struct
+import tracemalloc
 import warnings
+import zlib
 from collections.abc import Buffer
 from datetime import UTC, datetime
 from hashlib import file_digest, sha256
@@ -30,11 +32,16 @@ from image_fixtures import write_large_source_png
 from PIL import Image
 
 import h2hdb_ingest.artifact as artifact_module
+import h2hdb_ingest.artifact.archive as archive_module
+import h2hdb_ingest.artifact.images as images_module
+import h2hdb_ingest.artifact.model as model_module
+import h2hdb_ingest.artifact.renderer as renderer_module
 from h2hdb_ingest.artifact import (
     MAX_ARCHIVE_SIZE_BYTES,
     MAX_DECODED_PIXELS,
     MAX_ENCODED_PAGE_BYTES,
     MAX_IMAGE_LONG_SIDE,
+    MAX_METADATA_BYTES,
     MAX_PAGE_COUNT,
     MAX_PAGE_RENDER_WORKERS,
     PAGE_JPEG_QUALITY,
@@ -108,17 +115,34 @@ def _zip_info(name: str, compression: int) -> ZipInfo:
     return info
 
 
-def _canonical_archive(*pages: bytes) -> tuple[bytes, tuple[str, ...]]:
+def _canonical_archive(
+    *pages: bytes, metadata: bytes = b"Title: test\n"
+) -> tuple[bytes, tuple[str, ...]]:
     destination = BytesIO()
     names = tuple(canonical_page_member_name(index) for index in range(len(pages)))
     with ZipFile(destination, "w") as writer:
         writer.writestr(
             _zip_info("galleryinfo.txt", ZIP_DEFLATED),
-            b"Title: test\n",
+            metadata,
         )
         for name, content in zip(names, pages, strict=True):
             writer.writestr(_zip_info(name, ZIP_STORED), content)
     return destination.getvalue(), names
+
+
+def _replace_metadata_encoding(
+    archive: bytes, encoded: bytes, *, decoded_size: int, crc32: int
+) -> bytes:
+    """Replace a metadata-only ZIP payload while keeping both headers consistent."""
+    central_offset = struct.unpack_from("<I", archive, len(archive) - 6)[0]
+    local_size = 30 + len("galleryinfo.txt")
+    local = bytearray(archive[:local_size])
+    central = bytearray(archive[central_offset:-22])
+    end = bytearray(archive[-22:])
+    struct.pack_into("<III", local, 14, crc32, len(encoded), decoded_size)
+    struct.pack_into("<III", central, 16, crc32, len(encoded), decoded_size)
+    struct.pack_into("<I", end, 16, local_size + len(encoded))
+    return bytes(local) + encoded + bytes(central) + bytes(end)
 
 
 def _provision_library_root(root: Path) -> None:
@@ -703,7 +727,7 @@ def test_parallel_and_automatic_rendering_are_byte_identical_to_sequential(
         return 10 if configured is None else original_resolve(configured)
 
     monkeypatch.setattr(
-        "h2hdb_ingest.artifact.resolve_page_render_workers",
+        "h2hdb_ingest.artifact.renderer.resolve_page_render_workers",
         resolve,
     )
 
@@ -744,7 +768,7 @@ def test_automatic_page_rendering_runs_only_the_bounded_worker_count(
             for index in range(MAX_PAGE_RENDER_WORKERS)
         ),
     )
-    original = artifact_module._render_page
+    original = images_module._render_page
     rendezvous = Barrier(MAX_PAGE_RENDER_WORKERS)
     guard = Lock()
     active = 0
@@ -756,7 +780,7 @@ def test_automatic_page_rendering_runs_only_the_bounded_worker_count(
         return MAX_PAGE_RENDER_WORKERS
 
     monkeypatch.setattr(
-        "h2hdb_ingest.artifact.resolve_page_render_workers",
+        "h2hdb_ingest.artifact.renderer.resolve_page_render_workers",
         resolve,
     )
 
@@ -777,7 +801,7 @@ def test_automatic_page_rendering_runs_only_the_bounded_worker_count(
             with guard:
                 active -= 1
 
-    monkeypatch.setattr(artifact_module, "_render_page", observed_render)
+    monkeypatch.setattr(renderer_module, "_render_page", observed_render)
 
     artifact_module.render_archive(
         members,
@@ -822,7 +846,7 @@ def test_parallel_image_header_warning_filter_is_serialized_and_restored(
 
     def load(source: BinaryIO) -> None:
         try:
-            image = artifact_module._load_safe_image(source)
+            image = images_module._load_safe_image(source)
             image.close()
         except BaseException as error:  # test thread must relay every failure
             failures.append(error)
@@ -887,7 +911,7 @@ def test_parallel_image_decode_remains_outside_header_warning_lock(
 
     def load(source: BinaryIO, *, finished: Event | None = None) -> None:
         try:
-            image = artifact_module._load_safe_image(source)
+            image = images_module._load_safe_image(source)
             image.close()
         except BaseException as error:  # test thread must relay every failure
             failures.append(error)
@@ -920,7 +944,7 @@ def test_sequential_page_batch_closes_completed_spools_after_later_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     first_stream = BytesIO(b"rendered")
-    first = artifact_module._RenderedPageBuffer(
+    first = renderer_module._RenderedPageBuffer(
         image=cast(artifact_module.CanonicalImageEvidence, object()),
         stream=first_stream,
     )
@@ -931,7 +955,7 @@ def test_sequential_page_batch_closes_completed_spools_after_later_failure(
         *,
         policy: ArtifactRenderPolicy,
         progress: ProgressWork | None = None,
-    ) -> artifact_module._RenderedPageBuffer:
+    ) -> renderer_module._RenderedPageBuffer:
         nonlocal calls
         del policy, progress
         calls += 1
@@ -939,14 +963,14 @@ def test_sequential_page_batch_closes_completed_spools_after_later_failure(
             return first
         raise RuntimeError("second page failed")
 
-    monkeypatch.setattr(artifact_module, "_render_page_member", fail_second)
+    monkeypatch.setattr(renderer_module, "_render_page_member", fail_second)
     members = (
         _source_member(1, ArtifactSourceRole.PAGE, b"one.png", b"one"),
         _source_member(2, ArtifactSourceRole.PAGE, b"two.png", b"two"),
     )
 
     with pytest.raises(RuntimeError, match="second page failed"):
-        artifact_module._render_page_batch(
+        renderer_module._render_page_batch(
             members,
             policy=ArtifactRenderPolicy(max_image_short_side=64),
             executor=None,
@@ -1020,7 +1044,7 @@ def test_archive_writer_discards_partial_scratch_after_size_failure(
         b"Title: test\n",
     )
     destination = BytesIO(b"preserved")
-    monkeypatch.setattr(artifact_module, "MAX_ARCHIVE_SIZE_BYTES", 64)
+    monkeypatch.setattr(archive_module, "MAX_ARCHIVE_SIZE_BYTES", 64)
 
     with pytest.raises(PresentationImageError, match="before member write"):
         adapter.render_archive((metadata,), destination, gid=42)
@@ -1149,7 +1173,7 @@ def test_archive_writer_validates_source_authority_roles_and_page_caps(
     with pytest.raises(PresentationImageError, match="truncated or invalid"):
         adapter.render_archive((metadata, invalid_page), BytesIO(), gid=42)
 
-    monkeypatch.setattr(artifact_module, "MAX_PAGE_COUNT", 1)
+    monkeypatch.setattr(renderer_module, "MAX_PAGE_COUNT", 1)
     second_page = _source_member(
         4,
         ArtifactSourceRole.PAGE,
@@ -1176,8 +1200,8 @@ def test_presentation_policy_constants_are_exact() -> None:
 
 
 def test_dimension_and_encoded_size_boundaries_are_inclusive() -> None:
-    artifact_module._validate_dimensions(8192, 1, max_long_side=8192)
-    artifact_module._validate_dimensions(8000, 5000, max_long_side=8192)
+    model_module._validate_dimensions(8192, 1, max_long_side=8192)
+    model_module._validate_dimensions(8000, 5000, max_long_side=8192)
     artifact_module.CanonicalImageEvidence(
         sha256=b"d" * 32,
         size_bytes=32 * 1024 * 1024,
@@ -1186,9 +1210,9 @@ def test_dimension_and_encoded_size_boundaries_are_inclusive() -> None:
     )
 
     with pytest.raises(PresentationImageError, match="long side"):
-        artifact_module._validate_dimensions(8193, 1, max_long_side=8192)
+        model_module._validate_dimensions(8193, 1, max_long_side=8192)
     with pytest.raises(PresentationImageError, match="40 MP"):
-        artifact_module._validate_dimensions(8001, 5000, max_long_side=8192)
+        model_module._validate_dimensions(8001, 5000, max_long_side=8192)
     with pytest.raises(ValueError, match="encoded size"):
         artifact_module.CanonicalImageEvidence(
             sha256=b"d" * 32,
@@ -1292,7 +1316,7 @@ def test_encoded_output_limit_is_enforced_before_destination_write(
     Image.new("RGB", (40, 20), "red").save(source, format="PNG")
     source.seek(0)
     destination = BytesIO()
-    monkeypatch.setattr(artifact_module, "MAX_ENCODED_PAGE_BYTES", 16)
+    monkeypatch.setattr(images_module, "MAX_ENCODED_PAGE_BYTES", 16)
 
     with pytest.raises(PresentationImageError, match="encoded JPEG exceeds"):
         _rendered_page_bytes(
@@ -1578,24 +1602,24 @@ def test_archive_size_preflight_rejects_exact_non_zip64_overflow() -> None:
     existing = ["galleryinfo.txt"]
     next_name = "pages/0000.jpg"
     overhead = (
-        artifact_module._LOCAL_FILE_HEADER.size
+        archive_module._LOCAL_FILE_HEADER.size
         + len(next_name)
         + 1
         + sum(
-            artifact_module._CENTRAL_DIRECTORY_HEADER_BYTES + len(name)
+            archive_module._CENTRAL_DIRECTORY_HEADER_BYTES + len(name)
             for name in (*existing, next_name)
         )
-        + artifact_module._END_OF_CENTRAL_DIRECTORY.size
+        + archive_module._END_OF_CENTRAL_DIRECTORY.size
     )
     exact_current_size = MAX_ARCHIVE_SIZE_BYTES - overhead
-    artifact_module._require_projected_archive_size(
+    archive_module._require_projected_archive_size(
         exact_current_size,
         existing,
         next_name,
         1,
     )
     with pytest.raises(PresentationImageError, match="require ZIP64"):
-        artifact_module._require_projected_archive_size(
+        archive_module._require_projected_archive_size(
             exact_current_size + 1,
             existing,
             next_name,
@@ -1717,7 +1741,7 @@ def test_archive_rejects_raw_central_fields_normalized_by_zipfile(
     )
     page_header_offset = (
         central_offset
-        + artifact_module._CENTRAL_DIRECTORY_HEADER.size
+        + archive_module._CENTRAL_DIRECTORY_HEADER.size
         + first_name_size
         + first_extra_size
         + first_comment_size
@@ -1749,7 +1773,7 @@ def test_archive_preflights_total_and_central_directory_bounds(
     Image.new("RGB", (40, 20), "red").save(page, format="JPEG")
     archive_bytes, names = _canonical_archive(page.getvalue())
     monkeypatch.setattr(
-        artifact_module,
+        archive_module,
         "MAX_ARCHIVE_SIZE_BYTES",
         len(archive_bytes) - 1,
     )
@@ -1757,7 +1781,7 @@ def test_archive_preflights_total_and_central_directory_bounds(
         inspect_presentation_archive(BytesIO(archive_bytes), names)
 
     monkeypatch.setattr(
-        artifact_module,
+        archive_module,
         "MAX_ARCHIVE_SIZE_BYTES",
         MAX_ARCHIVE_SIZE_BYTES,
     )
@@ -1767,6 +1791,23 @@ def test_archive_preflights_total_and_central_directory_bounds(
     struct.pack_into("<I", changed, central_size_offset, central_size + 1)
     with pytest.raises(PresentationImageError, match="central directory size"):
         inspect_presentation_archive(BytesIO(changed), names)
+
+
+@pytest.mark.parametrize("change", ("truncated_eocd", "zip_comment", "trailing_bytes"))
+def test_archive_requires_complete_comment_free_eocd_at_exact_end(change: str) -> None:
+    archive, names = _canonical_archive()
+    match change:
+        case "truncated_eocd":
+            archive = archive[:-1]
+        case "zip_comment":
+            destination = BytesIO(archive)
+            with ZipFile(destination, "a") as writer:
+                writer.comment = b"foreign comment"
+            archive = destination.getvalue()
+        case "trailing_bytes":
+            archive += b"foreign trailer"
+    with pytest.raises(PresentationImageError, match=r"central directory|EOCD|comment"):
+        inspect_presentation_archive(BytesIO(archive), names)
 
 
 def test_archive_rejects_reordered_members_and_prefixed_bytes() -> None:
@@ -1902,6 +1943,98 @@ def test_archive_reads_and_crc_validates_bounded_metadata() -> None:
         inspect_presentation_archive(BytesIO(archive), names)
 
 
+@pytest.mark.parametrize(
+    "change",
+    (
+        "valid",
+        "invalid_deflate",
+        "truncated_eof",
+        "trailing_bytes",
+        "concatenated_streams",
+        "declared_shorter",
+        "declared_longer",
+        "wrong_crc",
+        "over_policy_output",
+    ),
+)
+def test_metadata_requires_one_complete_stream_with_exact_size_and_crc(
+    change: str,
+) -> None:
+    content = b"A" * (MAX_METADATA_BYTES + 1 if change == "over_policy_output" else 16)
+    archive, _ = _canonical_archive(metadata=content)
+    central_offset = struct.unpack_from("<I", archive, len(archive) - 6)[0]
+    encoded = archive[30 + len("galleryinfo.txt") : central_offset]
+    size, checksum = len(content), zlib.crc32(content)
+    match change:
+        case "invalid_deflate":
+            encoded = b"\xff"
+        case "truncated_eof":
+            encoded = encoded[:-1]
+        case "trailing_bytes":
+            encoded += b"foreign"
+        case "concatenated_streams":
+            encoded += encoded
+        case "declared_shorter" | "over_policy_output":
+            size -= 1
+            checksum = zlib.crc32(content[:size])
+        case "declared_longer":
+            size += 1
+        case "wrong_crc":
+            checksum = 0
+    mutated = _replace_metadata_encoding(
+        archive, encoded, decoded_size=size, crc32=checksum
+    )
+    if change == "valid":
+        evidence = inspect_presentation_archive(BytesIO(mutated), ())
+        assert evidence.pages == ()
+        assert evidence.archive_sha256 == sha256(mutated).digest()
+    else:
+        with pytest.raises(PresentationImageError, match="metadata"):
+            inspect_presentation_archive(BytesIO(mutated), ())
+
+
+def test_metadata_expansion_is_rejected_without_materializing_unbounded_output() -> (
+    None
+):
+    archive, _ = _canonical_archive(metadata=b"A")
+    encoder = zlib.compressobj(wbits=-15)
+    # A tiny declared member expands to 64 MiB; construct it without allocating that.
+    block = b"A" * MAX_METADATA_BYTES
+    encoded = b"".join(encoder.compress(block) for _ in range(64)) + encoder.flush()
+    mutated = _replace_metadata_encoding(
+        archive, encoded, decoded_size=1, crc32=zlib.crc32(b"A")
+    )
+    tracemalloc.start()
+    try:
+        with pytest.raises(PresentationImageError, match="metadata"):
+            inspect_presentation_archive(BytesIO(mutated), ())
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    # Allows bounded input/output copies and parser overhead, far below 64 MiB.
+    assert peak < 8 * MAX_METADATA_BYTES
+
+
+def test_archive_inspection_reads_each_local_header_once() -> None:
+    page = BytesIO()
+    Image.new("RGB", (40, 20), "red").save(page, format="JPEG")
+    archive, names = _canonical_archive(page.getvalue(), page.getvalue())
+    with ZipFile(BytesIO(archive)) as opened:
+        header_reads = dict.fromkeys(
+            (info.header_offset for info in opened.infolist()), 0
+        )
+
+    class HeaderReader(BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            if size == 30 and self.tell() in header_reads:
+                header_reads[self.tell()] += 1
+            return super().read(size)
+
+    evidence = inspect_presentation_archive(HeaderReader(archive), names)
+    assert len(evidence.pages) == 2
+    assert tuple(header_reads.values()) == (1, 1, 1)
+
+
 def test_every_worker_path_fails_identically_and_discards_scratch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1936,7 +2069,7 @@ def test_every_worker_path_fails_identically_and_discards_scratch(
     )
     policy = ArtifactRenderPolicy(max_image_short_side=16)
     monkeypatch.setattr(
-        "h2hdb_ingest.artifact.resolve_page_render_workers",
+        "h2hdb_ingest.artifact.renderer.resolve_page_render_workers",
         lambda configured: 10 if configured is None else configured,
     )
 
@@ -1986,8 +2119,9 @@ def test_large_source_streams_to_spools_and_preserves_exact_byte_authority(
         spools.append(cast(BinaryIO, stream))
         return cast(BinaryIO, stream)
 
-    monkeypatch.setattr(artifact_module, "SpooledTemporaryFile", disk_spool)
-    original_render = artifact_module._render_page
+    monkeypatch.setattr(renderer_module, "SpooledTemporaryFile", disk_spool)
+    monkeypatch.setattr(images_module, "SpooledTemporaryFile", disk_spool)
+    original_render = images_module._render_page
 
     def render_then_change(
         source: BinaryIO,
@@ -2011,7 +2145,7 @@ def test_large_source_streams_to_spools_and_preserves_exact_byte_authority(
                         changed.write(b"unexpected trailing byte")
         return evidence
 
-    monkeypatch.setattr(artifact_module, "_render_page", render_then_change)
+    monkeypatch.setattr(renderer_module, "_render_page", render_then_change)
     bytes_read = 0
     with path.open("rb") as file:
         digest = file_digest(file, "sha256").digest()
@@ -2110,7 +2244,8 @@ def test_page_enospc_keeps_original_failure_when_all_spool_closes_fail(
         spools.append(stream)
         return stream
 
-    monkeypatch.setattr(artifact_module, "SpooledTemporaryFile", spool)
+    monkeypatch.setattr(renderer_module, "SpooledTemporaryFile", spool)
+    monkeypatch.setattr(images_module, "SpooledTemporaryFile", spool)
     image = BytesIO()
     Image.new("RGB", (32, 32), "red").save(image, format="PNG")
     destination = BytesIO()

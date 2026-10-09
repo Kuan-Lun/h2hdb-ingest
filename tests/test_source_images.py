@@ -237,7 +237,7 @@ def test_regular_decoders_retain_parallelism() -> None:
 def test_pipeline_and_native_versions_participate_in_policy_fingerprint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import h2hdb_ingest.artifact as artifact_module
+    import h2hdb_ingest.artifact.model as artifact_module
 
     policy = ArtifactRenderPolicy()
     baseline = artifact_policy_fingerprint_sha256(policy)
@@ -278,7 +278,7 @@ def test_real_hundred_megapixel_source_completes_without_pixel_rejection(
 def test_large_output_setting_downscales_to_output_pixel_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import h2hdb_ingest.artifact as artifact_module
+    import h2hdb_ingest.artifact.images as artifact_module
 
     monkeypatch.setattr(artifact_module, "MAX_DECODED_PIXELS", 100)
     with load_source_page_image(

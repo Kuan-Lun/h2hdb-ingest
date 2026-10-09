@@ -24,8 +24,9 @@ from h2hdb import (
 )
 from PIL import Image
 
-import h2hdb_ingest.artifact as artifact_module
+import h2hdb_ingest.artifact.renderer as artifact_module
 from h2hdb_ingest import IngestConfig, IngestPathsConfig, ResidentConfig
+from h2hdb_ingest.artifact import ArtifactRenderPolicy
 from h2hdb_ingest.database_audit import IngestDatabaseAudit
 from h2hdb_ingest.filesystem import FilesystemCompletionMarker
 from h2hdb_ingest.maintenance import LibraryMaintenanceOutcome
@@ -115,7 +116,7 @@ def test_runtime_reports_real_source_database_and_parallel_cbz_progress(
     def render(
         member: ArtifactSourceMember,
         *,
-        policy: artifact_module.ArtifactRenderPolicy,
+        policy: ArtifactRenderPolicy,
         progress: ProgressWork | None = None,
     ) -> artifact_module._RenderedPageBuffer:
         with workers_lock:
