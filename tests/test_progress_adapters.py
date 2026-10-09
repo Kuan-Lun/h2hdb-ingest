@@ -22,10 +22,12 @@ from h2hdb import (
 )
 from PIL import Image
 
-import h2hdb_ingest.artifact as artifact_module
+import h2hdb_ingest.artifact.images as images_module
+import h2hdb_ingest.artifact.renderer as artifact_module
 from h2hdb_ingest.artifact import (
     ArtifactPreparationRenderer,
     ArtifactRenderPolicy,
+    CanonicalImageEvidence,
     PresentationImageError,
 )
 from h2hdb_ingest.core_source import VNextFilesystemSourceAdapter
@@ -105,12 +107,12 @@ def test_completed_worker_is_visible_before_slow_first_page_and_zip_write(
     work = progress.begin("publication", announce=False)
     members = _members()
     first_started, release_first, second_completed = Event(), Event(), Event()
-    render_page = artifact_module._render_page
+    render_page = images_module._render_page
     advance = work.advance
 
     def block_first(
         source: BinaryIO, destination: BinaryIO, *, policy: ArtifactRenderPolicy
-    ) -> artifact_module.CanonicalImageEvidence:
+    ) -> CanonicalImageEvidence:
         if source is members[1].source:
             first_started.set()
             assert release_first.wait(5)

@@ -37,7 +37,7 @@ from library_fixtures import (
     _source_root,
 )
 
-import h2hdb_ingest.artifact as artifact_module
+import h2hdb_ingest.artifact.renderer as artifact_module
 import h2hdb_ingest.library as library_module
 from h2hdb_ingest._library_journal import create_fresh_journal
 from h2hdb_ingest._library_layout import validate_precreated_library_layout

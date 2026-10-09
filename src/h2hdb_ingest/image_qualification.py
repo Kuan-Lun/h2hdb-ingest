@@ -16,10 +16,8 @@ from typing import BinaryIO, Literal, cast
 from h2hdb import ArtifactFailureContext, VNextSourceQualification
 
 from ._image_performance import current_image_measurement, measure_image_work
-from .artifact import (
-    ArtifactRenderPolicy,
-    load_source_page_image,
-)
+from .artifact.images import load_source_page_image
+from .artifact.model import ArtifactRenderPolicy
 from .artifact_errors import (
     attach_page_failure_context,
     attach_qualification_failure_context,

@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-01T16:26:01+00:00",
+  "checked_at": "2026-10-09T17:05:25+00:00",
   "manifest_sha256": "53d1d7332521001911514e9a11e8a4bcff9db957c0a7462b61af7f424fcb8180",
   "node": [
     {
@@ -9,7 +9,7 @@
       "name": "markdownlint-cli2"
     }
   ],
-  "project_version": "0.30.3",
+  "project_version": "0.30.4",
   "python": [
     {
       "declared": "hatchling>=1.32.0,<2.0.0",
@@ -32,7 +32,7 @@
     {
       "declared": "h2hdb>=0.43.0,<0.46.0",
       "group": "runtime",
-      "latest": "0.45.2",
+      "latest": "0.45.8",
       "latest_satisfies": true,
       "name": "h2hdb",
       "python_3_14": true,
@@ -50,7 +50,7 @@
     {
       "declared": "pydantic>=2.13.4,<3.0.0",
       "group": "runtime",
-      "latest": "2.13.5",
+      "latest": "2.14.0",
       "latest_satisfies": true,
       "name": "pydantic",
       "python_3_14": true,
@@ -95,7 +95,7 @@
     {
       "declared": "hypothesis>=6.165.10,<7.0.0",
       "group": "optional:dev",
-      "latest": "6.168.3",
+      "latest": "6.168.5",
       "latest_satisfies": true,
       "name": "hypothesis",
       "python_3_14": true,
@@ -104,7 +104,7 @@
     {
       "declared": "mypy>=2.3.1",
       "group": "optional:dev",
-      "latest": "2.3.1",
+      "latest": "2.4.0",
       "latest_satisfies": true,
       "name": "mypy",
       "python_3_14": true,
@@ -140,7 +140,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.16.9",
+      "latest": "0.16.10",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -157,7 +157,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all build/runtime/development/Node direct candidates against the 0.30.2 receipt; the only new direct candidate is Core 0.45.2 (formerly 0.45.0). Reviewed Core 0.45.1 bounded decision-query and 0.45.2 pre-statement idle-session admission changes in the local release history: schema9, public facade contracts and telemetry2 remain unchanged, within the existing >=0.43,<0.46 lane. The isolated local environment resolves Core 0.45.2 normally. Other direct candidates are unchanged from the previously reviewed receipt and all latest releases remain within declared bounds; no dependency manifest change is warranted. This release exposes the existing cumulative source_progress records at INFO without changing their schema, qualification/image policy, native fingerprint, artifact bytes, or library journal v5. Runtime regression, installed-wheel routing probe and four-role candidate Compose acceptance are recorded separately.",
+    "note": "Reviewed registry candidates against the previous 0.30.3 receipt and Python 3.14 support. Core 0.45.8 remains in the existing 0.43-0.45 schema-9/facade lane; reviewed intervening source/publication validation and cleanup/analysis commits. Pydantic 2.14.0 release notes: Python support, enum/config and schema fixes; upgraded local and clean wheel environments, existing configuration and runtime tests retained. Hypothesis 6.168.5 field-annotation fix, mypy 2.4.0 native parser/typeshed changes, Ruff 0.16.10 preview/server fixes reviewed; local strict lint/format/mypy checks passed with upgraded tools and unchanged rules. Other build/runtime/dev/Node direct latest versions unchanged and satisfy existing bounds; Pillow/libvips versions unchanged. Candidate Core 0.45.8 plus Ingest 0.30.4 resolved normally in a clean environment (43 packages, no --no-deps). No requirement or upper-bound change. Full merge and live integration results are separate evidence, not asserted by this audit receipt.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
